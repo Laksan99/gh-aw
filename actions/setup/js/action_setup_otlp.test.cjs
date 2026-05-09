@@ -24,6 +24,8 @@ const mockSendJobSetupSpan = vi.fn();
 const VALID_TRACE_ID = "0102030405060708090a0b0c0d0e0f10";
 /** 16 lowercase hex chars — valid OTLP span ID */
 const VALID_SPAN_ID = "0102030405060708";
+/** 16 lowercase hex chars — valid OTLP parent span ID */
+const VALID_PARENT_SPAN_ID = "1112131415161718";
 
 describe("action_setup_otlp.cjs", () => {
   /** @type {string} */
@@ -41,7 +43,7 @@ describe("action_setup_otlp.cjs", () => {
 
     // Patch the shared CJS module exports — run() re-destructures on every call
     sendOtlpModule.sendJobSetupSpan = mockSendJobSetupSpan;
-    mockSendJobSetupSpan.mockResolvedValue({ traceId: VALID_TRACE_ID, spanId: VALID_SPAN_ID });
+    mockSendJobSetupSpan.mockResolvedValue({ traceId: VALID_TRACE_ID, spanId: VALID_SPAN_ID, parentSpanId: VALID_PARENT_SPAN_ID });
 
     // Provide fresh temp files so GITHUB_OUTPUT and GITHUB_ENV writes are isolated
     tempDir = mkdtempSync(join(tmpdir(), "action-setup-otlp-test-"));
@@ -59,6 +61,8 @@ describe("action_setup_otlp.cjs", () => {
       "INPUT_TRACE-ID": process.env["INPUT_TRACE-ID"],
       INPUT_JOB_NAME: process.env.INPUT_JOB_NAME,
       "INPUT_JOB-NAME": process.env["INPUT_JOB-NAME"],
+      INPUT_PARENT_SPAN_ID: process.env.INPUT_PARENT_SPAN_ID,
+      "INPUT_PARENT-SPAN-ID": process.env["INPUT_PARENT-SPAN-ID"],
     };
 
     delete process.env.GH_AW_OTLP_ENDPOINTS;
@@ -67,6 +71,8 @@ describe("action_setup_otlp.cjs", () => {
     delete process.env["INPUT_TRACE-ID"];
     delete process.env.INPUT_JOB_NAME;
     delete process.env["INPUT_JOB-NAME"];
+    delete process.env.INPUT_PARENT_SPAN_ID;
+    delete process.env["INPUT_PARENT-SPAN-ID"];
     process.env.GITHUB_OUTPUT = outputFile;
     process.env.GITHUB_ENV = envFile;
   });
@@ -276,6 +282,13 @@ describe("action_setup_otlp.cjs", () => {
       await run();
 
       expect(console.log).toHaveBeenCalledWith(`[otlp] trace-id=${VALID_TRACE_ID} written to GITHUB_OUTPUT`);
+    });
+
+    it("should write parent-span-id to GITHUB_OUTPUT when parent span ID is valid", async () => {
+      await run();
+
+      const content = readFileSync(outputFile, "utf8");
+      expect(content).toContain(`parent-span-id=${VALID_PARENT_SPAN_ID}\n`);
     });
 
     it("should not write to GITHUB_OUTPUT when GITHUB_OUTPUT is not set", async () => {

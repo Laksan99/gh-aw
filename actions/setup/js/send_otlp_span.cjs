@@ -778,6 +778,10 @@ function isValidSpanId(id) {
  *   and if none of those are set a new random trace ID is generated.
  *   Pass the `trace-id` output of the activation job setup step to correlate all
  *   subsequent job spans under the same trace.
+ * @property {string} [parentSpanId] - Parent span ID to use for setup-span nesting.
+ *   When omitted the value is taken from the `INPUT_PARENT_SPAN_ID` environment variable
+ *   (the `parent-span-id` action input); if that is also absent the
+ *   `otel_parent_span_id` field from `aw_info.context` is used.
  */
 
 /**
@@ -785,7 +789,7 @@ function isValidSpanId(id) {
  * is configured) to the configured OTLP endpoint.
  *
  * This is designed to be called from `actions/setup/index.js` immediately after
- * the setup script completes.  It always returns `{ traceId, spanId }` so callers
+ * the setup script completes.  It always returns `{ traceId, spanId, parentSpanId }` so callers
  * can expose the trace ID as an action output and write both values to `$GITHUB_ENV`
  * for downstream step correlation — even when `OTEL_EXPORTER_OTLP_ENDPOINT` is not
  * set (no span is sent in that case).
@@ -796,6 +800,7 @@ function isValidSpanId(id) {
  * - `OTEL_SERVICE_NAME`            – service name (defaults to "gh-aw")
  * - `INPUT_JOB_NAME`               – job name passed via the `job-name` action input
  * - `INPUT_TRACE_ID`               – optional trace ID passed via the `trace-id` action input
+ * - `INPUT_PARENT_SPAN_ID`         – optional parent span ID passed via the `parent-span-id` action input
  * - `GH_AW_INFO_WORKFLOW_NAME`     – workflow name injected by the gh-aw compiler
  * - `GH_AW_INFO_ENGINE_ID`         – engine ID injected by the gh-aw compiler
  * - `GITHUB_RUN_ID`                – GitHub Actions run ID
@@ -813,7 +818,7 @@ function isValidSpanId(id) {
  *   (and specific comment) that triggered the workflow
  *
  * @param {SendJobSetupSpanOptions} [options]
- * @returns {Promise<{ traceId: string, spanId: string }>} The trace and span IDs used.
+ * @returns {Promise<{ traceId: string, spanId: string, parentSpanId: string }>} The trace/span IDs used and resolved parent span ID.
  */
 async function sendJobSetupSpan(options = {}) {
   // Resolve the trace ID before the early-return so it is always available as
@@ -823,6 +828,7 @@ async function sendJobSetupSpan(options = {}) {
 
   // Validate options.traceId if supplied; callers may pass raw user input.
   const optionsTraceId = options.traceId && isValidTraceId(options.traceId) ? options.traceId : "";
+  const optionsParentSpanId = options.parentSpanId && isValidSpanId(options.parentSpanId) ? options.parentSpanId : "";
 
   // Normalize INPUT_TRACE_ID to lowercase before validating: OTLP requires lowercase
   // hex, but trace IDs pasted from external tools may use uppercase characters.
@@ -830,6 +836,8 @@ async function sendJobSetupSpan(options = {}) {
   // input name hyphen instead of converting it to an underscore.
   const rawInputTraceId = (process.env.INPUT_TRACE_ID || process.env["INPUT_TRACE-ID"] || "").trim().toLowerCase();
   const inputTraceId = isValidTraceId(rawInputTraceId) ? rawInputTraceId : "";
+  const rawInputParentSpanId = (process.env.INPUT_PARENT_SPAN_ID || process.env["INPUT_PARENT-SPAN-ID"] || "").trim().toLowerCase();
+  const inputParentSpanId = isValidSpanId(rawInputParentSpanId) ? rawInputParentSpanId : "";
 
   // When this job was dispatched by a parent workflow, the parent's trace ID is
   // propagated via aw_context.otel_trace_id → aw_info.context.otel_trace_id so that
@@ -853,6 +861,7 @@ async function sendJobSetupSpan(options = {}) {
   const commentId = typeof awInfo.context?.comment_id === "string" ? awInfo.context.comment_id : "";
 
   const traceId = optionsTraceId || inputTraceId || contextTraceId || generateTraceId();
+  const parentSpanId = optionsParentSpanId || inputParentSpanId || contextParentSpanId || "";
 
   // Always generate a span ID so it can be written to GITHUB_ENV as
   // GITHUB_AW_OTEL_PARENT_SPAN_ID even when OTLP is not configured, allowing downstream
@@ -924,7 +933,7 @@ async function sendJobSetupSpan(options = {}) {
   const payload = buildOTLPPayload({
     traceId,
     spanId,
-    ...(contextParentSpanId ? { parentSpanId: contextParentSpanId } : {}),
+    ...(parentSpanId ? { parentSpanId } : {}),
     spanName: jobName ? `gh-aw.${jobName}.setup` : "gh-aw.job.setup",
     startMs,
     endMs,
@@ -939,12 +948,12 @@ async function sendJobSetupSpan(options = {}) {
 
   const endpoints = parseOTLPEndpoints();
   if (endpoints.length === 0) {
-    return { traceId, spanId };
+    return { traceId, spanId, parentSpanId };
   }
 
   // Pass skipJSONL: true so sendOTLPToAllEndpoints/sendOTLPSpan don't double-write the mirror.
   await sendOTLPToAllEndpoints(endpoints, payload, { skipJSONL: true });
-  return { traceId, spanId };
+  return { traceId, spanId, parentSpanId };
 }
 
 // ---------------------------------------------------------------------------
