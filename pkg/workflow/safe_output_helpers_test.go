@@ -233,7 +233,7 @@ func TestApplySafeOutputEnvToMap(t *testing.T) {
 			name: "safe outputs with staged flag",
 			workflowData: &WorkflowData{
 				SafeOutputs: &SafeOutputsConfig{
-					Staged: true,
+					Staged: templatableBoolPtr("true"),
 				},
 			},
 			expected: map[string]string{
@@ -294,13 +294,79 @@ func TestApplySafeOutputEnvToMap(t *testing.T) {
 	}
 }
 
-// TestApplySafeOutputEnvToSlice verifies the helper function for YAML string slices
+// TestApplyTraceContextEnvToMap verifies the helper function that injects TRACEPARENT
+// into the engine execution step environment.
+func TestApplyTraceContextEnvToMap(t *testing.T) {
+	t.Run("adds TRACEPARENT to empty map", func(t *testing.T) {
+		env := make(map[string]string)
+		applyTraceContextEnvToMap(env)
+		if len(env) != 1 {
+			t.Errorf("Expected 1 env var, got %d", len(env))
+		}
+		val, ok := env["TRACEPARENT"]
+		if !ok {
+			t.Fatal("Expected TRACEPARENT to be set")
+		}
+		// Must be a GitHub Actions expression that produces the W3C traceparent format
+		// when both OTEL IDs are present, and an empty string otherwise.
+		if !strings.Contains(val, "GITHUB_AW_OTEL_TRACE_ID") {
+			t.Errorf("TRACEPARENT expression should reference GITHUB_AW_OTEL_TRACE_ID, got: %q", val)
+		}
+		if !strings.Contains(val, "GITHUB_AW_OTEL_PARENT_SPAN_ID") {
+			t.Errorf("TRACEPARENT expression should reference GITHUB_AW_OTEL_PARENT_SPAN_ID, got: %q", val)
+		}
+		if !strings.Contains(val, "00-") {
+			t.Errorf("TRACEPARENT expression should include W3C version '00-', got: %q", val)
+		}
+		if !strings.Contains(val, "-01") {
+			t.Errorf("TRACEPARENT expression should include trace-flags '-01', got: %q", val)
+		}
+		// Fallback to empty string when OTEL not configured
+		if !strings.Contains(val, "|| ''") {
+			t.Errorf("TRACEPARENT expression should fall back to empty string when OTEL not configured, got: %q", val)
+		}
+	})
+
+	t.Run("sets TRACEPARENT unconditionally", func(t *testing.T) {
+		// applyTraceContextEnvToMap always sets TRACEPARENT. User overrides are applied
+		// afterwards by the engine via maps.Copy(env, workflowData.EngineConfig.Env),
+		// so they naturally win without needing a conditional here.
+		env := map[string]string{"TRACEPARENT": "00-custom-parent-01"}
+		applyTraceContextEnvToMap(env)
+		// The function overwrites any prior value with the GitHub Actions expression.
+		if env["TRACEPARENT"] == "" {
+			t.Error("TRACEPARENT should not be empty after applyTraceContextEnvToMap")
+		}
+		if env["TRACEPARENT"] == "00-custom-parent-01" {
+			t.Error("applyTraceContextEnvToMap should replace the prior value with the GHA expression")
+		}
+	})
+
+	t.Run("preserves existing keys in map", func(t *testing.T) {
+		env := map[string]string{
+			"ANTHROPIC_API_KEY": "${{ secrets.ANTHROPIC_API_KEY }}",
+			"GH_AW_PHASE":       "agent",
+		}
+		applyTraceContextEnvToMap(env)
+		if env["ANTHROPIC_API_KEY"] != "${{ secrets.ANTHROPIC_API_KEY }}" {
+			t.Error("applyTraceContextEnvToMap should not modify existing ANTHROPIC_API_KEY")
+		}
+		if env["GH_AW_PHASE"] != "agent" {
+			t.Error("applyTraceContextEnvToMap should not modify existing GH_AW_PHASE")
+		}
+		if _, ok := env["TRACEPARENT"]; !ok {
+			t.Error("applyTraceContextEnvToMap should add TRACEPARENT")
+		}
+	})
+}
+
 // TestBuildWorkflowMetadataEnvVars verifies the helper function for workflow metadata env vars
 func TestBuildWorkflowMetadataEnvVars(t *testing.T) {
 	tests := []struct {
 		name           string
 		workflowName   string
 		workflowSource string
+		localSourceURL string
 		expected       []string
 	}{
 		{
@@ -349,11 +415,31 @@ func TestBuildWorkflowMetadataEnvVars(t *testing.T) {
 				"          GH_AW_WORKFLOW_SOURCE: \"invalid-source\"\n",
 			},
 		},
+		{
+			name:           "local source URL used when no external source",
+			workflowName:   "Linter Miner",
+			localSourceURL: "${{ github.server_url }}/${{ github.repository }}/blob/${{ github.ref_name }}/.github/workflows/linter-miner.md",
+			expected: []string{
+				"          GH_AW_WORKFLOW_NAME: \"Linter Miner\"\n",
+				"          GH_AW_WORKFLOW_SOURCE_URL: \"${{ github.server_url }}/${{ github.repository }}/blob/${{ github.ref_name }}/.github/workflows/linter-miner.md\"\n",
+			},
+		},
+		{
+			name:           "external source takes precedence over local source URL",
+			workflowName:   "CI Helper",
+			workflowSource: "owner/repo/workflows/ci.md@main",
+			localSourceURL: "${{ github.server_url }}/${{ github.repository }}/blob/${{ github.ref_name }}/.github/workflows/ci.md",
+			expected: []string{
+				"          GH_AW_WORKFLOW_NAME: \"CI Helper\"\n",
+				"          GH_AW_WORKFLOW_SOURCE: \"owner/repo/workflows/ci.md@main\"\n",
+				"          GH_AW_WORKFLOW_SOURCE_URL: \"${{ github.server_url }}/owner/repo/blob/main/workflows/ci.md\"\n",
+			},
+		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			result := buildWorkflowMetadataEnvVars(tt.workflowName, tt.workflowSource)
+			result := buildWorkflowMetadataEnvVars(tt.workflowName, tt.workflowSource, tt.localSourceURL)
 
 			if len(result) != len(tt.expected) {
 				t.Errorf("Expected %d env vars, got %d", len(tt.expected), len(result))
@@ -444,10 +530,14 @@ func TestBuildSafeOutputJobEnvVars(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
+			var staged *TemplatableBool
+			if tt.staged {
+				staged = templatableBoolPtr("true")
+			}
 			result := buildSafeOutputJobEnvVars(
 				tt.trialMode,
 				tt.trialLogicalRepoSlug,
-				tt.staged,
+				staged,
 				tt.targetRepoSlug,
 			)
 
@@ -565,7 +655,7 @@ func TestEnginesUseSameHelperLogic(t *testing.T) {
 		TrialMode:        true,
 		TrialLogicalRepo: "owner/trial-repo",
 		SafeOutputs: &SafeOutputsConfig{
-			Staged: true,
+			Staged: templatableBoolPtr("true"),
 			UploadAssets: &UploadAssetsConfig{
 				BranchName:  "gh-aw-assets",
 				MaxSizeKB:   10240,

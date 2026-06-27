@@ -1,4 +1,6 @@
 ---
+private: true
+emoji: "🧹"
 description: CI cleaner that fixes format, lint, and test issues when CI fails on main branch. Schedule disabled (issue #26015); use workflow_dispatch to trigger manually.
 on:
   workflow_dispatch:
@@ -14,9 +16,9 @@ tracker-id: hourly-ci-cleaner
 # - Target: Focus on systematic fix application with minimal iteration
 # - Budget target: 15-20 turns for typical CI fixes
 # - max-turns: 20 (hard limit via Claude engine)
+max-turns: 20
 engine:
   id: claude
-  max-turns: 20
   agent: ci-cleaner
 network:
   allowed:
@@ -32,6 +34,7 @@ tools:
 sandbox:
   agent:
     id: awf
+    sudo: false
     mounts:
       - "/usr/bin/make:/usr/bin/make:ro"
       - "/usr/bin/go:/usr/bin/go:ro"
@@ -52,7 +55,7 @@ jobs:
       ci_run_id: ${{ steps.ci_check.outputs.ci_run_id }}
     steps:
       - name: Checkout repository
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
         with:
           persist-credentials: false
       - name: Check last CI workflow run status on main branch
@@ -118,7 +121,7 @@ imports:
   - ../agents/ci-cleaner.agent.md
 
 
-  - shared/observability-otlp.md
+  - shared/otlp.md
 ---
 
 # CI Cleaner

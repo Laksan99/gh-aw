@@ -1,6 +1,8 @@
 package cli
 
 import (
+	"fmt"
+
 	"github.com/github/gh-aw/pkg/logger"
 	"github.com/spf13/cobra"
 )
@@ -23,13 +25,17 @@ Available subcommands:
   - list       - List MCP servers defined in agentic workflows
   - list-tools - List tools for a specific MCP server, or find workflows using it
   - inspect    - Inspect MCP servers and list available tools, resources, and roots
-  - add        - Add an MCP server to an agentic workflow
-
-Examples:
-  gh aw mcp list                              # List all workflows with MCP servers
+  - add        - Add an MCP server to an agentic workflow`,
+		Example: `  gh aw mcp list                              # List all workflows with MCP servers
   gh aw mcp inspect weekly-research           # Inspect MCP servers in workflow
   gh aw mcp add my-workflow tavily            # Add Tavily MCP server to workflow
   gh aw mcp inspect weekly-research --server github --tool create_issue  # Inspect specific tool`,
+		Args: func(cmd *cobra.Command, args []string) error {
+			if len(args) > 0 {
+				return fmt.Errorf("unknown command %q for %q", args[0], cmd.CommandPath())
+			}
+			return nil
+		},
 		RunE: func(cmd *cobra.Command, args []string) error {
 			return cmd.Help()
 		},

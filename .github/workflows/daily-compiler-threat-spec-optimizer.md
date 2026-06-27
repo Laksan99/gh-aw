@@ -1,54 +1,66 @@
 ---
-name: Daily Compiler Threat Spec Optimizer
-description: Daily optimizer that reconciles compiler threat coverage with W3C specification-driven detection rules
+private: true
 on:
-  schedule: daily
-  workflow_dispatch:
-
+  schedule: weekly on monday around 03:00
+  workflow_dispatch: null
+max-daily-ai-credits: 10000
 permissions:
   contents: read
   issues: read
   pull-requests: read
   security-events: read
-
-tracker-id: daily-compiler-threat-spec-optimizer
-engine: copilot
-strict: true
-
 imports:
-  - uses: shared/daily-audit-base.md
-    with:
-      title-prefix: "[compiler-threat-spec] "
-      expires: 3d
-
-  - shared/observability-otlp.md
+- uses: shared/daily-audit-base.md
+  with:
+    expires: 3d
+    title-prefix: "[compiler-threat-spec] "
+- shared/otlp.md
 safe-outputs:
   create-pull-request:
-    title-prefix: "[compiler-threat-spec] "
-    labels: [security, compiler, specification, automation]
-    expires: 7d
     draft: false
-
+    expires: 7d
+    labels:
+    - security
+    - compiler
+    - specification
+    - automation
+    title-prefix: "[compiler-threat-spec] "
+description: Daily optimizer that reconciles compiler threat coverage with W3C specification-driven detection rules
+emoji: 🔒
+engine:
+  id: copilot
+  copilot-sdk: true
+name: Daily Compiler Threat Spec Optimizer
+strict: true
+timeout-minutes: 30
+sandbox:
+  agent:
+    sudo: false
 tools:
+  bash:
+  - git
+  - cat
+  - find
+  - ls
+  - sed
+  - awk
+  - grep
+  - head
+  - pwd
+  - go
   cli-proxy: true
+  edit: null
   github:
     mode: gh-proxy
-    toolsets: [default, issues, pull_requests, code_security]
-  edit:
-  bash:
-    - "git ls-files pkg/workflow/*.go"
-    - "git ls-files pkg/parser/*.go"
-    - "cat specs/compiler-threat-detection-spec.md"
-    - "git log --since='2 days ago' --oneline -- pkg/workflow pkg/parser actions/setup/js"
-    - "git diff -- pkg/workflow pkg/parser actions/setup/js"
-    - "go test -v ./pkg/workflow/..."
-
-timeout-minutes: 30
-
-firewall:
-  effective-token-steering: true
+    toolsets:
+    - default
+    - issues
+    - pull_requests
+    - code_security
+tracker-id: daily-compiler-threat-spec-optimizer
+features:
+  gh-aw-detection: true
 ---
-
 {{#runtime-import? .github/shared-instructions.md}}
 
 # Daily Compiler Threat Spec Optimizer
@@ -58,6 +70,10 @@ You are a specialized optimizer that maintains security detection rules for the 
 ## Mission
 
 Use `specs/compiler-threat-detection-spec.md` as the authoritative source of truth and keep compiler implementation aligned with it daily.
+
+## Tooling Constraint
+
+This workflow uses a restricted Copilot SDK shell allowlist. For repository inspection, use the approved shell commands above (`git`, `cat`, `find`, `ls`, `sed`, `awk`, `grep`, `head`, `pwd`, `go`) instead of built-in file read/view tools, and avoid requesting commands outside that set.
 
 This workflow simulates a team of experts in:
 - GitHub Actions compilation

@@ -1,392 +1,345 @@
 ---
-name: Dictation Instructions
-description: Instructions for fixing speech-to-text errors and improving text quality in gh-aw documentation and workflows
+name: dictation
+description: Dictation instructions for fixing speech-to-text errors and improving text quality in gh-aw workflows
 ---
 
 # Dictation Instructions
 
 ## Technical Context
 
-GitHub Agentic Workflows (gh-aw) is a Go-based GitHub CLI extension for writing AI-powered workflows in natural language using markdown files that compile to GitHub Actions YAML.
+gh-aw (GitHub Agentic Workflows) is a CLI extension for GitHub that compiles markdown workflow files into GitHub Actions YAML. It enables AI-powered workflows using natural language instructions with support for multiple engines (Copilot, Claude, Codex, Gemini), tools (GitHub API, bash, web-fetch, playwright), and security features (safe-outputs, network permissions, integrity levels).
 
 ## Project Glossary
 
-The following project-specific technical terms should be corrected when encountered in speech-to-text input:
-.github
-.github/agents/
-.github/aw/imports/
-.github/workflows/
-.lock.yml
-.md
-@copilot
-ACTIONS_STEP_DEBUG
-ANTHROPIC_API_KEY
-CLAUDE_CODE_OAUTH_TOKEN
-CODEX_API_KEY
-COPILOT_GITHUB_TOKEN
-COPILOT_MODEL
-COPILOT_PROVIDER_API_KEY
-COPILOT_PROVIDER_BASE_URL
-DEBUG
-FUZZY:BI-WEEKLY
-FUZZY:DAILY
-FUZZY:WEEKLY
-GEMINI_API_KEY
-GH_AW_AGENT_TOKEN
-GH_AW_ALLOWED_DOMAINS
-GH_AW_GITHUB_TOKEN
-GH_AW_PROMPT
-GH_AW_SAFE_OUTPUTS
-GH_AW_VERSION
-GH_AW_WORKFLOW_ID
-GH_HOST
-GH_TOKEN
-GITHUB_TOKEN
-MCP_GATEWAY_SESSION_TIMEOUT
-OPENAI_API_KEY
-OTEL_EXPORTER_OTLP_ENDPOINT
-RUNNER_TEMP
-SARIF
+acceptEdits
+actions
 activation
-activation-job
+actor
 add-comment
 add-wizard
-agent-job
+agent
+agent-output.json
 agentic
 agentic-workflows
+AGENTS.md
+ai-credits
 allowed
 allowed-domains
 allowed-files
-allowed-labels
+allowed-github-references
 allowed-repos
-allowlist
+ANTHROPIC_API_KEY
 api-target
-api.github.com
+append
 approval-labels
+approved
 artifact
-assign-to-agent
-assign-to-copilot
+artifacts
 audit
-auth
-auto-merge
-auto-triage-issues
-automation
+avoidHourBoundary
+avoidPeakMinutes
+aw-info.json
+aw.json
+aw.yml
 bash
 blocked
 blocked-users
+body
 branch
-build
-bun
 bypassPermissions
 cache
-cache-key
 cache-memory
+call-workflow
 checkout
-checks
 claude
-code-review
-code-scanning
+CLAUDE.md
+client-id
+close-issue
+close-pull-request
 codex
-coding-agent
-comment
+comment-memory
+compilation
 compile
-compile-workflow
-compiler
+conclusion
 concurrency
-concurrency-group
-config
 contents
 copilot
-create-agent-session
+COPILOT_GITHUB_TOKEN
+COPILOT_MODEL
 create-discussion
 create-issue
 create-pull-request
 create-pull-request-review-comment
 cron
 cross-repository
+crush
 custom
-custom-agent
+custom-safe-outputs
 daily
-debug
-default-branch
+default
 defaults
-deno
-dependabot
-description
+dependencies
 detection
+dev-tools
+discussion
+discussion-number
 discussions
 dispatch-workflow
-docker
-documentation
-dotnet
-draft
+DOCKER_HOST
+domain
+download-artifact
+edit
+effective-tokens
+end-date
+endpoint
 engine
-engine-config
+engine.bare
+engine.env
+engine.mcp
+engine.model
+engine.permission-mode
 env
-environment
-events
+ephemerals
 experiment
 experiments
 expires
-fallback-as-issue
 fallback-to-issue
-features
+feature-flags
+field_node_id
 firewall
 firewall-audit-logs
 footer
 frontmatter
-fuzzy
 fuzzy-schedule
-gateway
 gemini
-gh aw
-gh aw audit
-gh aw compile
-gh aw logs
-gh aw update
-gh aw upgrade
+gemini-flash
+gemini-pro
+GEMINI_API_KEY
 gh-aw
+GH_AW_DEFAULT_DETECTION_MODEL
+GH_AW_DEFAULT_MAX_EFFECTIVE_TOKENS
+GH_HOST
 github
-github-actions
 github-app
 github-token
-github/gh-aw
+github-tools
+GITHUB_TOKEN
+go.mod
+gpt-5
+gpt-5-mini
+haiku
 headers
+hide-older-comments
 hourly
 id-token
+ignore
+ignore-if-missing
+import-schema
 imports
 inlined-imports
-inputs
+integrity
 integrity-reactions
 issue
-issue-ops
-issue_comment
-issueops
+issue-comment
+issue-number
 issues
-javascript
-job-discriminator
+job
 jobs
-json
-json-schema
-label
-label-ops
-labelops
+keepaliveInterval
+label-command
 labels
+large
+lock.yml
 lockfile
-logs
+manifest
 markdown
+max-ai-credits
 max-continuations
+max-daily-ai-credits
 max-patch-size
+max-runs
 max-turns
 mcp
 mcp-gateway
-mcp-inspect
-mcp-list
-mcp-registry
 mcp-scripts
-mcp-server
 mcp-servers
-metadata
-milestone
+MCP_GATEWAY_SESSION_TIMEOUT
+member
+merge
+merged
 min-integrity
+min-samples
+min-version
+mini
 model
-needs.activation
+model-alias
 network
 network.allowed
-network.firewall
-node
 noop
-on-demand
+notify
+observability
+opencode
 opentelemetry
+opus
 organization
-outputs
+otel
+otlp
+owner
+package.json
+packages
+payloadDir
+pending
 permissions
-pip
 playwright
-prompt
-prompt-injection
+post-steps
+pre-activation
+pre-steps
+prepend
+preserve-branch-name
+private-key
+projected-effective-tokens
+prompt.txt
 protected-files
+pull-request
+pull-request-number
+pull-request-target
 pull-requests
 pull_request
 pull_request_target
-python
-recompile
+push
+push-to-pull-request-branch
+rate-limiting
+README.md
+redirect
 refusal-labels
+registry
+replace
 repo
 repo-memory
+report-incomplete
 repository
-repository_dispatch
+repository-dispatch
+required-labels
+required-title-prefix
+retention-days
 runs-on
+runs-on-slim
 runtime
 runtimes
-safe-inputs
 safe-outputs
 sandbox
 schedule
-secrets
 security
-session
-setup
-shared-workflow
+serena
+sessionTimeout
 skip-if-match
-slash_command
+slash-command
+sonnet
+spanId
 staged
-staged-mode
-stale
+start-date
+state.json
+state.runs
 steps.sanitized.outputs.body
 steps.sanitized.outputs.text
 steps.sanitized.outputs.title
+stop-after
+sub-agent
+sub-issues
 target-repo
-timeout
+threat-detection
 timeout-minutes
+timezone
 title-prefix
-token-weights
+tools
+tools.github
+tools.timeout
 toolsets
+total-effective-tokens
 traceId
-trigger
-triggers
-trusted
+traceparent
 trusted-users
-ubuntu-latest
+trustedBots
 unapproved
 update-issue
-update-pull-request
-validation
+update-project
+upload-artifact
+upload-asset
+user-rate-limit
+variants
 version
+warn
 web-fetch
 web-search
-webhook
 weekly
-workflow
+weight
+workflow-call
 workflow-dispatch
-workflow-run
 workflow_call
 workflow_dispatch
-workflow_run
 workflows
-workspace
-write-all
-yaml
-zizmor
+YAML
 
 ## Fix Speech-to-Text Errors
 
-When fixing dictated text, correct these common misrecognitions:
+Common misrecognitions to correct:
 
-### GitHub and Git Terms
-- "get hub" → github
-- "git lab" → gitlab
-- "get actions" → github-actions
-- "pull request" → pull-request (when used as compound modifier)
-- "issue ops" → issueops
-- "label ops" → labelops
-- "chat ops" → chatops
-- "multi repo ops" → multirepoops
-- "project ops" → projectops
-- "data ops" → data-ops
-- "dispatch ops" → dispatch-ops
-- "daily ops" → daily-ops
-
-### Workflow Configuration
-- "front matter" → frontmatter
-- "safe outputs" → safe-outputs (in configuration context)
-- "safe inputs" → safe-inputs (in configuration context)
-- "lock file" → .lock.yml or lockfile (depending on context)
-- "tool sets" → toolsets
-- "M.C.P." or "M C P" → MCP
-- "repo memory" → repo-memory (in configuration context)
-- "cache memory" → cache-memory (in configuration context)
-- "work flow" → workflow
-- "timeout minutes" → timeout-minutes
-- "runs on" → runs-on
-- "min integrity" → min-integrity (in configuration context)
-- "mcp gateway" → mcp-gateway
-- "mcp scripts" → mcp-scripts
-- "staged mode" → staged-mode
-- "token weights" → token-weights
-- "effective tokens" → effective-tokens
-
-### AI Engines
-- "co-pilot" → @copilot
-- "code x" → codex
-- "cloud" → claude (when referring to the AI engine)
-- "gem ini" → gemini (when referring to the AI engine)
-- "serena" → serena (code intelligence MCP server)
-
-### Commands and Operations
-- "G.H. A.W." → gh-aw or `gh aw` (depending on context)
-- "re-compile" → recompile
-- "work flow dispatch" → workflow_dispatch
-- "action lint" → actionlint
-- "ziz more" → zizmor
-- "poo teen" → poutine
-- "queue M.D." → qmd
-
-### File Formats and Extensions
-- "dot M.D." → .md
-- "dot Y.A.M.L." or "dot Y M L" → .yaml or .yml
-- "dot lock dot Y M L" → .lock.yml
-- "jason" → JSON (when referring to format)
-- "wasm" → WebAssembly or wasm (depending on context)
-
-### Technical Patterns
-- "A.P.I." → API
-- "U.R.L." → URL
-- "H.T.T.P." → HTTP
-- "H.T.T.P.S." → HTTPS
-- "S.H.A." → SHA
-- "C.I." → CI
-- "G.H." → GH (when referring to GitHub CLI)
-- "Y.A.M.L." → YAML
-- "O.I.D.C." → OIDC
-- "S.A.R.I.F." → SARIF
-
-### Hyphenation Rules
-Use hyphens for compound modifiers:
-- "safe outputs" → safe-outputs
-- "safe inputs" → safe-inputs
-- "cache memory" → cache-memory
-- "timeout minutes" → timeout-minutes
-- "cross repository" → cross-repository
-- "pull request" → pull-request (when used as adjective)
-- "mcp gateway" → mcp-gateway
-- "mcp scripts" → mcp-scripts
-- "token weights" → token-weights
-
-### Environment Variables
-Capitalize fully: GITHUB_TOKEN, GH_TOKEN, COPILOT_GITHUB_TOKEN, GH_AW_GITHUB_TOKEN, ANTHROPIC_API_KEY, OPENAI_API_KEY, GEMINI_API_KEY, CLAUDE_CODE_OAUTH_TOKEN, CODEX_API_KEY
-
-### Common Ambiguities
-- "their/there/they're" → use context to determine correct spelling
-- "its/it's" → its (possessive), it's (it is)
-- "your/you're" → your (possessive), you're (you are)
+- "GH away" → "gh-aw"
+- "G H A W" → "gh-aw"
+- "lock Y M L" → "lock.yml"
+- "Y A M L" → "YAML"
+- "MCP" → "MCP" (not "M C P")
+- "front matter" → "frontmatter" (one word)
+- "safe outputs" → "safe-outputs" (hyphenated)
+- "workflow dispatch" → "workflow-dispatch" (hyphenated in YAML context)
+- "pull request" → "pull-request" (hyphenated in YAML context)
+- "cop pilot" → "copilot" (one word)
+- "code X" → "codex" (one word)
+- "bypass permissions" → "bypassPermissions" (camelCase)
+- "accept edits" → "acceptEdits" (camelCase)
+- "Gemini" → "gemini" (lowercase in YAML context)
+- "engine dot model" → "engine.model"
+- "engine dot env" → "engine.env"
+- "engine dot MCP" → "engine.mcp"
+- "tools dot GitHub" → "tools.github"
+- "MCP gateway" → "mcp-gateway" (hyphenated)
+- "MCP scripts" → "mcp-scripts" (hyphenated)
+- "cache memory" → "cache-memory" (hyphenated)
+- "repo memory" → "repo-memory" (hyphenated)
+- "allowed repos" → "allowed-repos" (hyphenated in YAML context)
+- "min integrity" → "min-integrity" (hyphenated in YAML context)
+- "pre activation" → "pre-activation" (hyphenated)
+- "A W dot Y M L" → "aw.yml"
+- "A W dot JSON" → "aw.json"
+- "GitHub token" → "github-token" (hyphenated in YAML context)
+- "GitHub app" → "github-app" (hyphenated in YAML context)
+- "steps dot sanitized dot outputs dot text" → "steps.sanitized.outputs.text"
+- "fuzzy schedule" → "fuzzy-schedule" (hyphenated)
+- "cross repository" → "cross-repository" (hyphenated)
+- "sub agent" → "sub-agent" (hyphenated)
+- "sub issues" → "sub-issues" (hyphenated)
+- "GitHub tools" → "github-tools" (hyphenated in YAML context)
+- "hide older comments" → "hide-older-comments" (hyphenated)
+- "preserve branch name" → "preserve-branch-name" (hyphenated)
+- "max daily AI credits" → "max-daily-ai-credits" (hyphenated)
+- "AI credits" → "ai-credits" (hyphenated)
+- "open code" → "opencode" (one word when used as engine name)
+- "crush" → "crush" (CLI engine name, lowercase)
+- "anthropic API key" → "ANTHROPIC_API_KEY" (uppercase with underscores)
+- "gemini API key" → "GEMINI_API_KEY" (uppercase with underscores)
+- "close issue" → "close-issue" (hyphenated in YAML context)
+- "close pull request" → "close-pull-request" (hyphenated in YAML context)
 
 ## Clean Up and Improve Text
 
-Remove filler words and improve clarity:
-
-### Remove These Filler Words
-- humm, um, uh, uhh, umm
-- you know, like, basically, actually, literally
-- kind of, sort of, I mean, I think
-- right?, okay?, so yeah, well
-
-### Improve Clarity
-1. Remove redundant phrases:
-   - "in order to" → "to"
-   - "at this point in time" → "now"
-   - "due to the fact that" → "because"
-   - "in the event that" → "if"
-
-2. Make text more concise:
-   - Remove unnecessary qualifiers (very, really, quite)
-   - Use active voice instead of passive voice
-   - Replace wordy phrases with simpler alternatives
-
-3. Maintain technical accuracy:
-   - Keep all technical terms from the glossary
-   - Preserve code examples and commands exactly
-   - Don't simplify technical concepts
+- Remove filler words: humm, you know, um, uh, like, basically, actually, so, well, right, okay
+- Remove false starts and repeated words
+- Improve clarity and sentence structure
+- Make text more professional and concise
+- Fix run-on sentences
+- Correct grammar and punctuation
+- Maintain the user's intended meaning and tone
+- Preserve technical terminology exactly as provided
 
 ## Guidelines
 

@@ -1,16 +1,25 @@
 ---
+private: true
+emoji: "📅"
 description: Daily report analyzing repository issues with clustering, metrics, and trend charts
 on: daily
+max-daily-ai-credits: 10000
 permissions:
   contents: read
   actions: read
   issues: read
   pull-requests: read
   discussions: read
-engine: copilot
+engine:
+  id: copilot
+  copilot-sdk: true
+  driver: .github/drivers/copilot_sdk_driver_sample_python.py
 runs-on: aw-gpu-runner-T4
 strict: true
 tracker-id: daily-issues-report
+sandbox:
+  agent:
+    sudo: false
 tools:
   cli-proxy: true
   github:
@@ -20,7 +29,7 @@ tools:
 timeout-minutes: 30
 runtimes:
   node:
-    version: "24"
+    version: "22"
 experiments:
   output_format:
     variants: [collapsible, inline]
@@ -44,14 +53,14 @@ imports:
       title-prefix: "[daily issues] "
   - ../skills/jqschema/SKILL.md
   - shared/issues-data-fetch.md
-  - shared/python-dataviz.md
-  - shared/python-nlp.md
   - shared/trends.md
+  - shared/python-nlp.md
 
-  - shared/observability-otlp.md
-firewall:
-  effective-token-steering: true
+  - shared/otlp.md
+features:
+  gh-aw-detection: true
 ---
+
 {{#runtime-import? .github/shared-instructions.md}}
 
 {{#runtime-import .github/shared/editorial.md}}
@@ -77,11 +86,11 @@ Generate a daily report analyzing up to 1000 issues from the repository (see `is
 
 ## Phase 1: Load and Prepare Data
 
-The issues data has been pre-fetched and is available at `/tmp/gh-aw/issues-data/issues.json`.
+The issues data has been pre-fetched and is available at `/tmp/gh-aw/agent/issues-data/issues.json`.
 
 1. **Load the issues data**:
    ```bash
-   jq 'length' /tmp/gh-aw/issues-data/issues.json
+   jq 'length' /tmp/gh-aw/agent/issues-data/issues.json
    ```
 
 2. **Prepare data for Python analysis**:
@@ -273,7 +282,7 @@ Create a new discussion with the comprehensive report.
 ```markdown
 Brief 2-3 paragraph summary of key findings: total issues analyzed, main clusters identified, notable trends, and any concerns that need attention.
 
-{{#if experiments.output_format == "collapsible"}}<details>
+{{#if experiments.output_format == 'collapsible'}}<details>
 <summary>📊 Full Report Details</summary>{{/if}}
 
 ### 📈 Issue Activity Trends
@@ -343,7 +352,7 @@ Brief 2-3 paragraph summary of key findings: total issues analyzed, main cluster
 2. [Another recommendation]
 3. [...]
 
-{{#if experiments.output_format == "collapsible"}}</details>{{/if}}
+{{#if experiments.output_format == 'collapsible'}}</details>{{/if}}
 
 ---
 *Report generated automatically by the Daily Issues Report workflow*

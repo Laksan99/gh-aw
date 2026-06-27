@@ -1,17 +1,26 @@
 ---
+private: true
+emoji: "✍️"
 description: Generates new agentic workflow markdown files based on user requests when invoked with /craft command
 on:
   slash_command:
     strategy: centralized
     name: craft
     events: [issues]
+max-daily-ai-credits: 10000
 permissions:
   contents: read
   issues: read
   pull-requests: read
-engine: copilot
+  copilot-requests: write
+engine:
+  id: copilot
+  copilot-sdk: true
 imports:
-  - shared/observability-otlp.md
+  - shared/otlp.md
+sandbox:
+  agent:
+    sudo: false
 tools:
   cli-proxy: true
   edit:
@@ -31,13 +40,12 @@ safe-outputs:
     max: 1
   push-to-pull-request-branch:
   messages:
-    footer: "> ⚒️ *Crafted with care by [{workflow_name}]({run_url})*{effective_tokens_suffix}{history_link}"
+    footer: "> ⚒️ *Crafted with care by [{workflow_name}]({run_url})*{ai_credits_suffix}{history_link}"
     run-started: "🛠️ Master Crafter at work! [{workflow_name}]({run_url}) is forging a new workflow on this {event_type}..."
     run-success: "⚒️ Masterpiece complete! [{workflow_name}]({run_url}) has crafted your workflow. May it serve you well! 🎖️"
     run-failure: "🛠️ Forge cooling down! [{workflow_name}]({run_url}) {status}. The anvil awaits another attempt..."
 features:
-  copilot-requests: true
-
+  gh-aw-detection: true
 ---
 
 # Workflow Craft Agent

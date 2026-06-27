@@ -1,6 +1,11 @@
 package workflow
 
-import "github.com/github/gh-aw/pkg/logger"
+import (
+	"math"
+
+	"github.com/github/gh-aw/pkg/logger"
+	"github.com/github/gh-aw/pkg/typeutil"
+)
 
 var safeOutputsBuilderLog = logger.New("workflow:safe_outputs_builder")
 
@@ -40,6 +45,15 @@ func (b *handlerConfigBuilder) AddStringSlice(key string, value []string) *handl
 	return b
 }
 
+// AddMapSlice adds a slice of string maps field only if the slice is not empty.
+// Useful for structured list fields such as allowed-transitions.
+func (b *handlerConfigBuilder) AddMapSlice(key string, value []map[string]string) *handlerConfigBuilder {
+	if len(value) > 0 {
+		b.config[key] = value
+	}
+	return b
+}
+
 // AddTemplatableStringSlice adds a string slice field that may contain a GitHub Actions
 // expression.  When the slice has exactly one element and that element is a GitHub Actions
 // expression (as produced by preprocessStringArrayFieldAsTemplatable or
@@ -68,6 +82,33 @@ func (b *handlerConfigBuilder) AddBoolPtr(key string, value *bool) *handlerConfi
 	if value != nil {
 		b.config[key] = *value
 	}
+	return b
+}
+
+// AddBoolOrInt adds a boolean-or-integer field when the value is set.
+// This preserves explicit false/0 values, which differ from an omitted field.
+func (b *handlerConfigBuilder) AddBoolOrInt(key string, value any) *handlerConfigBuilder {
+	switch v := value.(type) {
+	case nil:
+		return b
+	case bool:
+		b.config[key] = v
+		return b
+	case float64:
+		if math.Trunc(v) != v {
+			safeOutputsBuilderLog.Printf("Ignoring non-integer float for %s: %v", key, v)
+			return b
+		}
+		if intValue, ok := typeutil.ParseIntValue(v); ok {
+			b.config[key] = intValue
+			return b
+		}
+	}
+	if intValue, ok := typeutil.ParseIntValue(value); ok {
+		b.config[key] = intValue
+		return b
+	}
+	safeOutputsBuilderLog.Printf("Ignoring unsupported bool-or-int value for %s: %T", key, value)
 	return b
 }
 

@@ -1,7 +1,18 @@
 // @ts-check
 /// <reference types="@actions/github-script" />
 
-const { createEngineLogParser, generateConversationMarkdown, generateInformationSection, formatInitializationSummary, formatToolUse, parseLogEntries, AWF_INFRA_LINE_RE } = require("./log_parser_shared.cjs");
+const {
+  createEngineLogParser,
+  generateConversationMarkdown,
+  generateInformationSection,
+  formatInitializationSummary,
+  formatToolUse,
+  parseLogEntries,
+  AWF_INFRA_LINE_RE,
+  isCopilotEventLogEntries,
+  convertLegacyLogEntriesToCopilotEvents,
+  convertCopilotEventsToLegacyLogEntries,
+} = require("./log_parser_shared.cjs");
 const { ERR_PARSE } = require("./error_codes.cjs");
 
 const main = createEngineLogParser({
@@ -52,10 +63,12 @@ function extractAwfTokenWarnings(logEntries) {
     if (typeof value.message === "string") addMatches(value.message);
     if (typeof value.content === "string") addMatches(value.content);
     if (typeof value.system === "string") addMatches(value.system);
+    if (typeof value.data?.content === "string") addMatches(value.data.content);
 
     if (Array.isArray(value.content)) visit(value.content);
     if (Array.isArray(value.message?.content)) visit(value.message.content);
     if (Array.isArray(value.system)) visit(value.system);
+    if (value.data && typeof value.data === "object") visit(value.data);
   };
 
   for (const entry of logEntries) visit(entry);
@@ -63,28 +76,13 @@ function extractAwfTokenWarnings(logEntries) {
 }
 
 /**
- * Extracts the premium request count from the log content using regex
- * @param {string} logContent - The raw log content as a string
- * @returns {number} The number of premium requests consumed (defaults to 1 if not found)
+ * Detects whether parsed entries are Copilot SDK events.jsonl entries that need
+ * conversion into the normalized trace structure used by summary renderers.
+ * @param {Array<any>} logEntries
+ * @returns {boolean}
  */
-function extractPremiumRequestCount(logContent) {
-  // Try various patterns that might appear in the Copilot CLI output
-  // Use \d+(?:\.\d+)? to match both integers and decimals (e.g., 1, 0.33, 2.5)
-  const patterns = [/premium\s+requests?\s+consumed:?\s*(\d+(?:\.\d+)?)/i, /(\d+(?:\.\d+)?)\s+premium\s+requests?\s+consumed/i, /consumed\s+(\d+(?:\.\d+)?)\s+premium\s+requests?/i];
-
-  for (const pattern of patterns) {
-    const match = logContent.match(pattern);
-    if (match && match[1]) {
-      const count = parseFloat(match[1]);
-      if (!isNaN(count) && count > 0) {
-        return count;
-      }
-    }
-  }
-
-  // Default to 1 if no match found
-  // For agentic workflows, 1 premium request is consumed per workflow run
-  return 1;
+function isCopilotSdkEventsFormat(logEntries) {
+  return isCopilotEventLogEntries(logEntries);
 }
 
 /**
@@ -124,8 +122,26 @@ function parseCopilotLog(logContent) {
     return { markdown: "## Agent Log Summary\n\nLog format not recognized as Copilot JSON array or JSONL.\n", logEntries: [] };
   }
 
+  const isEventFormat = isCopilotSdkEventsFormat(logEntries);
+  let canonicalLogEntries = isEventFormat ? logEntries : convertLegacyLogEntriesToCopilotEvents(logEntries, { sourceEngine: "copilot" });
+  const legacyRenderEntries = isEventFormat ? convertCopilotEventsToLegacyLogEntries(canonicalLogEntries) : logEntries;
+  if (isEventFormat && !canonicalLogEntries.some(entry => entry?.type === "session.result")) {
+    const legacyResult = legacyRenderEntries.find(entry => entry?.type === "result");
+    canonicalLogEntries.push({
+      type: "session.result",
+      data: {
+        numTurns: legacyResult?.num_turns,
+        durationMs: legacyResult?.duration_ms,
+        totalCostUsd: legacyResult?.total_cost_usd,
+        usage: legacyResult?.usage,
+        errors: legacyResult?.errors,
+        permissionDenials: legacyResult?.permission_denials,
+      },
+    });
+  }
+
   // Generate conversation markdown using shared function
-  const conversationResult = generateConversationMarkdown(logEntries, {
+  const conversationResult = generateConversationMarkdown(canonicalLogEntries, {
     formatToolCallback: (toolUse, toolResult) => formatToolUse(toolUse, toolResult, { includeDetailedParameters: true }),
     formatInitCallback: initEntry =>
       formatInitializationSummary(initEntry, {
@@ -171,7 +187,7 @@ function parseCopilotLog(logContent) {
   });
 
   let markdown = conversationResult.markdown;
-  const awfTokenWarnings = extractAwfTokenWarnings(logEntries);
+  const awfTokenWarnings = extractAwfTokenWarnings(canonicalLogEntries);
 
   if (awfTokenWarnings.length > 0) {
     markdown += "## ⚠️ Firewall Steering\n\n";
@@ -182,23 +198,13 @@ function parseCopilotLog(logContent) {
   }
 
   // Add Information section
-  const lastEntry = logEntries[logEntries.length - 1];
-  const initEntry = logEntries.find(entry => entry.type === "system" && entry.subtype === "init");
+  const lastEntry = legacyRenderEntries[legacyRenderEntries.length - 1];
 
   markdown += generateInformationSection(lastEntry, {
-    additionalInfoCallback: entry => {
-      // Display premium request consumption if using a premium model
-      const isPremiumModel = initEntry && initEntry.model_info && initEntry.model_info.billing && initEntry.model_info.billing.is_premium === true;
-      if (isPremiumModel) {
-        // Prefer the count stored in the result entry (pretty-print format), fall back to regex scan
-        const premiumRequestCount = entry._premium_requests != null ? entry._premium_requests : extractPremiumRequestCount(logContent);
-        return `**Premium Requests Consumed:** ${premiumRequestCount}\n\n`;
-      }
-      return "";
-    },
+    additionalInfoCallback: () => "",
   });
 
-  return { markdown, logEntries };
+  return { markdown, logEntries: canonicalLogEntries };
 }
 
 /**
@@ -221,7 +227,11 @@ function parsePrettyPrintFormat(logContent) {
   const DEEP_INDENT_RE = /^ {4,}/;
   const MODEL_BREAKDOWN_RE = /^Breakdown by AI model:/;
   const MODEL_LINE_RE = /^ +(\S+)\s+([\d.]+k?)\s+in,\s+([\d.]+k?)\s+out(?:,\s+([\d.]+k?)\s+cached)?/;
-  const USAGE_LINES_RE = /^(Total usage est:|API time spent:|Total session time:|Total code changes:)/;
+  // Recognise both legacy ("Total usage est:" / "API time spent:" / …) and the
+  // newer Copilot CLI footer ("Changes  +N -N", "Duration  Ns", "Tokens  ↑N ↓N (cached)").
+  // The newer footer omits a colon and uses arrow glyphs, so we extend the regex rather than
+  // relying on the legacy "Total …:" prefix alone.
+  const USAGE_LINES_RE = /^(?:Total usage est:|API time spent:|Total session time:|Total code changes:|Changes\s+[+-]?\d|Duration\s+\d|Tokens\s+[↑↓])/;
 
   const parseTokenCount = s => {
     const n = parseFloat(s);
@@ -235,9 +245,7 @@ function parsePrettyPrintFormat(logContent) {
   let inputTokens = 0;
   let outputTokens = 0;
   let cacheReadTokens = 0;
-  let premiumRequests = 1;
   let modelName = "unknown";
-  let hasPremiumModel = false;
   let inModelBreakdown = false;
   let i = 0;
 
@@ -283,10 +291,28 @@ function parsePrettyPrintFormat(logContent) {
 
     // Skip usage stat lines
     if (USAGE_LINES_RE.test(trimmed)) {
-      const premMatch = trimmed.match(/(\d+(?:\.\d+)?)\s+Premium\s+request/i);
-      if (premMatch) {
-        premiumRequests = parseFloat(premMatch[1]);
-        hasPremiumModel = true;
+      // Newer Copilot CLI footer: "Tokens    ↑ 163.9k • ↓ 567 • 149.2k (cached)"
+      // The arrow + (cached) form has no "Breakdown by AI model" section, so this
+      // is the only place token totals appear. Capture them when present so they
+      // surface in the Information section.
+      const tokenMatch = trimmed.match(/^Tokens\s+↑\s*([\d.]+k?)\s*[•·]\s*↓\s*([\d.]+k?)(?:\s*[•·]\s*([\d.]+k?)\s*\(cached\))?/);
+      if (tokenMatch) {
+        if (inputTokens === 0) inputTokens = parseTokenCount(tokenMatch[1]);
+        if (outputTokens === 0) outputTokens = parseTokenCount(tokenMatch[2]);
+        if (tokenMatch[3] && cacheReadTokens === 0) cacheReadTokens = parseTokenCount(tokenMatch[3]);
+      } else {
+        // Newer footer variant where the cached count is shown inline after the
+        // up-arrow rather than trailing the line:
+        //   "Tokens    ↑ 422.2k (375.0k cached) • ↓ 2.4k"
+        // (emitted by Copilot CLI 1.0.55). The trailing-cached regex above does
+        // not match this ordering, so handle it explicitly to avoid dropping the
+        // token totals from the Information section.
+        const inlineCachedMatch = trimmed.match(/^Tokens\s+↑\s*([\d.]+k?)\s*\(\s*([\d.]+k?)\s+cached\s*\)\s*[•·]\s*↓\s*([\d.]+k?)/);
+        if (inlineCachedMatch) {
+          if (inputTokens === 0) inputTokens = parseTokenCount(inlineCachedMatch[1]);
+          if (cacheReadTokens === 0) cacheReadTokens = parseTokenCount(inlineCachedMatch[2]);
+          if (outputTokens === 0) outputTokens = parseTokenCount(inlineCachedMatch[3]);
+        }
       }
       i++;
       continue;
@@ -307,8 +333,6 @@ function parsePrettyPrintFormat(logContent) {
         inputTokens += parseTokenCount(modelMatch[2]);
         outputTokens += parseTokenCount(modelMatch[3]);
         if (modelMatch[4]) cacheReadTokens += parseTokenCount(modelMatch[4]);
-        const isPremMatch = line.match(/\(Est\.\s+[\d.]+\s+Premium\s+request/i);
-        if (isPremMatch) hasPremiumModel = true;
         i++;
         continue;
       }
@@ -334,9 +358,6 @@ function parsePrettyPrintFormat(logContent) {
     tools: [],
     session_id: null,
   };
-  if (hasPremiumModel) {
-    initEntry.model_info = { billing: { is_premium: true } };
-  }
   entries.push(initEntry);
 
   // Tool call entries (assistant + user result pairs)
@@ -393,7 +414,6 @@ function parsePrettyPrintFormat(logContent) {
     type: "result",
     num_turns: numTurns,
     usage,
-    _premium_requests: premiumRequests,
   });
 
   return entries;
@@ -688,8 +708,8 @@ function parseDebugLogFormat(logContent) {
                     // Add reasoning_text first (agent's thinking before response/tools)
                     if (message.reasoning_text && message.reasoning_text.trim()) {
                       content.push({
-                        type: "text",
-                        text: message.reasoning_text,
+                        type: "thinking",
+                        thinking: message.reasoning_text,
                       });
                     }
 
@@ -831,6 +851,14 @@ function parseDebugLogFormat(logContent) {
             const content = [];
             const toolResults = []; // Collect tool calls to create synthetic results (debug logs don't include actual results)
 
+            // Add reasoning_text first (agent's thinking before response/tools)
+            if (message.reasoning_text && message.reasoning_text.trim()) {
+              content.push({
+                type: "thinking",
+                thinking: message.reasoning_text,
+              });
+            }
+
             if (message.content && message.content.trim()) {
               content.push({
                 type: "text",
@@ -969,7 +997,6 @@ if (typeof module !== "undefined" && module.exports) {
   module.exports = {
     main,
     parseCopilotLog,
-    extractPremiumRequestCount,
     parsePrettyPrintFormat,
   };
 }

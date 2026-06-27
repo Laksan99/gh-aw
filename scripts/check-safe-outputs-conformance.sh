@@ -3,8 +3,9 @@ set +o histexpand
 
 # Safe Outputs Specification Conformance Checker
 # This script implements automated checks for the Safe Outputs specification
-# Specification: docs/src/content/docs/reference/safe-outputs-specification.md
-# Version: 1.19.0 (2026-04-30)
+# Specification: docs/src/content/docs/specs/safe-outputs-specification.md
+# Spec Version: 1.23.0 (2026-06-10)
+# Script Version: 1.25.0 (2026-06-22)
 
 set -euo pipefail
 
@@ -274,7 +275,7 @@ check_staged_mode
 # REQ-001: RFC 2119 Keyword Usage
 echo "Running REQ-001: RFC 2119 Keyword Usage..."
 check_rfc2119() {
-    local spec_file="docs/src/content/docs/reference/safe-outputs-specification.md"
+    local spec_file="docs/src/content/docs/specs/safe-outputs-specification.md"
     local failed=0
     
     # Check key sections have RFC 2119 keywords
@@ -294,7 +295,7 @@ check_rfc2119
 # REQ-002: Safe Output Type Completeness
 echo "Running REQ-002: Safe Output Type Completeness..."
 check_type_completeness() {
-    local spec_file="docs/src/content/docs/reference/safe-outputs-specification.md"
+    local spec_file="docs/src/content/docs/specs/safe-outputs-specification.md"
     local failed=0
     
     # Extract type names
@@ -323,7 +324,7 @@ check_type_completeness
 # REQ-003: Verification Method Specification
 echo "Running REQ-003: Verification Method Specification..."
 check_verification_methods() {
-    local spec_file="docs/src/content/docs/reference/safe-outputs-specification.md"
+    local spec_file="docs/src/content/docs/specs/safe-outputs-specification.md"
     local failed=0
     
     # Check key requirements have verification methods
@@ -890,6 +891,46 @@ check_mce_actionable_errors() {
 }
 check_mce_actionable_errors
 
+# MCE-006: JSON-RPC Core Server Error Code Validity and Plain Object Error Handling (Section 8.2)
+echo "Running MCE-006: JSON-RPC Core Server Error Code Validity..."
+check_mce_core_error_handling() {
+    local core_file="actions/setup/js/mcp_server_core.cjs"
+    local failed=0
+
+    # Per spec Section 8.2 (JSON-RPC 2.0 compliance): The MCP server MUST return valid
+    # JSON-RPC error codes (negative integers) in all error responses. Positive integers
+    # such as process exit codes (1, 2, etc.) are NOT valid JSON-RPC error codes and MUST
+    # NOT be used, as they produce non-conformant responses (e.g. "code=1").
+    # The handleMessage function MUST also properly serialize error messages from thrown
+    # plain objects (non-Error instances) to avoid '[object Object]' in error responses.
+
+    if [ ! -f "$core_file" ]; then
+        log_high "MCE-006: MCP server core file missing: $core_file"
+        return
+    fi
+
+    # Check that the error code is validated as a negative integer before use.
+    # The guard pattern (e.code < 0) prevents positive subprocess exit codes from
+    # being forwarded as JSON-RPC error codes.
+    if ! grep -qE "e\.code < 0|err\.code < 0|code.*<.*0" "$core_file"; then
+        log_critical "MCE-006: MCP server core does not guard against non-negative JSON-RPC error codes — non-conformant responses possible (Section 8.2)"
+        failed=1
+    fi
+
+    # Check that error messages from thrown plain objects are serialized with String()
+    # to prevent '[object Object]' appearing as the error message when non-Error
+    # instances are thrown by handler code.
+    if ! grep -qE 'String\(e\.message\)|String\(err\.message\)' "$core_file"; then
+        log_high "MCE-006: MCP server core does not use String() for error message serialization — risk of '[object Object]' in responses (Section 8.2)"
+        failed=1
+    fi
+
+    if [ $failed -eq 0 ]; then
+        log_pass "MCE-006: MCP server core enforces valid JSON-RPC error codes and proper error message serialization (Section 8.2)"
+    fi
+}
+check_mce_core_error_handling
+
 # TYPE-001: merge_pull_request Handler Existence and Default Branch Protection (Section 7.3, v1.17.0)
 echo "Running TYPE-001: merge_pull_request Handler Existence and Default Branch Protection..."
 check_merge_pull_request_handler() {
@@ -1137,12 +1178,12 @@ check_system_types_ordering() {
 }
 check_system_types_ordering
 
-# EXEC-002: Zero Max Limit Disables Type (Section 10.5)
+# EXEC-002: Zero Max Limit Disables Type (Section 10.6)
 echo "Running EXEC-002: Zero Max Limit Disables Type..."
 check_zero_max_disables_type() {
     local failed=0
 
-    # Per spec Section 10.5: When max: 0 is configured for a safe output type,
+    # Per spec Section 10.6: When max: 0 is configured for a safe output type,
     # the type MUST be disabled (MCP tool not registered, no config generated).
 
     # Check Go compiler: types with max: 0 should not appear in generated config
@@ -1174,6 +1215,399 @@ check_zero_max_disables_type() {
     fi
 }
 check_zero_max_disables_type
+
+# WTD-001: Reviewable Annotation Requirements (Section 10.5 WTD1, T-WTD-001)
+echo "Running WTD-001: Reviewable Annotation Requirements..."
+check_wtd_reviewable_annotation() {
+    local threat_warning_file="actions/setup/js/threat_detection_warning.cjs"
+    local footer_file="actions/setup/js/generate_footer.cjs"
+    local failed=0
+
+    # Per spec Section 10.5 WTD1: Reviewable outputs MUST include all three of:
+    # 1. A caution block with "agentic threat detected" text
+    # 2. A visible threat label string: "agentic threat detected"
+    # 3. An XML comment marker: <!-- gh-aw-threat-detected -->
+    # The implementation uses generate_footer.cjs (for the caution block) and
+    # threat_detection_warning.cjs (centralised marker/helper).
+
+    if [ ! -f "$footer_file" ]; then
+        log_high "WTD-001: Footer generator missing: $footer_file"
+        return
+    fi
+
+    # Check caution block with WTD1-required text (requirement 1)
+    if ! grep -q "\[!CAUTION\]" "$footer_file"; then
+        log_critical "WTD-001: Footer generator missing [!CAUTION] block (WTD1 requirement 1)"
+        failed=1
+    fi
+
+    # Check label string "agentic threat detected" (requirement 2)
+    if ! grep -q "agentic threat detected" "$footer_file"; then
+        log_critical "WTD-001: Footer generator missing 'agentic threat detected' label string (WTD1 requirement 2)"
+        failed=1
+    fi
+
+    # Check XML comment marker (requirement 3) — may be defined in the centralised
+    # threat_detection_warning.cjs helper and injected via getThreatDetectedMarker()
+    local marker_found=0
+    if grep -q "gh-aw-threat-detected" "$footer_file" 2>/dev/null; then
+        marker_found=1
+    elif [ -f "$threat_warning_file" ] && grep -q "gh-aw-threat-detected" "$threat_warning_file" 2>/dev/null; then
+        # Footer delegates to threat_detection_warning.cjs via getThreatDetectedMarker
+        if grep -q "getThreatDetectedMarker" "$footer_file"; then
+            marker_found=1
+        fi
+    fi
+    if [ $marker_found -eq 0 ]; then
+        log_critical "WTD-001: XML marker '<!-- gh-aw-threat-detected -->' not found in footer or centralised helper (WTD1 requirement 3)"
+        failed=1
+    fi
+
+    if [ $failed -eq 0 ]; then
+        log_pass "WTD-001: Reviewable annotation includes caution block, threat label, and XML marker (WTD1)"
+    fi
+}
+check_wtd_reviewable_annotation
+
+# WTD-002: Convertible Fallback push_to_pull_request_branch → create_pull_request (Section 10.5 WTD2, T-WTD-002)
+echo "Running WTD-002: Convertible Fallback for push_to_pull_request_branch..."
+check_wtd_convertible_fallback() {
+    local push_handler="actions/setup/js/push_to_pull_request_branch.cjs"
+    local manager="actions/setup/js/safe_output_handler_manager.cjs"
+    local failed=0
+
+    # Per spec Section 10.5 WTD2: push_to_pull_request_branch MUST fall back to
+    # create_pull_request with WTD1 caution, label, and XML marker when threat
+    # detection executes in warn mode and reports a threat signal.
+
+    if [ ! -f "$push_handler" ]; then
+        log_high "WTD-002: push_to_pull_request_branch handler missing: $push_handler"
+        failed=1
+    else
+        # Check the handler has detection conclusion handling
+        if ! grep -q "GH_AW_DETECTION_CONCLUSION\|detectionConclusionEnv" "$push_handler"; then
+            log_high "WTD-002: push_to_pull_request_branch handler does not check GH_AW_DETECTION_CONCLUSION (WTD2)"
+            failed=1
+        fi
+
+        # Check it creates a review PR (fallback to create_pull_request semantics)
+        # The handler may create a pull request directly via octokit rather than
+        # delegating to the create_pull_request safe output type
+        if ! grep -qE "create_pull_request|createPullRequest|review.*PR|review.*pr|pulls\.create|review_pr" "$push_handler"; then
+            log_high "WTD-002: push_to_pull_request_branch handler missing create_pull_request fallback (WTD2)"
+            failed=1
+        fi
+
+        # Check that the caution text is emitted in the fallback
+        if ! grep -q "agentic threat detected" "$push_handler"; then
+            log_high "WTD-002: push_to_pull_request_branch fallback missing 'agentic threat detected' text (WTD2 / WTD1)"
+            failed=1
+        fi
+    fi
+
+    # Also verify the handler manager registers push_to_pull_request_branch as Convertible
+    if [ -f "$manager" ]; then
+        if ! grep -qE "convertible|push_to_pull_request_branch.*create_pull_request|Convertible" "$manager"; then
+            log_medium "WTD-002: Handler manager does not declare push_to_pull_request_branch as Convertible (WTD2)"
+            failed=1
+        fi
+    fi
+
+    if [ $failed -eq 0 ]; then
+        log_pass "WTD-002: push_to_pull_request_branch has convertible fallback to create_pull_request (WTD2)"
+    fi
+}
+check_wtd_convertible_fallback
+
+# WTD-003: Abort-Class Outputs Produce Threat-Detected Error Outcomes (Section 10.5 WTD3, T-WTD-003)
+echo "Running WTD-003: Abort-Class Output Handling..."
+check_wtd_abort_outputs() {
+    local manager="actions/setup/js/safe_output_handler_manager.cjs"
+    local failed=0
+
+    # Per spec Section 10.5 WTD3: Abort-classified outputs MUST NOT be applied.
+    # Implementations MUST activate a threat-detected code path, emit an explicit
+    # failure summary, and return a machine-readable threat-detected error outcome.
+
+    if [ ! -f "$manager" ]; then
+        log_high "WTD-003: Safe output handler manager missing: $manager"
+        return
+    fi
+
+    # Check THREAT_WARNING_ABORT_TYPES set exists (defines abort-class types)
+    if ! grep -q "THREAT_WARNING_ABORT_TYPES" "$manager"; then
+        log_critical "WTD-003: THREAT_WARNING_ABORT_TYPES not defined in handler manager (WTD3)"
+        failed=1
+    fi
+
+    # Check abort policy stops execution (MUST NOT apply the safe output)
+    if ! grep -qE "policy.*abort|abort.*policy|abort.*threat|threat.*abort" "$manager"; then
+        log_high "WTD-003: Abort policy branch not found in handler manager (WTD3)"
+        failed=1
+    fi
+
+    # Check machine-readable threat-detected error outcome is returned
+    if ! grep -qE "threat_detected_abort_policy|threatDetected.*true|errorCode.*threat" "$manager"; then
+        log_high "WTD-003: No machine-readable threat-detected error outcome in handler manager (WTD3)"
+        failed=1
+    fi
+
+    # Verify WTD3 requirement ID is referenced in code comments (for traceability)
+    if ! grep -q "WTD3\|WTD-3\|Requirement.*WTD" "$manager"; then
+        log_low "WTD-003: WTD3 requirement ID not referenced in handler manager for traceability"
+        failed=1
+    fi
+
+    if [ $failed -eq 0 ]; then
+        log_pass "WTD-003: Abort-class outputs have threat-detected abort handling and machine-readable error outcomes (WTD3)"
+    fi
+}
+check_wtd_abort_outputs
+
+# TYPE-005: add_comment Status-Comment Reuse Extension (Section 7.1, v1.21.0)
+echo "Running TYPE-005: add_comment Status-Comment Reuse Extension..."
+check_add_comment_status_target() {
+    local handler="actions/setup/js/add_comment.cjs"
+    local failed=0
+
+    # Per spec Section 7.1 (v1.21.0):
+    # 1. When target:"status" is set and a reusable status comment ID is available,
+    #    implementations MUST update the existing issue/PR comment instead of creating a new one.
+    # 2. When target:"status" is set but no reusable status comment ID is available,
+    #    implementations MUST create a new comment.
+    # 3. target:"status" and comment_id MUST be rejected for discussion comments.
+
+    if [ ! -f "$handler" ]; then
+        log_high "TYPE-005: add_comment handler missing: $handler"
+        return
+    fi
+
+    # Check that target=status handling exists
+    if ! grep -qE 'target.*status|status.*target' "$handler"; then
+        log_high "TYPE-005: add_comment handler has no target=status handling (Section 7.1 requirement 1/2)"
+        failed=1
+    fi
+
+    # Check that existing comment update path exists (MUST update existing comment when ID available)
+    if ! grep -qE 'updateComment|update.*comment|commentIdToReuse|comment_id.*reuse' "$handler"; then
+        log_high "TYPE-005: add_comment handler lacks existing comment update path for status reuse (Section 7.1 requirement 1)"
+        failed=1
+    fi
+
+    # Check that fallback to new comment creation exists (MUST create new when no ID available)
+    if ! grep -qE 'no reusable status comment|creating a new comment|statusCommentId.*null|statusCommentId.*empty' "$handler"; then
+        log_medium "TYPE-005: add_comment handler may lack fallback new-comment creation for target=status with no ID (Section 7.1 requirement 2)"
+        failed=1
+    fi
+
+    # Check that discussion rejection is implemented (MUST reject target=status for discussions)
+    if ! grep -qE 'discussion.*reject|only.*issue.*pull.request|issue.*pull.request.*only|not.*discussion' "$handler"; then
+        log_high "TYPE-005: add_comment handler must reject target=status for discussion comments (Section 7.1 requirement 3)"
+        failed=1
+    fi
+
+    if [ $failed -eq 0 ]; then
+        log_pass "TYPE-005: add_comment handler correctly implements status-comment reuse extension (Section 7.1 v1.21.0)"
+    fi
+}
+check_add_comment_status_target
+
+# TYPE-006: push_to_pull_request_branch base-branch Parameter (Section 7.3, v1.22.0)
+echo "Running TYPE-006: push_to_pull_request_branch base-branch Parameter..."
+check_push_to_pr_branch_base_branch() {
+    local handler="actions/setup/js/push_to_pull_request_branch.cjs"
+    local go_config="pkg/workflow/push_to_pull_request_branch.go"
+    local failed=0
+
+    # Per spec Section 7.3 (v1.22.0): push_to_pull_request_branch MUST support a
+    # base-branch configuration parameter. When omitted, the handler resolves the base
+    # branch via: (1) explicit config, (2) runtime checkout manifest, (3) origin/HEAD,
+    # (4) repository default branch via API.
+
+    if [ ! -f "$handler" ]; then
+        log_high "TYPE-006: push_to_pull_request_branch handler missing: $handler"
+        return
+    fi
+
+    # Check that the handler reads a base_branch config value
+    if ! grep -qE "base_branch|base-branch|baseBranch" "$handler"; then
+        log_high "TYPE-006: push_to_pull_request_branch handler does not read base-branch config (Section 7.3 v1.22.0)"
+        failed=1
+    fi
+
+    # Check that Go config struct has a BaseBranch field (spec requires explicit config support)
+    if [ -f "$go_config" ]; then
+        if ! grep -q "BaseBranch\|base-branch" "$go_config"; then
+            log_high "TYPE-006: push_to_pull_request_branch Go config struct missing BaseBranch field (Section 7.3 v1.22.0)"
+            failed=1
+        fi
+    else
+        log_medium "TYPE-006: Go config file missing: $go_config — cannot verify BaseBranch field"
+        failed=1
+    fi
+
+    if [ $failed -eq 0 ]; then
+        log_pass "TYPE-006: push_to_pull_request_branch supports base-branch configuration parameter (Section 7.3 v1.22.0)"
+    fi
+}
+check_push_to_pr_branch_base_branch
+
+# TYPE-007: Hang-Safety for Handler Git Operations (Section 7.3, v1.22.0)
+echo "Running TYPE-007: Hang-Safety for Handler Git Operations..."
+check_git_hang_safety() {
+    local git_helpers="actions/setup/js/git_helpers.cjs"
+    local push_handler="actions/setup/js/push_to_pull_request_branch.cjs"
+    local failed=0
+
+    # Per spec Section 7.3 (v1.22.0): Base-branch resolution MUST NOT depend on
+    # interactive credential prompts; git operations issued by the handler MUST run
+    # with GIT_TERMINAL_PROMPT=0 and an enforced timeout so credential-less
+    # environments fail fast rather than hanging.
+
+    if [ ! -f "$git_helpers" ]; then
+        log_high "TYPE-007: git_helpers.cjs missing — hang-safety cannot be verified: $git_helpers"
+        return
+    fi
+
+    # Check GIT_TERMINAL_PROMPT=0 is set in the shared git helper
+    if ! grep -qE 'GIT_TERMINAL_PROMPT.*"0"|GIT_TERMINAL_PROMPT.*=.*0' "$git_helpers"; then
+        log_critical "TYPE-007: GIT_TERMINAL_PROMPT=0 not set in $git_helpers — interactive prompt hang risk (Section 7.3 v1.22.0)"
+        failed=1
+    fi
+
+    # Check that an enforced timeout is present in the git helper (default 60 s per spec)
+    if ! grep -qE "timeout|TIMEOUT" "$git_helpers"; then
+        log_critical "TYPE-007: No enforced timeout found in $git_helpers — indefinite hang risk (Section 7.3 v1.22.0)"
+        failed=1
+    fi
+
+    # Confirm push_to_pull_request_branch routes git operations through git_helpers
+    if [ -f "$push_handler" ]; then
+        if ! grep -q "git_helpers" "$push_handler"; then
+            log_high "TYPE-007: push_to_pull_request_branch does not import git_helpers.cjs — hang-safety coverage uncertain (Section 7.3 v1.22.0)"
+            failed=1
+        fi
+    fi
+
+    if [ $failed -eq 0 ]; then
+        log_pass "TYPE-007: Git operations enforce GIT_TERMINAL_PROMPT=0 and timeout for hang-safety (Section 7.3 v1.22.0)"
+    fi
+}
+check_git_hang_safety
+
+# TYPE-008: create_check_run Handler Existence and Dual-Permission Profile (Section 7.3, v1.23.0)
+echo "Running TYPE-008: create_check_run Handler and Dual-Permission Profile..."
+check_create_check_run_handler() {
+    local handler="actions/setup/js/create_check_run.cjs"
+    local go_config="pkg/workflow/create_check_run.go"
+    local handler_registry="pkg/workflow/safe_output_handlers.go"
+    local failed=0
+
+    # Per spec Section 7.3 (v1.23.0): create_check_run handler must exist
+    if [ ! -f "$handler" ]; then
+        log_high "TYPE-008: create_check_run handler missing: $handler"
+        failed=1
+    fi
+
+    # Per spec Section 7.3: Go config struct must exist with Target field support
+    if [ ! -f "$go_config" ]; then
+        log_high "TYPE-008: create_check_run Go config file missing: $go_config"
+        failed=1
+    elif ! grep -q "Target" "$go_config"; then
+        log_high "TYPE-008: create_check_run Go config missing Target field for PR targeting (Section 7.3 v1.23.0)"
+        failed=1
+    fi
+
+    # Per spec Section 7.3 dual-permission profile: checks:write without target,
+    # adds pull-requests:read when target is configured.
+    if [ -f "$handler_registry" ]; then
+        if ! grep -q "NewPermissionsContentsReadChecksWrite" "$handler_registry"; then
+            log_critical "TYPE-008: create_check_run dual-permission profile missing checks:write base permission (Section 7.3 v1.23.0)"
+            failed=1
+        fi
+        if ! grep -q "NewPermissionsContentsReadChecksWritePRRead" "$handler_registry"; then
+            log_high "TYPE-008: create_check_run dual-permission profile missing pull-requests:read when target configured (Section 7.3 v1.23.0)"
+            failed=1
+        fi
+        # Verify the target-conditional branch exists in the registry
+        if ! grep -A 15 '"create-check-run"' "$handler_registry" | grep -q "Target"; then
+            log_high "TYPE-008: create_check_run permission builder does not branch on Target field (Section 7.3 v1.23.0)"
+            failed=1
+        fi
+    else
+        log_medium "TYPE-008: Handler registry file missing: $handler_registry — cannot verify dual-permission profile"
+        failed=1
+    fi
+
+    # Per spec Section 7.3: SHA resolution must fall back to GITHUB_SHA / context.sha
+    if [ -f "$handler" ]; then
+        if ! grep -qE "GITHUB_SHA|context\.sha" "$handler"; then
+            log_high "TYPE-008: create_check_run handler missing GITHUB_SHA / context.sha fallback for SHA resolution (Section 7.3 v1.23.0)"
+            failed=1
+        fi
+    fi
+
+    # Per spec Section 7.3: staged mode must skip the Checks API call
+    if [ -f "$handler" ]; then
+        if ! grep -q "isStaged\|isStagedMode\|staged" "$handler"; then
+            log_high "TYPE-008: create_check_run handler missing staged mode handling (Section 7.3 v1.23.0)"
+            failed=1
+        fi
+    fi
+
+    if [ $failed -eq 0 ]; then
+        log_pass "TYPE-008: create_check_run handler exists with dual-permission profile and staged mode support (Section 7.3 v1.23.0)"
+    fi
+}
+check_create_check_run_handler
+
+# TYPE-009: add_comment discussions Permission Opt-In Default (Section 7.1, v1.24.0)
+echo "Running TYPE-009: add_comment discussions Permission Opt-In Default..."
+check_add_comment_discussions_optin() {
+    local go_config="pkg/workflow/add_comment.go"
+    local tools_json="pkg/workflow/js/safe_outputs_tools.json"
+    local handler_registry="pkg/workflow/safe_output_handlers.go"
+    local failed=0
+
+    # Per spec Section 7.1 (v1.24.0): discussions:write permission is opt-in for add_comment.
+    # Default (nil or false) must EXCLUDE discussions:write.
+
+    # Check Go struct comment documents "Default (nil or false) excludes discussions:write"
+    if [ -f "$go_config" ]; then
+        if ! grep -qE "nil.*false.*excludes.*discussions|false.*excludes.*discussions:write|Default.*nil.*false.*excludes" "$go_config"; then
+            log_high "TYPE-009: add_comment Go config does not document that default excludes discussions:write (Section 7.1 v1.24.0)"
+            failed=1
+        fi
+    else
+        log_high "TYPE-009: add_comment Go config missing: $go_config"
+        failed=1
+    fi
+
+    # Check tool description discloses the opt-in requirement to the agent
+    if [ -f "$tools_json" ]; then
+        if ! grep -iE "discussions.*opt.in|opt.in.*discussions|discussions.*false|not.*require.*discussions.*write|default.*not.*discussions" "$tools_json"; then
+            log_medium "TYPE-009: Tool description in $tools_json may not disclose opt-in requirement for discussions:write (Section 7.1 v1.24.0)"
+            failed=1
+        fi
+    else
+        log_medium "TYPE-009: Tool definitions file missing: $tools_json"
+        failed=1
+    fi
+
+    # Check permissions test confirms default excludes discussions (verifying behavioural test coverage)
+    local perm_test="pkg/workflow/safe_outputs_permissions_test.go"
+    if [ -f "$perm_test" ]; then
+        if ! grep -qiE "default.*excludes.*discussions|excludes.*discussions.*default|add-comment.*default.*pull-requests.*discussions" "$perm_test"; then
+            log_low "TYPE-009: No test case confirming default exclusion of discussions:write for add_comment (Section 7.1 v1.24.0)"
+            failed=1
+        fi
+    fi
+
+    if [ $failed -eq 0 ]; then
+        log_pass "TYPE-009: add_comment discussions:write is opt-in by default as required (Section 7.1 v1.24.0)"
+    fi
+}
+check_add_comment_discussions_optin
 
 # Summary
 echo ""

@@ -3,11 +3,12 @@
 package styles
 
 import (
+	"os"
 	"strings"
 	"testing"
 
 	lipgloss "charm.land/lipgloss/v2"
-	"charm.land/lipgloss/v2/compat"
+	"github.com/charmbracelet/x/term"
 )
 
 // TestAdaptiveColorsHaveBothVariants verifies that all adaptive colors
@@ -227,11 +228,11 @@ func TestDarkColorsAreOriginalDracula(t *testing.T) {
 	}
 }
 
-// TestAdaptiveColorVarsUseHexConstants verifies that the exported AdaptiveColor vars
+// TestAdaptiveColorVarsUseHexConstants verifies that the exported adaptive color vars
 // are backed by the expected hex constants (spot-check a few key colors).
 func TestAdaptiveColorVarsUseHexConstants(t *testing.T) {
-	// Verify that the compat.AdaptiveColor vars hold non-nil color values.
-	colors := map[string]compat.AdaptiveColor{
+	// Verify that the adaptiveColor vars hold non-nil color values.
+	colors := map[string]adaptiveColor{
 		"ColorError":       ColorError,
 		"ColorWarning":     ColorWarning,
 		"ColorSuccess":     ColorSuccess,
@@ -252,6 +253,85 @@ func TestAdaptiveColorVarsUseHexConstants(t *testing.T) {
 			}
 			if c.Dark == nil {
 				t.Errorf("%s.Dark is nil", name)
+			}
+		})
+	}
+}
+
+func TestAdaptiveColorRGBASwitching(t *testing.T) {
+	original := hasDarkBackground
+	t.Cleanup(func() {
+		hasDarkBackground = original
+	})
+
+	c := adaptiveColor{
+		Light: lipgloss.Color("#123456"),
+		Dark:  lipgloss.Color("#abcdef"),
+	}
+
+	hasDarkBackground = true
+	r, g, b, a := c.RGBA()
+	wantR, wantG, wantB, wantA := c.Dark.RGBA()
+	if r != wantR || g != wantG || b != wantB || a != wantA {
+		t.Fatalf("dark background RGBA = (%d,%d,%d,%d), want (%d,%d,%d,%d)", r, g, b, a, wantR, wantG, wantB, wantA)
+	}
+
+	hasDarkBackground = false
+	r, g, b, a = c.RGBA()
+	wantR, wantG, wantB, wantA = c.Light.RGBA()
+	if r != wantR || g != wantG || b != wantB || a != wantA {
+		t.Fatalf("light background RGBA = (%d,%d,%d,%d), want (%d,%d,%d,%d)", r, g, b, a, wantR, wantG, wantB, wantA)
+	}
+}
+
+func TestConfigureHasDarkBackgroundUsesStderr(t *testing.T) {
+	original := hasDarkBackground
+	t.Cleanup(func() {
+		hasDarkBackground = original
+	})
+
+	var gotReader term.File
+	var gotWriter term.File
+	configureHasDarkBackground(func(terminalInput term.File, terminalOutput term.File) bool {
+		gotReader = terminalInput
+		gotWriter = terminalOutput
+		return false
+	})
+
+	if gotReader != os.Stdin {
+		t.Fatalf("reader = %v, want os.Stdin", gotReader)
+	}
+	if gotWriter != os.Stderr {
+		t.Fatalf("writer = %v, want os.Stderr", gotWriter)
+	}
+	if hasDarkBackground {
+		t.Fatalf("hasDarkBackground = %v, want false", hasDarkBackground)
+	}
+}
+
+func TestShouldProbeTerminalBackground(t *testing.T) {
+	tests := []struct {
+		name string
+		goos string
+		want bool
+	}{
+		{
+			name: "windows always skips startup probe",
+			goos: "windows",
+			want: false,
+		},
+		{
+			name: "non-windows still probes",
+			goos: "linux",
+			want: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := shouldProbeTerminalBackground(tt.goos)
+			if got != tt.want {
+				t.Fatalf("shouldProbeTerminalBackground(%q) = %v, want %v", tt.goos, got, tt.want)
 			}
 		})
 	}

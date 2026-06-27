@@ -57,7 +57,7 @@ func TestBuildConsolidatedSafeOutputsJob(t *testing.T) {
 			},
 			expectedJobName:  "safe_outputs",
 			checkPermissions: true,
-			expectedPerms:    []string{"contents: read", "issues: write", "discussions: write"},
+			expectedPerms:    []string{"contents: read", "issues: write", "pull-requests: write"},
 		},
 		{
 			name: "set issue field only",
@@ -97,7 +97,7 @@ func TestBuildConsolidatedSafeOutputsJob(t *testing.T) {
 			},
 			expectedJobName:  "safe_outputs",
 			checkPermissions: true,
-			expectedPerms:    []string{"contents: read", "issues: write", "discussions: write"},
+			expectedPerms:    []string{"contents: read", "issues: write", "pull-requests: write"},
 		},
 		{
 			name: "with threat detection enabled",
@@ -167,7 +167,7 @@ func TestBuildConsolidatedSafeOutputsJob(t *testing.T) {
 			}
 
 			// Verify timeout is set
-			assert.Equal(t, 15, job.TimeoutMinutes)
+			assert.Equal(t, 45, job.TimeoutMinutes)
 
 			// Verify job condition is set
 			assert.NotEmpty(t, job.If)
@@ -264,6 +264,53 @@ func TestBuildConsolidatedSafeOutputsJobNeedsIncludesConfiguredDependencies(t *t
 	assert.Equal(t, 1, secretsFetcherCount, "duplicate configured dependencies should be deduplicated")
 }
 
+// TestBuildConsolidatedSafeOutputsJobTimeoutMinutes tests that the timeout-minutes field
+// is correctly applied to the safe_outputs job, with 45 minutes as the default.
+func TestBuildConsolidatedSafeOutputsJobTimeoutMinutes(t *testing.T) {
+	tests := []struct {
+		name            string
+		timeoutMinutes  int
+		expectedTimeout int
+	}{
+		{
+			name:            "default timeout (0 = unset) falls back to 45 minutes",
+			timeoutMinutes:  0,
+			expectedTimeout: 45,
+		},
+		{
+			name:            "custom timeout of 30 minutes",
+			timeoutMinutes:  30,
+			expectedTimeout: 30,
+		},
+		{
+			name:            "custom timeout of 120 minutes",
+			timeoutMinutes:  120,
+			expectedTimeout: 120,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			compiler := NewCompiler()
+			compiler.jobManager = NewJobManager()
+
+			workflowData := &WorkflowData{
+				Name: "Test Workflow",
+				SafeOutputs: &SafeOutputsConfig{
+					CreateIssues:   &CreateIssuesConfig{TitlePrefix: "[Test] "},
+					TimeoutMinutes: tt.timeoutMinutes,
+				},
+			}
+
+			job, _, err := compiler.buildConsolidatedSafeOutputsJob(workflowData, string(constants.AgentJobName), "test-workflow.md")
+			require.NoError(t, err, "Should build job without error")
+			require.NotNil(t, job, "Job should not be nil")
+
+			assert.Equal(t, tt.expectedTimeout, job.TimeoutMinutes, "Job timeout should match expected value")
+		})
+	}
+}
+
 func TestCompileSafeOutputsNeedsForCustomCredentialJob(t *testing.T) {
 	tempDir := t.TempDir()
 	workflowPath := filepath.Join(tempDir, "safe-needs.md")
@@ -325,6 +372,80 @@ jobs:
 	assert.Contains(t, needsValues, string(constants.ActivationJobName), "safe_outputs should keep built-in dependency on activation")
 	assert.Contains(t, needsValues, "secrets_fetcher", "safe_outputs should include custom credential supplier job")
 	assert.Contains(t, string(lockContent), "needs.secrets_fetcher.outputs.app_id", "compiled workflow should retain custom needs output references")
+}
+
+func TestCompileSafeOutputsTimeoutMinutesFromFrontmatter(t *testing.T) {
+	tests := []struct {
+		name            string
+		frontmatter     string
+		expectedTimeout string
+	}{
+		{
+			name: "default timeout is 45 minutes",
+			frontmatter: `---
+on:
+  workflow_dispatch: {}
+permissions:
+  contents: read
+safe-outputs:
+  noop:
+    report-as-issue: false
+---
+# Test
+`,
+			expectedTimeout: "timeout-minutes: 45",
+		},
+		{
+			name: "custom timeout of 30 minutes from frontmatter",
+			frontmatter: `---
+on:
+  workflow_dispatch: {}
+permissions:
+  contents: read
+safe-outputs:
+  timeout-minutes: 30
+  noop:
+    report-as-issue: false
+---
+# Test
+`,
+			expectedTimeout: "timeout-minutes: 30",
+		},
+		{
+			name: "custom timeout of 120 minutes from frontmatter",
+			frontmatter: `---
+on:
+  workflow_dispatch: {}
+permissions:
+  contents: read
+safe-outputs:
+  timeout-minutes: 120
+  noop:
+    report-as-issue: false
+---
+# Test
+`,
+			expectedTimeout: "timeout-minutes: 120",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			tempDir := t.TempDir()
+			workflowPath := filepath.Join(tempDir, "safe-timeout.md")
+			require.NoError(t, os.WriteFile(workflowPath, []byte(tt.frontmatter), 0644))
+
+			compiler := NewCompiler()
+			require.NoError(t, compiler.CompileWorkflow(workflowPath))
+
+			lockPath := stringutil.MarkdownToLockFile(workflowPath)
+			lockContent, err := os.ReadFile(lockPath)
+			require.NoError(t, err)
+
+			assert.Contains(t, string(lockContent), tt.expectedTimeout,
+				"safe_outputs job should have the expected timeout-minutes value")
+		})
+	}
 }
 
 func TestBuildJobLevelSafeOutputEnvVars(t *testing.T) {
@@ -401,7 +522,7 @@ func TestBuildJobLevelSafeOutputEnvVars(t *testing.T) {
 			workflowData: &WorkflowData{
 				Name: "Test Workflow",
 				SafeOutputs: &SafeOutputsConfig{
-					Staged: true,
+					Staged: templatableBoolPtr("true"),
 				},
 			},
 			workflowID: "test-workflow",
@@ -437,6 +558,21 @@ func TestBuildJobLevelSafeOutputEnvVars(t *testing.T) {
 			workflowID:    "test-workflow",
 			checkContains: true,
 		},
+		{
+			name: "with slash command and placeholder",
+			workflowData: &WorkflowData{
+				Name:               "Test Workflow",
+				Command:            []string{"review-bot"},
+				CommandPlaceholder: "to review this PR",
+				SafeOutputs:        &SafeOutputsConfig{},
+			},
+			workflowID: "test-workflow",
+			expectedVars: map[string]string{
+				"GH_AW_COMMANDS":            `"[\"review-bot\"]"`,
+				"GH_AW_COMMAND_PLACEHOLDER": `"to review this PR"`,
+			},
+			checkContains: true,
+		},
 	}
 
 	for _, tt := range tests {
@@ -464,6 +600,21 @@ func TestBuildJobLevelSafeOutputEnvVars(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestBuildJobLevelSafeOutputEnvVarsIncludesCompiledProjectUTC(t *testing.T) {
+	compiler := NewCompiler()
+	compiler.repoConfigLoaded = true
+	compiler.repoConfig = &RepoConfig{UTC: "-07:00"}
+
+	workflowData := &WorkflowData{
+		Name:        "Test Workflow",
+		SafeOutputs: &SafeOutputsConfig{},
+	}
+	envVars := compiler.buildJobLevelSafeOutputEnvVars(workflowData, "test-workflow")
+
+	require.NotNil(t, envVars)
+	assert.Equal(t, `"-07:00"`, envVars["GH_AW_PROJECT_UTC"])
 }
 
 // TestBuildDetectionSuccessCondition tests the detection condition builder
@@ -539,8 +690,9 @@ func TestJobWithGitHubApp(t *testing.T) {
 	// Should include app token minting step
 	assert.Contains(t, stepsContent, "Generate GitHub App token")
 
-	// Should include app token invalidation step
-	assert.Contains(t, stepsContent, "Invalidate GitHub App token")
+	// Explicit app token invalidation step should not be generated.
+	// actions/create-github-app-token handles revocation in its post step.
+	assert.NotContains(t, stepsContent, "Invalidate GitHub App token")
 }
 
 // TestAssignToAgentWithGitHubAppUsesAgentToken tests that when github-app: is configured,
@@ -784,9 +936,9 @@ func TestGitHubAppWithPushToPRBranch(t *testing.T) {
 	tokenMintCount := strings.Count(stepsContent, "Generate GitHub App token")
 	assert.Equal(t, 1, tokenMintCount, "App token minting step should appear exactly once, found %d times", tokenMintCount)
 
-	// Should include app token invalidation step exactly once
+	// Explicit app token invalidation step should not be generated
 	tokenInvalidateCount := strings.Count(stepsContent, "Invalidate GitHub App token")
-	assert.Equal(t, 1, tokenInvalidateCount, "App token invalidation step should appear exactly once, found %d times", tokenInvalidateCount)
+	assert.Equal(t, 0, tokenInvalidateCount, "App token invalidation step should not be generated, found %d times", tokenInvalidateCount)
 
 	// Token step should come before checkout step (checkout references the token)
 	tokenIndex := strings.Index(stepsContent, "Generate GitHub App token")
@@ -797,7 +949,186 @@ func TestGitHubAppWithPushToPRBranch(t *testing.T) {
 	assert.Contains(t, stepsContent, "id: safe-outputs-app-token")
 }
 
-// TestJobWithGitHubAppWorkflowCallUsesTargetRepoNameFallback is a regression test verifying that
+func TestBuildSafeOutputJobPreStepsRunBeforeGitHubAppToken(t *testing.T) {
+	compiler := NewCompiler()
+
+	workflowData := &WorkflowData{
+		Name: "Test Workflow",
+		SafeOutputs: &SafeOutputsConfig{
+			GitHubApp: &GitHubAppConfig{
+				AppID:      "${{ vars.ACTIONS_APP_ID }}",
+				PrivateKey: "${{ secrets.ACTIONS_PRIVATE_KEY }}",
+			},
+		},
+	}
+
+	job, err := compiler.buildSafeOutputJob(workflowData, SafeOutputJobConfig{
+		JobName:     "add_comment",
+		StepName:    "Add Comment",
+		StepID:      "add_comment",
+		MainJobName: string(constants.AgentJobName),
+		Script:      "console.log('test')",
+		Permissions: NewPermissionsFromMap(map[PermissionScope]PermissionLevel{
+			PermissionIssues: PermissionWrite,
+		}),
+		PreSteps: []string{
+			"      - name: Pre setup\n",
+			"        run: echo \"pre\"\n",
+		},
+	})
+
+	require.NoError(t, err, "Should successfully build safe output job")
+	require.NotNil(t, job, "Job should not be nil")
+
+	stepsContent := strings.Join(job.Steps, "")
+	preIdx := strings.Index(stepsContent, "Pre setup")
+	tokenIdx := strings.Index(stepsContent, "Generate GitHub App token")
+	scriptIdx := strings.Index(stepsContent, "Add Comment")
+
+	require.NotEqual(t, -1, preIdx, "Pre-step should be present")
+	require.NotEqual(t, -1, tokenIdx, "GitHub App token step should be present")
+	require.NotEqual(t, -1, scriptIdx, "Main safe-output step should be present")
+
+	assert.Less(t, preIdx, tokenIdx, "Pre-steps should run before GitHub App token minting")
+	assert.Less(t, tokenIdx, scriptIdx, "GitHub App token minting should still happen before the main safe-output step")
+}
+
+// TestGitHubAppTokenStepWithOTLPHeaders ensures the app token step insertion point
+// stays aligned when OTLP header masking steps are present.
+func TestGitHubAppTokenStepWithOTLPHeaders(t *testing.T) {
+	compiler := NewCompiler()
+	compiler.jobManager = NewJobManager()
+
+	workflowData := &WorkflowData{
+		Name: "Test Workflow",
+		Env: `"env":
+  OTEL_EXPORTER_OTLP_HEADERS: "Authorization=******"`,
+		SafeOutputs: &SafeOutputsConfig{
+			GitHubApp: &GitHubAppConfig{
+				AppID:      "${{ vars.ACTIONS_APP_ID }}",
+				PrivateKey: "${{ secrets.ACTIONS_PRIVATE_KEY }}",
+			},
+			AddComments: &AddCommentsConfig{},
+			AddLabels: &AddLabelsConfig{
+				Allowed: []string{"bug"},
+			},
+		},
+	}
+
+	job, _, err := compiler.buildConsolidatedSafeOutputsJob(workflowData, string(constants.AgentJobName), "test.md")
+	require.NoError(t, err, "Should successfully build job")
+	require.NotNil(t, job, "Job should not be nil")
+
+	stepsContent := strings.Join(job.Steps, "")
+	maskIndex := strings.Index(stepsContent, "Mask OTLP telemetry headers")
+	downloadIndex := strings.Index(stepsContent, "Download agent output artifact")
+	setupEnvEchoIndex := strings.Index(stepsContent, "GH_AW_AGENT_OUTPUT=/tmp/gh-aw/agent_output.json")
+	tokenIndex := strings.Index(stepsContent, "Generate GitHub App token")
+
+	require.NotEqual(t, -1, maskIndex, "OTLP headers mask step should be present")
+	require.NotEqual(t, -1, downloadIndex, "agent output download step should be present")
+	require.NotEqual(t, -1, setupEnvEchoIndex, "setup-agent-output-env run command should be present")
+	require.NotEqual(t, -1, tokenIndex, "GitHub App token step should be present")
+
+	assert.Less(t, maskIndex, downloadIndex, "masking should happen before artifact download")
+	assert.Less(t, setupEnvEchoIndex, tokenIndex, "app token step must be inserted after setup-agent-output-env run block")
+	// Regression guard: app token insertion must not split setup-agent-output-env and leave
+	// an `echo ...` run line nested under a previous `with:` block.
+	assert.NotContains(t, stepsContent, "with:\n          echo \"GH_AW_AGENT_OUTPUT=/tmp/gh-aw/agent_output.json\" >> \"$GITHUB_OUTPUT\"",
+		"app token step must not split setup-agent-output-env into a nested echo under with:")
+}
+
+// TestGitHubAppTokenStepWithOTLPAttributes ensures the app token step insertion point
+// stays aligned when the OTLP attributes masking step is present (GH_AW_OTLP_ATTRIBUTES path).
+func TestGitHubAppTokenStepWithOTLPAttributes(t *testing.T) {
+	compiler := NewCompiler()
+	compiler.jobManager = NewJobManager()
+
+	workflowData := &WorkflowData{
+		Name: "Test Workflow",
+		Env: `"env":
+  GH_AW_OTLP_ATTRIBUTES: "{\"service.name\":\"test\"}"`,
+		SafeOutputs: &SafeOutputsConfig{
+			GitHubApp: &GitHubAppConfig{
+				AppID:      "${{ vars.ACTIONS_APP_ID }}",
+				PrivateKey: "${{ secrets.ACTIONS_PRIVATE_KEY }}",
+			},
+			AddComments: &AddCommentsConfig{},
+			AddLabels: &AddLabelsConfig{
+				Allowed: []string{"bug"},
+			},
+		},
+	}
+
+	job, _, err := compiler.buildConsolidatedSafeOutputsJob(workflowData, string(constants.AgentJobName), "test.md")
+	require.NoError(t, err, "Should successfully build job")
+	require.NotNil(t, job, "Job should not be nil")
+
+	stepsContent := strings.Join(job.Steps, "")
+	attrMaskIndex := strings.Index(stepsContent, "Mask OTLP custom attribute values")
+	downloadIndex := strings.Index(stepsContent, "Download agent output artifact")
+	setupEnvEchoIndex := strings.Index(stepsContent, "GH_AW_AGENT_OUTPUT=/tmp/gh-aw/agent_output.json")
+	tokenIndex := strings.Index(stepsContent, "Generate GitHub App token")
+
+	require.NotEqual(t, -1, attrMaskIndex, "OTLP attributes mask step should be present")
+	require.NotEqual(t, -1, downloadIndex, "agent output download step should be present")
+	require.NotEqual(t, -1, setupEnvEchoIndex, "setup-agent-output-env run command should be present")
+	require.NotEqual(t, -1, tokenIndex, "GitHub App token step should be present")
+
+	assert.Less(t, attrMaskIndex, downloadIndex, "attributes masking should happen before artifact download")
+	assert.Less(t, setupEnvEchoIndex, tokenIndex, "app token step must be inserted after setup-agent-output-env run block")
+	assert.NotContains(t, stepsContent, "with:\n          echo \"GH_AW_AGENT_OUTPUT=/tmp/gh-aw/agent_output.json\" >> \"$GITHUB_OUTPUT\"",
+		"app token step must not split setup-agent-output-env into a nested echo under with:")
+}
+
+// TestGitHubAppTokenStepWithOTLPHeadersAndAttributes ensures the app token step insertion
+// point stays aligned when both OTLP header masking and attribute masking steps are present
+// (insertIndex is incremented twice — highest-risk composition).
+func TestGitHubAppTokenStepWithOTLPHeadersAndAttributes(t *testing.T) {
+	compiler := NewCompiler()
+	compiler.jobManager = NewJobManager()
+
+	workflowData := &WorkflowData{
+		Name: "Test Workflow",
+		Env: `"env":
+  OTEL_EXPORTER_OTLP_HEADERS: "Authorization=******"
+  GH_AW_OTLP_ATTRIBUTES: "{\"service.name\":\"test\"}"`,
+		SafeOutputs: &SafeOutputsConfig{
+			GitHubApp: &GitHubAppConfig{
+				AppID:      "${{ vars.ACTIONS_APP_ID }}",
+				PrivateKey: "${{ secrets.ACTIONS_PRIVATE_KEY }}",
+			},
+			AddComments: &AddCommentsConfig{},
+			AddLabels: &AddLabelsConfig{
+				Allowed: []string{"bug"},
+			},
+		},
+	}
+
+	job, _, err := compiler.buildConsolidatedSafeOutputsJob(workflowData, string(constants.AgentJobName), "test.md")
+	require.NoError(t, err, "Should successfully build job")
+	require.NotNil(t, job, "Job should not be nil")
+
+	stepsContent := strings.Join(job.Steps, "")
+	headerMaskIndex := strings.Index(stepsContent, "Mask OTLP telemetry headers")
+	attrMaskIndex := strings.Index(stepsContent, "Mask OTLP custom attribute values")
+	downloadIndex := strings.Index(stepsContent, "Download agent output artifact")
+	setupEnvEchoIndex := strings.Index(stepsContent, "GH_AW_AGENT_OUTPUT=/tmp/gh-aw/agent_output.json")
+	tokenIndex := strings.Index(stepsContent, "Generate GitHub App token")
+
+	require.NotEqual(t, -1, headerMaskIndex, "OTLP headers mask step should be present")
+	require.NotEqual(t, -1, attrMaskIndex, "OTLP attributes mask step should be present")
+	require.NotEqual(t, -1, downloadIndex, "agent output download step should be present")
+	require.NotEqual(t, -1, setupEnvEchoIndex, "setup-agent-output-env run command should be present")
+	require.NotEqual(t, -1, tokenIndex, "GitHub App token step should be present")
+
+	assert.Less(t, headerMaskIndex, downloadIndex, "header masking should happen before artifact download")
+	assert.Less(t, attrMaskIndex, downloadIndex, "attributes masking should happen before artifact download")
+	assert.Less(t, setupEnvEchoIndex, tokenIndex, "app token step must be inserted after setup-agent-output-env run block")
+	assert.NotContains(t, stepsContent, "with:\n          echo \"GH_AW_AGENT_OUTPUT=/tmp/gh-aw/agent_output.json\" >> \"$GITHUB_OUTPUT\"",
+		"app token step must not split setup-agent-output-env into a nested echo under with:")
+}
+
 // a safe-output job compiled for a workflow_call trigger uses
 // needs.activation.outputs.target_repo_name (repo name only, no owner prefix) as the repositories
 // fallback for the GitHub App token mint step, instead of the full target_repo slug.
@@ -982,7 +1313,7 @@ func TestCreateCodeScanningAlertUploadJob(t *testing.T) {
 			name: "staged mode does not create upload job",
 			config: &CreateCodeScanningAlertsConfig{
 				BaseSafeOutputConfig: BaseSafeOutputConfig{
-					Staged: true,
+					Staged: templatableBoolPtr("true"),
 				},
 			},
 			expectUploadJob: false,
@@ -1050,6 +1381,8 @@ func TestCreateCodeScanningAlertUploadJob(t *testing.T) {
 					"Upload job must only run when sarif_file is non-empty")
 				assert.Contains(t, uploadJob.If, string(constants.SafeOutputsJobName),
 					"Upload job if-condition must reference safe_outputs outputs")
+				assert.Contains(t, uploadJob.Permissions, "actions: read",
+					"Upload job permissions must include actions: read for private-repo SARIF uploads")
 
 				uploadSteps := strings.Join(uploadJob.Steps, "")
 

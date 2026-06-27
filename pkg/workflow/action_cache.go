@@ -5,13 +5,15 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strings"
 	"time"
 
 	"github.com/github/gh-aw/pkg/constants"
-
 	"github.com/github/gh-aw/pkg/logger"
+	"github.com/github/gh-aw/pkg/setutil"
+	"github.com/github/gh-aw/pkg/sliceutil"
 )
 
 var actionCacheLog = logger.New("workflow:action_cache")
@@ -93,6 +95,80 @@ func (c *ActionCache) DeleteContainerPin(image string) {
 		c.dirty = true
 		actionCacheLog.Printf("Deleted container pin for image=%s", image)
 	}
+}
+
+// PruneOrphanedEntries removes action cache entries whose keys are not present
+// in referencedKeys. It returns the number of entries that were removed.
+// This is used to keep actions-lock.json a faithful reflection of what the
+// compiled workflows actually reference — entries for old action versions that
+// are no longer used by any workflow are removed.
+func (c *ActionCache) PruneOrphanedEntries(referencedKeys map[string]bool) int {
+	if len(referencedKeys) == 0 {
+		return 0
+	}
+
+	// Compiler-generated actions that should never be pruned.
+	// These are embedded in Go code rather than markdown workflows and include:
+	// - Core workflow actions (cache, checkout, github-script)
+	// - Runtime setup actions (from runtime_definitions.go)
+	// - Security scanning actions (CodeQL)
+	compilerGeneratedRepos := []string{
+		"actions/cache/",
+		"actions/checkout",
+		"actions/github-script",
+		"github/codeql-action/upload-sarif",
+	}
+
+	// Add all runtime-managed actions from runtime_definitions.go
+	for _, runtime := range knownRuntimes {
+		if runtime.ActionRepo != "" {
+			compilerGeneratedRepos = append(compilerGeneratedRepos, runtime.ActionRepo)
+		}
+	}
+
+	isCompilerGenerated := func(cacheKey string) bool {
+		for _, repo := range compilerGeneratedRepos {
+			if strings.HasPrefix(cacheKey, repo) {
+				return true
+			}
+		}
+		return false
+	}
+
+	pruned := 0
+	for key := range c.Entries {
+		if !referencedKeys[key] && !isCompilerGenerated(key) {
+			delete(c.Entries, key)
+			c.dirty = true
+			pruned++
+			actionCacheLog.Printf("Pruned orphaned action cache entry: %s", key)
+		}
+	}
+	if pruned > 0 {
+		actionCacheLog.Printf("Pruned %d orphaned action cache entries, %d entries remaining", pruned, len(c.Entries))
+	}
+	return pruned
+}
+
+// PruneStaleContainerPins removes container pin entries whose keys are not present
+// in knownImages. It returns the number of entries that were removed.
+// This is used to keep actions-lock.json consistent with the set of images
+// actually referenced by the compiled lock files.
+func (c *ActionCache) PruneStaleContainerPins(knownImages map[string]struct {
+}) int {
+	if c.ContainerPins == nil {
+		return 0
+	}
+	pruned := 0
+	for image := range c.ContainerPins {
+		if !setutil.Contains(knownImages, image) {
+			delete(c.ContainerPins, image)
+			c.dirty = true
+			pruned++
+			actionCacheLog.Printf("Pruned stale container pin for image=%s", image)
+		}
+	}
+	return pruned
 }
 
 // Load loads the cache from disk
@@ -190,11 +266,7 @@ func (c *ActionCache) Save() error {
 // marshalSorted marshals the cache with entries sorted by key
 func (c *ActionCache) marshalSorted() ([]byte, error) {
 	// Extract and sort the entry keys
-	keys := make([]string, 0, len(c.Entries))
-	for key := range c.Entries {
-		keys = append(keys, key)
-	}
-	sort.Strings(keys)
+	keys := sliceutil.SortedKeys(c.Entries)
 
 	// Manually construct JSON with sorted keys
 	var result []byte
@@ -224,11 +296,7 @@ func (c *ActionCache) marshalSorted() ([]byte, error) {
 
 	// Add containers section if non-empty
 	if len(c.ContainerPins) > 0 {
-		pinKeys := make([]string, 0, len(c.ContainerPins))
-		for k := range c.ContainerPins {
-			pinKeys = append(pinKeys, k)
-		}
-		sort.Strings(pinKeys)
+		pinKeys := sliceutil.SortedKeys(c.ContainerPins)
 
 		result = append(result, []byte(",\n  \"containers\": {\n")...)
 		for i, k := range pinKeys {
@@ -330,6 +398,30 @@ func (c *ActionCache) FindEntryBySHA(repo, sha string) (ActionCacheEntry, bool) 
 		}
 	}
 	return ActionCacheEntry{}, false
+}
+
+// FindAnyEntryForRepo finds any cache entry for the given repo,
+// preferring the newest version (by sorting keys and taking first match).
+// Returns the cache key, entry, and true if found, or empty values and false if not found.
+// This is used when the compiler needs to reference an action but doesn't know the version.
+func (c *ActionCache) FindAnyEntryForRepo(repo string) (string, ActionCacheEntry, bool) {
+	prefix := repo + "@"
+	var matchedKeys []string
+	for key := range c.Entries {
+		if strings.HasPrefix(key, prefix) {
+			matchedKeys = append(matchedKeys, key)
+		}
+	}
+	if len(matchedKeys) == 0 {
+		actionCacheLog.Printf("No cache entries found for repo: %s", repo)
+		return "", ActionCacheEntry{}, false
+	}
+	// Sort keys and take the first one (lexicographically, which tends to favor newer versions)
+	sort.Strings(matchedKeys)
+	firstKey := matchedKeys[len(matchedKeys)-1] // Take the last one for descending order (v9 > v1)
+	entry := c.Entries[firstKey]
+	actionCacheLog.Printf("Found cache entry for %s: %s", repo, firstKey)
+	return firstKey, entry, true
 }
 
 // Set stores a new cache entry, preserving any already-cached inputs when the SHA
@@ -488,81 +580,98 @@ func (c *ActionCache) GetCachePath() string {
 // for each repo+SHA combination. For example, if both "actions/cache@v4" and "actions/cache@v4.3.0"
 // point to the same SHA and version, only "actions/cache@v4.3.0" is kept.
 func (c *ActionCache) deduplicateEntries() {
-	// Group entries by repo+SHA
-	type entryKey struct {
-		repo string
-		sha  string
-	}
-	groups := make(map[entryKey][]string)
-
-	for key, entry := range c.Entries {
-		ek := entryKey{repo: entry.Repo, sha: entry.SHA}
-		groups[ek] = append(groups[ek], key)
-	}
-
-	// For each group with multiple entries, keep only the most precise one
+	groups := c.groupEntriesByRepoAndSHA()
 	var toDelete []string
-	var deduplicationDetails []string // Track details for user-friendly message
-
+	var deduplicationDetails []string
 	for ek, keys := range groups {
 		if len(keys) <= 1 {
 			continue
 		}
-
-		// Truncate SHA for logging (handle short SHAs in tests)
-		shortSHA := ek.sha
-		if len(ek.sha) > 8 {
-			shortSHA = ek.sha[:8]
+		actionCacheLog.Printf("Found %d cache entries for %s with SHA %s", len(keys), ek.repo, truncateSHAForLog(ek.sha))
+		keyInfos := buildDedupKeyInfos(keys)
+		if len(keyInfos) <= 1 {
+			continue
 		}
-		actionCacheLog.Printf("Found %d cache entries for %s with SHA %s", len(keys), ek.repo, shortSHA)
-
-		// Find the most precise version reference
-		// Extract the version reference from each key (format: "repo@versionRef")
-		type keyInfo struct {
-			key        string
-			versionRef string
+		keepVersion, removedKeys, removedVersions := collectDedupRemovals(keyInfos)
+		for _, removedKey := range removedKeys {
+			toDelete = append(toDelete, removedKey)
+			actionCacheLog.Printf("Deduplicating: keeping %s, removing %s", keyInfos[0].key, removedKey)
 		}
-		keyInfos := make([]keyInfo, len(keys))
-		for i, key := range keys {
-			parts := strings.SplitN(key, "@", 2)
-			versionRef := ""
-			if len(parts) == 2 {
-				versionRef = parts[1]
-			}
-			keyInfos[i] = keyInfo{key: key, versionRef: versionRef}
-		}
-
-		// Sort by version precision (most precise first)
-		sort.Slice(keyInfos, func(i, j int) bool {
-			return isMorePreciseVersion(keyInfos[i].versionRef, keyInfos[j].versionRef)
-		})
-
-		// Keep the most precise version, mark others for deletion
-		keepVersion := keyInfos[0].versionRef
-		var removedVersions []string
-		for i := 1; i < len(keyInfos); i++ {
-			toDelete = append(toDelete, keyInfos[i].key)
-			removedVersions = append(removedVersions, keyInfos[i].versionRef)
-			actionCacheLog.Printf("Deduplicating: keeping %s, removing %s", keyInfos[0].key, keyInfos[i].key)
-		}
-
-		// Build user-friendly message
-		detail := fmt.Sprintf("%s: kept %s, removed %s", ek.repo, keepVersion, strings.Join(removedVersions, ", "))
-		deduplicationDetails = append(deduplicationDetails, detail)
+		deduplicationDetails = append(deduplicationDetails, fmt.Sprintf("%s: kept %s, removed %s", ek.repo, keepVersion, strings.Join(removedVersions, ", ")))
 	}
-
-	// Delete the less precise entries
-	for _, key := range toDelete {
-		delete(c.Entries, key)
-	}
-
+	c.deleteDedupEntries(toDelete)
 	if len(toDelete) > 0 {
 		actionCacheLog.Printf("Deduplicated %d entries, %d entries remaining", len(toDelete), len(c.Entries))
-		// Log detailed deduplication info at verbose level
 		for _, detail := range deduplicationDetails {
 			actionCacheLog.Printf("Deduplication detail: %s", detail)
 		}
 	}
+}
+
+type deduplicationKey struct {
+	repo string
+	sha  string
+}
+
+type cacheKeyInfo struct {
+	key        string
+	versionRef string
+}
+
+func (c *ActionCache) groupEntriesByRepoAndSHA() map[deduplicationKey][]string {
+	groups := make(map[deduplicationKey][]string)
+	for key, entry := range c.Entries {
+		ek := deduplicationKey{repo: entry.Repo, sha: entry.SHA}
+		groups[ek] = append(groups[ek], key)
+	}
+	return groups
+}
+
+func buildDedupKeyInfos(keys []string) []cacheKeyInfo {
+	keyInfos := make([]cacheKeyInfo, len(keys))
+	for i, key := range keys {
+		parts := strings.SplitN(key, "@", 2)
+		versionRef := ""
+		if len(parts) == 2 {
+			versionRef = parts[1]
+		}
+		keyInfos[i] = cacheKeyInfo{key: key, versionRef: versionRef}
+	}
+	slices.SortFunc(keyInfos, func(a, b cacheKeyInfo) int {
+		switch {
+		case isMorePreciseVersion(a.versionRef, b.versionRef):
+			return -1
+		case isMorePreciseVersion(b.versionRef, a.versionRef):
+			return 1
+		default:
+			return 0
+		}
+	})
+	return keyInfos
+}
+
+func collectDedupRemovals(keyInfos []cacheKeyInfo) (string, []string, []string) {
+	keepVersion := keyInfos[0].versionRef
+	removedKeys := make([]string, 0, len(keyInfos)-1)
+	removedVersions := make([]string, 0, len(keyInfos)-1)
+	for i := 1; i < len(keyInfos); i++ {
+		removedKeys = append(removedKeys, keyInfos[i].key)
+		removedVersions = append(removedVersions, keyInfos[i].versionRef)
+	}
+	return keepVersion, removedKeys, removedVersions
+}
+
+func (c *ActionCache) deleteDedupEntries(toDelete []string) {
+	for _, key := range toDelete {
+		delete(c.Entries, key)
+	}
+}
+
+func truncateSHAForLog(sha string) string {
+	if len(sha) > 8 {
+		return sha[:8]
+	}
+	return sha
 }
 
 // PruneStaleGHAWEntries removes entries from the cache for the gh-aw-actions

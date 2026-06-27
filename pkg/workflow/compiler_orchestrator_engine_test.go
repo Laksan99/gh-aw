@@ -9,6 +9,7 @@ import (
 
 	"github.com/github/gh-aw/pkg/parser"
 	"github.com/github/gh-aw/pkg/testutil"
+	"github.com/github/gh-aw/pkg/workflow/compilerenv"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -53,38 +54,6 @@ Test content
 	assert.NotNil(t, result.importsResult)
 }
 
-func TestSetupEngineAndImports_PreservesFirewallTokenSteeringForStringEngine(t *testing.T) {
-	tmpDir := testutil.TempDir(t, "engine-firewall-token-steering")
-
-	testContent := `---
-on: push
-engine: copilot
-network:
-  allowed:
-    - defaults
-firewall:
-  effective-token-steering: true
----
-
-# Test Workflow
-`
-
-	testFile := filepath.Join(tmpDir, "test.md")
-	require.NoError(t, os.WriteFile(testFile, []byte(testContent), 0644))
-
-	compiler := NewCompiler()
-	content := []byte(testContent)
-
-	frontmatterResult, err := parser.ExtractFrontmatterFromContent(string(content))
-	require.NoError(t, err)
-
-	result, err := compiler.setupEngineAndImports(frontmatterResult, testFile, content, tmpDir)
-	require.NoError(t, err, "setup should succeed")
-	require.NotNil(t, result)
-	require.NotNil(t, result.engineConfig)
-	assert.True(t, result.engineConfig.EnableTokenSteering, "firewall.effective-token-steering should be preserved after string-engine import expansion")
-}
-
 // TestSetupEngineAndImports_DefaultEngine tests engine defaulting when not specified
 func TestSetupEngineAndImports_DefaultEngine(t *testing.T) {
 	tmpDir := testutil.TempDir(t, "engine-default")
@@ -111,6 +80,242 @@ on: push
 
 	// Should default to copilot
 	assert.Equal(t, "copilot", result.engineSetting)
+}
+
+func TestSetupEngineAndImports_DefaultMaxTurnsFromEnv(t *testing.T) {
+	t.Setenv(compilerenv.DefaultMaxTurns, "9")
+
+	tmpDir := testutil.TempDir(t, "engine-default-max-turns")
+	testContent := `---
+on: push
+engine: claude
+---
+
+# Test Workflow
+`
+	testFile := filepath.Join(tmpDir, "test.md")
+	require.NoError(t, os.WriteFile(testFile, []byte(testContent), 0644))
+
+	compiler := NewCompiler()
+	content := []byte(testContent)
+	frontmatterResult, err := parser.ExtractFrontmatterFromContent(string(content))
+	require.NoError(t, err)
+
+	result, err := compiler.setupEngineAndImports(frontmatterResult, testFile, content, tmpDir)
+	require.NoError(t, err)
+	require.NotNil(t, result)
+	require.NotNil(t, result.engineConfig)
+	assert.Equal(t, "9", result.engineConfig.MaxTurns)
+}
+
+func TestSetupEngineAndImports_ExplicitMaxTurnsOverridesEnvDefault(t *testing.T) {
+	t.Setenv(compilerenv.DefaultMaxTurns, "9")
+
+	tmpDir := testutil.TempDir(t, "engine-explicit-max-turns")
+	testContent := `---
+on: push
+engine:
+  id: claude
+  max-turns: 4
+---
+
+# Test Workflow
+`
+	testFile := filepath.Join(tmpDir, "test.md")
+	require.NoError(t, os.WriteFile(testFile, []byte(testContent), 0644))
+
+	compiler := NewCompiler()
+	content := []byte(testContent)
+	frontmatterResult, err := parser.ExtractFrontmatterFromContent(string(content))
+	require.NoError(t, err)
+
+	result, err := compiler.setupEngineAndImports(frontmatterResult, testFile, content, tmpDir)
+	require.NoError(t, err)
+	require.NotNil(t, result)
+	require.NotNil(t, result.engineConfig)
+	assert.Equal(t, "4", result.engineConfig.MaxTurns)
+}
+
+func TestSetupEngineAndImports_TopLevelMaxTurnsOverridesEnvDefault(t *testing.T) {
+	t.Setenv(compilerenv.DefaultMaxTurns, "9")
+
+	tmpDir := testutil.TempDir(t, "engine-top-level-max-turns")
+	testContent := "---\n" +
+		"on: push\n" +
+		"engine: codex\n" +
+		`max-turns: "${{ inputs.max-turns }}"` + "\n" +
+		"---\n\n" +
+		"# Test Workflow\n"
+	testFile := filepath.Join(tmpDir, "test.md")
+	require.NoError(t, os.WriteFile(testFile, []byte(testContent), 0644))
+
+	compiler := NewCompiler()
+	content := []byte(testContent)
+	frontmatterResult, err := parser.ExtractFrontmatterFromContent(string(content))
+	require.NoError(t, err)
+
+	result, err := compiler.setupEngineAndImports(frontmatterResult, testFile, content, tmpDir)
+	require.NoError(t, err)
+	require.NotNil(t, result)
+	require.NotNil(t, result.engineConfig)
+	assert.Equal(t, "${{ inputs.max-turns }}", result.engineConfig.MaxTurns)
+}
+
+func TestSetupEngineAndImports_ImportedTopLevelMaxTurns(t *testing.T) {
+	tmpDir := testutil.TempDir(t, "engine-imported-max-turns")
+
+	sharedContent := `---
+engine:
+  id: claude
+max-turns: 4
+---
+
+# Shared Workflow
+`
+	sharedDir := filepath.Join(tmpDir, "shared")
+	require.NoError(t, os.MkdirAll(sharedDir, 0755))
+	require.NoError(t, os.WriteFile(filepath.Join(sharedDir, "common.md"), []byte(sharedContent), 0644))
+
+	testContent := `---
+on: push
+imports:
+  - shared/common.md
+---
+
+# Test Workflow
+`
+	testFile := filepath.Join(tmpDir, "test.md")
+	require.NoError(t, os.WriteFile(testFile, []byte(testContent), 0644))
+
+	compiler := NewCompiler()
+	content := []byte(testContent)
+	frontmatterResult, err := parser.ExtractFrontmatterFromContent(string(content))
+	require.NoError(t, err)
+
+	result, err := compiler.setupEngineAndImports(frontmatterResult, testFile, content, tmpDir)
+	require.NoError(t, err)
+	require.NotNil(t, result)
+	require.NotNil(t, result.engineConfig)
+	assert.Equal(t, "claude", result.engineSetting)
+	assert.Equal(t, "4", result.engineConfig.MaxTurns)
+}
+
+func TestSetupEngineAndImports_ImportedTopLevelMaxToolDenials(t *testing.T) {
+	tmpDir := testutil.TempDir(t, "engine-imported-max-tool-denials")
+
+	sharedContent := `---
+engine:
+  id: copilot
+  copilot-sdk: true
+max-tool-denials: 9
+---
+
+# Shared Workflow
+`
+	sharedDir := filepath.Join(tmpDir, "shared")
+	require.NoError(t, os.MkdirAll(sharedDir, 0755))
+	require.NoError(t, os.WriteFile(filepath.Join(sharedDir, "common.md"), []byte(sharedContent), 0644))
+
+	testContent := `---
+on: push
+imports:
+  - shared/common.md
+---
+
+# Test Workflow
+`
+	testFile := filepath.Join(tmpDir, "test.md")
+	require.NoError(t, os.WriteFile(testFile, []byte(testContent), 0644))
+
+	compiler := NewCompiler()
+	content := []byte(testContent)
+	frontmatterResult, err := parser.ExtractFrontmatterFromContent(string(content))
+	require.NoError(t, err)
+
+	result, err := compiler.setupEngineAndImports(frontmatterResult, testFile, content, tmpDir)
+	require.NoError(t, err)
+	require.NotNil(t, result)
+	require.NotNil(t, result.engineConfig)
+	assert.Equal(t, "copilot", result.engineSetting)
+	assert.Equal(t, "9", result.engineConfig.MaxToolDenials)
+}
+
+func TestSetupEngineAndImports_ImportedTopLevelMaxTurnCacheMisses(t *testing.T) {
+	tmpDir := testutil.TempDir(t, "engine-imported-max-turn-cache-misses")
+
+	sharedContent := `---
+engine: copilot
+max-turn-cache-misses: 7
+---
+
+# Shared Workflow
+`
+	sharedDir := filepath.Join(tmpDir, "shared")
+	require.NoError(t, os.MkdirAll(sharedDir, 0755))
+	require.NoError(t, os.WriteFile(filepath.Join(sharedDir, "common.md"), []byte(sharedContent), 0644))
+
+	testContent := `---
+on: push
+imports:
+  - shared/common.md
+---
+
+# Test Workflow
+`
+	testFile := filepath.Join(tmpDir, "test.md")
+	require.NoError(t, os.WriteFile(testFile, []byte(testContent), 0644))
+
+	compiler := NewCompiler()
+	content := []byte(testContent)
+	frontmatterResult, err := parser.ExtractFrontmatterFromContent(string(content))
+	require.NoError(t, err)
+
+	result, err := compiler.setupEngineAndImports(frontmatterResult, testFile, content, tmpDir)
+	require.NoError(t, err)
+	require.NotNil(t, result)
+	require.NotNil(t, result.engineConfig)
+	assert.Equal(t, "copilot", result.engineSetting)
+	assert.Equal(t, 7, result.engineConfig.MaxTurnCacheMisses)
+}
+
+// TestSetupEngineAndImports_MainMaxTurnCacheMissesTakesPrecedenceOverImport verifies that
+// a main workflow's max-turn-cache-misses frontmatter wins over the same field in an import.
+func TestSetupEngineAndImports_MainMaxTurnCacheMissesTakesPrecedenceOverImport(t *testing.T) {
+	tmpDir := testutil.TempDir(t, "engine-main-cache-misses-wins")
+
+	sharedContent := `---
+engine: copilot
+max-turn-cache-misses: 7
+---
+
+# Shared Workflow
+`
+	sharedDir := filepath.Join(tmpDir, "shared")
+	require.NoError(t, os.MkdirAll(sharedDir, 0755))
+	require.NoError(t, os.WriteFile(filepath.Join(sharedDir, "common.md"), []byte(sharedContent), 0644))
+
+	testContent := `---
+on: push
+max-turn-cache-misses: 3
+imports:
+  - shared/common.md
+---
+
+# Test Workflow
+`
+	testFile := filepath.Join(tmpDir, "test.md")
+	require.NoError(t, os.WriteFile(testFile, []byte(testContent), 0644))
+
+	compiler := NewCompiler()
+	content := []byte(testContent)
+	frontmatterResult, err := parser.ExtractFrontmatterFromContent(string(content))
+	require.NoError(t, err)
+
+	result, err := compiler.setupEngineAndImports(frontmatterResult, testFile, content, tmpDir)
+	require.NoError(t, err)
+	require.NotNil(t, result)
+	require.NotNil(t, result.engineConfig)
+	assert.Equal(t, 3, result.engineConfig.MaxTurnCacheMisses, "main workflow max-turn-cache-misses must win over import")
 }
 
 // TestSetupEngineAndImports_EngineOverride tests command-line engine override

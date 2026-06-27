@@ -325,7 +325,7 @@ func (e *CodexEngine) extractOutputSizeFromJSONFallback(jsonStr string) int {
 	for i := 1; i < len(parts); i++ {
 		// Find the quoted string value
 		part := strings.TrimSpace(parts[i])
-		if len(part) == 0 || part[0] != '"' {
+		if part == "" || part[0] != '"' {
 			continue
 		}
 
@@ -380,4 +380,10 @@ func (e *CodexEngine) extractCodexTokenUsage(line string) int {
 // GetLogParserScriptId returns the JavaScript script name for parsing Codex logs
 func (e *CodexEngine) GetLogParserScriptId() string {
 	return "parse_codex_log"
+}
+
+// GetErrorDetectionScriptId returns the JavaScript script name for detecting
+// post-run agent errors from the host runner (including invalid/unsupported model names).
+func (e *CodexEngine) GetErrorDetectionScriptId() string {
+	return "detect_agent_errors"
 }

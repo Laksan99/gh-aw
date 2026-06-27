@@ -36,6 +36,8 @@ on:
     types: [completed]
 tools:
   github: false
+features:
+  dangerously-disable-sandbox-agent: "controlled environment with no internet access"
 sandbox:
   agent: false
 ---
@@ -81,6 +83,8 @@ on:
       - develop
 tools:
   github: false
+features:
+  dangerously-disable-sandbox-agent: "controlled environment with no internet access"
 sandbox:
   agent: false
 ---
@@ -116,6 +120,119 @@ Test workflow content.`,
 			warningCount:  0,
 		},
 		{
+			name: "workflow_run with sibling bots - strict mode - should pass",
+			frontmatter: `---
+on:
+  bots:
+    - dependabot
+  workflow_run:
+    workflows:
+      - build
+    types:
+      - completed
+    branches:
+      - main
+tools:
+  github:
+    toolsets: [repos]
+---
+
+# Workflow Run With Bots
+Test workflow content.`,
+			filename:      "workflow-run-with-bots-strict.md",
+			strictMode:    true,
+			expectError:   false,
+			expectWarning: false,
+			warningCount:  0,
+		},
+		{
+			name: "workflow_run with sibling roles all - strict mode - should pass",
+			frontmatter: `---
+on:
+  roles: all
+  workflow_run:
+    workflows:
+      - build
+    types:
+      - completed
+    branches:
+      - main
+tools:
+  github:
+    toolsets: [repos]
+---
+
+# Workflow Run With Roles
+Test workflow content.`,
+			filename:      "workflow-run-with-roles-strict.md",
+			strictMode:    true,
+			expectError:   false,
+			expectWarning: false,
+			warningCount:  0,
+		},
+		{
+			name: "workflow_run without workflows - should error",
+			frontmatter: `---
+strict: false
+on:
+  workflow_run:
+    types: [completed]
+tools:
+  github: false
+---
+
+# Workflow Run Without Workflows
+Test workflow content.`,
+			filename:      "workflow-run-no-workflows.md",
+			strictMode:    false,
+			expectError:   true,
+			expectWarning: false,
+			errorContains: "workflow_run trigger must include a non-empty workflows field",
+			warningCount:  0,
+		},
+		{
+			name: "workflow_run with empty workflows - strict mode - should error",
+			frontmatter: `---
+on:
+  workflow_run:
+    workflows: []
+    types: [completed]
+tools:
+  github:
+    toolsets: [repos]
+---
+
+# Workflow Run Empty Workflows
+Test workflow content.`,
+			filename:      "workflow-run-empty-workflows.md",
+			strictMode:    true,
+			expectError:   true,
+			expectWarning: false,
+			errorContains: "workflow_run trigger must include a non-empty workflows field",
+			warningCount:  0,
+		},
+		{
+			name: "workflow_run with whitespace workflows - non-strict mode - should error",
+			frontmatter: `---
+strict: false
+on:
+  workflow_run:
+    workflows: [" ", ""]
+    types: [completed]
+tools:
+  github: false
+---
+
+# Workflow Run Whitespace Workflows
+Test workflow content.`,
+			filename:      "workflow-run-whitespace-workflows.md",
+			strictMode:    false,
+			expectError:   true,
+			expectWarning: false,
+			errorContains: "workflow_run trigger must include a non-empty workflows field",
+			warningCount:  0,
+		},
+		{
 			name: "no workflow_run - should pass",
 			frontmatter: `---
 strict: false
@@ -124,6 +241,8 @@ on:
     branches: [main]
 tools:
   github: false
+features:
+  dangerously-disable-sandbox-agent: "controlled environment with no internet access"
 sandbox:
   agent: false
 ---
@@ -148,6 +267,8 @@ on:
     types: [completed]
 tools:
   github: false
+features:
+  dangerously-disable-sandbox-agent: "controlled environment with no internet access"
 sandbox:
   agent: false
 ---
@@ -171,6 +292,8 @@ on:
     branches: []
 tools:
   github: false
+features:
+  dangerously-disable-sandbox-agent: "controlled environment with no internet access"
 sandbox:
   agent: false
 ---
@@ -241,6 +364,8 @@ strict: false
 on: push
 tools:
   github: false
+features:
+  dangerously-disable-sandbox-agent: "controlled environment with no internet access"
 sandbox:
   agent: false
 ---
@@ -261,6 +386,8 @@ on:
     types: [completed]
 tools:
   github: false
+features:
+  dangerously-disable-sandbox-agent: "controlled environment with no internet access"
 sandbox:
   agent: false
 ---

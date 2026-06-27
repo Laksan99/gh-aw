@@ -14,15 +14,9 @@
 // Use it for any frontmatter field that accepts "${{ inputs.N }}" alongside
 // plain integers (e.g. timeout-minutes).
 //
-// preprocessBoolFieldAsString must be called before YAML unmarshaling so
-// that a struct field typed as *string can store both literal booleans
-// ("true"/"false") and GitHub Actions expression strings.  Free-form
-// string literals that are not expressions are rejected with an error.
-//
-// preprocessIntFieldAsString must be called before YAML unmarshaling so
-// that a struct field typed as *string can store both literal integers
-// and GitHub Actions expression strings.  Free-form string literals that
-// are not expressions are rejected with an error.
+// preprocessBoolFieldAsString and preprocessIntFieldAsString live in
+// config_preprocessing.go. They must be called before YAML unmarshaling so
+// *string fields can accept both literal values and GitHub Actions expressions.
 //
 // # JS side
 //
@@ -34,12 +28,17 @@ package workflow
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strconv"
-	"strings"
 
 	"github.com/github/gh-aw/pkg/logger"
+	"gopkg.in/yaml.v3"
 )
+
+var templatablesLog = logger.New("workflow:templatables")
+
+const templatableBoolErrorExample = "value must be a boolean or a GitHub Actions expression (e.g. '${{ inputs.flag }}')"
 
 // TemplatableInt32 represents an integer frontmatter field that also accepts
 // GitHub Actions expression strings (e.g. "${{ inputs.timeout }}").  The
@@ -72,9 +71,11 @@ func (t *TemplatableInt32) UnmarshalJSON(data []byte) error {
 	// Try a JSON string (e.g. "${{ inputs.timeout }}")
 	var s string
 	if err := json.Unmarshal(data, &s); err != nil {
+		templatablesLog.Printf("TemplatableInt32 rejected: not number or string: %s", data)
 		return fmt.Errorf("timeout-minutes must be an integer or a GitHub Actions expression (e.g. '${{ inputs.timeout }}'), got %s", data)
 	}
 	if !isExpression(s) {
+		templatablesLog.Printf("TemplatableInt32 rejected non-expression string: %q", s)
 		return fmt.Errorf("timeout-minutes must be an integer or a GitHub Actions expression (e.g. '${{ inputs.timeout }}'), got string %q", s)
 	}
 	*t = TemplatableInt32(s)
@@ -135,45 +136,117 @@ func (t *TemplatableInt32) Ptr() *TemplatableInt32 {
 	return &v
 }
 
-// preprocessBoolFieldAsString converts the value of a boolean config field
-// to a string before YAML unmarshaling.  This lets struct fields typed as
-// *string accept both literal boolean values (true/false) and GitHub Actions
-// expression strings (e.g. "${{ inputs.draft-prs }}").
-//
-// If the value is a bool it is converted to "true" or "false".
-// If the value is a string it must be a GitHub Actions expression (starts
-// with "${{" and ends with "}}"); any other free-form string is rejected
-// and an error is returned.
-func preprocessBoolFieldAsString(configData map[string]any, fieldName string, log *logger.Logger) error {
-	if configData == nil {
+// TemplatableBool represents a boolean frontmatter field that also accepts
+// GitHub Actions expression strings (e.g. "${{ inputs.enabled }}"). The
+// underlying value is always stored as a string: boolean literals as "true" or
+// "false", expressions verbatim.
+type TemplatableBool string
+
+// UnmarshalJSON allows TemplatableBool to accept both JSON booleans and JSON
+// strings that are GitHub Actions expressions.
+func (t *TemplatableBool) UnmarshalJSON(data []byte) error {
+	var b bool
+	if err := json.Unmarshal(data, &b); err == nil {
+		if b {
+			*t = TemplatableBool("true")
+		} else {
+			*t = TemplatableBool("false")
+		}
 		return nil
 	}
-	if val, exists := configData[fieldName]; exists {
-		switch v := val.(type) {
-		case bool:
-			if v {
-				configData[fieldName] = "true"
+
+	var s string
+	if err := json.Unmarshal(data, &s); err != nil {
+		return fmt.Errorf("%s, got %s", templatableBoolErrorExample, data)
+	}
+	if !isExpression(s) {
+		return fmt.Errorf("%s, got string %q", templatableBoolErrorExample, s)
+	}
+	*t = TemplatableBool(s)
+	return nil
+}
+
+// UnmarshalYAML allows TemplatableBool to accept both YAML booleans and GitHub
+// Actions expression strings.
+func (t *TemplatableBool) UnmarshalYAML(node *yaml.Node) error {
+	switch node.Kind {
+	case yaml.ScalarNode:
+		switch node.Tag {
+		case "!!bool":
+			if node.Value == "true" {
+				*t = TemplatableBool("true")
 			} else {
-				configData[fieldName] = "false"
+				*t = TemplatableBool("false")
 			}
-			if log != nil {
-				log.Printf("Converted %s bool to string before unmarshaling", fieldName)
+			return nil
+		case "!!str":
+			if !isExpression(node.Value) {
+				return fmt.Errorf("%s, got string %q", templatableBoolErrorExample, node.Value)
 			}
-		case string:
-			if !isExpression(v) {
-				return fmt.Errorf("field %q must be a boolean or a GitHub Actions expression (e.g. '${{ inputs.flag }}'), got string %q", fieldName, v)
-			}
-			// expression string is already in the correct form
+			*t = TemplatableBool(node.Value)
+			return nil
 		}
+	}
+	return errors.New(templatableBoolErrorExample)
+}
+
+// MarshalJSON emits a JSON boolean for literal values and a JSON string for
+// GitHub Actions expressions.
+func (t *TemplatableBool) MarshalJSON() ([]byte, error) {
+	switch string(*t) {
+	case "true":
+		return json.Marshal(true)
+	case "false":
+		return json.Marshal(false)
+	default:
+		return json.Marshal(string(*t))
+	}
+}
+
+// String returns the underlying string representation of the value.
+func (t *TemplatableBool) String() string {
+	return string(*t)
+}
+
+func templatableBoolPtrToStringPtr(value *TemplatableBool) *string {
+	if value == nil {
+		return nil
+	}
+	s := value.String()
+	return &s
+}
+
+func templatableBoolIsTrue(value *TemplatableBool) bool {
+	return value != nil && value.String() == "true"
+}
+
+// templatableBoolEnvVarValue returns only staged values that must be preserved
+// in env vars at runtime. Literal false is treated the same as unset, while
+// literal true and GitHub Actions expressions must be propagated.
+func templatableBoolEnvVarValue(value *TemplatableBool) *string {
+	if value == nil {
+		return nil
+	}
+	s := value.String()
+	if s == "true" || isExpression(s) {
+		return &s
 	}
 	return nil
 }
 
-// buildTemplatableBoolEnvVar returns a YAML environment variable entry for a
-// templatable boolean field. If value is a GitHub Actions expression it is
+func resolveSafeOutputsStagedValue(trialMode bool, staged *TemplatableBool) *string {
+	if trialMode {
+		s := "true"
+		return &s
+	}
+	return templatableBoolEnvVarValue(staged)
+}
+
+// buildTemplatableEnvVar returns a YAML environment variable entry for a
+// templatable field. If value is a GitHub Actions expression it is
 // embedded unquoted so that GitHub Actions can evaluate it at runtime;
 // otherwise the literal string is quoted. Returns nil if value is nil.
-func buildTemplatableBoolEnvVar(envVarName string, value *string) []string {
+func buildTemplatableEnvVar(envVarName string, value *string) []string {
 	if value == nil {
 		return nil
 	}
@@ -182,6 +255,14 @@ func buildTemplatableBoolEnvVar(envVarName string, value *string) []string {
 		return []string{fmt.Sprintf("          %s: %s\n", envVarName, v)}
 	}
 	return []string{fmt.Sprintf("          %s: %q\n", envVarName, v)}
+}
+
+// buildTemplatableBoolEnvVar returns a YAML environment variable entry for a
+// templatable boolean field. If value is a GitHub Actions expression it is
+// embedded unquoted so that GitHub Actions can evaluate it at runtime;
+// otherwise the literal string is quoted. Returns nil if value is nil.
+func buildTemplatableBoolEnvVar(envVarName string, value *string) []string {
+	return buildTemplatableEnvVar(envVarName, value)
 }
 
 // AddTemplatableBool adds a templatable boolean field to the handler config.
@@ -208,106 +289,12 @@ func (b *handlerConfigBuilder) AddTemplatableBool(key string, value *string) *ha
 	return b
 }
 
-// preprocessIntFieldAsString converts the value of an integer config field
-// to a string before YAML unmarshaling.  This lets struct fields typed as
-// *string accept both literal integer values and GitHub Actions expression
-// strings (e.g. "${{ inputs.max-issues }}").
-//
-// If the value is an int, int64, float64, or uint64 it is converted to its
-// decimal string representation.
-// If the value is a string it must be a GitHub Actions expression (starts
-// with "${{" and ends with "}}"); any other free-form string is rejected
-// and an error is returned.
-func preprocessIntFieldAsString(configData map[string]any, fieldName string, log *logger.Logger) error {
-	if configData == nil {
-		return nil
-	}
-	if val, exists := configData[fieldName]; exists {
-		switch v := val.(type) {
-		case int:
-			configData[fieldName] = strconv.Itoa(v)
-			if log != nil {
-				log.Printf("Converted %s int to string before unmarshaling", fieldName)
-			}
-		case int64:
-			configData[fieldName] = strconv.FormatInt(v, 10)
-			if log != nil {
-				log.Printf("Converted %s int64 to string before unmarshaling", fieldName)
-			}
-		case float64:
-			configData[fieldName] = strconv.Itoa(int(v))
-			if log != nil {
-				log.Printf("Converted %s float64 to string before unmarshaling", fieldName)
-			}
-		case uint64:
-			configData[fieldName] = strconv.FormatUint(v, 10)
-			if log != nil {
-				log.Printf("Converted %s uint64 to string before unmarshaling", fieldName)
-			}
-		case string:
-			if !isExpression(v) {
-				return fmt.Errorf("field %q must be an integer or a GitHub Actions expression (e.g. '${{ inputs.max }}'), got string %q", fieldName, v)
-			}
-			// expression string is already in the correct form
-		}
-	}
-	return nil
-}
-
-// preprocessStringArrayFieldAsTemplatable handles a string-array config field that also
-// accepts a GitHub Actions expression string (e.g. "${{ inputs.labels }}").
-//
-// When the field value is an expression string it is wrapped in a single-element []string
-// so that existing YAML struct-unmarshal code (which expects []string) continues to work
-// unchanged.  The handler config builder then detects this single-element expression slice
-// and stores it as a JSON string rather than a JSON array, allowing GitHub Actions to
-// evaluate the expression at runtime before the config.json file is written.
-//
-// Free-form strings that are not GitHub Actions expressions are rejected with an error.
-// Array values ([]string, []any) are left untouched for the normal YAML unmarshal path.
-func preprocessStringArrayFieldAsTemplatable(configData map[string]any, fieldName string, log *logger.Logger) error {
-	if configData == nil {
-		return nil
-	}
-	if val, exists := configData[fieldName]; exists {
-		if s, ok := val.(string); ok {
-			if !isExpression(s) {
-				// Build an example expression that is syntactically valid for fieldNames
-				// containing hyphens: dot-notation (e.g. inputs.foo) is invalid for those,
-				// so use bracket notation (e.g. inputs['foo']) instead.
-				var exampleExpr string
-				if strings.Contains(fieldName, "-") {
-					exampleExpr = fmt.Sprintf("${{ inputs['%s'] }}", fieldName)
-				} else {
-					exampleExpr = fmt.Sprintf("${{ inputs.%s }}", fieldName)
-				}
-				return fmt.Errorf("field %q must be an array of strings or a GitHub Actions expression (e.g. '%s'), got string %q", fieldName, exampleExpr, s)
-			}
-			// Wrap the expression in a single-element slice so the []string struct field
-			// can receive it after YAML marshaling/unmarshaling.
-			configData[fieldName] = []string{s}
-			if log != nil {
-				log.Printf("Wrapped %s expression string in single-element array before unmarshaling", fieldName)
-			}
-		}
-		// Arrays ([]string, []any) are left unchanged for YAML unmarshal to handle.
-	}
-	return nil
-}
-
 // buildTemplatableIntEnvVar returns a YAML environment variable entry for a
 // templatable integer field. If value is a GitHub Actions expression it is
 // embedded unquoted so that GitHub Actions can evaluate it at runtime;
 // otherwise the literal string is quoted. Returns nil if value is nil.
 func buildTemplatableIntEnvVar(envVarName string, value *string) []string {
-	if value == nil {
-		return nil
-	}
-	v := *value
-	if isExpression(v) {
-		return []string{fmt.Sprintf("          %s: %s\n", envVarName, v)}
-	}
-	return []string{fmt.Sprintf("          %s: %q\n", envVarName, v)}
+	return buildTemplatableEnvVar(envVarName, value)
 }
 
 // AddTemplatableInt adds a templatable integer field to the handler config.

@@ -1,4 +1,6 @@
 ---
+private: true
+emoji: "🎙️"
 name: Dictation Prompt Generator
 description: Generates optimized prompts for voice dictation and speech-to-text workflows
 on:
@@ -11,14 +13,17 @@ permissions:
   issues: read
   pull-requests: read
 
-engine: copilot
+  copilot-requests: write
+engine:
+  id: copilot
+  copilot-sdk: true
 
 network: defaults
 
 imports:
   - shared/reporting.md
 
-  - shared/observability-otlp.md
+  - shared/otlp.md
 tools:
   cli-proxy: true
   edit:
@@ -37,14 +42,20 @@ safe-outputs:
     auto-merge: true
 
 timeout-minutes: 10
-features:
-  copilot-requests: true
-
 ---
 
 # Dictation Prompt Generator
 
 Extract technical vocabulary from documentation files and create a concise dictation instruction file for fixing speech-to-text errors and improving text clarity.
+
+## Required Safe Output (Must Do)
+
+Before you finish, you **MUST** call exactly one safe-output tool:
+- Use `create_pull_request` if you made meaningful updates to `DICTATION.md`.
+- Use `noop` if no meaningful update is needed after analysis.
+- Use `report_incomplete` only if a blocker prevented completion.
+
+Do **not** end with prose-only output. A safe-output tool call is required for successful workflow completion.
 
 ## Your Mission
 

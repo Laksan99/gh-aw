@@ -70,6 +70,7 @@ func TestGetAllCodemods_ContainsExpectedCodemods(t *testing.T) {
 		"timeout-minutes-migration",
 		"network-firewall-migration",
 		"command-to-slash-command-migration",
+		"workflow-dispatch-required-false-with-slash-command",
 		"mcp-scripts-mode-removal",
 		"upload-assets-to-upload-asset-migration",
 		"write-permissions-to-read-migration",
@@ -81,20 +82,32 @@ func TestGetAllCodemods_ContainsExpectedCodemods(t *testing.T) {
 		"grep-tool-removal",
 		"mcp-network-to-top-level-migration",
 		"discussion-trigger-categories-lowercase",
+		"safe-output-title-prefix-to-required-title-prefix",
+		"safe-output-merge-pr-constraints",
+		"safe-output-add-reviewer-allowlists",
 		"safe-inputs-to-mcp-scripts",
 		"rate-limit-to-user-rate-limit",
+		"effective-tokens-to-ai-credits",
+		"messages-effective-tokens-suffix-to-ai-credits-suffix",
 		"engine-max-runs-to-top-level",
+		"max-runs-to-max-turns",
+		"engine-max-turns-to-top-level",
 		"steps-run-secrets-to-env",
 		"engine-env-secrets-to-engine-config",
+		"top-level-env-secrets-guided-error",
 		"serena-tools-to-shared-import",
 		"workflow-run-branches-default",
 		"checkout-persist-credentials-false",
 		"pull-request-target-checkout-false",
 		"dependabot-toolset-permissions",
+		"features-copilot-requests-to-permissions",
 		"features-byok-copilot-removal",
 		"features-inline-agents-removal",
 		"mount-as-clis-to-cli-proxy",
 		"bash-single-quoted-args-rewrite",
+		"infer-to-disable-model-invocation",
+		"mentions-allow-team-members-to-allowed-collaborators",
+		"engine-copilot-sdk-driver-to-driver",
 	}
 
 	for _, expectedID := range expectedIDs {
@@ -111,6 +124,27 @@ func TestGetAllCodemods_NoduplicateIDs(t *testing.T) {
 		assert.False(t, seenIDs[codemod.ID], "Duplicate codemod ID found: %s", codemod.ID)
 		seenIDs[codemod.ID] = true
 	}
+}
+
+func TestGetCodemods_DisablesRequestedCodemods(t *testing.T) {
+	codemods, err := GetCodemods([]string{"timeout-minutes-migration", "network-firewall-migration"})
+	require.NoError(t, err)
+
+	var ids []string
+	for _, codemod := range codemods {
+		ids = append(ids, codemod.ID)
+	}
+
+	assert.NotContains(t, ids, "timeout-minutes-migration")
+	assert.NotContains(t, ids, "network-firewall-migration")
+	assert.Contains(t, ids, "command-to-slash-command-migration")
+}
+
+func TestGetCodemods_UnknownDisabledCodemodReturnsError(t *testing.T) {
+	codemods, err := GetCodemods([]string{"not-a-real-codemod"})
+	require.Error(t, err)
+	assert.Nil(t, codemods)
+	assert.Contains(t, err.Error(), "unknown codemod ID(s): not-a-real-codemod")
 }
 
 func TestGetAllCodemods_InExpectedOrder(t *testing.T) {
@@ -131,6 +165,7 @@ func expectedCodemodOrder() []string {
 		"timeout-minutes-migration",
 		"network-firewall-migration",
 		"command-to-slash-command-migration",
+		"workflow-dispatch-required-false-with-slash-command",
 		"mcp-scripts-mode-removal",
 		"upload-assets-to-upload-asset-migration",
 		"write-permissions-to-read-migration",
@@ -152,22 +187,30 @@ func expectedCodemodOrder() []string {
 		"bots-to-on-bots",
 		"engine-steps-to-top-level",
 		"engine-max-runs-to-top-level",
+		"max-runs-to-max-turns",
+		"engine-max-turns-to-top-level",
 		"steps-run-secrets-to-env",
 		"engine-env-secrets-to-engine-config",
+		"top-level-env-secrets-guided-error",
 		"assign-to-agent-default-agent-to-name",
 		"playwright-allowed-domains-migration",
 		"expires-integer-to-string",
 		"app-to-github-app",
 		"github-app-app-id-to-client-id",
+		"safe-output-title-prefix-to-required-title-prefix",
+		"safe-output-merge-pr-constraints",
+		"safe-output-add-reviewer-allowlists",
 		"safe-inputs-to-mcp-scripts",
 		"rate-limit-to-user-rate-limit",
-		"plugins-to-dependencies",
+		"effective-tokens-to-ai-credits",
+		"messages-effective-tokens-suffix-to-ai-credits-suffix",
 		"serena-tools-to-shared-import",
 		"workflow-run-branches-default",
 		"checkout-persist-credentials-false",
 		"pull-request-target-checkout-false",
 		"dependabot-toolset-permissions",
 		"github-repos-to-allowed-repos",
+		"features-copilot-requests-to-permissions",
 		"features-byok-copilot-removal",
 		"features-inline-agents-removal",
 		"features-cli-proxy-to-tools-github-mode",
@@ -176,5 +219,9 @@ func expectedCodemodOrder() []string {
 		"sandbox-mcp-container-removal",
 		"sandbox-mcp-version-removal",
 		"sandbox-agent-false-removal",
+		"infer-to-disable-model-invocation",
+		"run-install-scripts-to-runtimes-node",
+		"mentions-allow-team-members-to-allowed-collaborators",
+		"engine-copilot-sdk-driver-to-driver",
 	}
 }

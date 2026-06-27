@@ -110,6 +110,7 @@ describe("emit_outcome_spans.cjs", () => {
       RUNNER_ENVIRONMENT: process.env.RUNNER_ENVIRONMENT,
       GH_AW_INFO_STAGED: process.env.GH_AW_INFO_STAGED,
       GH_AW_INFO_VERSION: process.env.GH_AW_INFO_VERSION,
+      GH_AW_INFO_CLI_VERSION: process.env.GH_AW_INFO_CLI_VERSION,
       OTEL_SERVICE_NAME: process.env.OTEL_SERVICE_NAME,
     };
 
@@ -131,6 +132,7 @@ describe("emit_outcome_spans.cjs", () => {
     process.env.RUNNER_ENVIRONMENT = "github-hosted";
     delete process.env.GH_AW_INFO_STAGED;
     delete process.env.GH_AW_INFO_VERSION;
+    delete process.env.GH_AW_INFO_CLI_VERSION;
     delete process.env.OTEL_SERVICE_NAME;
 
     const emitModulePath = req.resolve("./emit_outcome_spans.cjs");
@@ -174,7 +176,7 @@ describe("emit_outcome_spans.cjs", () => {
   });
 
   it("builds item and summary spans using aw_info staged/version metadata and mirrors locally without endpoints", async () => {
-    currentAwInfo = { staged: true, agent_version: "v9.9.9" };
+    currentAwInfo = { staged: true, cli_version: "v0.79.1", agent_version: "2.1.168" };
     currentSummary = {
       runs_checked: 3,
       total_outcomes: 2,
@@ -182,6 +184,15 @@ describe("emit_outcome_spans.cjs", () => {
       rejected: 1,
       ignored: 0,
       pending: 0,
+      noop: 0,
+      accepted_strong: 1,
+      accepted_medium: 0,
+      accepted_weak: 0,
+      fallback_exists_only_count: 1,
+      noop_rate: 0,
+      zero_touch: 1,
+      zero_touch_rate: 1,
+      median_resolution_sec: 42,
       acceptance_rate: 0.5,
       waste_rate: 0.5,
       date: "2026-05-13",
@@ -192,16 +203,31 @@ describe("emit_outcome_spans.cjs", () => {
         JSON.stringify({
           type: "issue",
           result: "accepted",
-          detail: "created item",
+          outcome_status: "accepted",
+          evidence_strength: "strong",
+          signal: "merged",
+          detail: "merged",
           workflow: "triage",
           run_id: 101,
           url: "https://github.com/github/gh-aw/issues/1",
           repo: "github/gh-aw",
           timestamp: "2026-05-13T09:00:00Z",
+          review_comments: 0,
+          changed_files: 3,
+          additions: 10,
+          deletions: 2,
+          reactions_total: 5,
+          reactions_positive: 4,
+          reactions_negative: 1,
+          comments: 0,
+          zero_touch: true,
         }),
         JSON.stringify({
           type: "comment",
           result: "rejected",
+          outcome_status: "unknown",
+          evidence_strength: "weak",
+          signal: "target_exists_only",
           workflow: "triage",
           run_id: 102,
           repo: "github/gh-aw",
@@ -228,7 +254,7 @@ describe("emit_outcome_spans.cjs", () => {
     expect(mockBuildOTLPBatchPayload).toHaveBeenCalledWith(
       expect.objectContaining({
         serviceName: "gh-aw",
-        scopeVersion: "v9.9.9",
+        scopeVersion: "v0.79.1",
         resourceAttributes: [
           { key: "github.repository", value: "github/gh-aw" },
           { key: "deployment.environment", value: "staging" },
@@ -257,16 +283,43 @@ describe("emit_outcome_spans.cjs", () => {
       expect.objectContaining({
         spanName: "gh-aw.outcome.evaluation",
         parentSpanId: summarySpan.spanId,
-        statusCode: 2,
+        statusCode: 0,
       })
     );
 
     expect(summarySpan.attributes).toContainEqual({ key: "gh-aw.exporter.name", value: "outcome-collector" });
     expect(summarySpan.attributes).toContainEqual({ key: "gh-aw.outcome.date", value: "2026-05-13" });
+    expect(summarySpan.attributes).toContainEqual({ key: "gh-aw.outcome.zero_touch_count", value: 1 });
+    expect(summarySpan.attributes).toContainEqual({ key: "gh-aw.outcome.accepted_strong", value: 1 });
+    expect(summarySpan.attributes).toContainEqual({ key: "gh-aw.outcome.fallback_exists_only_count", value: 1 });
     expect(spans[1].attributes).toContainEqual({ key: "gh-aw.exporter.name", value: "outcome-collector" });
     expect(spans[1].attributes).toContainEqual({ key: "gh-aw.outcome.url", value: "https://github.com/github/gh-aw/issues/1" });
-    expect(spans[1].attributes).toContainEqual({ key: "gh-aw.outcome.detail", value: "created item" });
+    expect(spans[1].attributes).toContainEqual({ key: "gh-aw.outcome.detail", value: "merged" });
+    expect(spans[1].attributes).toContainEqual({ key: "gh-aw.outcome.outcome_status", value: "accepted" });
+    expect(spans[1].attributes).toContainEqual({ key: "gh-aw.outcome.evidence_strength", value: "strong" });
+    expect(spans[1].attributes).toContainEqual({ key: "gh-aw.outcome.signal", value: "merged" });
     expect(spans[1].attributes).toContainEqual({ key: "gh-aw.outcome.created_at", value: "2026-05-13T09:00:00Z" });
+    expect(spans[1].attributes).toContainEqual({ key: "gh-aw.outcome.review_comments", value: 0 });
+    expect(spans[1].attributes).toContainEqual({ key: "gh-aw.outcome.changed_files", value: 3 });
+    expect(spans[1].attributes).toContainEqual({ key: "gh-aw.outcome.additions", value: 10 });
+    expect(spans[1].attributes).toContainEqual({ key: "gh-aw.outcome.deletions", value: 2 });
+    expect(spans[1].attributes).toContainEqual({ key: "gh-aw.outcome.reactions_total", value: 5 });
+    expect(spans[1].attributes).toContainEqual({ key: "gh-aw.outcome.reactions_positive", value: 4 });
+    expect(spans[1].attributes).toContainEqual({ key: "gh-aw.outcome.reactions_negative", value: 1 });
+    expect(spans[1].attributes).toContainEqual({ key: "gh-aw.outcome.comments", value: 0 });
+    expect(spans[1].attributes).toContainEqual({ key: "gh-aw.outcome.zero_touch", value: true });
+    expect(spans[2].attributes.find(attr => attr.key === "gh-aw.outcome.review_comments")).toBeUndefined();
+    expect(spans[2].attributes.find(attr => attr.key === "gh-aw.outcome.changed_files")).toBeUndefined();
+    expect(spans[2].attributes.find(attr => attr.key === "gh-aw.outcome.additions")).toBeUndefined();
+    expect(spans[2].attributes.find(attr => attr.key === "gh-aw.outcome.deletions")).toBeUndefined();
+    expect(spans[2].attributes.find(attr => attr.key === "gh-aw.outcome.reactions_total")).toBeUndefined();
+    expect(spans[2].attributes.find(attr => attr.key === "gh-aw.outcome.reactions_positive")).toBeUndefined();
+    expect(spans[2].attributes.find(attr => attr.key === "gh-aw.outcome.reactions_negative")).toBeUndefined();
+    expect(spans[2].attributes.find(attr => attr.key === "gh-aw.outcome.comments")).toBeUndefined();
+    expect(spans[2].attributes.find(attr => attr.key === "gh-aw.outcome.zero_touch")).toBeUndefined();
+    expect(spans[2].attributes).toContainEqual({ key: "gh-aw.outcome.outcome_status", value: "unknown" });
+    expect(spans[2].attributes).toContainEqual({ key: "gh-aw.outcome.evidence_strength", value: "weak" });
+    expect(spans[2].attributes).toContainEqual({ key: "gh-aw.outcome.signal", value: "target_exists_only" });
 
     expect(mockAppendToOTLPJSONL).toHaveBeenCalledOnce();
     expect(mockSendOTLPToAllEndpoints).not.toHaveBeenCalled();

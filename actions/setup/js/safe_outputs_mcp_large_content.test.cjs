@@ -11,10 +11,17 @@ describe.sequential("safe_outputs_mcp_server.cjs large content handling", () => 
       fs.mkdirSync(tempOutputDir, { recursive: !0 }),
       (tempConfigFile = path.join(tempOutputDir, "config.json")),
       (tempOutputFile = path.join(tempOutputDir, "outputs.jsonl")),
+      // Provide a target repo so create_issue handler's resolveAndValidateRepo succeeds
+      // without depending on the ambient CI env (GITHUB_REPOSITORY).
+      (process.env.GH_AW_TARGET_REPO_SLUG = "test-owner/test-repo"),
       fs.writeFileSync(tempConfigFile, JSON.stringify({ "create-issue": {} })));
     const toolsJsonPath = path.join(tempOutputDir, "tools.json"),
-      toolsJsonContent = fs.readFileSync(path.join(__dirname, "safe_outputs_tools.json"), "utf8");
-    fs.writeFileSync(toolsJsonPath, toolsJsonContent);
+      tools = JSON.parse(fs.readFileSync(path.join(__dirname, "safe_outputs_tools.json"), "utf8")),
+      createIssueTool = tools.find(tool => tool.name === "create_issue");
+    if (createIssueTool?.inputSchema?.properties?.body) {
+      createIssueTool.inputSchema.properties.body.maxLength = 2e5;
+    }
+    fs.writeFileSync(toolsJsonPath, JSON.stringify(tools));
   }),
     afterEach(() => {
       (Object.keys(process.env).forEach(k => {

@@ -1,4 +1,5 @@
 ---
+emoji: "🔍"
 description: Monthly workflow that identifies stale repositories in an organization and creates detailed activity reports
 name: Stale Repository Identifier
 on:
@@ -31,7 +32,7 @@ imports:
       title-prefix: "[stale-repo-identifier] "
   - ../skills/jqschema/SKILL.md
 
-  - shared/observability-otlp.md
+  - shared/otlp.md
 network:
   allowed:
     - defaults
@@ -57,7 +58,7 @@ safe-outputs:
       - "**/*.jpg"
       - "**/*.svg"
   messages:
-    footer: "> 🔍 *Analysis by [{workflow_name}]({run_url})*{effective_tokens_suffix}{history_link}"
+    footer: "> 🔍 *Analysis by [{workflow_name}]({run_url})*{ai_credits_suffix}{history_link}"
     run-started: "🔍 Stale Repository Identifier starting! [{workflow_name}]({run_url}) is analyzing repository activity..."
     run-success: "✅ Analysis complete! [{workflow_name}]({run_url}) has finished analyzing stale repositories."
     run-failure: "⚠️ Analysis interrupted! [{workflow_name}]({run_url}) {status}."
@@ -85,7 +86,7 @@ env:
 steps:
   - name: Run stale-repos
     id: stale-repos
-    uses: github/stale-repos@v9.0.8
+    uses: github/stale-repos@v9.0.15
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       ORGANIZATION: ${{ env.ORGANIZATION }}
@@ -97,10 +98,10 @@ steps:
     env:
       INACTIVE_REPOS: ${{ steps.stale-repos.outputs.inactiveRepos }}
     run: |
-      mkdir -p /tmp/stale-repos-data
-      echo "$INACTIVE_REPOS" > /tmp/stale-repos-data/inactive-repos.json
+      mkdir -p /tmp/gh-aw/agent/stale-repos-data
+      echo "$INACTIVE_REPOS" > /tmp/gh-aw/agent/stale-repos-data/inactive-repos.json
       echo "Stale repositories data saved"
-      echo "Total stale repositories: $(jq 'length' /tmp/stale-repos-data/inactive-repos.json)"
+      echo "Total stale repositories: $(jq 'length' /tmp/gh-aw/agent/stale-repos-data/inactive-repos.json)"
 
 ---
 
@@ -128,7 +129,7 @@ Analyze repositories identified as potentially stale by the stale-repos tool and
 ## Data Available
 
 The stale-repos tool has identified potentially inactive repositories. The output is saved at:
-- **File**: `/tmp/stale-repos-data/inactive-repos.json`
+- **File**: `/tmp/gh-aw/agent/stale-repos-data/inactive-repos.json`
 
 This file contains an array of repository objects with information about each stale repository.
 
@@ -138,12 +139,12 @@ This file contains an array of repository objects with information about each st
 
 Read the stale repositories data:
 ```bash
-cat /tmp/stale-repos-data/inactive-repos.json | jq .
+cat /tmp/gh-aw/agent/stale-repos-data/inactive-repos.json | jq .
 ```
 
 Analyze the structure and count:
 ```bash
-echo "Total stale repositories: $(jq 'length' /tmp/stale-repos-data/inactive-repos.json)"
+echo "Total stale repositories: $(jq 'length' /tmp/gh-aw/agent/stale-repos-data/inactive-repos.json)"
 ```
 
 ### Step 2: Deep Research Each Repository

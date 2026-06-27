@@ -1,11 +1,52 @@
 // @ts-check
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import { createRequire } from "module";
+import { fileURLToPath } from "url";
 import * as fs from "fs";
 import * as path from "path";
 import * as os from "os";
 
 const require = createRequire(import.meta.url);
+
+const { getPatchPathForBranch, getPatchPathForBranchInRepo } = require("./git_patch_utils.cjs");
+const { getBundlePathForBranch, getBundlePathForBranchInRepo } = require("./generate_git_bundle.cjs");
+
+// The privileged handler derives patch/bundle paths from `branch` (and `repo`)
+// via resolveTransportPaths, so tests must write transport files at the
+// canonical derived location and let the handler discover them.
+//
+// `/tmp/gh-aw` is a process-global path shared by every test file. Vitest runs
+// test files in parallel processes, so a cleanup that globbed the whole
+// directory would delete another file's in-flight transport files mid-test.
+// Track only the paths this file created and delete just those.
+const createdTransportPaths = new Set();
+function canonicalPatchPath(branch, repo) {
+  fs.mkdirSync("/tmp/gh-aw", { recursive: true });
+  const p = repo ? getPatchPathForBranchInRepo(branch, repo) : getPatchPathForBranch(branch);
+  createdTransportPaths.add(p);
+  return p;
+}
+function canonicalBundlePath(branch, repo) {
+  fs.mkdirSync("/tmp/gh-aw", { recursive: true });
+  const p = repo ? getBundlePathForBranchInRepo(branch, repo) : getBundlePathForBranch(branch);
+  createdTransportPaths.add(p);
+  return p;
+}
+function cleanupCanonicalTransports() {
+  for (const p of createdTransportPaths) {
+    try {
+      fs.rmSync(p, { force: true });
+    } catch {}
+  }
+  createdTransportPaths.clear();
+}
+
+beforeEach(() => {
+  cleanupCanonicalTransports();
+});
+afterEach(() => {
+  cleanupCanonicalTransports();
+});
 
 describe("create_pull_request - draft policy enforcement", () => {
   let tempDir;
@@ -35,7 +76,8 @@ describe("create_pull_request - draft policy enforcement", () => {
     global.github = {
       rest: {
         pulls: {
-          create: vi.fn().mockResolvedValue({ data: { number: 1, html_url: "https://github.com/test" } }),
+          create: vi.fn().mockResolvedValue({ data: { number: 1, html_url: "https://github.com/test", head: { sha: "abc123" } } }),
+          createReview: vi.fn().mockResolvedValue({ data: { id: 77, html_url: "https://github.com/test/review/77" } }),
         },
         repos: {
           get: vi.fn().mockResolvedValue({ data: { default_branch: "main" } }),
@@ -168,6 +210,7 @@ describe("create_pull_request - bundle transport shallow checkout", () => {
           get: vi.fn().mockResolvedValue({ data: { default_branch: "main" } }),
         },
         issues: {
+          create: vi.fn().mockResolvedValue({ data: { number: 99, html_url: "https://github.com/test-owner/test-repo/issues/99" } }),
           addLabels: vi.fn().mockResolvedValue({}),
         },
       },
@@ -183,6 +226,16 @@ describe("create_pull_request - bundle transport shallow checkout", () => {
       getExecOutput: vi.fn().mockImplementation((cmd, args) => {
         if (cmd === "git" && args[0] === "rev-parse" && args[1] === "--is-shallow-repository") {
           return Promise.resolve({ exitCode: 0, stdout: "true\n", stderr: "" });
+        }
+        if (cmd === "git" && args[0] === "bundle" && args[1] === "verify") {
+          // Declare a fake prerequisite so ensureFullHistoryForBundle proceeds.
+          return Promise.resolve({ exitCode: 1, stdout: "", stderr: `The bundle requires this ref:\n${"a".repeat(40)}\n` });
+        }
+        if (cmd === "git" && args[0] === "cat-file" && args[1] === "-e") {
+          // Report the prerequisite object as already present by default so
+          // ensureFullHistoryForBundle returns early (no fetch). Tests that need
+          // to exercise the fetch/deepen path override this within the test.
+          return Promise.resolve({ exitCode: 0, stdout: "", stderr: "" });
         }
         if (cmd === "git" && args[0] === "rev-list") {
           return Promise.resolve({ exitCode: 0, stdout: "1\n", stderr: "" });
@@ -222,8 +275,8 @@ describe("create_pull_request - bundle transport shallow checkout", () => {
     vi.clearAllMocks();
   });
 
-  it("should unshallow before fetching a bundle", async () => {
-    const patchPath = path.join(tempDir, "test.patch");
+  it("should fetch bundle prerequisite commits directly from origin in shallow repositories", async () => {
+    const patchPath = canonicalPatchPath("feature/test");
     fs.writeFileSync(
       patchPath,
       `From abc123 Mon Sep 17 00:00:00 2001
@@ -242,58 +295,190 @@ index 0000000..abc1234
 2.34.1
 `
     );
-    const bundlePath = path.join(tempDir, "test.bundle");
+    const bundlePath = canonicalBundlePath("feature/test");
     fs.writeFileSync(bundlePath, "bundle content");
 
-    const { main } = require("./create_pull_request.cjs");
-    const handler = await main({ base_branch: "main", preserve_branch_name: true });
-    const result = await handler({ title: "Test PR", body: "Test body", branch: "feature/test", patch_path: patchPath, bundle_path: bundlePath }, {});
-
-    expect(result.success).toBe(true);
-    expect(global.exec.exec).toHaveBeenCalledWith("git", ["fetch", "--unshallow", "origin"], expect.any(Object));
-    expect(global.exec.exec).toHaveBeenCalledWith("git", ["fetch", bundlePath, "refs/heads/feature/test:refs/heads/feature/test"]);
-    const unshallowCallIndex = global.exec.exec.mock.calls.findIndex(([, args]) => Array.isArray(args) && args[0] === "fetch" && args[1] === "--unshallow");
-    const bundleFetchCallIndex = global.exec.exec.mock.calls.findIndex(([, args]) => Array.isArray(args) && args[0] === "fetch" && args[1] === bundlePath);
-    expect(unshallowCallIndex).toBeGreaterThanOrEqual(0);
-    expect(bundleFetchCallIndex).toBeGreaterThan(unshallowCallIndex);
-  });
-
-  it("should resolve bundle source ref from list-heads when JSONL branch ref is missing in bundle", async () => {
-    const patchPath = path.join(tempDir, "test.patch");
-    fs.writeFileSync(
-      patchPath,
-      `From abc123 Mon Sep 17 00:00:00 2001
-From: Test Author <test@example.com>
-Date: Mon, 1 Jan 2024 00:00:00 +0000
-Subject: [PATCH] Test commit
-
-diff --git a/test.txt b/test.txt
-new file mode 100644
-index 0000000..abc1234
---- /dev/null
-+++ b/test.txt
-@@ -0,0 +1 @@
-+Hello World
---
-2.34.1
-`
-    );
-    const bundlePath = path.join(tempDir, "test.bundle");
-    fs.writeFileSync(bundlePath, "bundle content");
-
-    global.exec.exec.mockImplementation((cmd, args) => {
-      if (cmd === "git" && Array.isArray(args) && args[0] === "fetch" && args[1] === bundlePath && args[2] === "refs/heads/ops-review-may09-2026:refs/heads/ops-review-may09-2026") {
-        throw new Error("fatal: couldn't find remote ref refs/heads/ops-review-may09-2026");
+    // Force the prerequisite-missing path so the direct SHA fetch runs.
+    const prereq = "a".repeat(40);
+    let prereqFetched = false;
+    global.exec.getExecOutput = vi.fn().mockImplementation((cmd, args) => {
+      if (cmd === "git" && args[0] === "rev-parse" && args[1] === "--is-shallow-repository") {
+        return Promise.resolve({ exitCode: 0, stdout: "true\n", stderr: "" });
+      }
+      if (cmd === "git" && args[0] === "bundle" && args[1] === "verify") {
+        return Promise.resolve({ exitCode: 1, stdout: "", stderr: `The bundle requires this ref:\n${prereq}\n` });
+      }
+      if (cmd === "git" && args[0] === "config") {
+        return Promise.resolve({ exitCode: 1, stdout: "", stderr: "" });
+      }
+      if (cmd === "git" && args[0] === "cat-file" && args[1] === "-e") {
+        // Missing until the direct SHA fetch brings it in.
+        return Promise.resolve({ exitCode: prereqFetched ? 0 : 1, stdout: "", stderr: "" });
+      }
+      if (cmd === "git" && args[0] === "rev-list") {
+        return Promise.resolve({ exitCode: 0, stdout: "1\n", stderr: "" });
+      }
+      return Promise.resolve({ exitCode: 0, stdout: "", stderr: "" });
+    });
+    global.exec.exec = vi.fn().mockImplementation((cmd, args) => {
+      if (cmd === "git" && Array.isArray(args) && args[0] === "fetch" && args.includes("origin") && args.includes(prereq)) {
+        prereqFetched = true;
       }
       return Promise.resolve(0);
     });
 
+    const { main } = require("./create_pull_request.cjs");
+    const handler = await main({ base_branch: "main", preserve_branch_name: true });
+    const result = await handler({ title: "Test PR", body: "Test body", branch: "feature/test" }, {});
+
+    expect(result.success).toBe(true);
+    // Initial bundle fetch is now via getExecOutput (with ignoreReturnCode: true) rather than exec,
+    // so the bundle fetch appears in getExecOutput.mock.calls.
+    const bundleFetchCall = global.exec.getExecOutput.mock.calls.find(([, args]) => Array.isArray(args) && args[0] === "fetch" && args[1] === bundlePath);
+    if (!bundleFetchCall) {
+      throw new Error("expected bundle fetch call via getExecOutput");
+    }
+    expect(bundleFetchCall[1][2]).toMatch(/^refs\/heads\/feature\/test:refs\/bundles\/create-pr-feature-test-[a-f0-9]{8}$/);
+    const bundleTempRef = bundleFetchCall[1][2].split(":")[1];
+    expect(global.exec.exec).toHaveBeenCalledWith("git", ["update-ref", "refs/heads/feature/test", bundleTempRef]);
+    expect(global.exec.exec).toHaveBeenCalledWith("git", ["reset", "--hard"]);
+    // Primary path: the exact prerequisite SHA is fetched directly from origin,
+    // with no broad iterative deepen and no --unshallow.
+    const directFetch = global.exec.exec.mock.calls.find(([, args]) => Array.isArray(args) && args[0] === "fetch" && args.includes("origin") && args.includes(prereq));
+    expect(directFetch).toBeTruthy();
+    const deepenCall = global.exec.exec.mock.calls.find(([, args]) => Array.isArray(args) && args[0] === "fetch" && typeof args[1] === "string" && args[1].startsWith("--deepen="));
+    expect(deepenCall).toBeUndefined();
+    const unshallowCall = global.exec.exec.mock.calls.find(([, args]) => Array.isArray(args) && args[0] === "fetch" && args.includes("--unshallow"));
+    expect(unshallowCall).toBeUndefined();
+  });
+
+  it("should pass signed_commits false to bundle pushes", async () => {
+    const patchPath = canonicalPatchPath("feature/test");
+    fs.writeFileSync(
+      patchPath,
+      `From abc123 Mon Sep 17 00:00:00 2001
+From: Test Author <test@example.com>
+Date: Mon, 1 Jan 2024 00:00:00 +0000
+Subject: [PATCH] Test commit
+
+diff --git a/test.txt b/test.txt
+new file mode 100644
+index 0000000..abc1234
+--- /dev/null
++++ b/test.txt
+@@ -0,0 +1 @@
++Hello World
+--
+2.34.1
+`
+    );
+    const bundlePath = canonicalBundlePath("feature/test");
+    fs.writeFileSync(bundlePath, "bundle content");
+
+    const { main } = require("./create_pull_request.cjs");
+    const handler = await main({ base_branch: "main", preserve_branch_name: true, signed_commits: false });
+    const result = await handler({ title: "Test PR", body: "Test body", branch: "feature/test" }, {});
+
+    expect(result.success).toBe(true);
+    expect(pushSignedSpy).toHaveBeenCalledWith(expect.objectContaining({ signedCommits: false }));
+  });
+
+  it("should rewrite bundle history to a single commit and retry when signed push rejects merge commits", async () => {
+    const patchPath = canonicalPatchPath("feature/test");
+    fs.writeFileSync(
+      patchPath,
+      `From abc123 Mon Sep 17 00:00:00 2001
+From: Test Author <test@example.com>
+Date: Mon, 1 Jan 2024 00:00:00 +0000
+Subject: [PATCH] Test commit
+
+diff --git a/test.txt b/test.txt
+new file mode 100644
+index 0000000..abc1234
+--- /dev/null
++++ b/test.txt
+@@ -0,0 +1 @@
++Hello World
+--
+2.34.1
+`
+    );
+    const bundlePath = canonicalBundlePath("feature/test");
+    fs.writeFileSync(bundlePath, "bundle content");
+
+    let revParseHeadCallCount = 0;
     global.exec.getExecOutput.mockImplementation((cmd, args) => {
       if (cmd === "git" && args[0] === "rev-parse" && args[1] === "--is-shallow-repository") {
         return Promise.resolve({ exitCode: 0, stdout: "true\n", stderr: "" });
       }
       if (cmd === "git" && args[0] === "rev-list") {
         return Promise.resolve({ exitCode: 0, stdout: "1\n", stderr: "" });
+      }
+      if (cmd === "git" && args[0] === "ls-remote") {
+        return Promise.resolve({ exitCode: 0, stdout: "", stderr: "" });
+      }
+      if (cmd === "git" && args[0] === "rev-parse" && args[1] === "HEAD") {
+        revParseHeadCallCount += 1;
+        return Promise.resolve({ exitCode: 0, stdout: revParseHeadCallCount === 1 ? "old-head-sha\n" : "new-head-sha\n", stderr: "" });
+      }
+      if (cmd === "git" && args[0] === "log" && args[1] === "-1" && args[2] === "--format=%s" && args[3] === "HEAD") {
+        return Promise.resolve({ exitCode: 0, stdout: "bundle merge headline\n", stderr: "" });
+      }
+      if (cmd === "git" && args[0] === "diff" && args[1] === "--cached" && args[2] === "--name-only") {
+        return Promise.resolve({ exitCode: 0, stdout: "test.txt\n", stderr: "" });
+      }
+      return Promise.resolve({ exitCode: 0, stdout: "", stderr: "" });
+    });
+
+    pushSignedSpy
+      .mockRejectedValueOnce(new Error("pushSignedCommits: refusing unsigned push for branch 'feature/test': merge commit detected. " + "GitHub's createCommitOnBranch GraphQL mutation cannot represent merge commits."))
+      .mockResolvedValueOnce("bundle-tip");
+
+    const { main } = require("./create_pull_request.cjs");
+    const handler = await main({ base_branch: "main", preserve_branch_name: true });
+    const result = await handler({ title: "Test PR", body: "Test body", branch: "feature/test" }, {});
+
+    expect(result.success).toBe(true);
+    expect(result.fallback_used).not.toBe(true);
+    expect(pushSignedSpy).toHaveBeenCalledTimes(2);
+    expect(global.exec.exec).toHaveBeenCalledWith("git", ["reset", "--soft", "origin/main"]);
+    expect(global.exec.exec).toHaveBeenCalledWith("git", ["commit", "-m", "bundle merge headline"]);
+    expect(global.github.rest.issues.create).not.toHaveBeenCalled();
+  });
+
+  it("should resolve bundle source ref from list-heads when JSONL branch ref is missing in bundle", async () => {
+    const patchPath = canonicalPatchPath("ops-review-may09-2026");
+    fs.writeFileSync(
+      patchPath,
+      `From abc123 Mon Sep 17 00:00:00 2001
+From: Test Author <test@example.com>
+Date: Mon, 1 Jan 2024 00:00:00 +0000
+Subject: [PATCH] Test commit
+
+diff --git a/test.txt b/test.txt
+new file mode 100644
+index 0000000..abc1234
+--- /dev/null
++++ b/test.txt
+@@ -0,0 +1 @@
++Hello World
+--
+2.34.1
+`
+    );
+    const bundlePath = canonicalBundlePath("ops-review-may09-2026");
+    fs.writeFileSync(bundlePath, "bundle content");
+
+    global.exec.getExecOutput.mockImplementation((cmd, args, options) => {
+      if (cmd === "git" && args[0] === "rev-parse" && args[1] === "--is-shallow-repository") {
+        return Promise.resolve({ exitCode: 0, stdout: "true\n", stderr: "" });
+      }
+      if (cmd === "git" && args[0] === "rev-list") {
+        return Promise.resolve({ exitCode: 0, stdout: "1\n", stderr: "" });
+      }
+      // Initial bundle fetch via getExecOutput with ignoreReturnCode: the JSONL branch ref is missing
+      if (cmd === "git" && args[0] === "fetch" && args[1] === bundlePath && options && options.ignoreReturnCode) {
+        return Promise.resolve({ exitCode: 1, stderr: "fatal: couldn't find remote ref refs/heads/ops-review-may09-2026", stdout: "" });
       }
       if (cmd === "git" && args[0] === "bundle" && args[1] === "list-heads" && args[2] === bundlePath) {
         return Promise.resolve({
@@ -310,11 +495,576 @@ index 0000000..abc1234
 
     const { main } = require("./create_pull_request.cjs");
     const handler = await main({ base_branch: "main", preserve_branch_name: true });
-    const result = await handler({ title: "Test PR", body: "Test body", branch: "ops-review-may09-2026", patch_path: patchPath, bundle_path: bundlePath }, {});
+    const result = await handler({ title: "Test PR", body: "Test body", branch: "ops-review-may09-2026" }, {});
 
     expect(result.success).toBe(true);
     expect(global.exec.getExecOutput).toHaveBeenCalledWith("git", ["bundle", "list-heads", bundlePath]);
-    expect(global.exec.exec).toHaveBeenCalledWith("git", ["fetch", bundlePath, "refs/heads/main:refs/heads/ops-review-may09-2026"]);
+    const resolvedFetchCall = global.exec.exec.mock.calls.find(([, args]) => Array.isArray(args) && args[0] === "fetch" && args[1] === bundlePath && args[2].startsWith("refs/heads/main:"));
+    if (!resolvedFetchCall) {
+      throw new Error("expected resolved bundle fetch call");
+    }
+    expect(resolvedFetchCall[1][2]).toMatch(/^refs\/heads\/main:refs\/bundles\/create-pr-ops-review-may09-2026-[a-f0-9]{8}$/);
+  });
+
+  it("should fall back to HEAD refspec when bundle contains only HEAD (no refs/heads/* entry)", async () => {
+    const patchPath = canonicalPatchPath("docs/update-migration-version-2026-05-19-4fe3b9f7f99fc1d6");
+    fs.writeFileSync(
+      patchPath,
+      `From abc123 Mon Sep 17 00:00:00 2001
+From: Test Author <test@example.com>
+Date: Mon, 1 Jan 2024 00:00:00 +0000
+Subject: [PATCH] Test commit
+
+diff --git a/test.txt b/test.txt
+new file mode 100644
+index 0000000..abc1234
+--- /dev/null
++++ b/test.txt
+@@ -0,0 +1 @@
++Hello World
+--
+2.34.1
+`
+    );
+    const bundlePath = canonicalBundlePath("docs/update-migration-version-2026-05-19-4fe3b9f7f99fc1d6");
+    fs.writeFileSync(bundlePath, "bundle content");
+
+    global.exec.getExecOutput.mockImplementation((cmd, args, options) => {
+      if (cmd === "git" && args[0] === "rev-parse" && args[1] === "--is-shallow-repository") {
+        return Promise.resolve({ exitCode: 0, stdout: "true\n", stderr: "" });
+      }
+      if (cmd === "git" && args[0] === "rev-list") {
+        return Promise.resolve({ exitCode: 0, stdout: "1\n", stderr: "" });
+      }
+      // Initial bundle fetch (refs/heads/* refspec) fails because the JSONL branch ref is absent
+      if (cmd === "git" && args[0] === "fetch" && args[1] === bundlePath && options && options.ignoreReturnCode && typeof args[2] === "string" && args[2].startsWith("refs/heads/")) {
+        return Promise.resolve({ exitCode: 1, stderr: "fatal: couldn't find remote ref refs/heads/docs/update-migration-version-2026-05-19-4fe3b9f7f99fc1d6", stdout: "" });
+      }
+      // HEAD-based bundle fetch (fallback path) succeeds — no prerequisite errors
+      if (cmd === "git" && args[0] === "fetch" && args[1] === bundlePath && options && options.ignoreReturnCode && typeof args[2] === "string" && args[2].startsWith("HEAD:")) {
+        return Promise.resolve({ exitCode: 0, stdout: "", stderr: "" });
+      }
+      // Bundle contains only HEAD — no refs/heads/* entry (the bug scenario)
+      if (cmd === "git" && args[0] === "bundle" && args[1] === "list-heads" && args[2] === bundlePath) {
+        return Promise.resolve({
+          exitCode: 0,
+          stdout: "ac85f4047717ec43c931d750575f5251c45dc705 HEAD\n",
+          stderr: "",
+        });
+      }
+      if (cmd === "git" && args && args[0] === "ls-remote") {
+        return Promise.resolve({ exitCode: 0, stdout: "", stderr: "" });
+      }
+      return Promise.resolve({ exitCode: 0, stdout: "", stderr: "" });
+    });
+
+    const { main } = require("./create_pull_request.cjs");
+    const handler = await main({ base_branch: "main", preserve_branch_name: true });
+    const result = await handler({ title: "Test PR", body: "Test body", branch: "docs/update-migration-version-2026-05-19-4fe3b9f7f99fc1d6" }, {});
+
+    expect(result.success).toBe(true);
+    expect(global.exec.getExecOutput).toHaveBeenCalledWith("git", ["bundle", "list-heads", bundlePath]);
+    // HEAD-based bundle fetch is now performed via getExecOutput (ignoreReturnCode: true)
+    // so the code can distinguish prerequisite errors from other failures.
+    const headFetchCall = global.exec.getExecOutput.mock.calls.find(
+      ([, args, opts]) => Array.isArray(args) && args[0] === "fetch" && args[1] === bundlePath && typeof args[2] === "string" && args[2].startsWith("HEAD:") && opts && opts.ignoreReturnCode
+    );
+    if (!headFetchCall) {
+      throw new Error("expected HEAD-based bundle fetch call via getExecOutput");
+    }
+    expect(headFetchCall[1][2]).toMatch(/^HEAD:refs\/bundles\/create-pr-docs-update-migration-version-2026-05-19-4fe3b9f7f99fc1d6-[a-f0-9]{8}$/);
+  });
+
+  it("should fetch prerequisite commits from origin and retry when HEAD-only bundle has missing prerequisites (non-main dispatch scenario)", async () => {
+    // Simulates: worker was dispatched from a non-main branch; its bundle has only HEAD
+    // (no refs/heads/* entry) AND the prerequisite is the feature-branch tip, which is
+    // not reachable from the local main-only shallow checkout in safe_outputs.
+    // Fix: the fallback HEAD fetch path must do the same prerequisite recovery as the
+    // initial fetch path.
+    const branchName = "docs/update-migration-version-2026-05-19-4fe3b9f7f99fc1d6";
+    const patchPath = canonicalPatchPath(branchName);
+    fs.writeFileSync(
+      patchPath,
+      `From abc123 Mon Sep 17 00:00:00 2001
+From: Test Author <test@example.com>
+Date: Mon, 1 Jan 2024 00:00:00 +0000
+Subject: [PATCH] Test commit
+
+diff --git a/test.txt b/test.txt
+new file mode 100644
+index 0000000..abc1234
+--- /dev/null
++++ b/test.txt
+@@ -0,0 +1 @@
++Hello World
+--
+2.34.1
+`
+    );
+    const bundlePath = canonicalBundlePath(branchName);
+    fs.writeFileSync(bundlePath, "bundle content");
+
+    const featureBranchTip = "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2";
+
+    global.exec.getExecOutput.mockImplementation((cmd, args, options) => {
+      if (cmd === "git" && args[0] === "rev-parse" && args[1] === "--is-shallow-repository") {
+        return Promise.resolve({ exitCode: 0, stdout: "true\n", stderr: "" });
+      }
+      if (cmd === "git" && args[0] === "rev-list") {
+        return Promise.resolve({ exitCode: 0, stdout: "1\n", stderr: "" });
+      }
+      // Initial bundle fetch (named ref) fails — bundle only has HEAD
+      if (cmd === "git" && args[0] === "fetch" && args[1] === bundlePath && options && options.ignoreReturnCode && typeof args[2] === "string" && args[2].startsWith("refs/heads/")) {
+        return Promise.resolve({ exitCode: 1, stderr: `fatal: couldn't find remote ref refs/heads/${branchName}`, stdout: "" });
+      }
+      // HEAD-based bundle fetch fails because prerequisite (feature-branch tip) is missing
+      if (cmd === "git" && args[0] === "fetch" && args[1] === bundlePath && options && options.ignoreReturnCode && typeof args[2] === "string" && args[2].startsWith("HEAD:")) {
+        return Promise.resolve({ exitCode: 1, stderr: `error: Repository lacks these prerequisite commits:\nerror: ${featureBranchTip}`, stdout: "" });
+      }
+      // Bundle contains only HEAD — no refs/heads/* entry
+      if (cmd === "git" && args[0] === "bundle" && args[1] === "list-heads" && args[2] === bundlePath) {
+        return Promise.resolve({
+          exitCode: 0,
+          stdout: `ac85f4047717ec43c931d750575f5251c45dc705 HEAD\n`,
+          stderr: "",
+        });
+      }
+      if (cmd === "git" && args && args[0] === "ls-remote") {
+        return Promise.resolve({ exitCode: 0, stdout: "", stderr: "" });
+      }
+      return Promise.resolve({ exitCode: 0, stdout: "", stderr: "" });
+    });
+
+    const { main } = require("./create_pull_request.cjs");
+    const handler = await main({ base_branch: "main", preserve_branch_name: true });
+    const result = await handler({ title: "Test PR", body: "Test body", branch: branchName }, {});
+
+    expect(result.success).toBe(true);
+    // Feature-branch tip prerequisite is fetched from origin
+    expect(global.exec.exec).toHaveBeenCalledWith("git", ["fetch", "--filter=blob:none", "origin", featureBranchTip]);
+    // After prerequisite recovery, HEAD bundle is retried via exec
+    const bundleRetryFetchCalls = global.exec.exec.mock.calls.filter(([, args]) => Array.isArray(args) && args[0] === "fetch" && args[1] === bundlePath && typeof args[2] === "string" && args[2].startsWith("HEAD:"));
+    expect(bundleRetryFetchCalls.length).toBe(1);
+  });
+
+  it("should include retry context when HEAD-only bundle fetch still fails after prerequisite recovery", async () => {
+    const branchName = "docs/update-migration-version-2026-05-19-4fe3b9f7f99fc1d6";
+    const patchPath = canonicalPatchPath(branchName);
+    fs.writeFileSync(
+      patchPath,
+      `From abc123 Mon Sep 17 00:00:00 2001
+From: Test Author <test@example.com>
+Date: Mon, 1 Jan 2024 00:00:00 +0000
+Subject: [PATCH] Test commit
+
+diff --git a/test.txt b/test.txt
+new file mode 100644
+index 0000000..abc1234
+--- /dev/null
++++ b/test.txt
+@@ -0,0 +1 @@
++Hello World
+--
+2.34.1
+`
+    );
+    const bundlePath = canonicalBundlePath(branchName);
+    fs.writeFileSync(bundlePath, "bundle content");
+
+    const featureBranchTip = "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2";
+
+    global.exec.getExecOutput.mockImplementation((cmd, args, options) => {
+      if (cmd === "git" && args[0] === "rev-parse" && args[1] === "--is-shallow-repository") {
+        return Promise.resolve({ exitCode: 0, stdout: "true\n", stderr: "" });
+      }
+      if (cmd === "git" && args[0] === "rev-list") {
+        return Promise.resolve({ exitCode: 0, stdout: "1\n", stderr: "" });
+      }
+      if (cmd === "git" && args[0] === "fetch" && args[1] === bundlePath && options && options.ignoreReturnCode && typeof args[2] === "string" && args[2].startsWith("refs/heads/")) {
+        return Promise.resolve({ exitCode: 1, stderr: `fatal: couldn't find remote ref refs/heads/${branchName}`, stdout: "" });
+      }
+      if (cmd === "git" && args[0] === "fetch" && args[1] === bundlePath && options && options.ignoreReturnCode && typeof args[2] === "string" && args[2].startsWith("HEAD:")) {
+        return Promise.resolve({ exitCode: 1, stderr: `error: Repository lacks these prerequisite commits:\nerror: ${featureBranchTip}`, stdout: "" });
+      }
+      if (cmd === "git" && args[0] === "bundle" && args[1] === "list-heads" && args[2] === bundlePath) {
+        return Promise.resolve({
+          exitCode: 0,
+          stdout: `ac85f4047717ec43c931d750575f5251c45dc705 HEAD\n`,
+          stderr: "",
+        });
+      }
+      if (cmd === "git" && args && args[0] === "ls-remote") {
+        return Promise.resolve({ exitCode: 0, stdout: "", stderr: "" });
+      }
+      return Promise.resolve({ exitCode: 0, stdout: "", stderr: "" });
+    });
+
+    global.exec.exec.mockImplementation((cmd, args) => {
+      if (cmd === "git" && Array.isArray(args) && args[0] === "fetch" && args[1] === bundlePath && typeof args[2] === "string" && args[2].startsWith("HEAD:")) {
+        throw new Error("fatal: failed to read HEAD-only bundle");
+      }
+      return Promise.resolve(0);
+    });
+
+    const { main } = require("./create_pull_request.cjs");
+    const handler = await main({ base_branch: "main", preserve_branch_name: true });
+    const result = await handler({ title: "Test PR", body: "Test body", branch: branchName }, {});
+
+    expect(result.success).toBe(false);
+    expect(result.error).toBe("Failed to apply bundle");
+    expect(global.core.error).toHaveBeenCalledWith(expect.stringContaining("HEAD bundle fetch failed after fetching 1 prerequisite commit(s): fatal: failed to read HEAD-only bundle"));
+  });
+
+  it("should fetch prerequisite commits and retry bundle fetch when prerequisites are missing", async () => {
+    const patchPath = canonicalPatchPath("feature/test");
+    fs.writeFileSync(
+      patchPath,
+      `From abc123 Mon Sep 17 00:00:00 2001
+From: Test Author <test@example.com>
+Date: Mon, 1 Jan 2024 00:00:00 +0000
+Subject: [PATCH] Test commit
+
+diff --git a/test.txt b/test.txt
+new file mode 100644
+index 0000000..abc1234
+--- /dev/null
++++ b/test.txt
+@@ -0,0 +1 @@
++Hello World
+--
+2.34.1
+`
+    );
+    const bundlePath = canonicalBundlePath("feature/test");
+    fs.writeFileSync(bundlePath, "bundle content");
+
+    const missingSha = "256f08b38d9ce40cfa5d46385551caba8642a9df";
+    // The initial bundle fetch uses getExecOutput (ignoreReturnCode: true) so git stderr is captured.
+    // Real @actions/exec.exec only throws "The process '...' failed with exit code 1" — not the
+    // git error text — so the recovery path must read stderr from getExecOutput instead.
+    global.exec.getExecOutput.mockImplementation((cmd, args, options) => {
+      if (cmd === "git" && args[0] === "rev-parse" && args[1] === "--is-shallow-repository") {
+        return Promise.resolve({ exitCode: 0, stdout: "true\n", stderr: "" });
+      }
+      if (cmd === "git" && args[0] === "rev-list") {
+        return Promise.resolve({ exitCode: 0, stdout: "1\n", stderr: "" });
+      }
+      if (cmd === "git" && args[0] === "fetch" && args[1] === bundlePath && options && options.ignoreReturnCode) {
+        return Promise.resolve({ exitCode: 1, stderr: `error: Repository lacks these prerequisite commits:\nerror: ${missingSha}`, stdout: "" });
+      }
+      if (cmd === "git" && args && args[0] === "ls-remote") {
+        return Promise.resolve({ exitCode: 0, stdout: "", stderr: "" });
+      }
+      return Promise.resolve({ exitCode: 0, stdout: "", stderr: "" });
+    });
+
+    const { main } = require("./create_pull_request.cjs");
+    const handler = await main({ base_branch: "main", preserve_branch_name: true });
+    const result = await handler({ title: "Test PR", body: "Test body", branch: "feature/test" }, {});
+
+    expect(result.success).toBe(true);
+    // Prerequisites are fetched from origin via exec with --filter=blob:none to avoid downloading blobs
+    expect(global.exec.exec).toHaveBeenCalledWith("git", ["fetch", "--filter=blob:none", "origin", missingSha]);
+    // Retry bundle fetch is via exec (only the retry, not the initial attempt which was getExecOutput)
+    const bundleRetryFetchCalls = global.exec.exec.mock.calls.filter(([, args]) => Array.isArray(args) && args[0] === "fetch" && args[1] === bundlePath);
+    expect(bundleRetryFetchCalls.length).toBe(1);
+    expect(global.exec.getExecOutput).not.toHaveBeenCalledWith("git", ["bundle", "list-heads", bundlePath]);
+  });
+
+  it("should fetch all prerequisite commits in a single origin fetch and retry bundle fetch", async () => {
+    const patchPath = canonicalPatchPath("feature/test");
+    fs.writeFileSync(
+      patchPath,
+      `From abc123 Mon Sep 17 00:00:00 2001
+From: Test Author <test@example.com>
+Date: Mon, 1 Jan 2024 00:00:00 +0000
+Subject: [PATCH] Test commit
+
+diff --git a/test.txt b/test.txt
+new file mode 100644
+index 0000000..abc1234
+--- /dev/null
++++ b/test.txt
+@@ -0,0 +1 @@
++Hello World
+--
+2.34.1
+`
+    );
+    const bundlePath = canonicalBundlePath("feature/test");
+    fs.writeFileSync(bundlePath, "bundle content");
+
+    const missingSha1 = "256f08b38d9ce40cfa5d46385551caba8642a9df";
+    const missingSha2 = "aabbccddee1122334455667788990011aabbccdd";
+    global.exec.getExecOutput.mockImplementation((cmd, args, options) => {
+      if (cmd === "git" && args[0] === "rev-parse" && args[1] === "--is-shallow-repository") {
+        return Promise.resolve({ exitCode: 0, stdout: "true\n", stderr: "" });
+      }
+      if (cmd === "git" && args[0] === "rev-list") {
+        return Promise.resolve({ exitCode: 0, stdout: "1\n", stderr: "" });
+      }
+      if (cmd === "git" && args[0] === "fetch" && args[1] === bundlePath && options && options.ignoreReturnCode) {
+        return Promise.resolve({ exitCode: 1, stderr: `error: Repository lacks these prerequisite commits:\nerror: ${missingSha1}\nerror: ${missingSha2}`, stdout: "" });
+      }
+      if (cmd === "git" && args && args[0] === "ls-remote") {
+        return Promise.resolve({ exitCode: 0, stdout: "", stderr: "" });
+      }
+      return Promise.resolve({ exitCode: 0, stdout: "", stderr: "" });
+    });
+
+    const { main } = require("./create_pull_request.cjs");
+    const handler = await main({ base_branch: "main", preserve_branch_name: true });
+    const result = await handler({ title: "Test PR", body: "Test body", branch: "feature/test" }, {});
+
+    expect(result.success).toBe(true);
+    expect(global.exec.exec).toHaveBeenCalledWith("git", ["fetch", "--filter=blob:none", "origin", missingSha1, missingSha2]);
+    const bundleRetryFetchCalls = global.exec.exec.mock.calls.filter(([, args]) => Array.isArray(args) && args[0] === "fetch" && args[1] === bundlePath);
+    expect(bundleRetryFetchCalls.length).toBe(1);
+    expect(global.exec.getExecOutput).not.toHaveBeenCalledWith("git", ["bundle", "list-heads", bundlePath]);
+  });
+
+  it("should fail when fetching prerequisite commits from origin fails", async () => {
+    const patchPath = canonicalPatchPath("feature/test");
+    fs.writeFileSync(
+      patchPath,
+      `From abc123 Mon Sep 17 00:00:00 2001
+From: Test Author <test@example.com>
+Date: Mon, 1 Jan 2024 00:00:00 +0000
+Subject: [PATCH] Test commit
+
+diff --git a/test.txt b/test.txt
+new file mode 100644
+index 0000000..abc1234
+--- /dev/null
++++ b/test.txt
+@@ -0,0 +1 @@
++Hello World
+--
+2.34.1
+`
+    );
+    const bundlePath = canonicalBundlePath("feature/test");
+    fs.writeFileSync(bundlePath, "bundle content");
+
+    const missingSha = "256f08b38d9ce40cfa5d46385551caba8642a9df";
+    global.exec.getExecOutput.mockImplementation((cmd, args, options) => {
+      if (cmd === "git" && args[0] === "rev-parse" && args[1] === "--is-shallow-repository") {
+        return Promise.resolve({ exitCode: 0, stdout: "true\n", stderr: "" });
+      }
+      if (cmd === "git" && args[0] === "rev-list") {
+        return Promise.resolve({ exitCode: 0, stdout: "1\n", stderr: "" });
+      }
+      if (cmd === "git" && args[0] === "fetch" && args[1] === bundlePath && options && options.ignoreReturnCode) {
+        return Promise.resolve({ exitCode: 1, stderr: `error: Repository lacks these prerequisite commits:\nerror: ${missingSha}`, stdout: "" });
+      }
+      if (cmd === "git" && args && args[0] === "ls-remote") {
+        return Promise.resolve({ exitCode: 0, stdout: "", stderr: "" });
+      }
+      return Promise.resolve({ exitCode: 0, stdout: "", stderr: "" });
+    });
+    global.exec.exec.mockImplementation((cmd, args) => {
+      if (cmd === "git" && Array.isArray(args) && args[0] === "fetch" && args.includes("origin") && args.includes(missingSha)) {
+        throw new Error("fatal: couldn't connect to 'origin'");
+      }
+      return Promise.resolve(0);
+    });
+
+    const { main } = require("./create_pull_request.cjs");
+    const handler = await main({ base_branch: "main", preserve_branch_name: true });
+    const result = await handler({ title: "Test PR", body: "Test body", branch: "feature/test" }, {});
+
+    expect(result.success).toBe(false);
+    expect(result.error).toBe("Failed to apply bundle");
+    expect(global.core.error).toHaveBeenCalledWith(expect.stringContaining("Failed to apply bundle: fatal: couldn't connect to 'origin'"));
+    // No retry bundle fetch via exec — failed at prerequisite origin fetch
+    const bundleRetryFetchCalls = global.exec.exec.mock.calls.filter(([, args]) => Array.isArray(args) && args[0] === "fetch" && args[1] === bundlePath);
+    expect(bundleRetryFetchCalls.length).toBe(0);
+  });
+
+  it("should include retry context when bundle fetch still fails after prerequisite recovery", async () => {
+    const patchPath = canonicalPatchPath("feature/test");
+    fs.writeFileSync(
+      patchPath,
+      `From abc123 Mon Sep 17 00:00:00 2001
+From: Test Author <test@example.com>
+Date: Mon, 1 Jan 2024 00:00:00 +0000
+Subject: [PATCH] Test commit
+
+diff --git a/test.txt b/test.txt
+new file mode 100644
+index 0000000..abc1234
+--- /dev/null
++++ b/test.txt
+@@ -0,0 +1 @@
++Hello World
+--
+2.34.1
+`
+    );
+    const bundlePath = canonicalBundlePath("feature/test");
+    fs.writeFileSync(bundlePath, "bundle content");
+
+    const missingSha = "256f08b38d9ce40cfa5d46385551caba8642a9df";
+    global.exec.getExecOutput.mockImplementation((cmd, args, options) => {
+      if (cmd === "git" && args[0] === "rev-parse" && args[1] === "--is-shallow-repository") {
+        return Promise.resolve({ exitCode: 0, stdout: "true\n", stderr: "" });
+      }
+      if (cmd === "git" && args[0] === "rev-list") {
+        return Promise.resolve({ exitCode: 0, stdout: "1\n", stderr: "" });
+      }
+      if (cmd === "git" && args[0] === "fetch" && args[1] === bundlePath && options && options.ignoreReturnCode) {
+        return Promise.resolve({ exitCode: 1, stderr: `error: Repository lacks these prerequisite commits:\nerror: ${missingSha}`, stdout: "" });
+      }
+      if (cmd === "git" && args && args[0] === "ls-remote") {
+        return Promise.resolve({ exitCode: 0, stdout: "", stderr: "" });
+      }
+      return Promise.resolve({ exitCode: 0, stdout: "", stderr: "" });
+    });
+    global.exec.exec.mockImplementation((cmd, args) => {
+      if (cmd === "git" && Array.isArray(args) && args[0] === "fetch" && args[1] === bundlePath) {
+        throw new Error("fatal: failed to read bundle");
+      }
+      return Promise.resolve(0);
+    });
+
+    const { main } = require("./create_pull_request.cjs");
+    const handler = await main({ base_branch: "main", preserve_branch_name: true });
+    const result = await handler({ title: "Test PR", body: "Test body", branch: "feature/test" }, {});
+
+    expect(result.success).toBe(false);
+    expect(result.error).toBe("Failed to apply bundle");
+    expect(global.core.error).toHaveBeenCalledWith(expect.stringContaining("Bundle fetch failed after fetching 1 prerequisite commit(s): fatal: failed to read bundle"));
+    const bundleRetryFetchCalls = global.exec.exec.mock.calls.filter(([, args]) => Array.isArray(args) && args[0] === "fetch" && args[1] === bundlePath);
+    expect(bundleRetryFetchCalls.length).toBe(1);
+  });
+
+  it("should not fetch a bundle directly into the target branch", async () => {
+    const patchPath = canonicalPatchPath("autoloop/perf-comparison");
+    fs.writeFileSync(
+      patchPath,
+      `From abc123 Mon Sep 17 00:00:00 2001
+From: Test Author <test@example.com>
+Date: Mon, 1 Jan 2024 00:00:00 +0000
+Subject: [PATCH] Test commit
+
+diff --git a/test.txt b/test.txt
+new file mode 100644
+index 0000000..abc1234
+--- /dev/null
++++ b/test.txt
+@@ -0,0 +1 @@
++Hello World
+--
+2.34.1
+`
+    );
+    const bundlePath = canonicalBundlePath("autoloop/perf-comparison");
+    fs.writeFileSync(bundlePath, "bundle content");
+
+    const { main } = require("./create_pull_request.cjs");
+    const handler = await main({ base_branch: "main", preserve_branch_name: true });
+    const result = await handler({ title: "Test PR", body: "Test body\n\nCloses #57\nResolves test-owner/test-repo#58", branch: "autoloop/perf-comparison" }, {});
+
+    expect(result.success).toBe(true);
+    // The initial bundle fetch uses getExecOutput (not exec.exec) — ensure it never uses the direct branch refspec
+    expect(global.exec.getExecOutput).not.toHaveBeenCalledWith("git", ["fetch", bundlePath, "refs/heads/autoloop/perf-comparison:refs/heads/autoloop/perf-comparison"], expect.anything());
+    const bundleFetchCall = global.exec.getExecOutput.mock.calls.find(([, args]) => Array.isArray(args) && args[0] === "fetch" && args[1] === bundlePath);
+    if (!bundleFetchCall) {
+      throw new Error("expected bundle fetch call");
+    }
+    expect(bundleFetchCall[1][2]).toMatch(/^refs\/heads\/autoloop\/perf-comparison:refs\/bundles\/create-pr-autoloop-perf-comparison-[a-f0-9]{8}$/);
+    const bundleTempRef = bundleFetchCall[1][2].split(":")[1];
+    expect(global.exec.exec).toHaveBeenCalledWith("git", ["update-ref", "refs/heads/autoloop/perf-comparison", bundleTempRef]);
+  });
+
+  it("should give fallback issue bundle instructions that avoid direct branch fetches", async () => {
+    const patchPath = canonicalPatchPath("autoloop/perf-comparison");
+    fs.writeFileSync(
+      patchPath,
+      `From abc123 Mon Sep 17 00:00:00 2001
+From: Test Author <test@example.com>
+Date: Mon, 1 Jan 2024 00:00:00 +0000
+Subject: [PATCH] Test commit
+
+diff --git a/test.txt b/test.txt
+new file mode 100644
+index 0000000..abc1234
+--- /dev/null
++++ b/test.txt
+@@ -0,0 +1 @@
++Hello World
+--
+2.34.1
+`
+    );
+    const bundlePath = canonicalBundlePath("autoloop/perf-comparison");
+    fs.writeFileSync(bundlePath, "bundle content");
+    pushSignedSpy.mockRejectedValueOnce(new Error("push rejected"));
+
+    const { main } = require("./create_pull_request.cjs");
+    const handler = await main({ base_branch: "main", preserve_branch_name: true });
+    const result = await handler({ title: "Test PR", body: "Test body\n\nCloses #57\nResolves test-owner/test-repo#58", branch: "autoloop/perf-comparison" }, {});
+
+    expect(result.success).toBe(true);
+    expect(result.fallback_used).toBe(true);
+
+    const fallbackIssueBody = global.github.rest.issues.create.mock.calls[0][0].body;
+    const tempRefMatch = fallbackIssueBody.match(/refs\/heads\/autoloop\/perf-comparison:(refs\/bundles\/create-pr-autoloop-perf-comparison-[a-f0-9]{8})/);
+    if (!tempRefMatch?.[1]) {
+      throw new Error("expected fallback bundle temp ref");
+    }
+    const fallbackBundleTempRef = tempRefMatch[1];
+    expect(fallbackIssueBody).toContain(`git update-ref refs/heads/autoloop/perf-comparison ${fallbackBundleTempRef}`);
+    expect(fallbackIssueBody).toContain("git reset --hard");
+    expect(fallbackIssueBody).toContain(`git update-ref -d ${fallbackBundleTempRef}`);
+    expect(fallbackIssueBody).not.toContain("refs/heads/autoloop/perf-comparison:refs/heads/autoloop/perf-comparison");
+    expect(fallbackIssueBody).toContain("**Original error:** push rejected");
+    expect(fallbackIssueBody).toContain("Test body");
+    expect(fallbackIssueBody).toContain("Closes \\#57");
+    expect(fallbackIssueBody).toContain("Resolves test-owner/test-repo\\#58");
+    expect(fallbackIssueBody).not.toContain("Closes #57");
+    expect(fallbackIssueBody).not.toContain("Resolves test-owner/test-repo#58");
+  });
+
+  it("should include original error in fallback issue patch instructions when push fails (no bundle)", async () => {
+    const patchPath = canonicalPatchPath("autoloop/perf-comparison");
+    fs.writeFileSync(
+      patchPath,
+      `From abc123 Mon Sep 17 00:00:00 2001
+From: Test Author <test@example.com>
+Date: Mon, 1 Jan 2024 00:00:00 +0000
+Subject: [PATCH] Test commit
+
+diff --git a/test.txt b/test.txt
+new file mode 100644
+index 0000000..abc1234
+--- /dev/null
++++ b/test.txt
+@@ -0,0 +1 @@
++Hello World
+--
+2.34.1
+`
+    );
+    // No bundle file - forces the patch transport fallback path
+    pushSignedSpy.mockRejectedValueOnce(new Error("push rejected"));
+
+    const { main } = require("./create_pull_request.cjs");
+    const handler = await main({ base_branch: "main", preserve_branch_name: true });
+    const result = await handler({ title: "Test PR", body: "Test body\n\nCloses #57\nResolves test-owner/test-repo#58", branch: "autoloop/perf-comparison" }, {});
+
+    expect(result.success).toBe(true);
+    expect(result.fallback_used).toBe(true);
+
+    const fallbackIssueBody = global.github.rest.issues.create.mock.calls[0][0].body;
+    expect(fallbackIssueBody).toContain("**Original error:** push rejected");
+    expect(fallbackIssueBody).toContain("git am --3way");
+    expect(fallbackIssueBody).not.toContain("git update-ref");
+    expect(fallbackIssueBody).toContain("Test body");
+    expect(fallbackIssueBody).toContain("Closes \\#57");
+    expect(fallbackIssueBody).toContain("Resolves test-owner/test-repo\\#58");
+    expect(fallbackIssueBody).not.toContain("Closes #57");
+    expect(fallbackIssueBody).not.toContain("Resolves test-owner/test-repo#58");
   });
 });
 
@@ -393,7 +1143,8 @@ describe("create_pull_request - auto-close-issue configuration", () => {
     global.github = {
       rest: {
         pulls: {
-          create: vi.fn().mockResolvedValue({ data: { number: 1, html_url: "https://github.com/test" } }),
+          create: vi.fn().mockResolvedValue({ data: { number: 1, html_url: "https://github.com/test", head: { sha: "abc123" } } }),
+          createReview: vi.fn().mockResolvedValue({ data: { id: 77, html_url: "https://github.com/test/review/77" } }),
         },
         repos: {
           get: vi.fn().mockResolvedValue({ data: { default_branch: "main" } }),
@@ -548,6 +1299,7 @@ describe("create_pull_request - max limit enforcement", () => {
     expect(() => enforcePullRequestLimits(patchContent)).toThrow("E003");
     expect(() => enforcePullRequestLimits(patchContent)).toThrow("Cannot create pull request with more than 100 files");
     expect(() => enforcePullRequestLimits(patchContent)).toThrow("received 101");
+    expect(() => enforcePullRequestLimits(patchContent)).toThrow("max-patch-files");
   });
 
   it("should allow patches under the file limit", () => {
@@ -640,6 +1392,8 @@ describe("create_pull_request - max limit enforcement", () => {
     expect(parseDiffGitHeader("diff --git a/foo.txt b/foo.txt")).toBe("foo.txt");
     // Path with spaces (git always emits quoted form when path contains spaces)
     expect(parseDiffGitHeader('diff --git "a/dir/with space/x" "b/dir/with space/x"')).toBe("dir/with space/x");
+    // CRLF line ending should not leak trailing carriage-return into path
+    expect(parseDiffGitHeader("diff --git a/crlf.txt b/crlf.txt\r")).toBe("crlf.txt");
 
     // A patch with three different quoted/escaped files should count as 3.
     const patch = [
@@ -677,7 +1431,7 @@ describe("create_pull_request - max limit enforcement", () => {
     expect(countUniquePatchFiles(patchContent)).toBe(3);
 
     // Mixed: 2 parseable + 2 unparseable = 4 unique entries.
-    const mixed = ["diff --git a/a.txt b/a.txt", "diff --git ", "diff --git b/b.txt c/b.txt", "diff --git "].join("\n");
+    const mixed = ["diff --git a/a.txt b/a.txt", 'diff --git "a/missing b/missing', "diff --git b/b.txt c/b.txt", "diff --git "].join("\n");
     expect(countUniquePatchFiles(mixed)).toBe(4);
 
     // 200 unparseable headers must still trigger the default 100-file limit.
@@ -870,6 +1624,7 @@ describe("create_pull_request - normalizeBranchName: salt argument", () => {
 describe("create_pull_request - allowed-files strict allowlist", () => {
   let tempDir;
   let originalEnv;
+  let pushSignedSpy;
 
   beforeEach(() => {
     originalEnv = { ...process.env };
@@ -895,7 +1650,8 @@ describe("create_pull_request - allowed-files strict allowlist", () => {
     global.github = {
       rest: {
         pulls: {
-          create: vi.fn().mockResolvedValue({ data: { number: 1, html_url: "https://github.com/test" } }),
+          create: vi.fn().mockResolvedValue({ data: { number: 1, html_url: "https://github.com/test", head: { sha: "abc123" } } }),
+          createReview: vi.fn().mockResolvedValue({ data: { id: 77, html_url: "https://github.com/test/review/77" } }),
         },
         repos: {
           get: vi.fn().mockResolvedValue({ data: { default_branch: "main" } }),
@@ -912,12 +1668,26 @@ describe("create_pull_request - allowed-files strict allowlist", () => {
       exec: vi.fn().mockResolvedValue(0),
       getExecOutput: vi.fn().mockResolvedValue({ exitCode: 0, stdout: "abc123\n", stderr: "" }),
     };
+    const pushSignedCommitsModule = require("./push_signed_commits.cjs");
+    pushSignedSpy = vi.spyOn(pushSignedCommitsModule, "pushSignedCommits").mockResolvedValue("bundle-tip");
+    const promptsDir = path.join(tempDir, "prompts");
+    fs.mkdirSync(promptsDir, { recursive: true });
+    const requestReviewTemplateSrc = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../md/manifest_protection_request_review.md");
+    fs.copyFileSync(requestReviewTemplateSrc, path.join(promptsDir, "manifest_protection_request_review.md"));
+    const requestChangesTemplateSrc = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../md/manifest_protection_request_changes_review.md");
+    fs.copyFileSync(requestChangesTemplateSrc, path.join(promptsDir, "manifest_protection_request_changes_review.md"));
+    const threatWarningTemplateSrc = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../md/threat_warning_request_changes_review.md");
+    fs.copyFileSync(threatWarningTemplateSrc, path.join(promptsDir, "threat_warning_request_changes_review.md"));
+    process.env.GH_AW_PROMPTS_DIR = promptsDir;
 
     // Clear module cache so globals are picked up fresh
     delete require.cache[require.resolve("./create_pull_request.cjs")];
   });
 
   afterEach(() => {
+    if (pushSignedSpy) {
+      pushSignedSpy.mockRestore();
+    }
     for (const key of Object.keys(process.env)) {
       if (!(key in originalEnv)) {
         delete process.env[key];
@@ -963,18 +1733,23 @@ ${diffs}
 `;
   }
 
-  function writePatch(content) {
-    const p = path.join(tempDir, "test.patch");
+  function writePatch(branch, content) {
+    const p = canonicalPatchPath(branch);
     fs.writeFileSync(p, content);
     return p;
   }
 
+  function extractCompareUrlFromIssueBody(issueBody) {
+    const match = String(issueBody).match(/https:\/\/[^)\s]+\/compare\/[^)\s]+/);
+    return match ? match[0] : null;
+  }
+
   it("should reject files outside the allowed-files allowlist", async () => {
-    const patchPath = writePatch(createPatchWithFiles("src/index.js"));
+    const patchPath = writePatch("should-reject-files-outside-the-allowed-files-allowlist", createPatchWithFiles("src/index.js"));
 
     const { main } = require("./create_pull_request.cjs");
     const handler = await main({ allowed_files: [".github/aw/**"] });
-    const result = await handler({ patch_path: patchPath, title: "Test PR", body: "" }, {});
+    const result = await handler({ title: "Test PR", body: "", branch: "should-reject-files-outside-the-allowed-files-allowlist" }, {});
 
     expect(result.success).toBe(false);
     expect(result.error).toContain("outside the allowed-files list");
@@ -982,11 +1757,11 @@ ${diffs}
   });
 
   it("should reject a mixed patch where some files are outside the allowlist", async () => {
-    const patchPath = writePatch(createPatchWithFiles(".github/aw/github-agentic-workflows.md", "src/index.js"));
+    const patchPath = writePatch("should-reject-a-mixed-patch-where-some-files-are-outside-the", createPatchWithFiles(".github/aw/github-agentic-workflows.md", "src/index.js"));
 
     const { main } = require("./create_pull_request.cjs");
     const handler = await main({ allowed_files: [".github/aw/**"] });
-    const result = await handler({ patch_path: patchPath, title: "Test PR", body: "" }, {});
+    const result = await handler({ title: "Test PR", body: "", branch: "should-reject-a-mixed-patch-where-some-files-are-outside-the" }, {});
 
     expect(result.success).toBe(false);
     expect(result.error).toContain("outside the allowed-files list");
@@ -997,7 +1772,7 @@ ${diffs}
   it("should still enforce protected-files when allowed-files matches (orthogonal checks)", async () => {
     // allowed-files and protected-files are orthogonal: both checks must pass.
     // Matching the allowlist does NOT bypass the protected-files policy.
-    const patchPath = writePatch(createPatchWithFiles(".github/aw/instructions.md"));
+    const patchPath = writePatch("should-still-enforce-protected-files-when-allowed-files-matc", createPatchWithFiles(".github/aw/instructions.md"));
 
     const { main } = require("./create_pull_request.cjs");
     const handler = await main({
@@ -1005,7 +1780,7 @@ ${diffs}
       protected_path_prefixes: [".github/"],
       protected_files_policy: "blocked",
     });
-    const result = await handler({ patch_path: patchPath, title: "Test PR", body: "" }, {});
+    const result = await handler({ title: "Test PR", body: "", branch: "should-still-enforce-protected-files-when-allowed-files-matc" }, {});
 
     expect(result.success).toBe(false);
     expect(result.error).toContain("protected files");
@@ -1013,7 +1788,7 @@ ${diffs}
 
   it("should allow a protected file when both allowed-files matches and protected-files: allowed is set", async () => {
     // Both checks are satisfied explicitly: allowlist scope + protected-files permission.
-    const patchPath = writePatch(createPatchWithFiles(".github/aw/instructions.md"));
+    const patchPath = writePatch("should-allow-a-protected-file-when-both-allowed-files-matche", createPatchWithFiles(".github/aw/instructions.md"));
 
     const { main } = require("./create_pull_request.cjs");
     const handler = await main({
@@ -1021,7 +1796,7 @@ ${diffs}
       protected_path_prefixes: [".github/"],
       protected_files_policy: "allowed",
     });
-    const result = await handler({ patch_path: patchPath, title: "Test PR", body: "" }, {});
+    const result = await handler({ title: "Test PR", body: "", branch: "should-allow-a-protected-file-when-both-allowed-files-matche" }, {});
 
     // Should not be blocked by either check
     expect(result.error || "").not.toContain("protected files");
@@ -1029,17 +1804,153 @@ ${diffs}
   });
 
   it("should still enforce protected-files when allowed-files is not set", async () => {
-    const patchPath = writePatch(createPatchWithFiles(".github/aw/instructions.md"));
+    const patchPath = writePatch("should-still-enforce-protected-files-when-allowed-files-is-n", createPatchWithFiles(".github/aw/instructions.md"));
 
     const { main } = require("./create_pull_request.cjs");
     const handler = await main({
       protected_path_prefixes: [".github/"],
       protected_files_policy: "blocked",
     });
-    const result = await handler({ patch_path: patchPath, title: "Test PR", body: "" }, {});
+    const result = await handler({ title: "Test PR", body: "", branch: "should-still-enforce-protected-files-when-allowed-files-is-n" }, {});
 
     expect(result.success).toBe(false);
     expect(result.error).toContain("protected files");
+  });
+
+  it("should create PR with caution and request-changes review when protected-files is request_review", async () => {
+    const patchPath = writePatch("should-create-pr-with-caution-and-request-changes-review-whe", createPatchWithFiles(".github/aw/instructions.md"));
+
+    const { main } = require("./create_pull_request.cjs");
+    const handler = await main({
+      protected_path_prefixes: [".github/"],
+      protected_files_policy: "request_review",
+    });
+    const result = await handler({ title: "Test PR", body: "Body text", branch: "should-create-pr-with-caution-and-request-changes-review-whe" }, {});
+
+    expect(result.success).toBe(true);
+    expect(global.github.rest.pulls.create).toHaveBeenCalledTimes(1);
+    const createPrCall = global.github.rest.pulls.create.mock.calls[0][0];
+    expect(createPrCall.body).toContain("Protected files were modified in this change.");
+    expect(createPrCall.body).toContain(".github/aw/instructions.md");
+
+    expect(global.github.rest.pulls.createReview).toHaveBeenCalledTimes(1);
+    const createReviewCall = global.github.rest.pulls.createReview.mock.calls[0][0];
+    expect(createReviewCall.event).toBe("REQUEST_CHANGES");
+    expect(createReviewCall.body).toContain("Protected files were modified");
+    expect(createReviewCall.body).toContain(".github/aw/instructions.md");
+  });
+
+  it("should default to request_review when protected-files policy is unset", async () => {
+    const patchPath = writePatch("should-default-to-request-review-when-protected-files-policy", createPatchWithFiles(".github/aw/instructions.md"));
+
+    const { main } = require("./create_pull_request.cjs");
+    const handler = await main({
+      protected_path_prefixes: [".github/"],
+    });
+    const result = await handler({ title: "Test PR", body: "Body text", branch: "should-default-to-request-review-when-protected-files-policy" }, {});
+
+    expect(result.success).toBe(true);
+    expect(global.github.rest.pulls.create).toHaveBeenCalledTimes(1);
+    expect(global.github.rest.pulls.createReview).toHaveBeenCalledTimes(1);
+    const createReviewCall = global.github.rest.pulls.createReview.mock.calls[0][0];
+    expect(createReviewCall.event).toBe("REQUEST_CHANGES");
+  });
+
+  it("should retry with COMMENT when REQUEST_CHANGES review is rejected on own pull request", async () => {
+    const patchPath = writePatch("should-retry-with-comment-when-request-changes-review-is-rej", createPatchWithFiles(".github/aw/instructions.md"));
+    global.github.rest.pulls.createReview = vi
+      .fn()
+      .mockRejectedValueOnce(new Error("Can not request changes on your own pull request"))
+      .mockResolvedValueOnce({ data: { id: 78, html_url: "https://github.com/test/review/78" } });
+
+    const { main } = require("./create_pull_request.cjs");
+    const handler = await main({
+      protected_path_prefixes: [".github/"],
+      protected_files_policy: "request_review",
+    });
+    const result = await handler({ title: "Test PR", body: "Body text", branch: "should-retry-with-comment-when-request-changes-review-is-rej" }, {});
+
+    expect(result.success).toBe(true);
+    expect(global.github.rest.pulls.createReview).toHaveBeenCalledTimes(2);
+    expect(global.github.rest.pulls.createReview.mock.calls[0][0].event).toBe("REQUEST_CHANGES");
+    expect(global.github.rest.pulls.createReview.mock.calls[1][0].event).toBe("COMMENT");
+  });
+
+  it("should push branch with compare URL for protected-files fallback (patch transport)", async () => {
+    const patchPath = writePatch("feature/protected", createPatchWithFiles(".github/aw/instructions.md"));
+    const promptsDir = path.join(tempDir, "prompts");
+    fs.mkdirSync(promptsDir, { recursive: true });
+    const templateSrc = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../md/manifest_protection_create_pr_fallback.md");
+    fs.copyFileSync(templateSrc, path.join(promptsDir, "manifest_protection_create_pr_fallback.md"));
+    const pushFailedTemplateSrc = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../md/manifest_protection_push_failed_fallback.md");
+    fs.copyFileSync(pushFailedTemplateSrc, path.join(promptsDir, "manifest_protection_push_failed_fallback.md"));
+    process.env.GH_AW_PROMPTS_DIR = promptsDir;
+
+    global.github.rest.issues = {
+      create: vi.fn().mockResolvedValue({ data: { number: 77, html_url: "https://github.com/test-owner/test-repo/issues/77" } }),
+      update: vi.fn().mockResolvedValue({ data: {} }),
+    };
+
+    const { main } = require("./create_pull_request.cjs");
+    const handler = await main({
+      protected_path_prefixes: [".github/"],
+      protected_files_policy: "fallback-to-issue",
+    });
+    const result = await handler({ title: "Test PR", body: "Test body", branch: "feature/protected" }, {});
+
+    expect(result.success).toBe(true);
+    expect(result.fallback_used).toBe(true);
+    expect(result.issue_number).toBe(77);
+    // Branch must be pushed so the fallback issue can include a compare URL
+    expect(pushSignedSpy).toHaveBeenCalled();
+    expect(global.github.rest.issues.create).toHaveBeenCalledTimes(1);
+    // Issue body is updated after creation to add the close-keyword link
+    expect(global.github.rest.issues.update).toHaveBeenCalled();
+
+    const createCall = global.github.rest.issues.create.mock.calls[0][0];
+    // Should use the create-PR fallback template (compare URL), not the push-failed template
+    expect(createCall.body).toContain("/compare/main...");
+    expect(createCall.body).not.toContain("gh run download");
+    expect(createCall.body).not.toContain("git am --3way");
+  });
+
+  it("should push branch with compare URL for protected-files fallback (bundle transport)", async () => {
+    const patchPath = writePatch("feature/protected", createPatchWithFiles(".github/aw/instructions.md"));
+    const bundlePath = canonicalBundlePath("feature/protected");
+    fs.writeFileSync(bundlePath, "bundle content");
+    const promptsDir = path.join(tempDir, "prompts");
+    fs.mkdirSync(promptsDir, { recursive: true });
+    const templateSrc = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../md/manifest_protection_create_pr_fallback.md");
+    fs.copyFileSync(templateSrc, path.join(promptsDir, "manifest_protection_create_pr_fallback.md"));
+    const pushFailedTemplateSrc = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../md/manifest_protection_push_failed_fallback.md");
+    fs.copyFileSync(pushFailedTemplateSrc, path.join(promptsDir, "manifest_protection_push_failed_fallback.md"));
+    process.env.GH_AW_PROMPTS_DIR = promptsDir;
+
+    global.github.rest.issues = {
+      create: vi.fn().mockResolvedValue({ data: { number: 77, html_url: "https://github.com/test-owner/test-repo/issues/77" } }),
+      update: vi.fn().mockResolvedValue({ data: {} }),
+    };
+
+    const { main } = require("./create_pull_request.cjs");
+    const handler = await main({
+      protected_path_prefixes: [".github/"],
+      protected_files_policy: "fallback-to-issue",
+    });
+    const result = await handler({ title: "Test PR", body: "Test body", branch: "feature/protected" }, {});
+
+    expect(result.success).toBe(true);
+    expect(result.fallback_used).toBe(true);
+    expect(result.issue_number).toBe(77);
+    // Branch must be pushed so the fallback issue can include a compare URL
+    expect(pushSignedSpy).toHaveBeenCalled();
+    // Issue body is updated after creation to add the close-keyword link
+    expect(global.github.rest.issues.update).toHaveBeenCalled();
+
+    const createCall = global.github.rest.issues.create.mock.calls[0][0];
+    // Should use the create-PR fallback template (compare URL), not the push-failed template
+    expect(createCall.body).toContain("/compare/main...");
+    expect(createCall.body).not.toContain("gh run download");
+    expect(createCall.body).not.toContain("git am --3way");
   });
 });
 
@@ -1142,8 +2053,8 @@ ${diffs}
 `;
   }
 
-  function writePatch(content) {
-    const p = path.join(tempDir, "test.patch");
+  function writePatch(branch, content) {
+    const p = canonicalPatchPath(branch);
     fs.writeFileSync(p, content);
     return p;
   }
@@ -1151,27 +2062,27 @@ ${diffs}
   it("should ignore files matching excluded-files patterns (not blocked by allowed-files)", async () => {
     // excluded-files are excluded at patch generation time via git :(exclude) pathspecs.
     // Simulate post-generation: the patch already contains only the non-ignored file.
-    const patchPath = writePatch(createPatchWithFiles("src/index.js"));
+    const patchPath = writePatch("should-ignore-files-matching-excluded-files-patterns-not-blo", createPatchWithFiles("src/index.js"));
 
     const { main } = require("./create_pull_request.cjs");
     const handler = await main({
       excluded_files: ["auto-generated/**"],
       allowed_files: ["src/**"],
     });
-    const result = await handler({ patch_path: patchPath, title: "Test PR", body: "" }, {});
+    const result = await handler({ title: "Test PR", body: "", branch: "should-ignore-files-matching-excluded-files-patterns-not-blo" }, {});
 
     expect(result.error || "").not.toContain("outside the allowed-files list");
   });
 
   it("should still block non-ignored files that violate the allowed-files list", async () => {
-    const patchPath = writePatch(createPatchWithFiles("src/index.js", "other/file.txt"));
+    const patchPath = writePatch("should-still-block-non-ignored-files-that-violate-the-allowe", createPatchWithFiles("src/index.js", "other/file.txt"));
 
     const { main } = require("./create_pull_request.cjs");
     const handler = await main({
       excluded_files: ["auto-generated/**"],
       allowed_files: ["src/**"],
     });
-    const result = await handler({ patch_path: patchPath, title: "Test PR", body: "" }, {});
+    const result = await handler({ title: "Test PR", body: "", branch: "should-still-block-non-ignored-files-that-violate-the-allowe" }, {});
 
     expect(result.success).toBe(false);
     expect(result.error).toContain("outside the allowed-files list");
@@ -1182,7 +2093,7 @@ ${diffs}
   it("should ignore files matching excluded-files patterns (not blocked by protected-files)", async () => {
     // excluded-files are excluded at patch generation time via git :(exclude) pathspecs.
     // Simulate post-generation: the patch already contains only the non-ignored file.
-    const patchPath = writePatch(createPatchWithFiles("src/index.js"));
+    const patchPath = writePatch("should-ignore-files-matching-excluded-files-patterns-not-blo", createPatchWithFiles("src/index.js"));
 
     const { main } = require("./create_pull_request.cjs");
     const handler = await main({
@@ -1190,7 +2101,7 @@ ${diffs}
       protected_files: ["package.json"],
       protected_files_policy: "blocked",
     });
-    const result = await handler({ patch_path: patchPath, title: "Test PR", body: "" }, {});
+    const result = await handler({ title: "Test PR", body: "", branch: "should-ignore-files-matching-excluded-files-patterns-not-blo" }, {});
 
     expect(result.error || "").not.toContain("protected files");
   });
@@ -1204,7 +2115,7 @@ ${diffs}
       allowed_files: ["src/**"],
     });
     // No patch file — simulates all changes being ignored at generation time
-    const result = await handler({ patch_path: path.join(tempDir, "nonexistent.patch"), title: "Test PR", body: "" }, {});
+    const result = await handler({ title: "Test PR", body: "", branch: "should-allow-when-all-patch-files-are-ignored-even-with-allo" }, {});
 
     // No patch → treated as no changes, not an allowlist violation
     expect(result.error || "").not.toContain("outside the allowed-files list");
@@ -1240,6 +2151,7 @@ describe("create_pull_request - configured reviewers", () => {
       rest: {
         pulls: {
           create: vi.fn().mockResolvedValue({ data: { number: 42, html_url: "https://github.com/test/pull/42", node_id: "PR_42" } }),
+          createReview: vi.fn().mockResolvedValue({ data: { id: 77, html_url: "https://github.com/test/review/77" } }),
           requestReviewers: vi.fn().mockResolvedValue({}),
         },
         repos: {
@@ -1707,6 +2619,12 @@ describe("create_pull_request - patch apply fallback to original base commit", (
     tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "create-pr-fallback-test-"));
     patchFilePath = path.join(tempDir, "test.patch");
     fs.writeFileSync(patchFilePath, PATCH_CONTENT, "utf8");
+    // Write the same patch content at every canonical path consumed by tests in
+    // this describe, so the handler (which re-derives the path from
+    // message.branch) finds it.
+    for (const branch of ["test-branch", "preserve-me", "chaos/preserve-me", "some-branch"]) {
+      fs.writeFileSync(canonicalPatchPath(branch), PATCH_CONTENT, "utf8");
+    }
 
     global.core = {
       info: vi.fn(),
@@ -1726,6 +2644,7 @@ describe("create_pull_request - patch apply fallback to original base commit", (
       rest: {
         pulls: {
           create: vi.fn().mockResolvedValue({ data: { number: 42, html_url: "https://github.com/test/pull/42", node_id: "PR_42" } }),
+          createReview: vi.fn().mockResolvedValue({ data: { id: 77, html_url: "https://github.com/test/review/77" } }),
           requestReviewers: vi.fn().mockResolvedValue({}),
         },
         repos: {
@@ -1791,6 +2710,58 @@ describe("create_pull_request - patch apply fallback to original base commit", (
     return false;
   }
 
+  it("should create the PR branch from normalized base_commit before applying the patch when available", async () => {
+    global.exec = {
+      exec: vi.fn().mockResolvedValue(0),
+      getExecOutput: vi.fn().mockResolvedValue({ exitCode: 0, stdout: "", stderr: "" }),
+    };
+
+    const { main } = require("./create_pull_request.cjs");
+    const handler = await main({});
+    const result = await handler({ title: "Test PR", body: "Test body", branch: "test-branch", base_commit: `  ${MOCK_BASE_COMMIT_SHA}  ` }, {});
+
+    expect(result.success).toBe(true);
+    expect(global.exec.exec).toHaveBeenCalledWith("git", ["cat-file", "-e", MOCK_BASE_COMMIT_SHA]);
+    const checkoutWithBaseCommit = global.exec.exec.mock.calls.find(([cmd, args]) => cmd === "git" && Array.isArray(args) && args[0] === "checkout" && args[1] === "-b" && args[3] === MOCK_BASE_COMMIT_SHA);
+    expect(checkoutWithBaseCommit).toBeTruthy();
+  });
+
+  it("should ignore invalid base_commit values when creating the branch", async () => {
+    global.exec = {
+      exec: vi.fn().mockResolvedValue(0),
+      getExecOutput: vi.fn().mockResolvedValue({ exitCode: 0, stdout: "", stderr: "" }),
+    };
+
+    const { main } = require("./create_pull_request.cjs");
+    const handler = await main({});
+    const result = await handler({ title: "Test PR", body: "Test body", branch: "test-branch", base_commit: "not-a-sha --bad" }, {});
+
+    expect(result.success).toBe(true);
+    expect(global.exec.exec).not.toHaveBeenCalledWith("git", ["cat-file", "-e", "not-a-sha --bad"]);
+    expect(global.core.warning).toHaveBeenCalledWith("Ignoring invalid base_commit value for patch apply: not-a-sha --bad");
+  });
+
+  it("should fall back to base branch when base_commit is unavailable", async () => {
+    global.exec = {
+      exec: vi.fn().mockImplementation(async (cmd, args) => {
+        if (cmd === "git" && Array.isArray(args) && args[0] === "cat-file" && args[1] === "-e" && args[2] === MOCK_BASE_COMMIT_SHA) {
+          throw new Error("not in object store");
+        }
+        return 0;
+      }),
+      getExecOutput: vi.fn().mockResolvedValue({ exitCode: 0, stdout: "", stderr: "" }),
+    };
+
+    const { main } = require("./create_pull_request.cjs");
+    const handler = await main({});
+    const result = await handler({ title: "Test PR", body: "Test body", branch: "test-branch", base_commit: MOCK_BASE_COMMIT_SHA }, {});
+
+    expect(result.success).toBe(true);
+    expect(global.exec.exec).toHaveBeenCalledWith("git", ["cat-file", "-e", MOCK_BASE_COMMIT_SHA]);
+    const checkoutWithBaseBranch = global.exec.exec.mock.calls.find(([cmd, args]) => cmd === "git" && Array.isArray(args) && args[0] === "checkout" && args[1] === "-b" && args[3] === "main");
+    expect(checkoutWithBaseBranch).toBeTruthy();
+  });
+
   it("should fall back to original base commit when git am --3way fails with merge conflicts", async () => {
     let primaryAmAttempted = false;
     global.exec = {
@@ -1810,11 +2781,69 @@ describe("create_pull_request - patch apply fallback to original base commit", (
     const { main } = require("./create_pull_request.cjs");
     const handler = await main({});
 
-    const result = await handler({ title: "Test PR", body: "Test body", patch_path: patchFilePath, branch: "test-branch", base_commit: MOCK_BASE_COMMIT_SHA }, {});
+    const result = await handler({ title: "Test PR", body: "Test body", branch: "test-branch", base_commit: MOCK_BASE_COMMIT_SHA }, {});
 
     expect(result.success).toBe(true);
     // Should warn that the PR will show merge conflicts
     expect(global.core.warning).toHaveBeenCalledWith(expect.stringContaining("merge conflicts"));
+  });
+
+  it("should diff against the fallback pre-apply HEAD for post-apply protection checks", async () => {
+    let primaryAmAttempted = false;
+    const promptsDir = path.join(tempDir, "prompts");
+    fs.mkdirSync(promptsDir, { recursive: true });
+    fs.writeFileSync(path.join(promptsDir, "manifest_protection_request_review.md"), "Protected files: {{files}}", "utf8");
+    fs.writeFileSync(path.join(promptsDir, "manifest_protection_request_changes_review.md"), "Protected files: {{files}}", "utf8");
+    process.env.GH_AW_PROMPTS_DIR = promptsDir;
+    global.exec = {
+      exec: vi.fn().mockImplementation((cmd, args) => {
+        if (isGitAm3Way(cmd, args) && !primaryAmAttempted) {
+          primaryAmAttempted = true;
+          throw new Error("CONFLICT (content): Merge conflict in file.txt");
+        }
+        return Promise.resolve(0);
+      }),
+      getExecOutput: vi.fn().mockImplementation((cmd, args) => {
+        if (cmd === "git" && Array.isArray(args) && args[0] === "merge-base") {
+          return Promise.resolve({ exitCode: 0, stdout: "", stderr: "" });
+        }
+        if (cmd === "git" && Array.isArray(args) && args[0] === "rev-parse" && args[1] === "HEAD") {
+          return Promise.resolve({ exitCode: 0, stdout: primaryAmAttempted ? `${MOCK_BASE_COMMIT_SHA}\n` : "origin-main-head\n", stderr: "" });
+        }
+        if (cmd === "git" && Array.isArray(args) && args[0] === "diff" && args[1] === "--name-only" && args[2] === "--no-renames") {
+          expect(args[3]).toBe(`${MOCK_BASE_COMMIT_SHA}..HEAD`);
+          return Promise.resolve({ exitCode: 0, stdout: ".github/CODEOWNERS\n", stderr: "" });
+        }
+        if (cmd === "git" && Array.isArray(args) && args[0] === "diff" && args.includes("--diff-filter=U")) {
+          return Promise.resolve({ exitCode: 0, stdout: "", stderr: "" });
+        }
+        if (cmd === "git" && Array.isArray(args) && args[0] === "status") {
+          return Promise.resolve({ exitCode: 0, stdout: "", stderr: "" });
+        }
+        if (cmd === "git" && Array.isArray(args) && args[0] === "am" && args[1] === "--show-current-patch=diff") {
+          return Promise.resolve({ exitCode: 0, stdout: "", stderr: "" });
+        }
+        return Promise.resolve({ exitCode: 0, stdout: "", stderr: "" });
+      }),
+    };
+
+    const { main } = require("./create_pull_request.cjs");
+    const handler = await main({
+      protected_path_prefixes: [".github/"],
+    });
+    const result = await handler(
+      {
+        title: "Test PR",
+        body: "Test body",
+        branch: "test-branch",
+        base_commit: MOCK_BASE_COMMIT_SHA,
+      },
+      {}
+    );
+
+    expect(result.success).toBe(true);
+    expect(global.github.rest.pulls.createReview).toHaveBeenCalled();
+    expect(global.exec.getExecOutput).toHaveBeenCalledWith("git", ["diff", "--name-only", "--no-renames", `${MOCK_BASE_COMMIT_SHA}..HEAD`]);
   });
 
   it("should return error when both git am --3way and the fallback git am fail", async () => {
@@ -1834,10 +2863,80 @@ describe("create_pull_request - patch apply fallback to original base commit", (
     const { main } = require("./create_pull_request.cjs");
     const handler = await main({});
 
-    const result = await handler({ title: "Test PR", body: "Test body", patch_path: patchFilePath, branch: "test-branch", base_commit: MOCK_BASE_COMMIT_SHA }, {});
+    const result = await handler({ title: "Test PR", body: "Test body", branch: "test-branch", base_commit: MOCK_BASE_COMMIT_SHA }, {});
 
     expect(result.success).toBe(false);
     expect(result.error).toBe("Failed to apply patch");
+  });
+
+  it("should recover add/add conflicts during fallback git am --3way and continue", async () => {
+    let am3WayAttempts = 0;
+    let unresolvedChecks = 0;
+    const conflictedPath = " docs/file.md ";
+    global.exec = {
+      exec: vi.fn().mockImplementation((cmd, args) => {
+        if (isGitAm3Way(cmd, args)) {
+          am3WayAttempts += 1;
+          throw new Error("CONFLICT (add/add): Merge conflict in docs/file.md");
+        }
+        return Promise.resolve(0);
+      }),
+      getExecOutput: vi.fn().mockImplementation((cmd, args) => {
+        if (cmd === "git" && Array.isArray(args) && args[0] === "diff" && args.includes("--diff-filter=U")) {
+          unresolvedChecks += 1;
+          // First recovery attempt (after initial apply failure): no add/add conflicts.
+          // Second recovery attempt (during fallback): add/add conflict present.
+          if (unresolvedChecks === 1) {
+            return Promise.resolve({ exitCode: 0, stdout: "", stderr: "" });
+          }
+          return Promise.resolve({ exitCode: 0, stdout: `${conflictedPath}\0`, stderr: "" });
+        }
+        if (cmd === "git" && Array.isArray(args) && args[0] === "status" && args[1] === "--porcelain") {
+          return Promise.resolve({ exitCode: 0, stdout: `AA ${conflictedPath}\0`, stderr: "" });
+        }
+        return Promise.resolve({ exitCode: 0, stdout: "", stderr: "" });
+      }),
+    };
+
+    const { main } = require("./create_pull_request.cjs");
+    const handler = await main({});
+
+    const result = await handler({ title: "Test PR", body: "Test body", branch: "test-branch", base_commit: MOCK_BASE_COMMIT_SHA }, {});
+
+    expect(result.success).toBe(true);
+    expect(global.exec.exec).toHaveBeenCalledWith("git", ["checkout", "--theirs", "--", conflictedPath]);
+    expect(global.exec.exec).toHaveBeenCalledWith("git", ["am", "--continue"]);
+    expect(global.core.debug).toHaveBeenCalledWith(expect.stringContaining("Add/add recovery probe unresolved files"));
+  });
+
+  it("should log recovery failure details when add/add recovery throws", async () => {
+    global.exec = {
+      exec: vi.fn().mockImplementation((cmd, args) => {
+        if (isGitAm3Way(cmd, args)) {
+          throw new Error("CONFLICT (add/add): Merge conflict in docs/file.md");
+        }
+        if (cmd === "git" && Array.isArray(args) && args[0] === "checkout" && args[1] === "--theirs") {
+          throw new Error("failed to checkout theirs");
+        }
+        return Promise.resolve(0);
+      }),
+      getExecOutput: vi.fn().mockImplementation((cmd, args) => {
+        if (cmd === "git" && Array.isArray(args) && args[0] === "diff" && args.includes("--diff-filter=U")) {
+          return Promise.resolve({ exitCode: 0, stdout: "docs/file.md\0", stderr: "" });
+        }
+        if (cmd === "git" && Array.isArray(args) && args[0] === "status" && args[1] === "--porcelain") {
+          return Promise.resolve({ exitCode: 0, stdout: "AA docs/file.md\0", stderr: "" });
+        }
+        return Promise.resolve({ exitCode: 0, stdout: "", stderr: "" });
+      }),
+    };
+
+    const { main } = require("./create_pull_request.cjs");
+    const handler = await main({});
+    const result = await handler({ title: "Test PR", body: "Test body", branch: "test-branch", base_commit: MOCK_BASE_COMMIT_SHA }, {});
+
+    expect(result.success).toBe(false);
+    expect(global.core.warning).toHaveBeenCalledWith(expect.stringContaining("Automatic add/add conflict recovery attempt failed"));
   });
 
   it("should return error when original base commit is not available (cross-repo scenario)", async () => {
@@ -1861,7 +2960,7 @@ describe("create_pull_request - patch apply fallback to original base commit", (
     const { main } = require("./create_pull_request.cjs");
     const handler = await main({});
 
-    const result = await handler({ title: "Test PR", body: "Test body", patch_path: patchFilePath, branch: "test-branch", base_commit: MOCK_BASE_COMMIT_SHA }, {});
+    const result = await handler({ title: "Test PR", body: "Test body", branch: "test-branch", base_commit: MOCK_BASE_COMMIT_SHA }, {});
 
     expect(result.success).toBe(false);
     expect(result.error).toBe("Failed to apply patch");
@@ -1884,7 +2983,7 @@ describe("create_pull_request - patch apply fallback to original base commit", (
     const handler = await main({});
 
     // No base_commit provided - fallback should not be possible
-    const result = await handler({ title: "Test PR", body: "Test body", patch_path: patchFilePath, branch: "test-branch" }, {});
+    const result = await handler({ title: "Test PR", body: "Test body", branch: "test-branch" }, {});
 
     expect(result.success).toBe(false);
     expect(result.error).toBe("Failed to apply patch");
@@ -1914,7 +3013,7 @@ describe("create_pull_request - patch apply fallback to original base commit", (
     const { main } = require("./create_pull_request.cjs");
     const handler = await main({ preserve_branch_name: true, recreate_ref: true });
 
-    const result = await handler({ title: "Test PR", body: "Test body", patch_path: patchFilePath, branch: "preserve-me", base_commit: MOCK_BASE_COMMIT_SHA }, {});
+    const result = await handler({ title: "Test PR", body: "Test body", branch: "preserve-me", base_commit: MOCK_BASE_COMMIT_SHA }, {});
 
     expect(result.success).toBe(true);
     // Should have called deleteRef to force-delete the existing remote branch
@@ -1947,7 +3046,7 @@ describe("create_pull_request - patch apply fallback to original base commit", (
     const { main } = require("./create_pull_request.cjs");
     const handler = await main({ preserve_branch_name: true, fallback_as_issue: false });
 
-    const result = await handler({ title: "Test PR", body: "Test body", patch_path: patchFilePath, branch: "preserve-me", base_commit: MOCK_BASE_COMMIT_SHA }, {});
+    const result = await handler({ title: "Test PR", body: "Test body", branch: "preserve-me", base_commit: MOCK_BASE_COMMIT_SHA }, {});
 
     expect(result.success).toBe(false);
     expect(result.error_type).toBe("push_failed");
@@ -1974,11 +3073,65 @@ describe("create_pull_request - patch apply fallback to original base commit", (
     const { main } = require("./create_pull_request.cjs");
     const handler = await main({ preserve_branch_name: true, recreate_ref: true, fallback_as_issue: false });
 
-    const result = await handler({ title: "Test PR", body: "Test body", patch_path: patchFilePath, branch: "preserve-me", base_commit: MOCK_BASE_COMMIT_SHA }, {});
+    const result = await handler({ title: "Test PR", body: "Test body", branch: "preserve-me", base_commit: MOCK_BASE_COMMIT_SHA }, {});
 
     expect(result.success).toBe(false);
     expect(result.error_type).toBe("push_failed");
     expect(result.error).toContain('Failed to delete existing remote branch "preserve-me"');
+  });
+
+  it("should rename with random suffix when deleteRef is blocked by branch protection rules (recreate-ref fallback)", async () => {
+    let capturedRenamedBranch = null;
+    global.exec = {
+      exec: vi.fn().mockImplementation((cmd, args) => {
+        const cmdStr = typeof cmd === "string" ? cmd : `${cmd} ${(args || []).join(" ")}`;
+        // Capture the new branch name from: git branch -m <old> <new>
+        const renameMatch = cmdStr.match(/git branch -m \S+ (\S+)/);
+        if (renameMatch) {
+          capturedRenamedBranch = renameMatch[1];
+        }
+        return Promise.resolve(0);
+      }),
+      getExecOutput: vi.fn().mockImplementation((cmd, args) => {
+        const cmdStr = typeof cmd === "string" ? cmd : `${cmd} ${(args || []).join(" ")}`;
+        if (cmdStr.includes("ls-remote --heads origin")) {
+          return Promise.resolve({ exitCode: 0, stdout: "abc123\trefs/heads/chaos/preserve-me\n", stderr: "" });
+        }
+        return Promise.resolve({ exitCode: 0, stdout: "", stderr: "" });
+      }),
+    };
+    // Simulate the 422 "Repository rule violations found / Cannot delete this branch" error
+    // that occurs when chaos/* branches are protected by a ruleset that blocks deletion.
+    const ruleViolationError = Object.assign(new Error("Repository rule violations found\n\nCannot delete this branch\n\n - https://docs.github.com/rest/git/refs#delete-a-reference"), { status: 422 });
+    global.github.rest.git.deleteRef = vi.fn().mockRejectedValue(ruleViolationError);
+
+    const pushSignedCommitsModule = require("./push_signed_commits.cjs");
+    const pushSignedSpy = vi.spyOn(pushSignedCommitsModule, "pushSignedCommits").mockResolvedValue("bundle-tip");
+
+    const { main } = require("./create_pull_request.cjs");
+    const handler = await main({ preserve_branch_name: true, recreate_ref: true });
+
+    const result = await handler({ title: "Test PR", body: "Test body", branch: "chaos/preserve-me", base_commit: MOCK_BASE_COMMIT_SHA }, {});
+
+    expect(result.success).toBe(true);
+    // Should have attempted to delete the ref
+    expect(global.github.rest.git.deleteRef).toHaveBeenCalledWith({
+      owner: "test-owner",
+      repo: "test-repo",
+      ref: "heads/chaos/preserve-me",
+    });
+    // Should have fallen back to rename with suffix
+    expect(capturedRenamedBranch).not.toBeNull();
+    expect(capturedRenamedBranch).toMatch(/^chaos\/preserve-me-[0-9a-f]{8}$/);
+    const warningCalls = global.core.warning.mock.calls.map(call => String(call[0]));
+    expect(warningCalls.some(msg => msg.includes("cannot be deleted due to branch protection rules"))).toBe(true);
+    expect(warningCalls.some(msg => msg.includes("appending random suffix"))).toBe(true);
+    // The renamed branch must be used for the push and PR creation, not the original protected name
+    expect(pushSignedSpy).toHaveBeenCalledWith(expect.objectContaining({ branch: capturedRenamedBranch }));
+    expect(global.github.rest.pulls.create).toHaveBeenCalledWith(expect.objectContaining({ head: capturedRenamedBranch }));
+    expect(global.github.rest.pulls.create).not.toHaveBeenCalledWith(expect.objectContaining({ head: "chaos/preserve-me" }));
+
+    pushSignedSpy.mockRestore();
   });
 
   it("should append random suffix when preserve-branch-name is false and remote branch already exists", async () => {
@@ -2003,7 +3156,7 @@ describe("create_pull_request - patch apply fallback to original base commit", (
     const { main } = require("./create_pull_request.cjs");
     const handler = await main({});
 
-    const result = await handler({ title: "Test PR", body: "Test body", patch_path: patchFilePath, branch: "some-branch", base_commit: MOCK_BASE_COMMIT_SHA }, {});
+    const result = await handler({ title: "Test PR", body: "Test body", branch: "some-branch", base_commit: MOCK_BASE_COMMIT_SHA }, {});
 
     expect(result.success).toBe(true);
     expect(renameCalled).toBe(true);
@@ -2040,6 +3193,7 @@ describe("create_pull_request - copilot assignee on fallback issues", () => {
 
     // Push fails to trigger the fallback-issue path; issue creation succeeds
     global.github = {
+      request: vi.fn().mockResolvedValue({ data: { id: "task-123" } }),
       rest: {
         pulls: {
           create: vi.fn().mockRejectedValue(Object.assign(new Error("Permission denied"), { status: 403 })),
@@ -2051,9 +3205,13 @@ describe("create_pull_request - copilot assignee on fallback issues", () => {
         issues: {
           create: vi.fn().mockResolvedValue({ data: { number: 99, html_url: "https://github.com/test/issues/99" } }),
           addLabels: vi.fn().mockResolvedValue({}),
+          checkUserCanBeAssigned: vi.fn().mockResolvedValue({}),
+          get: vi.fn().mockResolvedValue({ data: { id: 12345, number: 99, assignees: [], html_url: "", title: "", body: "" } }),
+        },
+        users: {
+          getByUsername: vi.fn().mockResolvedValue({ data: { id: 99999 } }),
         },
       },
-      graphql: vi.fn(),
     };
 
     global.context = {
@@ -2097,50 +3255,36 @@ describe("create_pull_request - copilot assignee on fallback issues", () => {
     vi.clearAllMocks();
   });
 
-  it("should not call graphql for copilot assignment when GH_AW_ASSIGN_COPILOT is not set", async () => {
+  it("should not call request for copilot assignment when GH_AW_ASSIGN_COPILOT is not set", async () => {
     delete process.env.GH_AW_ASSIGN_COPILOT;
 
     const { main } = require("./create_pull_request.cjs");
     const handler = await main({ assignees: ["copilot"], allow_empty: true });
     await handler({ title: "Test PR", body: "Test body" }, {});
 
-    // No graphql calls for copilot assignment
-    expect(global.github.graphql).not.toHaveBeenCalled();
+    // No REST task creation calls for copilot assignment
+    expect(global.github.request).not.toHaveBeenCalled();
   });
 
-  it("should not call graphql when copilot is not in assignees even if GH_AW_ASSIGN_COPILOT is true", async () => {
+  it("should not call request when copilot is not in assignees even if GH_AW_ASSIGN_COPILOT is true", async () => {
     process.env.GH_AW_ASSIGN_COPILOT = "true";
 
     const { main } = require("./create_pull_request.cjs");
     const handler = await main({ assignees: ["user1"], allow_empty: true });
     await handler({ title: "Test PR", body: "Test body" }, {});
 
-    expect(global.github.graphql).not.toHaveBeenCalled();
+    expect(global.github.request).not.toHaveBeenCalled();
   });
 
-  it("should strip copilot from REST assignees for fallback issue but assign via graphql when enabled", async () => {
+  it("should strip copilot from REST assignees for fallback issue but assign via issue assignees REST when enabled", async () => {
     process.env.GH_AW_ASSIGN_COPILOT = "true";
 
     // Mock findAgent → getIssueDetails → assignAgentToIssue
-    global.github.graphql
-      .mockResolvedValueOnce({
-        repository: {
-          suggestedActors: {
-            nodes: [{ id: "COPILOT_AGENT_ID", login: "copilot-swe-agent", __typename: "Bot" }],
-          },
-        },
-      })
-      .mockResolvedValueOnce({
-        repository: {
-          issue: {
-            id: "ISSUE_NODE_ID",
-            assignees: { nodes: [] },
-          },
-        },
-      })
-      .mockResolvedValueOnce({
-        replaceActorsForAssignable: { __typename: "ReplaceActorsForAssignablePayload" },
-      });
+    global.github.rest.issues.get.mockResolvedValueOnce({
+      data: { id: 12345, number: 99, assignees: [], html_url: "", title: "", body: "" },
+    });
+    // GET assignability check + POST assignment
+    global.github.request.mockResolvedValueOnce({ status: 204 }).mockResolvedValueOnce({});
 
     const { main } = require("./create_pull_request.cjs");
     const handler = await main({ assignees: ["copilot", "user1"], allow_empty: true });
@@ -2151,8 +3295,10 @@ describe("create_pull_request - copilot assignee on fallback issues", () => {
     expect(issueCall.assignees).not.toContain("copilot");
     expect(issueCall.assignees).toContain("user1");
 
-    // Graphql should be called for copilot assignment
-    expect(global.github.graphql).toHaveBeenCalledTimes(3);
+    // One request for issue-scoped alias validation and one for REST assignment
+    expect(global.github.request).toHaveBeenCalledTimes(2);
+    const requestedRoutes = global.github.request.mock.calls.map(([route]) => route);
+    expect(requestedRoutes).toEqual(expect.arrayContaining(["GET /repos/{owner}/{repo}/issues/{issue_number}/assignees/{assignee}", "POST /repos/{owner}/{repo}/issues/{issue_number}/assignees"]));
   });
 
   it("should use configured fallback_labels for fallback issues instead of PR labels", async () => {
@@ -2162,6 +3308,18 @@ describe("create_pull_request - copilot assignee on fallback issues", () => {
 
     const issueCall = global.github.rest.issues.create.mock.calls[0][0];
     expect(issueCall.labels).toEqual(["agentic-workflows", "failure", "automated"]);
+  });
+
+  it("should sanitize closing keywords in permission-denied fallback issue body", async () => {
+    const { main } = require("./create_pull_request.cjs");
+    const handler = await main({ allow_empty: true });
+    await handler({ title: "Test PR", body: "Test body\n\nCloses #57\nResolves test-owner/test-repo#58" }, {});
+
+    const issueCall = global.github.rest.issues.create.mock.calls[0][0];
+    expect(issueCall.body).toContain("Closes \\#57");
+    expect(issueCall.body).toContain("Resolves test-owner/test-repo\\#58");
+    expect(issueCall.body).not.toContain("Closes #57");
+    expect(issueCall.body).not.toContain("Resolves test-owner/test-repo#58");
   });
 });
 
@@ -2175,6 +3333,15 @@ describe("create_pull_request - threat detection caution", () => {
     process.env.GITHUB_REPOSITORY = "test-owner/test-repo";
     process.env.GITHUB_BASE_REF = "main";
     tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "create-pr-threat-test-"));
+    const promptsDir = path.join(tempDir, "prompts");
+    fs.mkdirSync(promptsDir, { recursive: true });
+    const requestReviewTemplateSrc = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../md/manifest_protection_request_review.md");
+    fs.copyFileSync(requestReviewTemplateSrc, path.join(promptsDir, "manifest_protection_request_review.md"));
+    const requestChangesTemplateSrc = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../md/manifest_protection_request_changes_review.md");
+    fs.copyFileSync(requestChangesTemplateSrc, path.join(promptsDir, "manifest_protection_request_changes_review.md"));
+    const threatWarningTemplateSrc = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../md/threat_warning_request_changes_review.md");
+    fs.copyFileSync(threatWarningTemplateSrc, path.join(promptsDir, "threat_warning_request_changes_review.md"));
+    process.env.GH_AW_PROMPTS_DIR = promptsDir;
 
     global.core = {
       info: vi.fn(),
@@ -2194,6 +3361,7 @@ describe("create_pull_request - threat detection caution", () => {
       rest: {
         pulls: {
           create: vi.fn().mockResolvedValue({ data: { number: 42, html_url: "https://github.com/test/pull/42", node_id: "PR_42" } }),
+          createReview: vi.fn().mockResolvedValue({ data: { id: 77, html_url: "https://github.com/test/review/77" } }),
           requestReviewers: vi.fn().mockResolvedValue({}),
         },
         repos: {
@@ -2250,6 +3418,39 @@ describe("create_pull_request - threat detection caution", () => {
     const bodyIndex = prBody.indexOf("Agent body content");
     expect(cautionIndex).toBeGreaterThanOrEqual(0);
     expect(bodyIndex).toBeGreaterThan(cautionIndex);
+    expect(global.github.rest.pulls.createReview).toHaveBeenCalledTimes(1);
+    const createReviewCall = global.github.rest.pulls.createReview.mock.calls[0][0];
+    expect(createReviewCall.event).toBe("REQUEST_CHANGES");
+    expect(createReviewCall.body).toContain("Threat detection produced a warning");
+    expect(createReviewCall.body).toContain("need to be scrutinized");
+  });
+
+  it("should compose one REQUEST_CHANGES review when protected-files and threat warning are both active", async () => {
+    process.env.GH_AW_DETECTION_CONCLUSION = "warning";
+    process.env.GH_AW_DETECTION_REASON = "pattern-match";
+    const patchPath = canonicalPatchPath("should-compose-one-request-changes-review-when-protected-fil");
+    fs.writeFileSync(
+      patchPath,
+      `diff --git a/.github/aw/instructions.md b/.github/aw/instructions.md
+new file mode 100644
+index 0000000..abc1234
+--- /dev/null
++++ b/.github/aw/instructions.md
+@@ -0,0 +1 @@
++content
+`
+    );
+
+    const { main } = require("./create_pull_request.cjs");
+    const handler = await main({ allow_empty: true, protected_path_prefixes: [".github/"], protected_files_policy: "request_review" });
+    await handler({ title: "Test PR", body: "Agent body content", branch: "should-compose-one-request-changes-review-when-protected-fil" }, {});
+
+    expect(global.github.rest.pulls.createReview).toHaveBeenCalledTimes(1);
+    const createReviewCall = global.github.rest.pulls.createReview.mock.calls[0][0];
+    expect(createReviewCall.event).toBe("REQUEST_CHANGES");
+    expect(createReviewCall.body).toContain("Protected files were modified");
+    expect(createReviewCall.body).toContain("Threat detection produced a warning");
+    expect(createReviewCall.body).toContain("\n\n---\n\n");
   });
 
   it("should not include caution alert in PR body when GH_AW_DETECTION_CONCLUSION is not warning", async () => {
@@ -2261,6 +3462,7 @@ describe("create_pull_request - threat detection caution", () => {
 
     const prBody = global.github.rest.pulls.create.mock.calls[0][0].body;
     expect(prBody).not.toContain("[!CAUTION]");
+    expect(global.github.rest.pulls.createReview).not.toHaveBeenCalled();
   });
 
   it("should add agentic-threat-detected label when GH_AW_DETECTION_CONCLUSION is warning", async () => {
@@ -2411,7 +3613,7 @@ describe("create_pull_request - rate-limit retry", () => {
       const result = await resultPromise;
 
       expect(result.success).toBe(true);
-      expect(result.pull_request_number).toBe(42);
+      expect(result.number).toBe(42);
       // 1 initial (rate-limited) + 1 retry (succeeds) = 2 calls total
       expect(global.github.rest.pulls.create).toHaveBeenCalledTimes(2);
       expect(global.core.warning).toHaveBeenCalledWith(expect.stringContaining("create pull request"));
@@ -2501,5 +3703,310 @@ describe("create_pull_request - rate-limit retry", () => {
     expect(secondCall.body).toContain("user1");
     expect(secondCall.body).toContain("user2");
     expect(secondCall.body).toContain("could not be set");
+  });
+});
+
+describe("create_pull_request - branch-prefix config", () => {
+  let originalEnv;
+  let tempDir;
+
+  beforeEach(() => {
+    originalEnv = { ...process.env };
+    process.env.GH_AW_WORKFLOW_ID = "jsweep";
+    process.env.GITHUB_REPOSITORY = "test-owner/test-repo";
+    process.env.GITHUB_BASE_REF = "main";
+    tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "create-pr-branch-prefix-test-"));
+
+    global.core = {
+      info: vi.fn(),
+      warning: vi.fn(),
+      error: vi.fn(),
+      debug: vi.fn(),
+      setFailed: vi.fn(),
+      setOutput: vi.fn(),
+      startGroup: vi.fn(),
+      endGroup: vi.fn(),
+      summary: { addRaw: vi.fn().mockReturnThis(), write: vi.fn().mockResolvedValue(undefined) },
+    };
+    global.github = {
+      rest: {
+        pulls: { create: vi.fn().mockResolvedValue({ data: { number: 1, html_url: "https://github.com/test/pull/1" } }) },
+        repos: { get: vi.fn().mockResolvedValue({ data: { default_branch: "main" } }) },
+        issues: { addLabels: vi.fn().mockResolvedValue({}) },
+      },
+      graphql: vi.fn(),
+    };
+    global.context = {
+      eventName: "workflow_dispatch",
+      repo: { owner: "test-owner", repo: "test-repo" },
+      payload: {},
+    };
+    global.exec = {
+      exec: vi.fn().mockResolvedValue(0),
+      getExecOutput: vi.fn().mockResolvedValue({ exitCode: 0, stdout: "", stderr: "" }),
+    };
+
+    delete require.cache[require.resolve("./create_pull_request.cjs")];
+  });
+
+  afterEach(() => {
+    for (const key of Object.keys(process.env)) {
+      if (!(key in originalEnv)) delete process.env[key];
+    }
+    Object.assign(process.env, originalEnv);
+    if (tempDir && fs.existsSync(tempDir)) fs.rmSync(tempDir, { recursive: true, force: true });
+    delete global.core;
+    delete global.github;
+    delete global.context;
+    delete global.exec;
+    vi.clearAllMocks();
+  });
+
+  it("should prepend branch-prefix to auto-generated branch name when agent provides no branch", async () => {
+    const { main } = require("./create_pull_request.cjs");
+    const handler = await main({ branch_prefix: "signed/", allow_empty: true });
+
+    await handler({ title: "Test PR", body: "body" }, {});
+
+    const branchArg = global.github.rest.pulls.create.mock.calls[0][0].head;
+    expect(branchArg).toMatch(/^signed\/jsweep-/);
+  });
+
+  it("should prepend branch-prefix to agent-specified branch name", async () => {
+    const { main } = require("./create_pull_request.cjs");
+    const handler = await main({ branch_prefix: "signed/", allow_empty: true });
+
+    await handler({ title: "Test PR", body: "body", branch: "my-feature" }, {});
+
+    const branchArg = global.github.rest.pulls.create.mock.calls[0][0].head;
+    expect(branchArg).toMatch(/^signed\/my-feature/);
+  });
+
+  it("should not double-apply branch-prefix when agent branch already starts with the prefix", async () => {
+    const { main } = require("./create_pull_request.cjs");
+    const handler = await main({ branch_prefix: "signed/", allow_empty: true });
+
+    await handler({ title: "Test PR", body: "body", branch: "signed/already-prefixed" }, {});
+
+    const branchArg = global.github.rest.pulls.create.mock.calls[0][0].head;
+    expect(branchArg).toMatch(/^signed\/already-prefixed/);
+    expect(branchArg).not.toMatch(/^signed\/signed\//);
+  });
+
+  it("should not add any prefix when branch-prefix is not configured", async () => {
+    const { main } = require("./create_pull_request.cjs");
+    const handler = await main({ allow_empty: true });
+
+    await handler({ title: "Test PR", body: "body" }, {});
+
+    const branchArg = global.github.rest.pulls.create.mock.calls[0][0].head;
+    expect(branchArg).toMatch(/^jsweep-/);
+    expect(branchArg).not.toContain("signed/");
+  });
+
+  it("should normalize an invalid branch-prefix and emit a warning", async () => {
+    const { main } = require("./create_pull_request.cjs");
+    const handler = await main({ branch_prefix: "bad prefix: ", allow_empty: true });
+
+    await handler({ title: "Test PR", body: "body" }, {});
+
+    expect(global.core.warning).toHaveBeenCalledWith(expect.stringMatching(/branch prefix.*characters that are invalid/i));
+    const branchArg = global.github.rest.pulls.create.mock.calls[0][0].head;
+    // normalized prefix "bad-prefix" should be applied
+    expect(branchArg).toMatch(/^bad-prefix/);
+  });
+});
+
+describe("create_pull_request - E003 file-limit fallback-to-issue", () => {
+  let originalEnv;
+  let tempDir;
+
+  beforeEach(() => {
+    originalEnv = { ...process.env };
+    process.env.GH_AW_WORKFLOW_ID = "test-workflow";
+    process.env.GITHUB_REPOSITORY = "test-owner/test-repo";
+    process.env.GITHUB_BASE_REF = "main";
+    tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "create-pr-e003-test-"));
+
+    // Set up prompts directory with the E003 template so getPromptPath resolves
+    const promptsDir = path.join(tempDir, "prompts");
+    fs.mkdirSync(promptsDir, { recursive: true });
+    const templateSrc = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../md/e003_file_limit_fallback.md");
+    fs.copyFileSync(templateSrc, path.join(promptsDir, "e003_file_limit_fallback.md"));
+    process.env.GH_AW_PROMPTS_DIR = promptsDir;
+
+    global.core = {
+      info: vi.fn(),
+      warning: vi.fn(),
+      error: vi.fn(),
+      debug: vi.fn(),
+      setFailed: vi.fn(),
+      setOutput: vi.fn(),
+      startGroup: vi.fn(),
+      endGroup: vi.fn(),
+      summary: { addRaw: vi.fn().mockReturnThis(), write: vi.fn().mockResolvedValue(undefined) },
+    };
+
+    global.github = {
+      rest: {
+        pulls: { create: vi.fn().mockResolvedValue({ data: { number: 1, html_url: "https://github.com/test/pull/1" } }) },
+        repos: { get: vi.fn().mockResolvedValue({ data: { default_branch: "main" } }) },
+        issues: {
+          create: vi.fn().mockResolvedValue({ data: { number: 55, html_url: "https://github.com/test/issues/55" } }),
+          addLabels: vi.fn().mockResolvedValue({}),
+        },
+      },
+      graphql: vi.fn(),
+    };
+
+    global.context = {
+      eventName: "workflow_dispatch",
+      repo: { owner: "test-owner", repo: "test-repo" },
+      payload: {},
+      runId: "99999",
+    };
+
+    global.exec = {
+      exec: vi.fn().mockResolvedValue(0),
+      getExecOutput: vi.fn().mockResolvedValue({ exitCode: 0, stdout: "", stderr: "" }),
+    };
+
+    delete require.cache[require.resolve("./create_pull_request.cjs")];
+  });
+
+  afterEach(() => {
+    for (const key of Object.keys(process.env)) {
+      if (!(key in originalEnv)) delete process.env[key];
+    }
+    Object.assign(process.env, originalEnv);
+    if (tempDir && fs.existsSync(tempDir)) fs.rmSync(tempDir, { recursive: true, force: true });
+    delete global.core;
+    delete global.github;
+    delete global.context;
+    delete global.exec;
+    vi.clearAllMocks();
+  });
+
+  // Build a patch string touching `n` unique files
+  function buildOversizedPatch(n) {
+    const lines = [];
+    for (let i = 0; i < n; i++) {
+      lines.push(`diff --git a/file${i}.txt b/file${i}.txt`);
+      lines.push("index 1234567..abcdefg 100644");
+      lines.push(`--- a/file${i}.txt`);
+      lines.push(`+++ b/file${i}.txt`);
+      lines.push("@@ -1,1 +1,1 @@");
+      lines.push("-old");
+      lines.push("+new");
+    }
+    return lines.join("\n");
+  }
+
+  it("should create a fallback issue when E003 fires and fallback_as_issue is true (default)", async () => {
+    const patchPath = canonicalPatchPath("data/refresh");
+    fs.writeFileSync(patchPath, buildOversizedPatch(101));
+
+    const { main } = require("./create_pull_request.cjs");
+    const handler = await main({});
+    const result = await handler({ title: "Data refresh PR", body: "Daily update", branch: "data/refresh" }, {});
+
+    expect(result.success).toBe(true);
+    expect(result.fallback_used).toBe(true);
+    expect(result.issue_number).toBe(55);
+
+    // A fallback issue should have been created
+    expect(global.github.rest.issues.create).toHaveBeenCalledTimes(1);
+    const issueCall = global.github.rest.issues.create.mock.calls[0][0];
+
+    // The body should contain the E003 error message and the actionable fix
+    expect(issueCall.body).toContain("E003");
+    expect(issueCall.body).toContain("max-patch-files");
+
+    // The suggested limit must be >= the actual file count (101), not maxFiles * 2 (200)
+    expect(issueCall.body).toContain("max-patch-files: 101");
+    expect(issueCall.body).not.toContain("max-patch-files: 200");
+
+    // PR creation should NOT have been attempted
+    expect(global.github.rest.pulls.create).not.toHaveBeenCalled();
+  });
+
+  it("should use the actual received file count (not maxFiles*2) as the suggested limit", async () => {
+    const patchPath = canonicalPatchPath("api/regen");
+    fs.writeFileSync(patchPath, buildOversizedPatch(220));
+
+    const { main } = require("./create_pull_request.cjs");
+    const handler = await main({});
+    const result = await handler({ title: "API regen PR", body: "Daily update", branch: "api/regen" }, {});
+
+    expect(result.success).toBe(true);
+    expect(result.fallback_used).toBe(true);
+
+    const issueCall = global.github.rest.issues.create.mock.calls[0][0];
+    // With default limit=100 and 220 files, old code would suggest 200; correct is 220
+    expect(issueCall.body).toContain("max-patch-files: 220");
+    expect(issueCall.body).not.toContain("max-patch-files: 200");
+  });
+
+  it("should sanitize and apply title prefix to fallback issue title", async () => {
+    const patchPath = canonicalPatchPath("data/refresh");
+    fs.writeFileSync(patchPath, buildOversizedPatch(101));
+
+    const { main } = require("./create_pull_request.cjs");
+    const handler = await main({ title_prefix: "[bot]" });
+    const result = await handler({ title: "Data refresh PR", body: "Daily update", branch: "data/refresh" }, {});
+
+    expect(result.success).toBe(true);
+    const issueCall = global.github.rest.issues.create.mock.calls[0][0];
+    // Title prefix should be applied
+    expect(issueCall.title).toMatch(/^\[bot\]/);
+  });
+
+  it("should return staged preview instead of creating a fallback issue when in staged mode", async () => {
+    process.env.GH_AW_SAFE_OUTPUTS_STAGED = "true";
+
+    const patchPath = canonicalPatchPath("data/refresh");
+    fs.writeFileSync(patchPath, buildOversizedPatch(101));
+
+    const { main } = require("./create_pull_request.cjs");
+    const handler = await main({});
+    const result = await handler({ title: "Data refresh PR", body: "Daily update", branch: "data/refresh" }, {});
+
+    // Staged mode: no API side effects, just a preview
+    expect(result.success).toBe(true);
+    expect(result.staged).toBe(true);
+    expect(result.fallback_used).toBeUndefined();
+    expect(global.github.rest.issues.create).not.toHaveBeenCalled();
+    expect(global.github.rest.pulls.create).not.toHaveBeenCalled();
+    expect(global.core.summary.addRaw).toHaveBeenCalled();
+  });
+
+  it("should return success: false when E003 fires and fallback_as_issue is false", async () => {
+    const patchPath = canonicalPatchPath("data/refresh");
+    fs.writeFileSync(patchPath, buildOversizedPatch(101));
+
+    const { main } = require("./create_pull_request.cjs");
+    const handler = await main({ fallback_as_issue: false });
+    const result = await handler({ title: "Data refresh PR", body: "Daily update", branch: "data/refresh" }, {});
+
+    expect(result.success).toBe(false);
+    expect(result.error).toContain("E003");
+
+    // No fallback issue should have been created
+    expect(global.github.rest.issues.create).not.toHaveBeenCalled();
+  });
+
+  it("should pass when max_patch_files is raised above the file count", async () => {
+    const patchPath = canonicalPatchPath("data/refresh");
+    fs.writeFileSync(patchPath, buildOversizedPatch(150));
+
+    const { main } = require("./create_pull_request.cjs");
+    const handler = await main({ max_patch_files: 200 });
+    const result = await handler({ title: "Data refresh PR", body: "Daily update", branch: "data/refresh" }, {});
+
+    // Should succeed — limit was raised
+    expect(result.success).toBe(true);
+    expect(result.fallback_used).toBeUndefined();
+    expect(global.github.rest.pulls.create).toHaveBeenCalledTimes(1);
+    expect(global.github.rest.issues.create).not.toHaveBeenCalled();
   });
 });

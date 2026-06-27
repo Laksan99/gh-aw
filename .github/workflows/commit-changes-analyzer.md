@@ -1,4 +1,6 @@
 ---
+private: true
+emoji: "📊"
 name: Commit Changes Analyzer
 description: Analyzes and provides a comprehensive developer-focused report of all changes in the repository since a specified commit
 on:
@@ -8,13 +10,18 @@ on:
         description: 'GitHub commit URL to analyze changes since (e.g., https://github.com/owner/repo/commit/abc123)'
         required: true
         type: string
+max-daily-ai-credits: 10000
 permissions:
   contents: read
   issues: read
   pull-requests: read
+max-turns: 100
 engine:
-  id: claude
-  max-turns: 100
+  id: pi
+  model: copilot/gpt-5.4
+sandbox:
+  agent:
+    sudo: false
 tools:
   cli-proxy: true
   github:
@@ -33,7 +40,9 @@ imports:
   - shared/reporting.md
 
 
-  - shared/observability-otlp.md
+  - shared/otlp.md
+features:
+  gh-aw-detection: true
 ---
 
 # Commit Changes Analyzer

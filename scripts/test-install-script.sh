@@ -210,7 +210,7 @@ else
 fi
 
 # Check for exponential backoff
-if grep -q "RETRY_DELAY=\$((RETRY_DELAY \* 2))" "$PROJECT_ROOT/install-gh-aw.sh"; then
+if grep -q "RETRY_DELAY=\$((RETRY_DELAY \* 2))" "$PROJECT_ROOT/install-gh-aw.sh" || grep -q "delay=\$((delay \* 2))" "$PROJECT_ROOT/install-gh-aw.sh"; then
     echo "  ✓ PASS: Exponential backoff implemented"
 else
     echo "  ✗ FAIL: Exponential backoff not found"
@@ -311,6 +311,35 @@ if grep -q "Validating release.*exists" "$PROJECT_ROOT/install-gh-aw.sh"; then
     exit 1
 else
     echo "  ✓ PASS: Version validation logic removed"
+fi
+
+# Test 11: Verify latest download fallback functionality
+echo ""
+echo "Test 11: Verify latest download fallback functionality"
+
+if grep -q "FALLBACK_DOWNLOAD_URL" "$PROJECT_ROOT/install-gh-aw.sh"; then
+    echo "  ✓ PASS: Fallback download URL logic exists"
+else
+    echo "  ✗ FAIL: Fallback download URL logic not found"
+    exit 1
+fi
+
+if grep -q "api.github.com/repos/\$REPO/releases/latest" "$PROJECT_ROOT/install-gh-aw.sh"; then
+    echo "  ✓ PASS: Latest release tag fallback lookup exists"
+else
+    echo "  ✗ FAIL: Latest release tag fallback lookup not found"
+    exit 1
+fi
+
+# Test 12: Verify no-color gate for CI environments
+echo ""
+echo "Test 12: Verify no-color gate"
+if grep -q 'NO_COLOR+set' "$PROJECT_ROOT/install-gh-aw.sh" && \
+   grep -q 'RED=""' "$PROJECT_ROOT/install-gh-aw.sh"; then
+    echo "  ✓ PASS: No-color gate present and spec-compliant"
+else
+    echo "  ✗ FAIL: No-color gate missing or not spec-compliant"
+    exit 1
 fi
 
 echo ""

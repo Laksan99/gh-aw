@@ -212,16 +212,9 @@ func parseOptionalStringSliceField(value any, fieldName string) []string {
 	return result
 }
 
-// extractRateLimitConfig extracts the rate-limit config from frontmatter.
-// Preferred key: user-rate-limit
-// Legacy key (still accepted): rate-limit
+// extractRateLimitConfig extracts the user-rate-limit config from frontmatter.
 func (c *Compiler) extractRateLimitConfig(frontmatter map[string]any) *RateLimitConfig {
 	rateLimitValue, exists := frontmatter["user-rate-limit"]
-	legacyKey := false
-	if !exists || rateLimitValue == nil {
-		rateLimitValue, exists = frontmatter["rate-limit"]
-		legacyKey = exists && rateLimitValue != nil
-	}
 
 	if exists && rateLimitValue != nil {
 		switch v := rateLimitValue.(type) {
@@ -297,9 +290,6 @@ func (c *Compiler) extractRateLimitConfig(frontmatter map[string]any) *RateLimit
 				roleLog.Print("No ignored-roles specified, using defaults: admin, maintain, write")
 			}
 
-			if legacyKey {
-				roleLog.Print("Extracted legacy rate-limit configuration")
-			}
 			roleLog.Printf("Extracted user-rate-limit config: max=%d, window=%d, events=%v, ignored-roles=%v", config.Max, config.Window, config.Events, config.IgnoredRoles)
 			return config
 		}
@@ -600,7 +590,7 @@ func (c *Compiler) extractSkipAuthorAssociations(frontmatter map[string]any) map
 		normalizedAssociations := make([]string, 0, len(associations))
 		for _, association := range associations {
 			normalized := strings.ToUpper(strings.TrimSpace(association))
-			if normalized != "" {
+			if normalized != "" { //nolint:tolowerequalfold
 				normalizedAssociations = append(normalizedAssociations, normalized)
 			}
 		}
@@ -633,29 +623,29 @@ func (c *Compiler) extractAllowBotAuthoredTriggerComment(frontmatter map[string]
 	return false
 }
 
-// mergeStringSlicesDedup merges two string slices with deduplication (preserving order of first occurrence).
-// Logs the merged result under the given logLabel when the result is non-empty.
-func mergeStringSlicesDedup(top, imported []string, logLabel string) []string {
-	result := sliceutil.Deduplicate(append(top, imported...))
+// mergeUniqueLogged merges top-level and imported string slices using a union (deduplication preserving
+// order), logging the result at debug level under the given label.
+func mergeUniqueLogged(label string, top []string, imported []string) []string {
+	result := sliceutil.MergeUnique(top, imported...)
 	if len(result) > 0 {
-		roleLog.Printf("Merged %s: %v (top=%d, imported=%d, total=%d)", logLabel, result, len(top), len(imported), len(result))
+		roleLog.Printf("Merged %s: %v (top=%d, imported=%d, total=%d)", label, result, len(top), len(imported), len(result))
 	}
 	return result
 }
 
 // mergeSkipRoles merges top-level skip-roles with imported skip-roles (union)
-func (c *Compiler) mergeSkipRoles(topSkipRoles []string, importedSkipRoles []string) []string {
-	return mergeStringSlicesDedup(topSkipRoles, importedSkipRoles, "skip-roles")
+func mergeSkipRoles(topSkipRoles []string, importedSkipRoles []string) []string {
+	return mergeUniqueLogged("skip-roles", topSkipRoles, importedSkipRoles)
 }
 
 // mergeSkipBots merges top-level skip-bots with imported skip-bots (union)
-func (c *Compiler) mergeSkipBots(topSkipBots []string, importedSkipBots []string) []string {
-	return mergeStringSlicesDedup(topSkipBots, importedSkipBots, "skip-bots")
+func mergeSkipBots(topSkipBots []string, importedSkipBots []string) []string {
+	return mergeUniqueLogged("skip-bots", topSkipBots, importedSkipBots)
 }
 
 // mergeBots merges top-level bots with imported bots (union)
-func (c *Compiler) mergeBots(topBots []string, importedBots []string) []string {
-	return mergeStringSlicesDedup(topBots, importedBots, "bots")
+func mergeBots(topBots []string, importedBots []string) []string {
+	return mergeUniqueLogged("bots", topBots, importedBots)
 }
 
 // extractActivationGitHubToken extracts the 'github-token' field from the 'on:' section of frontmatter.

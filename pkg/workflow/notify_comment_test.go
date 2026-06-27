@@ -213,16 +213,16 @@ func TestConclusionJob(t *testing.T) {
 				}
 
 				// Check permissions based on what safe-outputs are configured
-				// When add-comment is configured, it requires issues and discussions permissions
+				// When add-comment is configured by default, it requires issues permission
 				// (PR comments are issue comments, so only issues: write is needed, not pull-requests: write)
 				// When only missing_tool/noop is configured, minimal permissions are needed
 				if tt.addCommentConfig {
-					// add-comment requires issues and discussions write permissions
+					// add-comment requires issues write permission by default
 					if !strings.Contains(job.Permissions, "issues: write") {
 						t.Error("Expected 'issues: write' permission when add-comment is configured")
 					}
-					if !strings.Contains(job.Permissions, "discussions: write") {
-						t.Error("Expected 'discussions: write' permission when add-comment is configured")
+					if strings.Contains(job.Permissions, "discussions: write") {
+						t.Error("Did not expect 'discussions: write' permission when add-comment is configured by default")
 					}
 				}
 				// No need to check for specific permissions when only noop/missing_tool is configured
@@ -1115,6 +1115,10 @@ func TestConclusionJobWorkflowCallArtifactPrefix(t *testing.T) {
 	if !strings.Contains(allSteps, prefixedArtifactName) {
 		t.Errorf("Expected conclusion job download step to use prefixed artifact name %q in workflow_call context, but it was not found.\nGenerated steps:\n%s", prefixedArtifactName, allSteps)
 	}
+	prefixedUsageArtifactName := "${{ needs.activation.outputs.artifact_prefix }}usage"
+	if !strings.Contains(allSteps, prefixedUsageArtifactName) {
+		t.Errorf("Expected conclusion job usage artifact upload to use prefixed artifact name %q in workflow_call context, but it was not found.\nGenerated steps:\n%s", prefixedUsageArtifactName, allSteps)
+	}
 
 	// Ensure the unprefixed artifact name is not used
 	if strings.Contains(allSteps, "name: agent\n") {
@@ -1148,5 +1152,164 @@ func TestConclusionJobNonWorkflowCallNoArtifactPrefix(t *testing.T) {
 	// In non-workflow_call context, the artifact download should use the plain (unprefixed) name.
 	if strings.Contains(allSteps, "needs.activation.outputs.artifact_prefix") {
 		t.Errorf("Expected conclusion job NOT to use artifact_prefix in non-workflow_call context.\nGenerated steps:\n%s", allSteps)
+	}
+	if !strings.Contains(allSteps, "name: usage") {
+		t.Errorf("Expected conclusion job to upload unprefixed usage artifact name in non-workflow_call context.\nGenerated steps:\n%s", allSteps)
+	}
+}
+
+// TestConclusionJobCategoriesFilterQuoting verifies that category names containing
+// special characters (particularly single quotes) are safely embedded as double-quoted
+// YAML scalars, preventing YAML injection via the GH_AW_FAILURE_CATEGORIES_FILTER and
+// GH_AW_FAILURE_EXCLUDED_CATEGORIES_FILTER env vars.
+func TestConclusionJobCategoriesFilterQuoting(t *testing.T) {
+	t.Run("included categories with single quote", func(t *testing.T) {
+		compiler := NewCompiler()
+		workflowData := &WorkflowData{
+			Name: "Test Workflow",
+			SafeOutputs: &SafeOutputsConfig{
+				NoOp:                           &NoOpConfig{},
+				ReportFailureAsIssue:           true,
+				ReportFailureAsIssueCategories: []string{"it's-a-category", "normal-category"},
+			},
+		}
+
+		job, err := compiler.buildConclusionJob(workflowData, string(constants.AgentJobName), []string{})
+		if err != nil {
+			t.Fatalf("Failed to build conclusion job: %v", err)
+		}
+		if job == nil {
+			t.Fatal("Expected conclusion job to be created")
+		}
+
+		jobYAML := strings.Join(job.Steps, "")
+		// Must use double-quoted YAML scalar (produced by %q), not single-quoted
+		if !strings.Contains(jobYAML, `GH_AW_FAILURE_CATEGORIES_FILTER: "[\"it's-a-category\",\"normal-category\"]"`) {
+			t.Errorf("Expected GH_AW_FAILURE_CATEGORIES_FILTER to be a safe double-quoted YAML scalar.\nGenerated YAML:\n%s", jobYAML)
+		}
+		if strings.Contains(jobYAML, "GH_AW_FAILURE_CATEGORIES_FILTER: '") {
+			t.Error("GH_AW_FAILURE_CATEGORIES_FILTER must not use single-quoted YAML scalar (injection risk)")
+		}
+	})
+
+	t.Run("excluded categories with single quote", func(t *testing.T) {
+		compiler := NewCompiler()
+		workflowData := &WorkflowData{
+			Name: "Test Workflow",
+			SafeOutputs: &SafeOutputsConfig{
+				NoOp:                                   &NoOpConfig{},
+				ReportFailureAsIssue:                   true,
+				ReportFailureAsIssueExcludedCategories: []string{"it's-excluded", "other-excluded"},
+			},
+		}
+
+		job, err := compiler.buildConclusionJob(workflowData, string(constants.AgentJobName), []string{})
+		if err != nil {
+			t.Fatalf("Failed to build conclusion job: %v", err)
+		}
+		if job == nil {
+			t.Fatal("Expected conclusion job to be created")
+		}
+
+		jobYAML := strings.Join(job.Steps, "")
+		// Must use double-quoted YAML scalar (produced by %q), not single-quoted
+		if !strings.Contains(jobYAML, `GH_AW_FAILURE_EXCLUDED_CATEGORIES_FILTER: "[\"it's-excluded\",\"other-excluded\"]"`) {
+			t.Errorf("Expected GH_AW_FAILURE_EXCLUDED_CATEGORIES_FILTER to be a safe double-quoted YAML scalar.\nGenerated YAML:\n%s", jobYAML)
+		}
+		if strings.Contains(jobYAML, "GH_AW_FAILURE_EXCLUDED_CATEGORIES_FILTER: '") {
+			t.Error("GH_AW_FAILURE_EXCLUDED_CATEGORIES_FILTER must not use single-quoted YAML scalar (injection risk)")
+		}
+	})
+}
+
+func TestConclusionJobIncludesUsageArtifactSteps(t *testing.T) {
+	compiler := NewCompiler()
+	workflowData := &WorkflowData{
+		Name: "Test Workflow",
+		On:   "issues",
+		SafeOutputs: &SafeOutputsConfig{
+			NoOp: &NoOpConfig{},
+		},
+	}
+
+	job, err := compiler.buildConclusionJob(workflowData, string(constants.AgentJobName), []string{})
+	if err != nil {
+		t.Fatalf("Failed to build conclusion job: %v", err)
+	}
+	if job == nil {
+		t.Fatal("Expected conclusion job to be created")
+	}
+
+	allSteps := strings.Join(job.Steps, "\n")
+	if !strings.Contains(allSteps, "Collect usage artifact files") {
+		t.Errorf("Expected conclusion job to collect usage artifact files.\nGenerated steps:\n%s", allSteps)
+	}
+	if !strings.Contains(allSteps, "Upload usage artifact") {
+		t.Errorf("Expected conclusion job to upload usage artifact.\nGenerated steps:\n%s", allSteps)
+	}
+	if !strings.Contains(allSteps, "/tmp/gh-aw/usage/aw_info.json") {
+		t.Errorf("Expected usage artifact to include aw_info.json path.\nGenerated steps:\n%s", allSteps)
+	}
+	if !strings.Contains(allSteps, "cp /tmp/gh-aw/aw_info.json /tmp/gh-aw/usage/aw_info.json") {
+		t.Errorf("Expected usage artifact collection to include aw_info.json copy command.\nGenerated steps:\n%s", allSteps)
+	}
+	if !strings.Contains(allSteps, "/tmp/gh-aw/usage/aw-info.jsonl") {
+		t.Errorf("Expected usage artifact to include aw-info.jsonl path.\nGenerated steps:\n%s", allSteps)
+	}
+	if !strings.Contains(allSteps, "/tmp/gh-aw/usage/agent_usage.jsonl") {
+		t.Errorf("Expected usage artifact to include agent_usage.jsonl path.\nGenerated steps:\n%s", allSteps)
+	}
+	if !strings.Contains(allSteps, "/tmp/gh-aw/usage/agent_usage.json") {
+		t.Errorf("Expected usage artifact to include agent_usage.json path.\nGenerated steps:\n%s", allSteps)
+	}
+	if !strings.Contains(allSteps, "cp /tmp/gh-aw/agent_usage.json /tmp/gh-aw/usage/agent_usage.json") {
+		t.Errorf("Expected usage artifact collection to copy agent_usage.json.\nGenerated steps:\n%s", allSteps)
+	}
+	if !strings.Contains(allSteps, "/tmp/gh-aw/usage/detection_usage.jsonl") {
+		t.Errorf("Expected usage artifact to include detection_usage.jsonl path.\nGenerated steps:\n%s", allSteps)
+	}
+	if !strings.Contains(allSteps, "/tmp/gh-aw/usage/github_rate_limits.jsonl") {
+		t.Errorf("Expected usage artifact to include GitHub API rate limit usage path.\nGenerated steps:\n%s", allSteps)
+	}
+	if !strings.Contains(allSteps, "/tmp/gh-aw/usage/agent/token_usage.jsonl") {
+		t.Errorf("Expected usage artifact to include agent token usage path.\nGenerated steps:\n%s", allSteps)
+	}
+	if !strings.Contains(allSteps, "/tmp/gh-aw/sandbox/firewall/audit/api-proxy-logs/token-usage.jsonl") {
+		t.Errorf("Expected usage artifact collection to include firewall audit token usage path for agent.\nGenerated steps:\n%s", allSteps)
+	}
+	// Verify non-empty check (-s) is used for token-usage copies so empty stub files from
+	// AWF's audit dir cannot zero out valid data written by the primary proxy-logs dir.
+	if !strings.Contains(allSteps, "[ -s /tmp/gh-aw/sandbox/firewall/logs/api-proxy-logs/token-usage.jsonl ]") {
+		t.Errorf("Expected usage artifact collection to use non-empty (-s) check for firewall/logs token-usage copy.\nGenerated steps:\n%s", allSteps)
+	}
+	if !strings.Contains(allSteps, "[ -s /tmp/gh-aw/sandbox/firewall/audit/api-proxy-logs/token-usage.jsonl ]") {
+		t.Errorf("Expected usage artifact collection to use non-empty (-s) check for firewall/audit token-usage copy.\nGenerated steps:\n%s", allSteps)
+	}
+	// Verify firewall/logs/ copy appears after firewall/audit/ copy so it wins (last non-empty wins).
+	logsIdx := strings.Index(allSteps, "[ -s /tmp/gh-aw/sandbox/firewall/logs/api-proxy-logs/token-usage.jsonl ]")
+	auditIdx := strings.Index(allSteps, "[ -s /tmp/gh-aw/sandbox/firewall/audit/api-proxy-logs/token-usage.jsonl ]")
+	if logsIdx > 0 && auditIdx > 0 && logsIdx <= auditIdx {
+		t.Errorf("Expected firewall/logs token-usage copy to appear AFTER firewall/audit copy (logs = higher priority).\nGenerated steps:\n%s", allSteps)
+	}
+	if !strings.Contains(allSteps, "/tmp/gh-aw/usage/detection/token_usage.jsonl") {
+		t.Errorf("Expected usage artifact to include detection token usage path.\nGenerated steps:\n%s", allSteps)
+	}
+	if !strings.Contains(allSteps, "/tmp/gh-aw/threat-detection/sandbox/firewall/audit/api-proxy-logs/token-usage.jsonl") {
+		t.Errorf("Expected usage artifact collection to include firewall audit token usage path for detection.\nGenerated steps:\n%s", allSteps)
+	}
+	if !strings.Contains(allSteps, "Usage artifact source file status:") {
+		t.Errorf("Expected usage artifact collection to log source file status for diagnostics.\nGenerated steps:\n%s", allSteps)
+	}
+	if !strings.Contains(allSteps, ": > /tmp/gh-aw/usage/agent/token_usage.jsonl") {
+		t.Errorf("Expected usage artifact collection to ensure agent token usage file exists.\nGenerated steps:\n%s", allSteps)
+	}
+	if !strings.Contains(allSteps, ": > /tmp/gh-aw/usage/detection/token_usage.jsonl") {
+		t.Errorf("Expected usage artifact collection to ensure detection token usage file exists.\nGenerated steps:\n%s", allSteps)
+	}
+	if !strings.Contains(allSteps, "generate_usage_activity_summary.cjs") {
+		t.Errorf("Expected usage artifact collection to generate activity summary aggregates.\nGenerated steps:\n%s", allSteps)
+	}
+	if !strings.Contains(allSteps, "/tmp/gh-aw/usage/activity/summary.json") {
+		t.Errorf("Expected usage artifact to include activity summary path.\nGenerated steps:\n%s", allSteps)
 	}
 }

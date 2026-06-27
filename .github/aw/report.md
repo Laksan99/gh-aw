@@ -4,9 +4,9 @@ description: Guidelines for creating agentic workflows that generate reports —
 
 # Report Generation
 
-Consult this file when creating an agentic workflow that generates reports — recurring status updates, audits, analysis summaries, or any structured output posted as a GitHub issue, discussion, or comment.
+For workflows that generate reports — status updates, audits, summaries — posted as GitHub issues, discussions, or comments.
 
-## Choosing the Right Output Type
+## Choosing the Output Type
 
 | Use case | Recommended output |
 |---|---|
@@ -14,18 +14,24 @@ Consult this file when creating an agentic workflow that generates reports — r
 | Inline update on an existing issue or PR | `add-comment` with `hide-older-comments` |
 | Discussion-based report (only when explicitly requested) | `create-discussion` with `close-older-discussions` |
 
-Use `create-issue` by default for reports — issues are familiar, searchable, and support the full close/expire cleanup mechanism. Only use `create-discussion` when the user explicitly asks for it.
+Default to `create-issue` — searchable, supports close/expire cleanup. Use `create-discussion` only when explicitly requested.
+
+### PM/Stakeholder Digests
+
+- `create-issue` for operational reports (backlog follow-ups, ownership tracking, recurring status).
+- `create-discussion` only when the requester explicitly wants threaded collaboration / async feedback.
+- If unclear, default to `create-issue`.
 
 ## Automatic Cleanup
 
-Reports accumulate over time. Always configure automatic cleanup when the workflow runs on a schedule or recurs.
+Configure cleanup for scheduled or recurring reports.
 
-- **`expires`**: Auto-closes the issue or discussion after a time period (e.g. `7` days, `2w`, `1m`). Use when reports become stale after a fixed window.
-- **`close-older-issues: true`**: Closes previous issues from the same workflow before creating a new one. Requires `title-prefix` or `labels` to identify matching issues.
-- **`close-older-discussions: true`**: Closes older discussions with the same title prefix or labels as "OUTDATED". Requires `title-prefix` or `labels`.
-- **`hide-older-comments: true`**: Minimizes previous comments from the same workflow before posting a new one. Useful for rolling status updates on the same issue or PR.
+- **`expires`** — auto-close after a window (e.g. `7`, `2w`, `1m`).
+- **`close-older-issues: true`** — close previous issues from the same workflow. Requires `title-prefix` or `labels`.
+- **`close-older-discussions: true`** — close older matching discussions as "OUTDATED". Requires `title-prefix` or `labels`.
+- **`hide-older-comments: true`** — minimize previous comments. Useful for rolling status updates.
 
-**Default recommendation for recurring reports:** use `create-issue` with `close-older-issues: true` and a stable `title-prefix` so only the latest report is active.
+**Recommended for recurring reports**: `create-issue` with `close-older-issues: true` and a stable `title-prefix`.
 
 ```yaml
 safe-outputs:
@@ -35,6 +41,25 @@ safe-outputs:
     close-older-issues: true
     expires: 30
 ```
+
+## Scheduled Report Window Scoping
+
+Always define the report window explicitly in the prompt so runs are deterministic and comparable.
+
+Good window examples:
+
+- `last 24 full hours ending at workflow start (UTC)`
+- `last 7 full days ending at workflow start (UTC)`
+- `since previous successful run timestamp`
+- `current calendar week to date (UTC, Monday 00:00 to now)`
+
+When choosing a strategy: use fixed durations for stable trend comparisons, run-based windows for continuous monitoring workflows, and calendar windows for stakeholder/business reporting.
+
+Window + no-op expectation:
+
+- call `noop` when the selected window has no qualifying updates to report
+- state the evaluated window in the no-op message for transparency
+- example (replace placeholders with computed values): `noop("No updates in last 24 full hours ({{window_start_utc}} to {{window_end_utc}})")`
 
 ## Report Style and Structure
 
@@ -46,19 +71,22 @@ safe-outputs:
 
 ### Progressive Disclosure
 
-Wrap detailed content in `<details><summary>Section Name</summary>` tags. Use for:
-- Verbose details (full logs, raw data)
-- Secondary information (minor warnings, extra context)
-- Per-item breakdowns when there are many items
+Wrap detail content in `<details><summary>Section Name</summary>`. Use for verbose logs/raw data, secondary info, per-item breakdowns. Keep summary, critical issues, and key metrics visible.
 
-Keep critical information visible (summary, critical issues, key metrics).
+### Alerts Instead of Emojis
 
-### Report Structure Pattern
+- `> [!NOTE]` — neutral status
+- `> [!WARNING]` — warnings
+- `> [!CAUTION]` — high-risk or blocking
 
-1. **Overview**: 1–2 paragraphs summarizing key findings
-2. **Critical Information**: Show immediately (summary stats, critical issues)
-3. **Details**: Use `<details><summary>Section Name</summary>` for expanded content
-4. **Context**: Add helpful metadata (workflow run, date, trigger)
+Do not use emoji severity markers (`✅`, `⚠️`, `❌`, `🧪`).
+
+### Structure Pattern
+
+1. **Overview** — 1–2 paragraphs of key findings
+2. **Critical info** — summary stats, critical issues (always visible)
+3. **Details** — `<details><summary>...</summary>` for expanded content
+4. **Context** — workflow run, date, trigger
 
 ### Example Report Structure
 
@@ -66,7 +94,9 @@ Keep critical information visible (summary, critical issues, key metrics).
 ### Summary
 - Key metric 1: value
 - Key metric 2: value
-- Status: ✅/⚠️/❌
+
+> [!WARNING]
+> Status: degradation detected in one or more checks.
 
 ### Critical Issues
 [Always visible - these are important]
@@ -97,13 +127,11 @@ Keep critical information visible (summary, critical issues, key metrics).
 
 ## Avoiding Mentions and Backlinks
 
-Reports often reference issues, PRs, or users. Without filtering, `@username` sends a notification and `#123` creates a cross-reference backlink on that issue or PR — adding noise every time the report runs.
+Without filtering, `@username` notifies users and `#123` creates cross-reference backlinks — noise every run.
 
-Use the built-in safe-outputs filtering options to suppress this automatically:
-
-- **`mentions: false`** — escapes all `@mentions` in AI-generated output so no notifications are sent.
-- **`allowed-github-references: []`** — escapes all `#123` / `owner/repo#123` references so no backlinks are created on referenced items.
-- **`max-bot-mentions: 0`** — neutralizes bot-trigger phrases such as `fixes #123` or `closes #456` that would otherwise close referenced issues.
+- **`mentions: false`** — escapes all `@mentions`, no notifications.
+- **`allowed-github-references: []`** — escapes `#123` / `owner/repo#123`, no backlinks.
+- **`max-bot-mentions: 0`** — neutralizes bot-trigger phrases like `fixes #123` / `closes #456`.
 
 ```yaml
 safe-outputs:
@@ -117,4 +145,4 @@ safe-outputs:
     expires: 30
 ```
 
-These options apply globally to all safe-output types (issues, comments, discussions) and are the recommended way to keep reports from polluting unrelated items.
+Applies globally to all safe-output types (issues, comments, discussions).

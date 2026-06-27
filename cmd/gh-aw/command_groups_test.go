@@ -23,6 +23,7 @@ func TestCommandGroupAssignments(t *testing.T) {
 		{name: "add-wizard command in setup group", commandName: "add-wizard", expectedGroup: "setup", shouldHaveGroup: true},
 		{name: "remove command in setup group", commandName: "remove", expectedGroup: "setup", shouldHaveGroup: true},
 		{name: "update command in setup group", commandName: "update", expectedGroup: "setup", shouldHaveGroup: true},
+		{name: "deploy command in setup group", commandName: "deploy", expectedGroup: "setup", shouldHaveGroup: true},
 		{name: "upgrade command in setup group", commandName: "upgrade", expectedGroup: "setup", shouldHaveGroup: true},
 		{name: "secrets command in setup group", commandName: "secrets", expectedGroup: "setup", shouldHaveGroup: true},
 
@@ -45,7 +46,11 @@ func TestCommandGroupAssignments(t *testing.T) {
 		{name: "status command in analysis group", commandName: "status", expectedGroup: "analysis", shouldHaveGroup: true},
 		{name: "list command in analysis group", commandName: "list", expectedGroup: "analysis", shouldHaveGroup: true},
 		{name: "health command in analysis group", commandName: "health", expectedGroup: "analysis", shouldHaveGroup: true},
+		{name: "outcomes command in analysis group", commandName: "outcomes", expectedGroup: "analysis", shouldHaveGroup: true},
 		{name: "checks command in analysis group", commandName: "checks", expectedGroup: "analysis", shouldHaveGroup: true},
+		// Hidden commands should still be grouped so they appear in the correct
+		// section when explicitly shown (for example in full help/test contexts).
+		{name: "view command in analysis group", commandName: "view", expectedGroup: "analysis", shouldHaveGroup: true},
 		{name: "experiments command in analysis group", commandName: "experiments", expectedGroup: "analysis", shouldHaveGroup: true},
 
 		// Utilities
@@ -127,7 +132,7 @@ func TestCommandGroupsExist(t *testing.T) {
 // are not appearing in the "Additional Commands" section
 func TestNoCommandsInAdditionalCommandsWithGroups(t *testing.T) {
 	// Commands that should NOT be in Additional Commands (should have groups)
-	commandsShouldHaveGroups := []string{"remove", "update", "trial", "mcp-server", "pr"}
+	commandsShouldHaveGroups := []string{"remove", "update", "deploy", "trial", "mcp-server", "pr"}
 
 	for _, cmdName := range commandsShouldHaveGroups {
 		t.Run("command "+cmdName+" has group", func(t *testing.T) {

@@ -6,16 +6,30 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"sort"
 	"strings"
 
 	"github.com/github/gh-aw/pkg/constants"
+	"github.com/github/gh-aw/pkg/setutil"
 
 	"github.com/github/gh-aw/pkg/console"
 	"github.com/github/gh-aw/pkg/logger"
 )
 
 var generateActionMetadataLog = logger.New("cli:generate_action_metadata")
+
+// jsdocDescriptionPattern matches a JSDoc block comment description line
+var jsdocDescriptionPattern = regexp.MustCompile(`/\*\*\s*\n\s*\*\s*([^\n]+)`)
+
+// coreGetInputPattern matches core.getInput('name') or core.getInput("name") calls
+var coreGetInputPattern = regexp.MustCompile(`core\.getInput\(['"]([^'"]+)['"]\)`)
+
+// coreSetOutputPattern matches core.setOutput('name', ...) or core.setOutput("name", ...) calls
+var coreSetOutputPattern = regexp.MustCompile(`core\.setOutput\(['"]([^'"]+)['"]`)
+
+// requireCJSPattern matches require('./filename.cjs') or require("./filename.cjs") calls
+var requireCJSPattern = regexp.MustCompile(`require\(['"]\.\/([^'"]+\.cjs)['"]\)`)
 
 // ActionMetadata represents metadata extracted from a JavaScript file
 type ActionMetadata struct {
@@ -179,8 +193,7 @@ func extractActionMetadata(filename, content string) (*ActionMetadata, error) {
 // extractDescription extracts description from JSDoc comment
 func extractDescription(content string) string {
 	// Look for JSDoc block comment at the start of main() or file
-	jsdocRegex := regexp.MustCompile(`/\*\*\s*\n\s*\*\s*([^\n]+)`)
-	matches := jsdocRegex.FindStringSubmatch(content)
+	matches := jsdocDescriptionPattern.FindStringSubmatch(content)
 	if len(matches) > 1 {
 		return strings.TrimSpace(matches[1])
 	}
@@ -202,30 +215,38 @@ func generateHumanReadableName(actionName string) string {
 // extractInputs extracts input parameters from core.getInput() calls
 func extractInputs(content string) []ActionInput {
 	var inputs []ActionInput
-	seen := make(map[string]bool)
+	seen := make(map[string]struct {
+	})
 
 	// Match core.getInput('name') or core.getInput("name")
-	inputRegex := regexp.MustCompile(`core\.getInput\(['"]([^'"]+)['"]\)`)
-	matches := inputRegex.FindAllStringSubmatch(content, -1)
+	matches := coreGetInputPattern.FindAllStringSubmatch(content, -1)
 
 	for _, match := range matches {
 		if len(match) > 1 {
 			inputName := match[1]
-			if !seen[inputName] {
+			if !setutil.Contains(seen, inputName) {
 				inputs = append(inputs, ActionInput{
 					Name:        inputName,
 					Description: "Input parameter: " + inputName,
 					Required:    false,
 					Default:     "",
 				})
-				seen[inputName] = true
+				seen[inputName] = struct {
+				}{}
 			}
 		}
 	}
 
 	// Sort inputs by name for consistency
-	sort.Slice(inputs, func(i, j int) bool {
-		return inputs[i].Name < inputs[j].Name
+	slices.SortFunc(inputs, func(a, b ActionInput) int {
+		switch {
+		case a.Name < b.Name:
+			return -1
+		case a.Name > b.Name:
+			return 1
+		default:
+			return 0
+		}
 	})
 
 	return inputs
@@ -234,28 +255,36 @@ func extractInputs(content string) []ActionInput {
 // extractOutputs extracts output parameters from core.setOutput() calls
 func extractOutputs(content string) []ActionOutput {
 	var outputs []ActionOutput
-	seen := make(map[string]bool)
+	seen := make(map[string]struct {
+	})
 
 	// Match core.setOutput('name', ...) or core.setOutput("name", ...)
-	outputRegex := regexp.MustCompile(`core\.setOutput\(['"]([^'"]+)['"]`)
-	matches := outputRegex.FindAllStringSubmatch(content, -1)
+	matches := coreSetOutputPattern.FindAllStringSubmatch(content, -1)
 
 	for _, match := range matches {
 		if len(match) > 1 {
 			outputName := match[1]
-			if !seen[outputName] {
+			if !setutil.Contains(seen, outputName) {
 				outputs = append(outputs, ActionOutput{
 					Name:        outputName,
 					Description: "Output parameter: " + outputName,
 				})
-				seen[outputName] = true
+				seen[outputName] = struct {
+				}{}
 			}
 		}
 	}
 
 	// Sort outputs by name for consistency
-	sort.Slice(outputs, func(i, j int) bool {
-		return outputs[i].Name < outputs[j].Name
+	slices.SortFunc(outputs, func(a, b ActionOutput) int {
+		switch {
+		case a.Name < b.Name:
+			return -1
+		case a.Name > b.Name:
+			return 1
+		default:
+			return 0
+		}
 	})
 
 	return outputs
@@ -264,18 +293,19 @@ func extractOutputs(content string) []ActionOutput {
 // extractDependencies extracts require() dependencies
 func extractDependencies(content string) []string {
 	var deps []string
-	seen := make(map[string]bool)
+	seen := make(map[string]struct {
+	})
 
 	// Match require('./filename.cjs') or require("./filename.cjs")
-	requireRegex := regexp.MustCompile(`require\(['"]\.\/([^'"]+\.cjs)['"]\)`)
-	matches := requireRegex.FindAllStringSubmatch(content, -1)
+	matches := requireCJSPattern.FindAllStringSubmatch(content, -1)
 
 	for _, match := range matches {
 		if len(match) > 1 {
 			dep := match[1]
-			if !seen[dep] {
+			if !setutil.Contains(seen, dep) {
 				deps = append(deps, dep)
-				seen[dep] = true
+				seen[dep] = struct {
+				}{}
 			}
 		}
 	}

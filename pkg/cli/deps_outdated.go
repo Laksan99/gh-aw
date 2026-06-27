@@ -1,12 +1,13 @@
 package cli
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
 	"os"
-	"sort"
+	"slices"
 	"strings"
 	"time"
 
@@ -39,7 +40,7 @@ type ProxyInfo struct {
 }
 
 // CheckOutdatedDependencies analyzes go.mod for outdated dependencies
-func CheckOutdatedDependencies(verbose bool) ([]OutdatedDependency, error) {
+func CheckOutdatedDependencies(ctx context.Context, verbose bool) ([]OutdatedDependency, error) {
 	depsOutdatedLog.Print("Starting outdated dependency check")
 
 	// Find go.mod file
@@ -63,7 +64,7 @@ func CheckOutdatedDependencies(verbose bool) ([]OutdatedDependency, error) {
 	// Check each dependency for updates
 	var outdated []OutdatedDependency
 	for _, dep := range deps {
-		latest, age, err := getLatestVersion(dep.Path, dep.Version, verbose)
+		latest, age, err := getLatestVersion(ctx, dep.Path, dep.Version, verbose)
 		if err != nil {
 			if verbose {
 				fmt.Fprintln(os.Stderr, console.FormatWarningMessage(fmt.Sprintf("Warning: could not check %s: %v", dep.Path, err)))
@@ -100,8 +101,15 @@ func DisplayOutdatedDependencies(outdated []OutdatedDependency, totalDeps int) {
 	fmt.Fprintln(os.Stderr, "")
 
 	// Sort by module name
-	sort.Slice(outdated, func(i, j int) bool {
-		return outdated[i].Module < outdated[j].Module
+	slices.SortFunc(outdated, func(a, b OutdatedDependency) int {
+		switch {
+		case a.Module < b.Module:
+			return -1
+		case a.Module > b.Module:
+			return 1
+		default:
+			return 0
+		}
 	})
 
 	// Display table
@@ -152,14 +160,18 @@ func parseGoMod(path string) ([]DependencyInfo, error) {
 }
 
 // getLatestVersion queries the Go proxy for the latest version
-func getLatestVersion(modulePath, currentVersion string, verbose bool) (string, time.Duration, error) {
+func getLatestVersion(ctx context.Context, modulePath, currentVersion string, verbose bool) (string, time.Duration, error) {
 	depsOutdatedLog.Printf("Checking latest version for %s (current: %s)", modulePath, currentVersion)
 
 	// Query Go proxy API
 	url := fmt.Sprintf("https://proxy.golang.org/%s/@latest", modulePath)
 
 	client := &http.Client{Timeout: 5 * time.Second}
-	resp, err := client.Get(url)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return "", 0, err
+	}
+	resp, err := client.Do(req)
 	if err != nil {
 		return "", 0, err
 	}

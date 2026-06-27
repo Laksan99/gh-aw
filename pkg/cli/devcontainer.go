@@ -8,7 +8,10 @@ import (
 	"path/filepath"
 	"strings"
 
+	"github.com/github/gh-aw/pkg/console"
 	"github.com/github/gh-aw/pkg/constants"
+	"github.com/github/gh-aw/pkg/fileutil"
+	"github.com/github/gh-aw/pkg/setutil"
 
 	"github.com/github/gh-aw/pkg/gitutil"
 	"github.com/github/gh-aw/pkg/logger"
@@ -68,9 +71,8 @@ func ensureDevcontainerConfig(verbose bool, additionalRepos []string) error {
 	defaultDevcontainerPath := filepath.Join(".devcontainer", "devcontainer.json")
 	devcontainerPath := defaultDevcontainerPath
 
-	// Create .devcontainer directory if it doesn't exist
 	devcontainerDir := ".devcontainer"
-	if err := os.MkdirAll(devcontainerDir, constants.DirPermPublic); err != nil {
+	if err := fileutil.EnsureParentDir(devcontainerPath, constants.DirPermPublic); err != nil {
 		return fmt.Errorf("failed to create .devcontainer directory: %w", err)
 	}
 	devcontainerLog.Printf("Ensured directory exists: %s", devcontainerDir)
@@ -164,7 +166,7 @@ func ensureDevcontainerConfig(verbose bool, additionalRepos []string) error {
 		}
 
 		if verbose {
-			fmt.Fprintf(os.Stderr, "Updated existing devcontainer at %s\n", devcontainerPath)
+			fmt.Fprintln(os.Stderr, console.FormatSuccessMessageStderr("Updated existing devcontainer at "+devcontainerPath))
 		}
 	} else {
 		// Create new configuration
@@ -191,7 +193,7 @@ func ensureDevcontainerConfig(verbose bool, additionalRepos []string) error {
 		}
 
 		if verbose {
-			fmt.Fprintf(os.Stderr, "Created new devcontainer at %s\n", devcontainerPath)
+			fmt.Fprintln(os.Stderr, console.FormatSuccessMessageStderr("Created new devcontainer at "+devcontainerPath))
 		}
 	}
 
@@ -225,6 +227,7 @@ func buildRepositoryPermissions(repoName, owner string, additionalRepos []string
 		repoName: {
 			Permissions: map[string]string{
 				"actions":       "write",
+				"checks":        "write",
 				"contents":      "write",
 				"discussions":   "read",
 				"issues":        "read",
@@ -282,21 +285,24 @@ func buildRepositoryPermissions(repoName, owner string, additionalRepos []string
 
 // mergeExtensions adds new extensions to existing list, avoiding duplicates
 func mergeExtensions(existing, toAdd []string) []string {
-	extensionSet := make(map[string]bool)
+	extensionSet := make(map[string]struct {
+	})
 	result := make([]string, 0, len(existing)+len(toAdd))
 
 	// Add existing extensions
 	for _, ext := range existing {
-		if !extensionSet[ext] {
-			extensionSet[ext] = true
+		if !setutil.Contains(extensionSet, ext) {
+			extensionSet[ext] = struct {
+			}{}
 			result = append(result, ext)
 		}
 	}
 
 	// Add new extensions if not already present
 	for _, ext := range toAdd {
-		if !extensionSet[ext] {
-			extensionSet[ext] = true
+		if !setutil.Contains(extensionSet, ext) {
+			extensionSet[ext] = struct {
+			}{}
 			result = append(result, ext)
 		}
 	}

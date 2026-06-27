@@ -1,4 +1,5 @@
 ---
+emoji: "🔧"
 timeout-minutes: 5
 strict: true
 on:
@@ -19,7 +20,7 @@ imports:
   - shared/github-guard-policy.md
   - shared/reporting.md
 
-  - shared/observability-otlp.md
+  - shared/otlp.md
 ---
 
 # Issue Triage Agent

@@ -1,4 +1,5 @@
 ---
+emoji: "🔒"
 name: Security Compliance Campaign
 description: Fix critical vulnerabilities before audit deadline with full tracking and reporting
 timeout-minutes: 30
@@ -33,7 +34,7 @@ safe-outputs:
     group: true
 
 imports:
-  - shared/observability-otlp.md
+  - shared/otlp.md
 tools:
   cli-proxy: true
   github:
@@ -44,6 +45,9 @@ tools:
     file-glob: "security-compliance-*/**"
 
 
+sandbox:
+  agent:
+    sudo: false
 ---
 
 # Security Compliance Campaign

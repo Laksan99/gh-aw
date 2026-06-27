@@ -79,7 +79,7 @@ func realFormatEventsLine(eventType string, dataJSON string) string {
 	return `{"type":"` + eventType + `","data":` + dataJSON + `,"id":"test-id","timestamp":"2026-04-02T04:00:00.000Z"}`
 }
 
-// TestParseEventsJSONLFile verifies that parseEventsJSONLFile correctly extracts
+// TestParseEventsJSONLFile verifies that parseEventsJSONLMetrics correctly extracts
 // turns, tool calls, tool sequences, and token counts from events.jsonl using
 // the real Copilot CLI format (nested data object, tool.execution_start events).
 func TestParseEventsJSONLFile(t *testing.T) {
@@ -103,7 +103,7 @@ func TestParseEventsJSONLFile(t *testing.T) {
 				realFormatEventsLine("tool.execution_complete", `{"toolCallId":"tc2","success":true,"model":"claude-sonnet-4.6"}`) + "\n" +
 				realFormatEventsLine("user.message", `{"content":"Now verify","agentMode":"autopilot"}`) + "\n" +
 				realFormatEventsLine("tool.execution_start", `{"toolCallId":"tc3","toolName":"bash","arguments":{"command":"go test"}}`) + "\n" +
-				realFormatEventsLine("session.shutdown", `{"shutdownType":"routine","totalPremiumRequests":2,"modelMetrics":{"claude-sonnet-4.6":{"requests":{"count":14,"cost":2},"usage":{"inputTokens":799195,"outputTokens":6148,"cacheReadTokens":721116,"cacheWriteTokens":0}}}}`) + "\n",
+				realFormatEventsLine("session.shutdown", `{"shutdownType":"routine","modelMetrics":{"claude-sonnet-4.6":{"requests":{"count":14,"cost":2},"usage":{"inputTokens":799195,"outputTokens":6148,"cacheReadTokens":721116,"cacheWriteTokens":0}}}}`) + "\n",
 			wantTurns:     2,
 			wantToolCalls: []string{"bash", "read_file"},
 			wantTokens:    805343, // 799195 + 6148
@@ -113,25 +113,18 @@ func TestParseEventsJSONLFile(t *testing.T) {
 			name: "session with one turn and shutdown with modelMetrics",
 			content: realFormatEventsLine("user.message", `{"content":"Do something"}`) + "\n" +
 				realFormatEventsLine("tool.execution_start", `{"toolCallId":"tc1","toolName":"mcpscripts-gh","arguments":{}}`) + "\n" +
-				realFormatEventsLine("session.shutdown", `{"shutdownType":"routine","totalPremiumRequests":3,"modelMetrics":{"claude-haiku-4.5":{"requests":{"count":1,"cost":0},"usage":{"inputTokens":5442,"outputTokens":457,"cacheReadTokens":0,"cacheWriteTokens":0}}}}`) + "\n",
+				realFormatEventsLine("session.shutdown", `{"shutdownType":"routine","modelMetrics":{"claude-haiku-4.5":{"requests":{"count":1,"cost":0},"usage":{"inputTokens":5442,"outputTokens":457,"cacheReadTokens":0,"cacheWriteTokens":0}}}}`) + "\n",
 			wantTurns:     1,
 			wantToolCalls: []string{"mcpscripts-gh"},
 			wantTokens:    5899, // 5442 + 457
 			wantSequences: 1,
 		},
 		{
-			name: "shutdown falls back to totalPremiumRequests when modelMetrics absent",
-			content: realFormatEventsLine("user.message", `{"content":"Hello"}`) + "\n" +
-				realFormatEventsLine("session.shutdown", `{"shutdownType":"routine","totalPremiumRequests":5}`) + "\n",
-			wantTurns:  1,
-			wantTokens: 5, // falls back to totalPremiumRequests
-		},
-		{
 			name: "repeated tool calls aggregated by name",
 			content: realFormatEventsLine("user.message", `{"content":"Run tests"}`) + "\n" +
 				realFormatEventsLine("tool.execution_start", `{"toolCallId":"tc1","toolName":"bash","arguments":{}}`) + "\n" +
 				realFormatEventsLine("tool.execution_start", `{"toolCallId":"tc2","toolName":"bash","arguments":{}}`) + "\n" +
-				realFormatEventsLine("session.shutdown", `{"shutdownType":"routine","totalPremiumRequests":1,"modelMetrics":{"m":{"usage":{"inputTokens":100,"outputTokens":10}}}}`) + "\n",
+				realFormatEventsLine("session.shutdown", `{"shutdownType":"routine","modelMetrics":{"m":{"usage":{"inputTokens":100,"outputTokens":10}}}}`) + "\n",
 			wantTurns:     1,
 			wantToolCalls: []string{"bash"},
 			wantTokens:    110,
@@ -151,7 +144,7 @@ func TestParseEventsJSONLFile(t *testing.T) {
 			name: "malformed lines are skipped gracefully",
 			content: realFormatEventsLine("user.message", `{"content":"Hello"}`) + "\n" +
 				"{invalid json}\n" +
-				realFormatEventsLine("session.shutdown", `{"totalPremiumRequests":2,"modelMetrics":{"m":{"usage":{"inputTokens":100,"outputTokens":20}}}}`) + "\n",
+				realFormatEventsLine("session.shutdown", `{"modelMetrics":{"m":{"usage":{"inputTokens":100,"outputTokens":20}}}}`) + "\n",
 			wantTurns:  1,
 			wantTokens: 120,
 		},
@@ -163,7 +156,7 @@ func TestParseEventsJSONLFile(t *testing.T) {
 			eventsPath := filepath.Join(dir, "events.jsonl")
 			require.NoError(t, os.WriteFile(eventsPath, []byte(tt.content), 0644))
 
-			metrics, err := parseEventsJSONLFile(eventsPath, false)
+			metrics, err := parseEventsJSONLMetrics(eventsPath, false)
 
 			if tt.wantErr {
 				assert.Error(t, err, "expected an error")
@@ -179,12 +172,12 @@ func TestParseEventsJSONLFile(t *testing.T) {
 			}
 
 			// Verify each expected tool name appears in ToolCalls
-			toolNames := make(map[string]bool)
+			toolNames := make(map[string]struct{})
 			for _, tc := range metrics.ToolCalls {
-				toolNames[tc.Name] = true
+				toolNames[tc.Name] = struct{}{}
 			}
 			for _, expectedTool := range tt.wantToolCalls {
-				assert.True(t, toolNames[expectedTool], "tool %q should be in ToolCalls", expectedTool)
+				assert.Contains(t, toolNames, expectedTool, "tool %q should be in ToolCalls", expectedTool)
 			}
 		})
 	}
@@ -207,13 +200,13 @@ func TestParseEventsJSONLFile_RealArtifact(t *testing.T) {
 		realFormatEventsLine("tool.execution_start", `{"toolCallId":"t9","toolName":"safeoutputs-add_comment","arguments":{}}`) + "\n" +
 		realFormatEventsLine("user.message", `{"content":"second turn"}`) + "\n" +
 		realFormatEventsLine("tool.execution_start", `{"toolCallId":"t10","toolName":"bash","arguments":{}}`) + "\n" +
-		realFormatEventsLine("session.shutdown", `{"shutdownType":"routine","totalPremiumRequests":2,"modelMetrics":{"claude-sonnet-4.6":{"requests":{"count":14,"cost":2},"usage":{"inputTokens":799195,"outputTokens":6148,"cacheReadTokens":721116,"cacheWriteTokens":0}},"claude-haiku-4.5":{"requests":{"count":1,"cost":0},"usage":{"inputTokens":5442,"outputTokens":457,"cacheReadTokens":0,"cacheWriteTokens":0}}}}`) + "\n"
+		realFormatEventsLine("session.shutdown", `{"shutdownType":"routine","modelMetrics":{"claude-sonnet-4.6":{"requests":{"count":14,"cost":2},"usage":{"inputTokens":799195,"outputTokens":6148,"cacheReadTokens":721116,"cacheWriteTokens":0}},"claude-haiku-4.5":{"requests":{"count":1,"cost":0},"usage":{"inputTokens":5442,"outputTokens":457,"cacheReadTokens":0,"cacheWriteTokens":0}}}}`) + "\n"
 
 	dir := t.TempDir()
 	eventsPath := filepath.Join(dir, "events.jsonl")
 	require.NoError(t, os.WriteFile(eventsPath, []byte(content), 0644))
 
-	metrics, err := parseEventsJSONLFile(eventsPath, false)
+	metrics, err := parseEventsJSONLMetrics(eventsPath, false)
 	require.NoError(t, err, "should parse without error")
 
 	assert.Equal(t, 2, metrics.Turns, "should detect 2 turns")
@@ -251,7 +244,7 @@ func TestExtractLogMetrics_EventsJSONLPriority(t *testing.T) {
 			realFormatEventsLine("session.start", `{"sessionId":"s1","copilotVersion":"1.0.0"}`) + "\n" +
 				realFormatEventsLine("user.message", `{"content":"Do something"}`) + "\n" +
 				realFormatEventsLine("tool.execution_start", `{"toolCallId":"tc1","toolName":"bash","arguments":{}}`) + "\n" +
-				realFormatEventsLine("session.shutdown", `{"shutdownType":"routine","totalPremiumRequests":7,"modelMetrics":{"m":{"usage":{"inputTokens":100,"outputTokens":20}}}}`) + "\n"
+				realFormatEventsLine("session.shutdown", `{"shutdownType":"routine","modelMetrics":{"m":{"usage":{"inputTokens":100,"outputTokens":20}}}}`) + "\n"
 		require.NoError(t, os.WriteFile(filepath.Join(sessionDir, "events.jsonl"),
 			[]byte(eventsContent), 0644))
 
@@ -307,13 +300,13 @@ func TestParseEventsJSONLFile_TBT(t *testing.T) {
 			lineWithTimestamp("user.message", `{"content":"turn 1"}`, "2026-01-01T10:00:00Z") + "\n" +
 			lineWithTimestamp("user.message", `{"content":"turn 2"}`, "2026-01-01T10:00:30Z") + "\n" +
 			lineWithTimestamp("user.message", `{"content":"turn 3"}`, "2026-01-01T10:01:30Z") + "\n" +
-			lineWithTimestamp("session.shutdown", `{"shutdownType":"routine","totalPremiumRequests":3,"modelMetrics":{"m":{"usage":{"inputTokens":100,"outputTokens":10}}}}`, "2026-01-01T10:02:00Z") + "\n"
+			lineWithTimestamp("session.shutdown", `{"shutdownType":"routine","modelMetrics":{"m":{"usage":{"inputTokens":100,"outputTokens":10}}}}`, "2026-01-01T10:02:00Z") + "\n"
 
 		dir := t.TempDir()
 		eventsPath := filepath.Join(dir, "events.jsonl")
 		require.NoError(t, os.WriteFile(eventsPath, []byte(content), 0644))
 
-		metrics, err := parseEventsJSONLFile(eventsPath, false)
+		metrics, err := parseEventsJSONLMetrics(eventsPath, false)
 		require.NoError(t, err, "should parse without error")
 
 		assert.Equal(t, 3, metrics.Turns, "should detect 3 turns")
@@ -323,13 +316,13 @@ func TestParseEventsJSONLFile_TBT(t *testing.T) {
 
 	t.Run("no TBT when only one turn", func(t *testing.T) {
 		content := lineWithTimestamp("user.message", `{"content":"single turn"}`, "2026-01-01T10:00:00Z") + "\n" +
-			lineWithTimestamp("session.shutdown", `{"shutdownType":"routine","totalPremiumRequests":1,"modelMetrics":{"m":{"usage":{"inputTokens":50,"outputTokens":5}}}}`, "2026-01-01T10:01:00Z") + "\n"
+			lineWithTimestamp("session.shutdown", `{"shutdownType":"routine","modelMetrics":{"m":{"usage":{"inputTokens":50,"outputTokens":5}}}}`, "2026-01-01T10:01:00Z") + "\n"
 
 		dir := t.TempDir()
 		eventsPath := filepath.Join(dir, "events.jsonl")
 		require.NoError(t, os.WriteFile(eventsPath, []byte(content), 0644))
 
-		metrics, err := parseEventsJSONLFile(eventsPath, false)
+		metrics, err := parseEventsJSONLMetrics(eventsPath, false)
 		require.NoError(t, err, "should parse without error")
 
 		assert.Equal(t, 1, metrics.Turns, "should detect 1 turn")
@@ -341,13 +334,13 @@ func TestParseEventsJSONLFile_TBT(t *testing.T) {
 		// Use realFormatEventsLine which always uses the same timestamp — no intervals.
 		content := realFormatEventsLine("user.message", `{"content":"turn 1"}`) + "\n" +
 			realFormatEventsLine("user.message", `{"content":"turn 2"}`) + "\n" +
-			realFormatEventsLine("session.shutdown", `{"shutdownType":"routine","totalPremiumRequests":2,"modelMetrics":{"m":{"usage":{"inputTokens":50,"outputTokens":5}}}}`) + "\n"
+			realFormatEventsLine("session.shutdown", `{"shutdownType":"routine","modelMetrics":{"m":{"usage":{"inputTokens":50,"outputTokens":5}}}}`) + "\n"
 
 		dir := t.TempDir()
 		eventsPath := filepath.Join(dir, "events.jsonl")
 		require.NoError(t, os.WriteFile(eventsPath, []byte(content), 0644))
 
-		metrics, err := parseEventsJSONLFile(eventsPath, false)
+		metrics, err := parseEventsJSONLMetrics(eventsPath, false)
 		require.NoError(t, err, "should parse without error")
 
 		assert.Equal(t, 2, metrics.Turns, "should detect 2 turns")

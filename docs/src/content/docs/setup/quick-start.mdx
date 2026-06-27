@@ -26,7 +26,7 @@ The aim here is to become familiar with **automated AI**: to install something t
 
 Before installing, ensure you have:
 
-- **AI Account** - [GitHub Copilot](https://github.com/features/copilot), [Anthropic Claude](https://www.anthropic.com/), [OpenAI Codex](https://openai.com/api/), or [Google Gemini](https://ai.google.dev/gemini-api)
+- **AI Account** - [GitHub Copilot](https://github.com/features/copilot), [Anthropic Claude](https://www.anthropic.com/), [OpenAI Codex](https://openai.com/api/), or [Google Gemini](https://ai.google.dev/gemini-api). If you already have GitHub Copilot, start there — it requires no extra account setup.
 - **GitHub Repository** - A repository where you have write access
 - **GitHub Actions** enabled - Check in [Settings → Actions](https://docs.github.com/en/repositories/managing-your-repositorys-settings-and-features/enabling-features-for-your-repository/managing-github-actions-settings-for-a-repository)
 - **GitHub CLI** (`gh`) v2.0.0+ - [Install here](https://cli.github.com). Check version: `gh --version`
@@ -62,7 +62,7 @@ From your repository root run:
 gh aw add-wizard githubnext/agentics/daily-repo-status
 ```
 
-`add-wizard` accepts workflow references in `<owner>/<repo>/<workflow-name>` format. In this example, `githubnext/agentics/daily-repo-status` points to the `daily-repo-status.md` workflow in the `githubnext/agentics` repository.
+`add-wizard` accepts workflow references in `<owner>/<repo>/<workflow-name>` format. In this example, `githubnext/agentics/daily-repo-status` references the `daily-repo-status` workflow hosted in the public [githubnext/agentics](https://github.com/githubnext/agentics) examples repository.
 
 This will take you through an interactive process to:
 
@@ -72,9 +72,11 @@ This will take you through an interactive process to:
 4. **Add the workflow** - Adds the workflow file (`.md`) and its generated GitHub Actions lock file (`.lock.yml`) to `.github/workflows/`.
 5. **Optionally trigger an initial run** - Starts the workflow immediately.
 
+The `.lock.yml` is the compiled GitHub Actions workflow generated from your markdown — it is what actually runs, and it is regenerated automatically, so you never edit it by hand. See [Lock File](/gh-aw/reference/workflow-structure/#lock-file-header) for the full explanation.
+
 > [!NOTE]
 > **Setting up `COPILOT_GITHUB_TOKEN`?**
-> 1. [Create a fine-grained PAT](https://github.com/settings/personal-access-tokens/new) under your user account.
+> 1. [Create a fine-grained Personal Access Token (PAT)](https://github.com/settings/personal-access-tokens/new) under your user account.
 > 2. Under **Permissions → Account permissions**, set **Copilot Requests** to **Read**, then generate the token.
 > 3. Add it as a repository secret from your repository root with `gh secret set COPILOT_GITHUB_TOKEN < /path/to/token.txt`, or use the GitHub UI. See [Authentication](/gh-aw/reference/auth/#copilot_github_token) for more detail.
 >
@@ -91,6 +93,13 @@ This will take you through an interactive process to:
 ### Step 3 - Wait for the workflow to complete
 
 An automated workflow run can take 2-3 minutes.
+
+To watch the run while it's in flight:
+
+- **From the browser**: open the **Actions** tab of your repository and select the most recent workflow run.
+- **From the CLI**: run `gh aw status` to list workflow state, or `gh run watch` to stream the latest run.
+
+When the run succeeds, a new issue titled with "Daily Repo Report" appears in the **Issues** tab of your repository. If the run fails, open the run from the **Actions** tab to view step logs and error output.
 
 Once your initial run is complete, a new issue will be created in your repository with a "Daily Repo Report". The report will be automatically generated and will analyze:
 
@@ -111,11 +120,6 @@ import dailyRepoReportResult from '../../../assets/daily-repo-report-result.png'
 With GitHub Agentic Workflows, you are in control! Your repository automation is fully customizable. You should shape your repo automation to match your priorities and your needs.
 
 To customize it now:
-
-> [!NOTE]
-> Workflows have two files: the `.md` file you edit and a generated `.lock.yml` file that GitHub Actions runs. `gh aw compile` regenerates the `.lock.yml` file from your markdown whenever you change the workflow configuration.
->
-> Within the `.md` file, the **frontmatter** (the configuration block between the `---` markers at the top) controls when the workflow runs, which AI engine powers it, and what tools it can access — changes here require recompiling. The **body** below contains your natural language task description and instructions — changes here take effect immediately on the next run.
 
 1. Open the workflow markdown file located at `.github/workflows/daily-repo-status.md` in your repository.
 
@@ -147,7 +151,7 @@ After waiting for the workflow to complete, check the new issue created with you
 
 ## What's next?
 
-There are hundreds of other ways to use GitHub Agentic Workflows! Explore some of these in [Peli's Agent Factory](https://github.github.com/gh-aw/blog/2026-01-12-welcome-to-pelis-agent-factory/).
+There are hundreds of other ways to use GitHub Agentic Workflows! Explore the [Agent Factory blog series](https://github.github.com/gh-aw/blog/2026-01-12-welcome-to-pelis-agent-factory/) — a 19-part tour of real-world agentic workflows authored by the gh-aw maintainers — for examples covering issue triage, releases, quality checks, and more.
 
 Continue learning with these resources:
 

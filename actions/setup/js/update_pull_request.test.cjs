@@ -20,6 +20,9 @@ const mockCore = {
 
 const mockGithub = {
   rest: {
+    issues: {
+      get: vi.fn(),
+    },
     pulls: {
       get: vi.fn(),
       update: vi.fn(),
@@ -70,6 +73,17 @@ describe("update_pull_request.cjs - executePRUpdate function", () => {
         number: 100,
         title: "Test PR",
         body: "Original body content",
+        html_url: "https://github.com/testowner/testrepo/pull/100",
+      },
+    });
+    mockGithub.rest.issues.get.mockResolvedValue({
+      data: {
+        number: 100,
+        title: "Test PR",
+        body: "Original body content",
+        state: "open",
+        labels: [],
+        assignees: [],
         html_url: "https://github.com/testowner/testrepo/pull/100",
       },
     });
@@ -802,8 +816,34 @@ describe("update_pull_request.cjs - update_branch behavior", () => {
       repo: "testrepo",
       pull_number: 100,
     });
-    expect(mockGithub.rest.pulls.get).not.toHaveBeenCalled();
+    // The handler now fetches the PR twice: once before mutation for before_state and
+    // once after updateBranch so after_state includes the real retained-update fields.
+    expect(mockGithub.rest.pulls.get).toHaveBeenCalledTimes(2);
+    expect(mockGithub.rest.pulls.get).toHaveBeenNthCalledWith(1, {
+      owner: "testowner",
+      repo: "testrepo",
+      pull_number: 100,
+    });
+    expect(mockGithub.rest.pulls.get).toHaveBeenNthCalledWith(2, {
+      owner: "testowner",
+      repo: "testrepo",
+      pull_number: 100,
+    });
     expect(mockGithub.rest.pulls.update).not.toHaveBeenCalled();
+    expect(result.before_state).toMatchObject({
+      title: "Test PR",
+      state: "",
+      base: "",
+      draft: false,
+      head_sha: "",
+    });
+    expect(result.after_state).toMatchObject({
+      title: "Test PR",
+      state: "",
+      base: "",
+      draft: false,
+      head_sha: "",
+    });
   });
 
   it("should call updateBranch before pulls.update when update_branch and title update are both requested", async () => {
@@ -846,5 +886,59 @@ describe("update_pull_request.cjs - update_branch behavior", () => {
     expect(result.error).toContain("update pull request #100 branch from base failed");
     expect(mockGithub.rest.pulls.updateBranch).toHaveBeenCalledTimes(1);
     expect(mockCore.warning).toHaveBeenCalledWith(expect.stringContaining("Failed to update pull request #100 branch from base"));
+  });
+
+  it("should treat no-new-commits updateBranch response as a non-fatal no-op", async () => {
+    mockGithub.rest.pulls.updateBranch.mockRejectedValueOnce(new Error("There are no new commits on the base branch."));
+
+    const handler = await updatePRModule.main({ update_branch: true });
+    const result = await handler({ pull_request_number: 100 });
+
+    expect(result.success).toBe(true);
+    expect(mockGithub.rest.pulls.updateBranch).toHaveBeenCalledTimes(1);
+    expect(mockGithub.rest.pulls.update).not.toHaveBeenCalled();
+    expect(mockCore.warning).toHaveBeenCalledWith(expect.stringContaining("branch from base (non-fatal)"));
+  });
+
+  it("should continue title/body updates when updateBranch reports merge conflict", async () => {
+    mockGithub.rest.pulls.updateBranch.mockRejectedValueOnce(new Error("merge conflict between base and head"));
+
+    const handler = await updatePRModule.main({ update_branch: true });
+    const result = await handler({
+      pull_request_number: 100,
+      title: "Updated PR",
+    });
+
+    expect(result.success).toBe(true);
+    expect(mockGithub.rest.pulls.updateBranch).toHaveBeenCalledTimes(1);
+    expect(mockGithub.rest.pulls.update).toHaveBeenCalledWith({
+      owner: "testowner",
+      repo: "testrepo",
+      pull_number: 100,
+      title: "Updated PR",
+    });
+    expect(mockCore.warning).toHaveBeenCalledWith(expect.stringContaining("branch from base (non-fatal)"));
+  });
+
+  it("should continue title/body updates when updateBranch gets workflows-permission 403", async () => {
+    const permissionError = new Error("refusing to allow a GitHub App to create or update workflow `.github/workflows/test.lock.yml` without `workflows` permission");
+    permissionError.status = 403;
+    mockGithub.rest.pulls.updateBranch.mockRejectedValueOnce(permissionError);
+
+    const handler = await updatePRModule.main({ update_branch: true });
+    const result = await handler({
+      pull_request_number: 100,
+      title: "Updated PR",
+    });
+
+    expect(result.success).toBe(true);
+    expect(mockGithub.rest.pulls.updateBranch).toHaveBeenCalledTimes(1);
+    expect(mockGithub.rest.pulls.update).toHaveBeenCalledWith({
+      owner: "testowner",
+      repo: "testrepo",
+      pull_number: 100,
+      title: "Updated PR",
+    });
+    expect(mockCore.warning).toHaveBeenCalledWith(expect.stringContaining("branch from base (non-fatal)"));
   });
 });

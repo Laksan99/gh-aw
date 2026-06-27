@@ -16,20 +16,23 @@ func TestBuiltinModelAliases(t *testing.T) {
 	aliases := BuiltinModelAliases()
 
 	expectedFamilies := []string{
-		"sonnet", "haiku", "opus",
-		"gpt-4.1", "gpt-5", "gpt-5-mini", "gpt-5-nano", "gpt-5-codex", "gpt-5-pro", "reasoning",
-		"gemini-flash", "gemini-flash-lite", "gemini-pro", "deep-research",
-		"mini", "large", "auto",
+		"sonnet", "sonnet-6x", "haiku", "opus", "opusplan",
+		"gpt-5", "gpt-5.5", "gpt-5.4", "gpt-5.3", "gpt-5.2", "gpt-5.1", "gpt-5-mini", "gpt-5-nano", "gpt-5-codex", "gpt-5-pro", "mai-code", "reasoning",
+		"gemini-flash", "gemini-flash-lite", "gemini-pro", "gemini-3-pro", "gemini-3-flash", "gemini-3.1-pro", "gemini-3.1-flash", "gemini-3.5-flash", "antigravity", "computer-use", "robotics", "deep-research",
+		"nano-banana",
+		"vision", "image-generation",
+		"mini", "large", "any", "agent", "small-agent", "copilot", "claude", "codex", "gemini", "summarization",
 	}
 	for _, family := range expectedFamilies {
 		patterns, ok := aliases[family]
 		assert.True(t, ok, "expected builtin alias for family %q", family)
 		assert.NotEmpty(t, patterns, "builtin alias %q should have at least one pattern", family)
 	}
+	assert.NotContains(t, aliases, "gpt-4.1", "gpt-4.1 alias should remain removed")
 
 	// Vendor aliases should include at least one copilot/* pattern.
 	// Meta-aliases (mini, large, auto) reference other alias names and are excluded here.
-	vendorFamilies := []string{"sonnet", "haiku", "opus", "gpt-4.1", "gpt-5", "gpt-5-mini", "gpt-5-nano", "gpt-5-codex", "gpt-5-pro", "reasoning", "gemini-flash", "gemini-flash-lite", "gemini-pro", "deep-research"}
+	vendorFamilies := []string{"sonnet", "sonnet-6x", "haiku", "opus", "gpt-5", "gpt-5.5", "gpt-5.4", "gpt-5.3", "gpt-5.2", "gpt-5-mini", "gpt-5-nano", "gpt-5-codex", "gpt-5-pro", "mai-code", "reasoning", "gemini-flash", "gemini-flash-lite", "gemini-pro", "gemini-3-pro", "gemini-3-flash", "gemini-3.1-pro", "gemini-3.1-flash", "gemini-3.5-flash", "antigravity", "nano-banana", "computer-use", "robotics", "deep-research"}
 	for _, family := range vendorFamilies {
 		patterns := aliases[family]
 		hasCopilot := false
@@ -45,17 +48,50 @@ func TestBuiltinModelAliases(t *testing.T) {
 	assert.Contains(t, aliases["gemini-flash"], "gemini/gemini-*flash*", "gemini-flash should support direct gemini/ provider models")
 	assert.Contains(t, aliases["gemini-flash-lite"], "gemini/gemini-*flash*lite*", "gemini-flash-lite should support direct gemini/ provider models")
 	assert.Contains(t, aliases["gemini-pro"], "gemini/gemini-*pro*", "gemini-pro should support direct gemini/ provider models")
+	assert.Equal(t, []string{"copilot/gpt-5.4*", "openai/gpt-5.4*"}, aliases["gpt-5.4"], "gpt-5.4 should map to copilot/openai gpt-5.4 family")
+	assert.Contains(t, aliases["gemini-3-pro"], "gemini/gemini-3*pro*", "gemini-3-pro should support direct gemini/ provider models")
+	assert.Contains(t, aliases["gemini-3-pro"], "google/nano-banana*", "gemini-3-pro should include Gemini 3 Pro image variant pattern")
+	assert.Contains(t, aliases["gemini-3-flash"], "gemini/gemini-3*flash*", "gemini-3-flash should support direct gemini/ provider models")
+	assert.Contains(t, aliases["gemini-3.1-pro"], "gemini/gemini-3.1*pro*", "gemini-3.1-pro should support direct gemini/ provider models")
+	assert.Contains(t, aliases["gemini-3.1-flash"], "gemini/gemini-3.1*flash*", "gemini-3.1-flash should support direct gemini/ provider models")
+	assert.Equal(t, []string{"copilot/gpt-5.5*", "openai/gpt-5.5*"}, aliases["gpt-5.5"], "gpt-5.5 should map to copilot/openai gpt-5.5 family")
+	assert.Equal(t, []string{"copilot/gpt-5.2*", "openai/gpt-5.2*"}, aliases["gpt-5.2"], "gpt-5.2 should map to copilot/openai gpt-5.2 family")
+	assert.Equal(t, []string{"copilot/gpt-5.1*", "openai/gpt-5.1*"}, aliases["gpt-5.1"], "gpt-5.1 should map to copilot/openai gpt-5.1 family")
+	assert.Equal(t, []string{"copilot/gemini-3.5*flash*", "google/gemini-3.5*flash*", "gemini/gemini-3.5*flash*"}, aliases["gemini-3.5-flash"], "gemini-3.5-flash should map to provider-specific Gemini 3.5 Flash patterns")
+	assert.Contains(t, aliases["antigravity"], "copilot/antigravity*", "antigravity should include copilot/ provider pattern")
+	assert.Equal(t, []string{"copilot/nano-banana*", "google/nano-banana*", "gemini/nano-banana*"}, aliases["nano-banana"], "nano-banana should map to provider-specific patterns")
+	assert.Equal(t, []string{"copilot/MAI-Code*", "copilot/mai-code*", "openai/MAI-Code*"}, aliases["mai-code"], "mai-code should map to provider-specific MAI-Code patterns")
+	assert.Equal(t, []string{"copilot/*sonnet-4.5*", "copilot/*sonnet-4.6*", "copilot/*sonnet-4-5-*", "anthropic/*sonnet-4-5-*", "copilot/*sonnet-4-6*", "anthropic/*sonnet-4-6*"}, aliases["sonnet-6x"], "sonnet-6x should target Sonnet 4.5/4.6 model families across dot and dated variants")
+	assert.Equal(t, []string{"opus?effort=high"}, aliases["opusplan"], "opusplan should map to opus with high reasoning effort")
 	assert.Contains(t, aliases["deep-research"], "gemini/deep-research*", "deep-research should support direct gemini/ provider models")
+	assert.Contains(t, aliases["vision"], "google/gemini-*image*", "vision should include google/ provider image patterns")
+	assert.Contains(t, aliases["vision"], "google/gemini-*flash*", "vision should include google/ provider flash patterns")
+	assert.Contains(t, aliases["image-generation"], "copilot/gpt-image*", "image-generation should include copilot gpt-image patterns")
+	assert.Contains(t, aliases["image-generation"], "openai/gpt-image*", "image-generation should include openai gpt-image patterns")
+	assert.Contains(t, aliases["image-generation"], "google/imagen*", "image-generation should include google imagen patterns")
 
 	// Meta-aliases reference other alias names (resolved recursively by AWF).
 	assert.Equal(t, []string{"haiku", "gpt-5-mini", "gpt-5-nano", "gemini-flash-lite"}, aliases["mini"], "mini should reference haiku, gpt-5-mini, gpt-5-nano, and gemini-flash-lite")
+	assert.Equal(t, []string{"haiku", "gpt-5-mini", "gemini-flash-lite", "mini"}, aliases["summarization"], "summarization should reference fast/lightweight models")
 	assert.Equal(t, []string{"sonnet", "gpt-5-pro", "gpt-5", "gemini-pro"}, aliases["large"], "large should reference sonnet, gpt-5-pro, gpt-5, and gemini-pro")
-	assert.Equal(t, []string{"large"}, aliases["auto"], "auto should fall back to large")
+	assert.Equal(t, []string{"copilot/*", "anthropic/*", "openai/*", "google/*", "gemini/*"}, aliases["any"], "any should provide a provider-wide catch-all fallback chain")
+	assert.Equal(t, []string{"sonnet-6x", "gpt-5.5", "gpt-5.4", "gpt-5.3", "gemini-pro", "any"}, aliases["agent"], "agent should default to the configured high-capability fallback chain before any-model fallback")
+	assert.Equal(t, []string{"haiku", "gpt-5-mini", "gemini-flash"}, aliases["small-agent"], "small-agent should default to the small/fast model fallback chain")
+	assert.Equal(t, []string{"agent"}, aliases["copilot"], "copilot should define per-engine default fallback chain")
+	assert.Equal(t, []string{"agent"}, aliases["claude"], "claude should define per-engine default fallback chain")
+	assert.Equal(t, []string{"agent"}, aliases["codex"], "codex should define per-engine default fallback chain")
+	assert.Equal(t, []string{"agent"}, aliases["gemini"], "gemini should define per-engine default fallback chain")
+	assert.NotContains(t, aliases["agent"], "opus", "agent default chain must not include opus")
 
 	// Returns a fresh copy — mutating one call's map must not affect another call.
 	aliases["sonnet"] = []string{"custom/model"}
 	aliases2 := BuiltinModelAliases()
 	assert.NotEqual(t, aliases["sonnet"], aliases2["sonnet"], "BuiltinModelAliases should return a fresh copy each time")
+
+	// Mutating an alias slice from one call must not affect the next call either.
+	aliases2["haiku"][0] = "custom/haiku"
+	aliases3 := BuiltinModelAliases()
+	assert.NotEqual(t, aliases2["haiku"][0], aliases3["haiku"][0], "BuiltinModelAliases should return fresh slices each time")
 }
 
 // awfConfigModelsResult is a helper type for parsing the apiProxy.models section
@@ -98,7 +134,6 @@ func TestBuildAWFConfigJSON_ModelsSection(t *testing.T) {
 		assert.NotEmpty(t, config.WorkflowData.ModelMappings, "ModelMappings should be populated on WorkflowData")
 		assert.Contains(t, config.WorkflowData.ModelMappings, "sonnet", "ModelMappings should include sonnet alias")
 		assert.Contains(t, config.WorkflowData.ModelMappings, "haiku", "ModelMappings should include haiku alias")
-		assert.Contains(t, config.WorkflowData.ModelMappings, "auto", "ModelMappings should include auto alias")
 	})
 
 	t.Run("frontmatter override is reflected in WorkflowData and in AWF config JSON", func(t *testing.T) {
@@ -256,25 +291,6 @@ func TestMergeImportedModelAliases(t *testing.T) {
 
 // correctly by ParseFrontmatterConfig.
 func TestFrontmatterModelsField(t *testing.T) {
-	t.Run("models field is parsed from frontmatter", func(t *testing.T) {
-		frontmatter := map[string]any{
-			"name": "test-workflow",
-			"models": map[string]any{
-				"my-model": []any{"copilot/my-model-v1", "openai/my-model-v1"},
-				"":         []any{"my-model"},
-			},
-		}
-
-		config, err := ParseFrontmatterConfig(frontmatter)
-		require.NoError(t, err, "ParseFrontmatterConfig should succeed with models field")
-		require.NotNil(t, config, "parsed config should not be nil")
-
-		assert.Equal(t, []string{"copilot/my-model-v1", "openai/my-model-v1"}, config.Models["my-model"],
-			"models[my-model] should be parsed correctly")
-		assert.Equal(t, []string{"my-model"}, config.Models[""],
-			"models default policy (empty key) should be parsed correctly")
-	})
-
 	t.Run("models field is optional", func(t *testing.T) {
 		frontmatter := map[string]any{
 			"name": "test-workflow",
@@ -283,6 +299,36 @@ func TestFrontmatterModelsField(t *testing.T) {
 		config, err := ParseFrontmatterConfig(frontmatter)
 		require.NoError(t, err, "ParseFrontmatterConfig should succeed without models field")
 		require.NotNil(t, config, "parsed config should not be nil")
-		assert.Nil(t, config.Models, "models should be nil when not specified in frontmatter")
+		assert.Nil(t, config.ModelCosts, "ModelCosts should be nil when not specified in frontmatter")
+	})
+
+	t.Run("models field with providers structure populates ModelCosts", func(t *testing.T) {
+		frontmatter := map[string]any{
+			"name": "test-workflow",
+			"models": map[string]any{
+				"providers": map[string]any{
+					"anthropic": map[string]any{
+						"models": map[string]any{
+							"my-custom-claude": map[string]any{
+								"cost": map[string]any{
+									"input":  "3e-06",
+									"output": "1.5e-05",
+								},
+							},
+						},
+					},
+				},
+			},
+		}
+
+		config, err := ParseFrontmatterConfig(frontmatter)
+		require.NoError(t, err, "ParseFrontmatterConfig should succeed with models providers structure")
+		require.NotNil(t, config, "parsed config should not be nil")
+
+		require.NotNil(t, config.ModelCosts, "ModelCosts should be populated from models providers structure")
+
+		providers, ok := config.ModelCosts["providers"].(map[string]any)
+		require.True(t, ok, "ModelCosts should contain a providers key")
+		assert.Contains(t, providers, "anthropic", "providers should contain anthropic")
 	})
 }

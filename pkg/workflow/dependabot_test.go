@@ -9,6 +9,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/github/gh-aw/pkg/setutil"
 	"github.com/github/gh-aw/pkg/testutil"
 
 	"github.com/goccy/go-yaml"
@@ -264,7 +265,7 @@ func TestGenerateDependabotConfig(t *testing.T) {
 	tempDir := testutil.TempDir(t, "test-*")
 	dependabotPath := filepath.Join(tempDir, "dependabot.yml")
 
-	ecosystems := map[string]bool{"npm": true}
+	ecosystems := map[string]struct{}{"npm": {}}
 
 	// Test creating new dependabot.yml
 	err := compiler.generateDependabotConfig(dependabotPath, ecosystems, false)
@@ -327,7 +328,7 @@ func TestGenerateDependabotConfig_PreserveExisting(t *testing.T) {
 	existingData, _ := yaml.Marshal(&existingConfig)
 	os.WriteFile(dependabotPath, existingData, 0644)
 
-	ecosystems := map[string]bool{"npm": true}
+	ecosystems := map[string]struct{}{"npm": {}}
 
 	// Try to generate without force - should preserve
 	err := compiler.generateDependabotConfig(dependabotPath, ecosystems, false)
@@ -400,7 +401,7 @@ updates:
 	}
 
 	updatedStr := string(updated)
-	if !strings.Contains(updatedStr, `dependency-name: "github/gh-aw-actions/**"`) {
+	if !strings.Contains(updatedStr, `dependency-name: "github/gh-aw-actions"`) {
 		t.Fatal("managed github/gh-aw-actions ignore entry should be added")
 	}
 }
@@ -467,7 +468,7 @@ updates:
 	if !strings.Contains(updatedStr, `dependency-name: "actions/checkout"`) {
 		t.Fatal("user-defined ignore entry should be preserved")
 	}
-	if !strings.Contains(updatedStr, `dependency-name: "github/gh-aw-actions/**"`) {
+	if !strings.Contains(updatedStr, `dependency-name: "github/gh-aw-actions"`) {
 		t.Fatal("managed github/gh-aw-actions ignore entry should be added")
 	}
 	if !strings.Contains(updatedStr, managedDependabotIgnoreComment) {
@@ -506,8 +507,52 @@ updates:
 	if !strings.Contains(updatedStr, "ignore:") {
 		t.Fatal("ignore block should still be present")
 	}
-	if !strings.Contains(updatedStr, `dependency-name: "github/gh-aw-actions/**"`) {
+	if !strings.Contains(updatedStr, `dependency-name: "github/gh-aw-actions"`) {
 		t.Fatal("managed github/gh-aw-actions ignore entry should be added when ignore is null")
+	}
+}
+
+func TestReconcileManagedDependabotIgnores_MigratesLegacyWildcardPattern(t *testing.T) {
+	compiler := NewCompiler()
+	tempDir := testutil.TempDir(t, "test-*")
+	dependabotPath := filepath.Join(tempDir, "dependabot.yml")
+
+	// Simulate an existing dependabot.yml with the old /**  pattern added by a previous compiler version.
+	original := `version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: "/.github/workflows"
+    schedule:
+      interval: weekly
+    ignore:
+      - dependency-name: "github/gh-aw-actions/**" # Managed by gh aw compile. Version-locked to the gh-aw compiler; do not bump.
+      - dependency-name: "actions/checkout"
+`
+	if err := os.WriteFile(dependabotPath, []byte(original), 0644); err != nil {
+		t.Fatalf("failed to write test dependabot.yml: %v", err)
+	}
+
+	err := compiler.ReconcileManagedDependabotIgnores(dependabotPath)
+	if err != nil {
+		t.Fatalf("expected no error, got: %v", err)
+	}
+
+	updated, err := os.ReadFile(dependabotPath)
+	if err != nil {
+		t.Fatalf("failed to read updated dependabot.yml: %v", err)
+	}
+
+	updatedStr := string(updated)
+	// The correct (non-wildcard) entry must be present so DependaBot respects the rule.
+	if !strings.Contains(updatedStr, `dependency-name: "github/gh-aw-actions"`) {
+		t.Fatal("correct managed github/gh-aw-actions ignore entry should be added alongside the legacy entry")
+	}
+	// User-defined entries must be preserved.
+	if !strings.Contains(updatedStr, `dependency-name: "actions/checkout"`) {
+		t.Fatal("user-defined ignore entry should be preserved during migration")
+	}
+	if !strings.Contains(updatedStr, managedDependabotIgnoreComment) {
+		t.Fatal("managed ignore entry should include the compiler-managed inline comment")
 	}
 }
 
@@ -933,10 +978,10 @@ func TestGenerateDependabotConfig_MultipleEcosystems(t *testing.T) {
 	tempDir := testutil.TempDir(t, "test-*")
 	dependabotPath := filepath.Join(tempDir, "dependabot.yml")
 
-	ecosystems := map[string]bool{
-		"npm":   true,
-		"pip":   true,
-		"gomod": true,
+	ecosystems := map[string]struct{}{
+		"npm":   {},
+		"pip":   {},
+		"gomod": {},
 	}
 
 	// Test creating new dependabot.yml with multiple ecosystems
@@ -970,9 +1015,9 @@ func TestGenerateDependabotConfig_MultipleEcosystems(t *testing.T) {
 	}
 
 	// Check that all ecosystems are present
-	ecosystemsFound := make(map[string]bool)
+	ecosystemsFound := make(map[string]struct{})
 	for _, update := range config.Updates {
-		ecosystemsFound[update.PackageEcosystem] = true
+		ecosystemsFound[update.PackageEcosystem] = struct{}{}
 		if update.Directory != "/.github/workflows" {
 			t.Errorf("expected directory '/.github/workflows', got %q", update.Directory)
 		}
@@ -982,7 +1027,7 @@ func TestGenerateDependabotConfig_MultipleEcosystems(t *testing.T) {
 	}
 
 	for ecosystem := range ecosystems {
-		if !ecosystemsFound[ecosystem] {
+		if !setutil.Contains(ecosystemsFound, ecosystem) {
 			t.Errorf("ecosystem %q not found in dependabot.yml", ecosystem)
 		}
 	}

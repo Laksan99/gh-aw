@@ -1,5 +1,7 @@
 package constants
 
+import "github.com/github/gh-aw/pkg/setutil"
+
 // EngineName represents an AI engine name identifier (copilot, claude, codex, custom).
 // This semantic type distinguishes engine names from arbitrary strings,
 // making engine selection explicit and type-safe.
@@ -20,6 +22,8 @@ const (
 	CodexEngine EngineName = "codex"
 	// GeminiEngine is the Google Gemini engine identifier
 	GeminiEngine EngineName = "gemini"
+	// AntigravityEngine is the Antigravity engine identifier
+	AntigravityEngine EngineName = "antigravity"
 	// OpenCodeEngine is the OpenCode engine identifier
 	OpenCodeEngine EngineName = "opencode"
 	// CrushEngine is the Crush engine identifier
@@ -36,7 +40,7 @@ const (
 // Deprecated: Use workflow.NewEngineCatalog(workflow.NewEngineRegistry()).IDs() for a
 // catalog-derived list. This slice is maintained for backward compatibility and must
 // stay in sync with the built-in engines registered in NewEngineCatalog.
-var AgenticEngines = []string{string(ClaudeEngine), string(CodexEngine), string(CopilotEngine), string(GeminiEngine), string(OpenCodeEngine), string(CrushEngine), string(PiEngine)}
+var AgenticEngines = []string{string(ClaudeEngine), string(CodexEngine), string(CopilotEngine), string(GeminiEngine), string(AntigravityEngine), string(OpenCodeEngine), string(CrushEngine), string(PiEngine)}
 
 // EngineOption represents a selectable AI engine with its display metadata and secret configuration
 type EngineOption struct {
@@ -59,7 +63,7 @@ var EngineOptions = []EngineOption{
 		Value:       string(CopilotEngine),
 		Label:       "GitHub Copilot",
 		Description: "GitHub Copilot CLI with agent support",
-		SecretName:  "COPILOT_GITHUB_TOKEN",
+		SecretName:  CopilotGitHubToken,
 		KeyURL:      "https://github.com/settings/personal-access-tokens/new",
 		WhenNeeded:  "Copilot workflows (CLI, engine, agent tasks, etc.)",
 	},
@@ -67,7 +71,7 @@ var EngineOptions = []EngineOption{
 		Value:              string(ClaudeEngine),
 		Label:              "Claude",
 		Description:        "Anthropic Claude Code coding agent",
-		SecretName:         "ANTHROPIC_API_KEY",
+		SecretName:         AnthropicAPIKey,
 		AlternativeSecrets: []string{},
 		KeyURL:             "https://console.anthropic.com/settings/keys",
 		WhenNeeded:         "Claude engine workflows",
@@ -76,8 +80,8 @@ var EngineOptions = []EngineOption{
 		Value:              string(CodexEngine),
 		Label:              "Codex",
 		Description:        "OpenAI Codex/GPT engine",
-		SecretName:         "OPENAI_API_KEY",
-		AlternativeSecrets: []string{"CODEX_API_KEY"},
+		SecretName:         OpenAIAPIKey,
+		AlternativeSecrets: []string{CodexAPIKey},
 		KeyURL:             "https://platform.openai.com/api-keys",
 		WhenNeeded:         "Codex/OpenAI engine workflows",
 	},
@@ -85,16 +89,24 @@ var EngineOptions = []EngineOption{
 		Value:       string(GeminiEngine),
 		Label:       "Gemini",
 		Description: "Google Gemini CLI coding agent",
-		SecretName:  "GEMINI_API_KEY",
+		SecretName:  GeminiAPIKey,
 		KeyURL:      "https://aistudio.google.com/app/apikey",
 		WhenNeeded:  "Gemini engine workflows",
+	},
+	{
+		Value:       string(AntigravityEngine),
+		Label:       "Antigravity",
+		Description: "Antigravity CLI coding agent",
+		SecretName:  AntigravityAPIKey,
+		KeyURL:      "https://aistudio.google.com/app/apikey",
+		WhenNeeded:  "Antigravity engine workflows",
 	},
 	{
 		Value:              string(OpenCodeEngine),
 		Label:              "OpenCode",
 		Description:        "OpenCode multi-provider AI coding agent (BYOK)",
-		SecretName:         "COPILOT_GITHUB_TOKEN",
-		AlternativeSecrets: []string{"ANTHROPIC_API_KEY", "OPENAI_API_KEY", "CODEX_API_KEY"},
+		SecretName:         CopilotGitHubToken,
+		AlternativeSecrets: []string{AnthropicAPIKey, OpenAIAPIKey, CodexAPIKey},
 		KeyURL:             "https://github.com/anomalyco/opencode",
 		WhenNeeded:         "OpenCode engine workflows (default: Copilot routing)",
 	},
@@ -102,8 +114,8 @@ var EngineOptions = []EngineOption{
 		Value:              string(CrushEngine),
 		Label:              "Crush",
 		Description:        "Crush multi-provider AI coding agent (BYOK)",
-		SecretName:         "COPILOT_GITHUB_TOKEN",
-		AlternativeSecrets: []string{"ANTHROPIC_API_KEY", "OPENAI_API_KEY", "CODEX_API_KEY"},
+		SecretName:         CopilotGitHubToken,
+		AlternativeSecrets: []string{AnthropicAPIKey, OpenAIAPIKey, CodexAPIKey},
 		KeyURL:             "https://github.com/charmbracelet/crush#installation",
 		WhenNeeded:         "Crush engine workflows (default: Copilot routing)",
 	},
@@ -111,8 +123,8 @@ var EngineOptions = []EngineOption{
 		Value:              string(PiEngine),
 		Label:              "Pi",
 		Description:        "Pi AI coding agent (experimental)",
-		SecretName:         "COPILOT_GITHUB_TOKEN",
-		AlternativeSecrets: []string{"ANTHROPIC_API_KEY", "OPENAI_API_KEY", "CODEX_API_KEY"},
+		SecretName:         CopilotGitHubToken,
+		AlternativeSecrets: []string{AnthropicAPIKey, OpenAIAPIKey, CodexAPIKey},
 		KeyURL:             "https://github.com/settings/personal-access-tokens/new",
 		WhenNeeded:         "Pi engine workflows",
 	},
@@ -162,18 +174,21 @@ func GetEngineOption(engineValue string) *EngineOption {
 // This includes primary secrets, alternative secrets, and system-level secrets.
 // The returned slice contains no duplicates.
 func GetAllEngineSecretNames() []string {
-	seen := make(map[string]bool)
+	seen := make(map[string]struct {
+	})
 	var secrets []string
 
 	// Add primary and alternative secrets from all engines
 	for _, opt := range EngineOptions {
-		if opt.SecretName != "" && !seen[opt.SecretName] {
-			seen[opt.SecretName] = true
+		if opt.SecretName != "" && !setutil.Contains(seen, opt.SecretName) {
+			seen[opt.SecretName] = struct {
+			}{}
 			secrets = append(secrets, opt.SecretName)
 		}
 		for _, alt := range opt.AlternativeSecrets {
-			if alt != "" && !seen[alt] {
-				seen[alt] = true
+			if alt != "" && !setutil.Contains(seen, alt) {
+				seen[alt] = struct {
+				}{}
 				secrets = append(secrets, alt)
 			}
 		}
@@ -181,14 +196,32 @@ func GetAllEngineSecretNames() []string {
 
 	// Add system-level secrets from SystemSecrets
 	for _, s := range SystemSecrets {
-		if s.Name != "" && !seen[s.Name] {
-			seen[s.Name] = true
+		if s.Name != "" && !setutil.Contains(seen, s.Name) {
+			seen[s.Name] = struct {
+			}{}
 			secrets = append(secrets, s.Name)
 		}
 	}
 
 	return secrets
 }
+
+// Primary secret names for each engine — the GitHub secret names that users configure
+// when setting up an engine workflow.
+const (
+	// CopilotGitHubToken is the GitHub token secret name required by the Copilot engine.
+	CopilotGitHubToken = "COPILOT_GITHUB_TOKEN"
+	// AnthropicAPIKey is the API key secret name required by the Claude engine.
+	AnthropicAPIKey = "ANTHROPIC_API_KEY"
+	// CodexAPIKey is the API key secret name used by the Codex engine.
+	CodexAPIKey = "CODEX_API_KEY"
+	// OpenAIAPIKey is the OpenAI API key secret name used by the Codex engine as an alternative.
+	OpenAIAPIKey = "OPENAI_API_KEY"
+	// GeminiAPIKey is the API key secret name required by the Gemini engine.
+	GeminiAPIKey = "GEMINI_API_KEY"
+	// AntigravityAPIKey is the API key secret name required by the Antigravity engine.
+	AntigravityAPIKey = "ANTIGRAVITY_API_KEY"
+)
 
 // Environment variable names for model configuration
 const (
@@ -202,6 +235,8 @@ const (
 	EnvVarModelAgentCustom = "GH_AW_MODEL_AGENT_CUSTOM"
 	// EnvVarModelAgentGemini configures the default Gemini model for agent execution
 	EnvVarModelAgentGemini = "GH_AW_MODEL_AGENT_GEMINI"
+	// EnvVarModelAgentAntigravity configures the default Antigravity model for agent execution
+	EnvVarModelAgentAntigravity = "GH_AW_MODEL_AGENT_ANTIGRAVITY"
 	// EnvVarModelAgentOpenCode configures the default OpenCode model for agent execution
 	EnvVarModelAgentOpenCode = "GH_AW_MODEL_AGENT_OPENCODE"
 	// EnvVarModelDetectionCopilot configures the default Copilot model for detection
@@ -212,6 +247,8 @@ const (
 	EnvVarModelDetectionCodex = "GH_AW_MODEL_DETECTION_CODEX"
 	// EnvVarModelDetectionGemini configures the default Gemini model for detection
 	EnvVarModelDetectionGemini = "GH_AW_MODEL_DETECTION_GEMINI"
+	// EnvVarModelDetectionAntigravity configures the default Antigravity model for detection
+	EnvVarModelDetectionAntigravity = "GH_AW_MODEL_DETECTION_ANTIGRAVITY"
 	// EnvVarModelDetectionOpenCode configures the default OpenCode model for detection
 	EnvVarModelDetectionOpenCode = "GH_AW_MODEL_DETECTION_OPENCODE"
 	// EnvVarModelAgentCrush configures the default Crush model for agent execution
@@ -240,6 +277,12 @@ const (
 	// Sent as a Bearer token in the Authorization header. Takes precedence over COPILOT_PROVIDER_API_KEY.
 	CopilotProviderBearerToken = "COPILOT_PROVIDER_BEARER_TOKEN"
 
+	// CopilotProviderWireAPI (OPTIONAL) selects the HTTP wire API used when talking to a BYOK provider.
+	// Accepted values: "responses" (OpenAI Responses API), "completions" (legacy Chat Completions API).
+	// The Copilot CLI defaults to "completions" for custom providers; set to "responses" for Azure
+	// o-series models (e.g. o4-mini) that reject the legacy endpoint with HTTP 400.
+	CopilotProviderWireAPI = "COPILOT_PROVIDER_WIRE_API"
+
 	// CopilotCLIIntegrationIDEnvVar is the native environment variable name supported by the Copilot CLI
 	// for identifying the calling integration. This tells the Copilot CLI that it is being invoked
 	// by agentic workflows.
@@ -248,15 +291,53 @@ const (
 	// CopilotCLIIntegrationIDValue is the value of the integration ID for agentic workflows.
 	CopilotCLIIntegrationIDValue = "agentic-workflows"
 
+	// CopilotSDKURIEnvVar is the environment variable name for the Copilot SDK URI.
+	// When copilot-sdk: true is set, this env var holds the HTTP endpoint URI
+	// where the harness-managed Copilot CLI sidecar listens for SDK connections
+	// (e.g. "http://127.0.0.1:3002"). It is set on every child process so that the @github/copilot-sdk
+	// library can locate the running Copilot HTTP server.
+	CopilotSDKURIEnvVar = "COPILOT_SDK_URI"
+
+	// CopilotSDKServerArgsEnvVar is the environment variable that holds the JSON-encoded
+	// CLI argument array for the headless Copilot CLI sidecar started by copilot_harness.cjs
+	// in GH_AW_COPILOT_SDK_DRIVER mode.
+	// The array includes all server control and configuration flags
+	// (--headless, --no-auto-update, --port, --add-dir, --log-level, etc.)
+	// that the engine computes at compile time. The harness reads this variable at
+	// runtime to start the sidecar without any argument parsing.
+	CopilotSDKServerArgsEnvVar = "GH_AW_COPILOT_SDK_SERVER_ARGS"
+
+	// CopilotSDKDriverEnvVar is set to "1" when the copilot_sdk_driver.cjs program
+	// is used as the execution command instead of inline SDK handling inside the harness.
+	// The harness checks this flag to run the driver as a regular subprocess via runProcess
+	// while still managing sidecar start/stop itself.
+	CopilotSDKDriverEnvVar = "GH_AW_COPILOT_SDK_DRIVER"
+
 	// CopilotBYOKDummyAPIKey is the placeholder API key used to trigger AWF's
 	// runtime BYOK detection for Copilot offline mode. The real credential remains
 	// isolated in the AWF API proxy sidecar.
 	CopilotBYOKDummyAPIKey = "dummy-byok-key-for-offline-mode"
 
+	// CopilotBYOKDummyAPIKeyEnvVar is the environment variable that holds the
+	// CopilotBYOKDummyAPIKey sentinel value in generated lock files. Using a
+	// non-*_API_KEY-shaped name for the literal value prevents secret scanners from
+	// flagging the generated artifact. COPILOT_API_KEY is then exported in the run:
+	// shell script via shell variable expansion so the value is never written
+	// inline next to a *_API_KEY key in the YAML env: block.
+	CopilotBYOKDummyAPIKeyEnvVar = "COPILOT_DUMMY_BYOK"
+
 	// CopilotBYOKDefaultModel is the explicit fallback model for Copilot BYOK mode.
 	// BYOK providers require a non-empty model, so this value is used when the
 	// corresponding GH_AW_MODEL_*_COPILOT variable is unset.
+	//
+	// Use Claude Sonnet 4.6 as the explicit default model for Copilot BYOK mode.
+	// This matches the current Copilot default model.
 	CopilotBYOKDefaultModel = "claude-sonnet-4.6"
+
+	// CodexDefaultModel is the default model for the Codex agentic engine.
+	// Used as the fallback when no explicit model is configured and the
+	// GH_AW_MODEL_AGENT_CODEX / GH_AW_MODEL_DETECTION_CODEX variable is unset.
+	CodexDefaultModel = "gpt-5.4"
 
 	// ClaudeCLIModelEnvVar is the native environment variable name supported by the Claude Code CLI
 	// for selecting the model. Setting this env var is equivalent to passing --model to the CLI.
@@ -265,6 +346,10 @@ const (
 	// GeminiCLIModelEnvVar is the native environment variable name supported by the Gemini CLI
 	// for selecting the model. Setting this env var is equivalent to passing --model to the CLI.
 	GeminiCLIModelEnvVar = "GEMINI_MODEL"
+
+	// AntigravityCLIModelEnvVar is the native environment variable name supported by the Antigravity CLI
+	// for selecting the model. Setting this env var is equivalent to passing --model to the CLI.
+	AntigravityCLIModelEnvVar = "ANTIGRAVITY_MODEL"
 
 	// CrushCLIModelEnvVar is the native environment variable name for Crush model selection.
 	// Crush uses provider/model format (e.g., "anthropic/claude-sonnet-4-20250514").
@@ -292,6 +377,10 @@ const (
 	// EnvVarMaxTurns is the maximum number of turns for agent execution
 	EnvVarMaxTurns = "GH_AW_MAX_TURNS"
 
+	// EnvVarMaxToolDenials is the maximum number of repeated tool denials
+	// allowed in Copilot SDK driver mode before inference is stopped.
+	EnvVarMaxToolDenials = "GH_AW_MAX_TOOL_DENIALS"
+
 	// EnvVarStartupTimeout is the tool startup timeout in seconds
 	EnvVarStartupTimeout = "GH_AW_STARTUP_TIMEOUT"
 
@@ -318,6 +407,12 @@ const (
 	// a comma- or newline-separated list of GitHub usernames elevated to "approved" integrity.
 	// Set as an org or repo variable to apply a consistent trusted user list across all workflows.
 	EnvVarGitHubTrustedUsers = "GH_AW_GITHUB_TRUSTED_USERS"
+)
+
+const (
+	// DefaultMaxToolDenials is the default maximum number of repeated tool
+	// denials allowed in Copilot SDK mode before stopping inference.
+	DefaultMaxToolDenials = 5
 )
 
 // CopilotStemCommands defines commands that Copilot CLI treats as "stem" commands

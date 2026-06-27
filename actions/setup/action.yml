@@ -7,7 +7,7 @@ inputs:
     description: 'Destination directory for activation files (default: ${RUNNER_TEMP}/gh-aw/actions)'
     required: false
   safe-output-artifact-client:
-    description: 'Install @actions/artifact so upload_artifact.cjs can upload GitHub Actions artifacts via REST API directly'
+    description: 'Deprecated no-op (artifact support is now built into setup action scripts)'
     required: false
     default: 'false'
   job-name:
@@ -20,6 +20,10 @@ inputs:
     default: ''
   parent-span-id:
     description: 'OTLP parent span ID (16-character hexadecimal string) for the setup span. Pass the setup-span-id output of the upstream setup step so job setup spans form a single tree.'
+    required: false
+    default: ''
+  otlp-oidc-token:
+    description: 'Optional pre-minted OIDC bearer token used for OTLP Authorization headers.'
     required: false
     default: ''
 

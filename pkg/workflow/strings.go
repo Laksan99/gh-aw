@@ -79,11 +79,8 @@
 package workflow
 
 import (
-	"crypto/hmac"
-	"crypto/rand"
-	"crypto/sha256"
-	"encoding/hex"
 	"fmt"
+	"hash/fnv"
 	"regexp"
 	"strings"
 
@@ -150,33 +147,25 @@ func ShortenCommand(command string) string {
 	return shortened
 }
 
-// GenerateHeredocDelimiterFromSeed creates a stable heredoc delimiter derived from a seed
-// (typically the workflow frontmatter hash hex string) so that repeated compilations of the
-// same workflow produce identical lock files.
+// escapeYAMLSingleQuoted escapes single quotes for YAML single-quoted scalars by doubling each
+// apostrophe per YAML 1.2.
+func escapeYAMLSingleQuoted(value string) string {
+	return strings.ReplaceAll(value, "'", "''")
+}
+
+// GenerateHeredocDelimiterFromContent creates a stable heredoc delimiter derived from the
+// content it wraps. The 16-character hex tag is an FNV-1a checksum of the content and name,
+// used only for deterministic identifier generation so the delimiter stays stable across
+// builds whenever the content is unchanged and changes only when the content changes.
 //
-// When seed is non-empty, the 16-character hex tag is derived deterministically via
-// HMAC-SHA256(key=seed, data=UPPER(name)), taking the first 8 bytes of the MAC.
-// Using HMAC (with the seed as the key and the name as the message) avoids any
-// length-extension or concatenation-collision concerns. This preserves the
-// injection-resistance guarantee (an attacker who cannot control the frontmatter hash
-// cannot predict the delimiter) while also making the compiled output stable.
-//
-// When seed is empty, the function falls back to crypto/rand — the same behaviour as
-// GenerateHeredocDelimiter — so callers that lack a hash continue to work correctly.
-func GenerateHeredocDelimiterFromSeed(name string, seed string) string {
+// The name prefix (e.g. "PROMPT", "MCP_CONFIG") is included for readability and to ensure
+// that two different heredocs wrapping identical content still produce distinct delimiters.
+func GenerateHeredocDelimiterFromContent(name string, content string) string {
+	h := fnv.New64a()
+	h.Write([]byte(strings.ToUpper(name)))
+	h.Write([]byte(content))
+	tag := fmt.Sprintf("%016x", h.Sum64())
 	upperName := strings.ToUpper(name)
-	var tag string
-	if seed != "" {
-		mac := hmac.New(sha256.New, []byte(seed))
-		mac.Write([]byte(upperName))
-		tag = hex.EncodeToString(mac.Sum(nil)[:8]) // first 8 bytes → 16 hex chars
-	} else {
-		b := make([]byte, 8)
-		if _, err := rand.Read(b); err != nil {
-			panic("crypto/rand failed: " + err.Error())
-		}
-		tag = hex.EncodeToString(b)
-	}
 	if name == "" {
 		return "GH_AW_" + tag + "_EOF"
 	}
@@ -214,7 +203,7 @@ func PrettifyToolName(toolName string) string {
 	}
 
 	// Handle bash specially - keep as "bash"
-	if strings.ToLower(toolName) == "bash" {
+	if strings.EqualFold(toolName, "bash") {
 		return "bash"
 	}
 

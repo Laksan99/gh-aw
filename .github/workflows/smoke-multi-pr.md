@@ -1,7 +1,13 @@
 ---
+private: true
+emoji: "🧪"
 name: Smoke Multi PR
 description: Test creating multiple pull requests in a single workflow run
 on:
+  slash_command:
+    name: smoke-multi-pr
+    strategy: centralized
+    events: [issues, issue_comment, pull_request, pull_request_comment]
   workflow_dispatch:
   pull_request:
     types: [labeled]
@@ -37,13 +43,15 @@ safe-outputs:
     max: 1
   messages:
     append-only-comments: true
-    footer: "> 🧪 *Multi PR smoke test by [{workflow_name}]({run_url})*{effective_tokens_suffix}{history_link}"
+    footer: "> 🧪 *Multi PR smoke test by [{workflow_name}]({run_url})*{ai_credits_suffix}{history_link}"
     run-started: "🧪 [{workflow_name}]({run_url}) is now testing multiple PR creation..."
     run-success: "✅ [{workflow_name}]({run_url}) successfully created multiple PRs."
     run-failure: "❌ [{workflow_name}]({run_url}) failed to create multiple PRs. Check the logs."
 timeout-minutes: 10
 imports:
-  - shared/observability-otlp.md
+  - shared/otlp.md
+features:
+  gh-aw-detection: false
 ---
 
 # Smoke Test: Multiple Pull Request Creation

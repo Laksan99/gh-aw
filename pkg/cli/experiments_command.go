@@ -10,13 +10,17 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"sort"
+	"slices"
+	"strconv"
 	"strings"
 
 	"github.com/github/gh-aw/pkg/console"
 	"github.com/github/gh-aw/pkg/constants"
 	"github.com/github/gh-aw/pkg/logger"
 	"github.com/github/gh-aw/pkg/parser"
+	"github.com/github/gh-aw/pkg/setutil"
+	"github.com/github/gh-aw/pkg/sliceutil"
+	"github.com/github/gh-aw/pkg/tty"
 	"github.com/github/gh-aw/pkg/workflow"
 	"github.com/spf13/cobra"
 )
@@ -95,10 +99,8 @@ workflow's pick_experiment step, containing variant counts and run history.
 
 Available subcommands:
   - list    - List all experiment workflow branches (default)
-  - analyze - Analyze a specific experiment workflow in detail
-
-Examples:
-  ` + string(constants.CLIExtensionPrefix) + ` experiments                        # List all experiments (default)
+  - analyze - Analyze a specific experiment workflow in detail`,
+		Example: `  ` + string(constants.CLIExtensionPrefix) + ` experiments                        # List all experiments (default)
   ` + string(constants.CLIExtensionPrefix) + ` experiments list                   # List all experiments
   ` + string(constants.CLIExtensionPrefix) + ` experiments list --json            # Output in JSON format
   ` + string(constants.CLIExtensionPrefix) + ` experiments analyze my-workflow    # Analyze experiments/my-workflow
@@ -131,10 +133,8 @@ func NewExperimentsListSubcommand() *cobra.Command {
 
 Reads the state.json file from each experiments/* branch and shows a summary
 of each workflow's A/B experiments: number of experiments defined, total runs,
-and timestamp of the most recent run.
-
-Examples:
-  ` + string(constants.CLIExtensionPrefix) + ` experiments list                             # List all experiments
+and timestamp of the most recent run.`,
+		Example: `  ` + string(constants.CLIExtensionPrefix) + ` experiments list                             # List all experiments
   ` + string(constants.CLIExtensionPrefix) + ` experiments list --json                      # Output in JSON format
   ` + string(constants.CLIExtensionPrefix) + ` experiments list --repo owner/repo           # List from a specific repository`,
 		RunE: func(cmd *cobra.Command, args []string) error {
@@ -161,13 +161,11 @@ func NewExperimentsAnalyzeSubcommand() *cobra.Command {
 		Long: `Analyze a specific experiment workflow in detail.
 
 The experiment argument is the workflow ID (branch name without the "experiments/"
-prefix, e.g. "my-workflow" for the "experiments/my-workflow" branch).
+prefix, e.g., "my-workflow" for the "experiments/my-workflow" branch).
 
 Reads the state.json file from the branch and shows per-variant counts, total
-runs, and the most recent run assignments.
-
-Examples:
-  ` + string(constants.CLIExtensionPrefix) + ` experiments analyze my-workflow              # Analyze experiments/my-workflow
+runs, and the most recent run assignments.`,
+		Example: `  ` + string(constants.CLIExtensionPrefix) + ` experiments analyze my-workflow              # Analyze experiments/my-workflow
   ` + string(constants.CLIExtensionPrefix) + ` experiments analyze my-workflow --json       # Output in JSON format
   ` + string(constants.CLIExtensionPrefix) + ` experiments analyze my-workflow --repo owner/repo  # Analyze in a specific repository`,
 		Args: cobra.ExactArgs(1),
@@ -211,7 +209,7 @@ func RunExperimentsList(config ExperimentsListConfig) error {
 		if err != nil {
 			return fmt.Errorf("failed to marshal JSON: %w", err)
 		}
-		fmt.Println(string(jsonBytes))
+		fmt.Fprintln(os.Stdout, string(jsonBytes))
 		return nil
 	}
 
@@ -274,7 +272,7 @@ func RunExperimentsAnalyze(config ExperimentsAnalyzeConfig) error {
 		if err != nil {
 			return fmt.Errorf("failed to marshal JSON: %w", err)
 		}
-		fmt.Println(string(jsonBytes))
+		fmt.Fprintln(os.Stdout, string(jsonBytes))
 		return nil
 	}
 
@@ -357,13 +355,18 @@ func loadLocalExperimentConfigs(experimentName string) map[string]*workflow.Expe
 func loadRemoteExperimentConfigs(repoOverride, experimentName string) map[string]*workflow.ExperimentConfig {
 	experimentsLog.Printf("Loading remote experiment configs for %s from %s", experimentName, repoOverride)
 
-	// Scan common workflow file name candidates: the experiment name as-is, and with
-	// a hyphen reintroduced before common separators. We try the exact name first since
-	// the sanitized form (hyphens removed, lowercased) is irreversible in general.
+	// Build the candidate list. First, use the directory listing to find the exact filename
+	// whose sanitized basename matches experimentName (e.g. "ci-coach" for "cicoach").
+	// Fall back to the bare experiment name if the listing is unavailable.
 	candidates := workflowFileCandidates(experimentName)
+	if resolved := findRemoteWorkflowFilenameForExperiment(repoOverride, experimentName); resolved != "" && resolved != experimentName {
+		// Prepend the resolved name so it is tried before the bare sanitized form.
+		// Skip when resolved == experimentName to avoid a redundant fetch.
+		candidates = append([]string{resolved}, candidates...)
+	}
 
 	for _, candidate := range candidates {
-		apiPath := ".github/workflows/" + candidate + ".md"
+		apiPath := constants.WorkflowsDirSlash + candidate + ".md"
 		args := []string{"api",
 			"repos/{owner}/{repo}/contents/" + url.PathEscape(apiPath),
 			"--jq", ".content",
@@ -402,6 +405,52 @@ func loadRemoteExperimentConfigs(repoOverride, experimentName string) map[string
 	return nil
 }
 
+// findRemoteWorkflowFilenameForExperiment lists .md files in .github/workflows/ via the
+// GitHub API and returns the basename (without .md) of the first file whose sanitized name
+// matches experimentName. This mirrors findWorkflowFileForExperiment for remote repos.
+// Returns "" when the directory cannot be listed or no match is found.
+func findRemoteWorkflowFilenameForExperiment(repoOverride, experimentName string) string {
+	args := []string{"api",
+		"repos/{owner}/{repo}/contents/.github/workflows",
+		"--jq", `[.[] | select(.name | endswith(".md")) | .name]`,
+		"--repo", repoOverride,
+	}
+	cmd := workflow.ExecGH(args...)
+	out, err := cmd.Output()
+	if err != nil {
+		experimentsLog.Printf("Failed to list remote workflow files from %s: %v", repoOverride, err)
+		return ""
+	}
+
+	var filenames []string
+	if err := json.Unmarshal(out, &filenames); err != nil {
+		experimentsLog.Printf("Failed to parse remote workflow file listing: %v", err)
+		return ""
+	}
+
+	return matchWorkflowFilenameByExperiment(filenames, experimentName)
+}
+
+// matchWorkflowFilenameByExperiment returns the basename (without .md) of the first file in
+// filenames whose sanitized name matches experimentName. Returns "" when no match is found.
+// Logs a warning when more than one file maps to the same sanitized name.
+func matchWorkflowFilenameByExperiment(filenames []string, experimentName string) string {
+	var matches []string
+	for _, filename := range filenames {
+		base := strings.TrimSuffix(filename, ".md")
+		if workflow.SanitizeWorkflowIDForCacheKey(base) == experimentName {
+			matches = append(matches, base)
+		}
+	}
+	if len(matches) == 0 {
+		return ""
+	}
+	if len(matches) > 1 {
+		experimentsLog.Printf("Ambiguous experiment name %q: multiple workflow files match (%s); using first", experimentName, strings.Join(matches, ", "))
+	}
+	return matches[0]
+}
+
 // findWorkflowFileForExperiment scans .github/workflows/ for a .md file whose sanitized
 // basename (lowercase, hyphens removed) matches the given experiment name.
 // Returns the file path or "" when no match is found.
@@ -419,14 +468,14 @@ func findWorkflowFileForExperiment(experimentName string) string {
 	return ""
 }
 
-// workflowFileCandidates returns a list of candidate workflow file basenames (without .md)
-// to try when looking up a remote workflow by its sanitized experiment name.
-// The sanitized form is lossy (hyphens removed), so we return the sanitized name itself
-// plus the original name as candidates.
+// workflowFileCandidates returns a fallback list of candidate workflow file basenames (without .md)
+// for remote lookups when the directory listing is unavailable. The sanitized form
+// (hyphens removed, lowercased) is irreversible, so only the experiment name itself is
+// returned here. The caller should prefer findRemoteWorkflowFilenameForExperiment which
+// resolves the real filename by scanning the remote directory.
 func workflowFileCandidates(experimentName string) []string {
-	// Start with the experiment name as-is (may already be the correct filename).
-	candidates := []string{experimentName}
-	return candidates
+	// Return the experiment name as-is as a last-resort fallback.
+	return []string{experimentName}
 }
 
 // fetchLocalExperiments lists experiment branches and reads their state from the local git repo.
@@ -448,7 +497,8 @@ func fetchLocalExperiments() ([]ExperimentInfo, error) {
 		return nil, fmt.Errorf("failed to list experiment branches: %w", err)
 	}
 
-	seen := make(map[string]bool)
+	seen := make(map[string]struct {
+	})
 	var experiments []ExperimentInfo
 
 	for line := range strings.SplitSeq(strings.TrimSpace(string(output)), "\n") {
@@ -456,10 +506,11 @@ func fetchLocalExperiments() ([]ExperimentInfo, error) {
 			continue
 		}
 		workflowID := extractExperimentName(line)
-		if workflowID == "" || seen[workflowID] {
+		if workflowID == "" || setutil.Contains(seen, workflowID) {
 			continue
 		}
-		seen[workflowID] = true
+		seen[workflowID] = struct {
+		}{}
 
 		branchName := experimentsBranchPrefix + workflowID
 		// Prefer remote ref; fall back to local.
@@ -634,8 +685,15 @@ func experimentDetailsFromState(workflowID, branchName string, state *Experiment
 			Total:    total,
 		})
 	}
-	sort.Slice(experiments, func(i, j int) bool {
-		return experiments[i].Name < experiments[j].Name
+	slices.SortFunc(experiments, func(a, b ExperimentVariantStats) int {
+		switch {
+		case a.Name < b.Name:
+			return -1
+		case a.Name > b.Name:
+			return 1
+		default:
+			return 0
+		}
 	})
 
 	recentRuns := state.Runs
@@ -708,9 +766,7 @@ func printExperimentDetails(d *ExperimentDetails) {
 	fmt.Fprintf(os.Stderr, "  Total runs: %d\n", d.TotalRuns)
 
 	if len(d.Experiments) > 0 {
-		fmt.Fprintln(os.Stderr, "\nExperiments:")
 		for _, exp := range d.Experiments {
-			fmt.Fprintf(os.Stderr, "  %s (total: %d):\n", exp.Name, exp.Total)
 			// Sort variants for deterministic display.
 			type kv struct {
 				k string
@@ -720,13 +776,31 @@ func printExperimentDetails(d *ExperimentDetails) {
 			for k, v := range exp.Variants {
 				pairs = append(pairs, kv{k, v})
 			}
-			sort.Slice(pairs, func(i, j int) bool { return pairs[i].k < pairs[j].k })
+			slices.SortFunc(pairs, func(a, b kv) int {
+				switch {
+				case a.k < b.k:
+					return -1
+				case a.k > b.k:
+					return 1
+				default:
+					return 0
+				}
+			})
+			rows := make([][]string, 0, len(pairs))
 			for _, p := range pairs {
 				pct := 0
 				if exp.Total > 0 {
 					pct = p.v * 100 / exp.Total
 				}
-				fmt.Fprintf(os.Stderr, "    %-20s %d (%d%%)\n", p.k, p.v, pct)
+				rows = append(rows, []string{p.k, strconv.Itoa(p.v), strconv.Itoa(pct) + "%"})
+			}
+			if len(rows) > 0 {
+				fmt.Fprintf(os.Stderr, "\n%s", console.RenderTable(console.TableConfig{
+					Title:   fmt.Sprintf("%s (total: %d)", exp.Name, exp.Total),
+					Headers: []string{"Variant", "Count", "Percent"},
+					Rows:    rows,
+					TTYFunc: tty.IsStderrTerminal,
+				}))
 			}
 		}
 	} else {
@@ -736,14 +810,20 @@ func printExperimentDetails(d *ExperimentDetails) {
 	printExperimentAnalyses(d.Analyses)
 
 	if len(d.RecentRuns) > 0 {
-		fmt.Fprintln(os.Stderr, "\nRecent runs:")
+		rows := make([][]string, 0, len(d.RecentRuns))
 		for _, run := range d.RecentRuns {
 			date := run.Timestamp
 			if len(date) >= 10 {
 				date = date[:10]
 			}
-			fmt.Fprintf(os.Stderr, "  %s  %-16s  %s\n", date, run.RunID, formatAssignments(run.Assignments))
+			rows = append(rows, []string{date, run.RunID, formatAssignments(run.Assignments)})
 		}
+		fmt.Fprintf(os.Stderr, "\n%s", console.RenderTable(console.TableConfig{
+			Title:   "Recent runs",
+			Headers: []string{"Date", "Run ID", "Assignments"},
+			Rows:    rows,
+			TTYFunc: tty.IsStderrTerminal,
+		}))
 	}
 }
 
@@ -752,11 +832,7 @@ func formatAssignments(assignments map[string]string) string {
 	if len(assignments) == 0 {
 		return "-"
 	}
-	keys := make([]string, 0, len(assignments))
-	for k := range assignments {
-		keys = append(keys, k)
-	}
-	sort.Strings(keys)
+	keys := sliceutil.SortedKeys(assignments)
 	parts := make([]string, 0, len(keys))
 	for _, k := range keys {
 		parts = append(parts, k+"="+assignments[k])

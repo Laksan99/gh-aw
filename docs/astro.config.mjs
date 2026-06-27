@@ -2,12 +2,12 @@
 import { defineConfig } from 'astro/config';
 import starlight from '@astrojs/starlight';
 import sitemap from '@astrojs/sitemap';
-import starlightLlmsTxt from 'starlight-llms-txt';
 import starlightLinksValidator from 'starlight-links-validator';
 import starlightGitHubAlerts from 'starlight-github-alerts';
 import starlightBlog from 'starlight-blog';
 import mermaid from 'astro-mermaid';
 import { fileURLToPath } from 'node:url';
+import { unified } from '@astrojs/markdown-remark';
 import remarkStripEmojis from './src/lib/remark/stripEmojis.js';
 import remarkTableDataLabels from './src/lib/remark/tableDataLabels.js';
 import rehypeTableWrapper from './src/lib/rehype/tableWrapper.js';
@@ -38,8 +38,10 @@ export default defineConfig({
 	base: '/gh-aw/',
 	trailingSlash: 'always',
 	markdown: {
-		remarkPlugins: [remarkStripEmojis, remarkTableDataLabels],
-		rehypePlugins: [rehypeTableWrapper],
+		processor: unified({
+			remarkPlugins: [remarkStripEmojis, remarkTableDataLabels],
+			rehypePlugins: [rehypeTableWrapper],
+		}),
 	},
 	vite: {
 		server: {
@@ -75,17 +77,19 @@ export default defineConfig({
 
 		// Introduction how-it-works → how-they-work
 		'/introduction/how-it-works/': '/gh-aw/introduction/how-they-work/',
+		'/introduction/slides/': '/gh-aw/',
+		'/slides/': '/gh-aw/',
 
 		// Tools → Setup renames
 		'/tools/cli/': '/gh-aw/setup/cli/',
 		'/tools/mcp-server/': '/gh-aw/reference/gh-aw-as-mcp-server/',
 		'/tools/agentic-authoring/': '/gh-aw/setup/creating-workflows/',
 
-		// Samples → Examples renames
-		'/samples/coding-development/': '/gh-aw/examples/issue-pr-events/coding-development/',
-		'/samples/quality-testing/': '/gh-aw/examples/issue-pr-events/quality-testing/',
-		'/samples/triage-analysis/': '/gh-aw/examples/issue-pr-events/triage-analysis/',
-		'/samples/research-planning/': '/gh-aw/examples/scheduled/research-planning/',
+		// Samples → Patterns renames
+		'/samples/coding-development/': '/gh-aw/patterns/daily-ops/',
+		'/samples/quality-testing/': '/gh-aw/patterns/daily-ops/',
+		'/samples/triage-analysis/': '/gh-aw/patterns/issue-ops/',
+		'/samples/research-planning/': '/gh-aw/patterns/daily-ops/',
 
 		// Setup renames
 		'/setup/agentic-authoring/': '/gh-aw/setup/creating-workflows/',
@@ -94,11 +98,12 @@ export default defineConfig({
 		// Reference renames
 		'/reference/custom-agents/': '/gh-aw/reference/copilot-custom-agents/',
 		'/reference/custom-agent/': '/gh-aw/reference/custom-agent-for-aw/',
+		'/reference/assign-to-copilot/': '/gh-aw/reference/copilot-cloud-agent/',
 
 		// Organization Practices moved under Guides
-		'/organization-practices/': '/gh-aw/guides/organization-practices/',
-		'/organization-practices/safe-rollout/': '/gh-aw/guides/organization-practices/safe-rollout/',
-		'/organization-practices/sharing-workflows/': '/gh-aw/guides/organization-practices/sharing-workflows/',
+		'/organization-practices/': '/gh-aw/practices/organization-practices/',
+		'/organization-practices/safe-rollout/': '/gh-aw/practices/safe-rollout/',
+		'/organization-practices/sharing-workflows/': '/gh-aw/practices/sharing-workflows/',
 
 		// Guides → Patterns renames
 		'/guides/chatops/': '/gh-aw/patterns/chat-ops/',
@@ -106,13 +111,15 @@ export default defineConfig({
 		'/guides/labelops/': '/gh-aw/patterns/label-ops/',
 		'/guides/dailyops/': '/gh-aw/patterns/daily-ops/',
 		'/guides/dispatchops/': '/gh-aw/patterns/dispatch-ops/',
-		'/guides/monitoring/': '/gh-aw/patterns/monitoring/',
+		'/guides/monitoring/': '/gh-aw/experimental/monitoring-with-projects/',
 		'/guides/multirepoops/': '/gh-aw/patterns/multi-repo-ops/',
-		'/guides/orchestration/': '/gh-aw/patterns/orchestration/',
-		'/guides/siderepoops/': '/gh-aw/patterns/side-repo-ops/',
+		'/guides/orchestration/': '/gh-aw/patterns/orchestrator-ops/',
+		'/patterns/orchestration/': '/gh-aw/patterns/orchestrator-ops/',
+		'/guides/siderepoops/': '/gh-aw/patterns/multi-repo-ops/',
+		'/patterns/side-repo-ops/': '/gh-aw/patterns/multi-repo-ops/',
 		'/guides/specops/': '/gh-aw/patterns/spec-ops/',
 		'/guides/researchplanassign/': '/gh-aw/patterns/research-plan-assign-ops/',
-		'/guides/trialops/': '/gh-aw/patterns/trial-ops/',
+		'/guides/trialops/': '/gh-aw/experimental/trial-ops/',
 
 		// Examples → Patterns renames
 		'/examples/comment-triggered/chatops/': '/gh-aw/patterns/chat-ops/',
@@ -125,19 +132,77 @@ export default defineConfig({
 		'/patterns/centralrepoops/': '/gh-aw/patterns/central-repo-ops/',
 		'/patterns/chatops/': '/gh-aw/patterns/chat-ops/',
 		'/patterns/dailyops/': '/gh-aw/patterns/daily-ops/',
-		'/patterns/dataops/': '/gh-aw/patterns/data-ops/',
+		'/patterns/dataops/': '/gh-aw/patterns/deterministic-ops/',
 		'/patterns/dispatchops/': '/gh-aw/patterns/dispatch-ops/',
 		'/patterns/issueops/': '/gh-aw/patterns/issue-ops/',
 		'/patterns/labelops/': '/gh-aw/patterns/label-ops/',
 		'/patterns/multirepoops/': '/gh-aw/patterns/multi-repo-ops/',
 		'/patterns/projectops/': '/gh-aw/patterns/project-ops/',
-		'/patterns/siderepoops/': '/gh-aw/patterns/side-repo-ops/',
+		'/patterns/siderepoops/': '/gh-aw/patterns/multi-repo-ops/',
 		'/patterns/specops/': '/gh-aw/patterns/spec-ops/',
 		'/patterns/researchplanassignops/': '/gh-aw/patterns/research-plan-assign-ops/',
 		'/patterns/batchops/': '/gh-aw/patterns/batch-ops/',
-		'/patterns/taskops/': '/gh-aw/patterns/task-ops/',
-		'/patterns/trialops/': '/gh-aw/patterns/trial-ops/',
+		'/patterns/taskops/': '/gh-aw/patterns/research-plan-assign-ops/',
+		'/patterns/trialops/': '/gh-aw/experimental/trial-ops/',
 		'/patterns/workqueueops/': '/gh-aw/patterns/workqueue-ops/',
+
+		// Guides → new locations
+		'/guides/deterministic-agentic-patterns/': '/gh-aw/patterns/deterministic-ops/',
+		'/patterns/deterministic-agentic-patterns/': '/gh-aw/patterns/deterministic-ops/',
+		'/guides/organization-practices/safe-rollout/': '/gh-aw/practices/safe-rollout/',
+		'/guides/organization-practices/sharing-workflows/': '/gh-aw/practices/sharing-workflows/',
+		'/guides/organization-practices/': '/gh-aw/guides/using-at-scale/',
+		'/guides/maintaining-repos/': '/gh-aw/examples/maintaining-repos/',
+		'/practices/maintaining-repos/': '/gh-aw/examples/maintaining-repos/',
+		'/guides/self-hosted-runners/': '/gh-aw/reference/self-hosted-runners/',
+		'/guides/packaging-imports/': '/gh-aw/guides/reusing-workflows/',
+		'/guides/web-search/': '/gh-aw/reference/web-search/',
+		'/guides/custom-otlp-attributes/': '/gh-aw/guides/open-telemetry/',
+		'/guides/telemetry/': '/gh-aw/guides/open-telemetry/',
+		'/guides/opentelemetry/': '/gh-aw/guides/open-telemetry/',
+		'/experimental/opentelemetry/': '/gh-aw/guides/open-telemetry/',
+		'/patterns/opentelemetry/': '/gh-aw/guides/open-telemetry/',
+		'/guides/getting-started-mcp/': '/gh-aw/guides/mcps/',
+		'/patterns/data-ops/': '/gh-aw/patterns/deterministic-ops/',
+		'/patterns/expert-ops/': '/gh-aw/patterns/monitor-ops/',
+		'/patterns/agentic-ops/': '/gh-aw/patterns/monitor-ops/',
+		'/patterns/task-ops/': '/gh-aw/patterns/research-plan-assign-ops/',
+		'/examples/comment-triggered/': '/gh-aw/patterns/chat-ops/',
+		'/examples/issue-pr-events/': '/gh-aw/patterns/issue-ops/',
+		'/examples/issue-pr-events/triage-analysis/': '/gh-aw/patterns/issue-ops/',
+		'/examples/issue-pr-events/coding-development/': '/gh-aw/patterns/daily-ops/',
+		'/examples/issue-pr-events/quality-testing/': '/gh-aw/patterns/daily-ops/',
+		'/examples/scheduled/': '/gh-aw/patterns/daily-ops/',
+		'/examples/scheduled/research-planning/': '/gh-aw/patterns/daily-ops/',
+		'/examples/manual/': '/gh-aw/patterns/dispatch-ops/',
+		'/examples/project-tracking/': '/gh-aw/patterns/project-ops/',
+		'/guides/audit-with-agents/': '/gh-aw/reference/audit/',
+		'/guides/ephemerals/': '/gh-aw/reference/ephemerals/',
+		'/guides/memoryops/': '/gh-aw/patterns/memory-ops/',
+		'/guides/memory-ops/': '/gh-aw/patterns/memory-ops/',
+		'/guides/serena/': '/gh-aw/reference/serena/',
+		'/guides/experiments/': '/gh-aw/experimental/experiments/',
+		'/practices/experiments/': '/gh-aw/experimental/experiments/',
+		'/practices/experiments-specification/': '/gh-aw/experimental/experiments-specification/',
+		'/reference/experiments-specification/': '/gh-aw/experimental/experiments-specification/',
+		'/reference/ai-credits-specification/': '/gh-aw/specs/ai-credits-specification/',
+		'/reference/copilot-sdk-driver-specification/': '/gh-aw/specs/copilot-sdk-driver-specification/',
+		'/reference/effective-tokens-specification/': '/gh-aw/specs/effective-tokens-specification/',
+		'/reference/forecast-specification/': '/gh-aw/specs/forecast-specification/',
+		'/reference/frontmatter-hash-specification/': '/gh-aw/specs/frontmatter-hash-specification/',
+		'/reference/fuzzy-schedule-specification/': '/gh-aw/specs/fuzzy-schedule-specification/',
+		'/reference/mcp-scripts-specification/': '/gh-aw/specs/mcp-scripts-specification/',
+		'/reference/model-alias-specification/': '/gh-aw/specs/model-alias-specification/',
+		'/reference/repository-package-manifest-specification/': '/gh-aw/specs/repository-package-manifest-specification/',
+		'/reference/safe-outputs-specification/': '/gh-aw/specs/safe-outputs-specification/',
+		'/practices/organization-practices/': '/gh-aw/guides/using-at-scale/',
+
+		'/reference/awf-reflect/': '/gh-aw/experimental/awf-reflect/',
+
+		// Patterns → Experimental
+		'/patterns/correction-ops/': '/gh-aw/experimental/correction-ops/',
+		'/patterns/trial-ops/': '/gh-aw/experimental/trial-ops/',
+		'/patterns/monitoring/': '/gh-aw/experimental/monitoring-with-projects/',
 	},
 	integrations: [
 		sitemap(),
@@ -227,34 +292,12 @@ export default defineConfig({
 				starlightLinksValidator({
 					errorOnRelativeLinks: true,
 					errorOnLocalLinks: true,
-				}),
-				starlightLlmsTxt({
-					description: 'GitHub Agentic Workflows (gh-aw) is a Go-based GitHub CLI extension that enables writing agentic workflows in natural language using markdown files, and running them as GitHub Actions workflows.',
-					optionalLinks: [
-						{
-							label: 'GitHub Repository',
-							url: 'https://github.com/github/gh-aw',
-							description: 'Source code and development resources for gh-aw'
-						},
-						{
-							label: 'GitHub CLI Documentation',
-							url: 'https://cli.github.com/manual/',
-							description: 'Documentation for the GitHub CLI tool'
-						}
-					],
-					customSets: [
-						{
-							label: "agentic-workflows",
-							paths: ['blog/*meet-the-workflows*'],
-							description: "A comprehensive blog series documenting workflow patterns, best practices, and real-world examples of agentic workflows created at Peli's Agent Factory"
-						}
-					]
 				})
 			],
 			sidebar: [
 				{
 					label: 'Introduction',
-					autogenerate: { directory: 'introduction' },
+					items: [{ autogenerate: { directory: 'introduction' } }],
 				},
 				{
 					label: 'Setup',
@@ -268,24 +311,15 @@ export default defineConfig({
 					label: 'Guides',
 					items: [
 						{ label: 'Agentic Authoring', link: '/guides/agentic-authoring/' },
-						{ label: 'Deterministic Agentic Patterns', link: '/guides/deterministic-agentic-patterns/' },
 						{ label: 'Editing Workflows', link: '/guides/editing-workflows/' },
-						{ label: 'Getting Started with MCP', link: '/guides/getting-started-mcp/' },
-						{ label: 'GitHub Actions Primer', link: '/guides/github-actions-primer/' },
-						{ label: 'Maintaining Repositories', link: '/guides/maintaining-repos/' },
+						{ label: 'Governance', link: '/guides/governance/' },
+						{ label: 'Reusing Workflows', link: '/guides/reusing-workflows/' },
+						{ label: 'Upgrading Workflows', link: '/guides/upgrading/' },
+						{ label: 'Using MCPs', link: '/guides/mcps/' },
 						{ label: 'Network Configuration', link: '/guides/network-configuration/' },
-						{ label: 'Organization Practices', link: '/guides/organization-practices/' },
-						{ label: 'Safe Rollout', link: '/guides/organization-practices/safe-rollout/' },
-						{ label: 'Sharing Workflows', link: '/guides/organization-practices/sharing-workflows/' },
-						{ label: 'Reusing Workflows', link: '/guides/packaging-imports/' },
-						{ label: 'Serena', link: '/guides/serena/' },
-						{ label: 'Using Custom MCPs', link: '/guides/mcps/' },
-						{ label: 'Upgrading', link: '/guides/upgrading/' },
-						{ label: 'Self-Hosted Runners', link: '/guides/self-hosted-runners/' },
-						{ label: 'Ephemerals', link: '/guides/ephemerals/' },
-						{ label: 'Web Search', link: '/guides/web-search/' },
-						{ label: 'Audit Reports', link: '/guides/audit-with-agents/' },
-						{ label: 'Custom OTLP Attributes', link: '/guides/custom-otlp-attributes/' },
+						{ label: 'OpenTelemetry', link: '/guides/open-telemetry/' },
+						{ label: 'GitHub Actions Primer', link: '/guides/github-actions-primer/' },
+						{ label: 'Using at Scale in Organizations', link: '/guides/using-at-scale/' },
 					],
 				},
 				{
@@ -293,55 +327,63 @@ export default defineConfig({
 					items: [
 						{ label: 'BatchOps', link: '/patterns/batch-ops/' },
 						{ label: 'CentralRepoOps', link: '/patterns/central-repo-ops/' },
-						{ label: 'CorrectionOps', link: '/patterns/correction-ops/' },
 						{ label: 'ChatOps', link: '/patterns/chat-ops/' },
-						{ label: 'DailyOps', link: '/patterns/daily-ops/' },
-						{ label: 'DataOps', link: '/patterns/data-ops/' },
+						{ label: 'DeterministicOps', link: '/patterns/deterministic-ops/' },
 						{ label: 'DispatchOps', link: '/patterns/dispatch-ops/' },
-						{ label: 'ExpertOps', link: '/patterns/expert-ops/' },
 						{ label: 'IssueOps', link: '/patterns/issue-ops/' },
 						{ label: 'LabelOps', link: '/patterns/label-ops/' },
-						{ label: 'MemoryOps', link: '/guides/memoryops/' },
+						{ label: 'MemoryOps', link: '/patterns/memory-ops/' },
+						{ label: 'MonitorOps', link: '/patterns/monitor-ops/' },
 						{ label: 'MultiRepoOps', link: '/patterns/multi-repo-ops/' },
-						{ label: 'Monitoring', link: '/patterns/monitoring/' },
-						{ label: 'Agentic Ops', link: '/patterns/agentic-ops/' },
-						{ label: 'Orchestration', link: '/patterns/orchestration/' },
+						{ label: 'OrchestratorOps', link: '/patterns/orchestrator-ops/' },
 						{ label: 'ProjectOps', link: '/patterns/project-ops/' },
 						{ label: 'ResearchPlanAssignOps', link: '/patterns/research-plan-assign-ops/' },
-						{ label: 'SideRepoOps', link: '/patterns/side-repo-ops/' },
+	
 						{ label: 'SpecOps', link: '/patterns/spec-ops/' },
-						{ label: 'TaskOps', link: '/patterns/task-ops/' },
-						{ label: 'TrialOps', link: '/patterns/trial-ops/' },
 						{ label: 'WorkQueueOps', link: '/patterns/workqueue-ops/' },
+					],
+				},
+				{
+					label: 'Practices',
+					items: [
+						{ label: 'Safe Rollout in Organizations', link: '/practices/safe-rollout/' },
+						{ label: 'Sharing Workflows in Organizations', link: '/practices/sharing-workflows/' },
+					],
+				},
+				{
+					label: 'Examples',
+					items: [
+						{ label: 'Automated Repository Maintenance', link: '/examples/maintaining-repos/' },
+						{ label: 'Triage from Side Repo', link: '/examples/multi-repo/triage-from-side-repo/' },
+						{ label: 'Code Quality Monitoring', link: '/examples/multi-repo/code-quality-monitoring/' },
+						{ label: 'Dependabot Rollout', link: '/examples/multi-repo/dependabot-rollout/' },
+						{ label: 'Feature Synchronization', link: '/examples/multi-repo/feature-sync/' },
+						{ label: 'Cross-Repo Issue Tracking', link: '/examples/multi-repo/issue-tracking/' },
 					],
 				},
 				{
 					label: 'Reference',
 					items: [
 						{ label: 'AI Engines', link: '/reference/engines/' },
-						{ label: 'Assign to Copilot', link: '/reference/assign-to-copilot/' },
 						{ label: 'Artifacts', link: '/reference/artifacts/' },
-						{ label: 'Audit', link: '/reference/audit/' },
+						{ label: 'Auditing Workflows', link: '/reference/audit/' },
 						{ label: 'Authentication', link: '/reference/auth/' },
 						{ label: 'Authentication (Projects)', link: '/reference/auth-projects/' },
-						{ label: 'AWF Reflect Route', link: '/reference/awf-reflect/' },
-						{ label: 'Cache Memory', link: '/reference/cache-memory/' },
-						{ label: 'Command Triggers', link: '/reference/command-triggers/' },
 						{ label: 'Compilation Process', link: '/reference/compilation-process/' },
-						{ label: 'Concurrency', link: '/reference/concurrency/' },
+						{ label: 'Measuring Impact', link: '/reference/measuring-impact/' },
+						{ label: 'Billing', link: '/reference/billing/' },
 						{ label: 'Cost Management', link: '/reference/cost-management/' },
 						{ label: 'Cost Management (Rate Limiting)', link: '/reference/rate-limiting-controls/' },
-						{ label: 'Cost Management (Effective Tokens)', link: '/reference/effective-tokens-specification/' },
 						{ label: 'Cost Management (Model Tables)', link: '/reference/model-tables/' },
+						{ label: 'Enterprise Configuration', link: '/reference/enterprise-configuration/' },
 						{ label: 'Environment Variables', link: '/reference/environment-variables/' },
 						{ label: 'FAQ', link: '/reference/faq/' },
-						{ label: 'Footers', link: '/reference/footers/' },
 						{ label: 'Frontmatter', link: '/reference/frontmatter/' },
-						{ label: 'Frontmatter (Hash Specification)', link: '/reference/frontmatter-hash-specification/' },
+						{ label: 'Frontmatter (Concurrency)', link: '/reference/concurrency/' },
 						{ label: 'Frontmatter (Schedule Syntax)', link: '/reference/schedule-syntax/' },
-						{ label: 'Frontmatter (Fuzzy Schedules)', link: '/reference/fuzzy-schedule-specification/' },
-						{ label: 'Frontmatter (Full)', link: '/reference/frontmatter-full/' },
 						{ label: 'Frontmatter (Triggers)', link: '/reference/triggers/' },
+						{ label: 'Frontmatter (Command Triggers)', link: '/reference/command-triggers/' },
+						{ label: 'Frontmatter (Full)', link: '/reference/frontmatter-full/' },
 						{ label: 'GH-AW Agent', link: '/reference/custom-agent-for-aw/' },
 						{ label: 'GH-AW as MCP Server', link: '/reference/gh-aw-as-mcp-server/' },
 						{ label: 'GitHub (Checkout)', link: '/reference/checkout/' },
@@ -354,37 +396,65 @@ export default defineConfig({
 						{ label: 'Imports', link: '/reference/imports/' },
 						{ label: 'Imports (APM)', link: '/reference/dependencies/' },
 						{ label: 'Imports (Copilot Agent Files)', link: '/reference/copilot-custom-agents/' },
-						{ label: 'Inline Sub-Agents', link: '/reference/inline-sub-agents/' },
+						{ label: 'Imports (Copilot Inline Sub-Agents)', link: '/reference/inline-sub-agents/' },
 						{ label: 'Imports (Dependabot)', link: '/reference/dependabot/' },
 						{ label: 'Indexing (QMD)', link: '/reference/qmd/' },
 						{ label: 'Markdown', link: '/reference/markdown/' },
-						{ label: 'MCP Gateway', link: '/reference/mcp-gateway/' },
-						{ label: 'Network Access', link: '/reference/network/' },
-						{ label: 'Playwright', link: '/reference/playwright/' },
-						{ label: 'Releases and Versioning', link: '/reference/releases/' },
-						{ label: 'Repo Memory', link: '/reference/repo-memory/' },
+								{ label: 'Outcomes', link: '/reference/outcomes/' },
+						{ label: 'OpenTelemetry Attributes', link: '/reference/open-telemetry/' },
+						{ label: 'Package Manifest', link: '/reference/aw-yml-package-manifest/' },
+								{ label: 'Releases and Versioning', link: '/reference/releases/' },
 						{ label: 'MCP Scripts', link: '/reference/mcp-scripts/' },
-						{ label: 'MCP Scripts (Spec)', link: '/reference/mcp-scripts-specification/' },
-						{ label: 'Safe Outputs', link: '/reference/safe-outputs/' },
+								{ label: 'Safe Outputs', link: '/reference/safe-outputs/' },
+						{ label: 'Safe Outputs (Copilot Cloud Agent)', link: '/reference/copilot-cloud-agent/' },
 						{ label: 'Safe Outputs (Custom)', link: '/reference/custom-safe-outputs/' },
 						{ label: 'Safe Outputs (Pull Requests)', link: '/reference/safe-outputs-pull-requests/' },
-						{ label: 'Safe Outputs (Spec)', link: '/reference/safe-outputs-specification/' },
-						{ label: 'Safe Outputs (Staged Mode)', link: '/reference/staged-mode/' },
+								{ label: 'Safe Outputs (Staged Mode)', link: '/reference/staged-mode/' },
+						{ label: 'Safe Outputs (Ephemerals)', link: '/reference/ephemerals/' },
+						{ label: 'Safe Outputs (Footers)', link: '/reference/footers/' },
 						{ label: 'Sandbox', link: '/reference/sandbox/' },
+						{ label: 'Self-Hosted Runners', link: '/reference/self-hosted-runners/' },
+						{ label: 'Sandbox (MCP Gateway)', link: '/reference/mcp-gateway/' },
+						{ label: 'Sandbox (Network Access)', link: '/reference/network/' },
 						{ label: 'Templating', link: '/reference/templating/' },
 						{ label: 'Threat Detection', link: '/reference/threat-detection/' },
 						{ label: 'Tools', link: '/reference/tools/' },
+						{ label: 'Tools (Cache Memory)', link: '/reference/cache-memory/' },
+						{ label: 'Tools (Repo Memory)', link: '/reference/repo-memory/' },
+						{ label: 'Tools (Playwright)', link: '/reference/playwright/' },
+						{ label: 'Tools (Serena)', link: '/reference/serena/' },
+						{ label: 'Tools (Web Search)', link: '/reference/web-search/' },
 						{ label: 'Triggering CI', link: '/reference/triggering-ci/' },
-						{ label: 'WASM Compilation', link: '/reference/wasm-compilation/' },
 						{ label: 'Workflow Structure', link: '/reference/workflow-structure/' },
 					],
 				},
 				{
+					label: 'Specs',
+					collapsed: true,
+					items: [{ autogenerate: { directory: 'specs' } }],
+				},
+				{
 					label: 'Troubleshooting',
-					autogenerate: { directory: 'troubleshooting' },
+					items: [{ autogenerate: { directory: 'troubleshooting' } }],
+				},
+				{
+					label: 'Experimental',
+					collapsed: true,
+					items: [
+						{ label: 'A/B Experiments', link: '/experimental/experiments/' },
+						{ label: 'A/B Experiments (Spec)', link: '/experimental/experiments-specification/' },
+						{ label: 'AWF Reflect Route', link: '/experimental/awf-reflect/' },
+						{ label: 'CorrectionOps', link: '/experimental/correction-ops/' },
+						{ label: 'Monitoring with Projects', link: '/experimental/monitoring-with-projects/' },
+						{ label: 'Safe-Outputs Samples', link: '/experimental/safe-outputs-samples/' },
+						{ label: 'TrialOps', link: '/experimental/trial-ops/' },
+						{ label: 'WASM Compilation', link: '/reference/wasm-compilation/' },
+
+					],
 				},
 				{ label: 'Agent Factory', link: '/agent-factory-status/' },
 				{ label: 'Editors', link: '/reference/editors/' },
+				{ label: 'About', link: '/about/' },
 			],
 		}),
 	],

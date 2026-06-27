@@ -59,6 +59,29 @@ func TestLoadRepoConfig_EmptyObject(t *testing.T) {
 	require.NoError(t, err, "empty aw.json should load without error")
 	assert.False(t, cfg.MaintenanceDisabled, "maintenance should be enabled by default")
 	assert.Nil(t, cfg.Maintenance, "maintenance config should be nil when not specified")
+	assert.True(t, cfg.IsHelpCommandEnabled(), "help command should be enabled by default")
+}
+
+func TestLoadRepoConfig_HelpCommandFalse(t *testing.T) {
+	dir := t.TempDir()
+	writeAWJSON(t, dir, `{"help_command": false}`)
+
+	cfg, err := LoadRepoConfig(dir)
+	require.NoError(t, err, "valid aw.json should load without error")
+	require.NotNil(t, cfg.HelpCommand, "help_command should be set")
+	assert.False(t, *cfg.HelpCommand, "help_command should be false when explicitly set")
+	assert.False(t, cfg.IsHelpCommandEnabled(), "help command should be disabled when help_command is false")
+}
+
+func TestLoadRepoConfig_HelpCommandTrue(t *testing.T) {
+	dir := t.TempDir()
+	writeAWJSON(t, dir, `{"help_command": true}`)
+
+	cfg, err := LoadRepoConfig(dir)
+	require.NoError(t, err, "valid aw.json should load without error")
+	require.NotNil(t, cfg.HelpCommand, "help_command should be set")
+	assert.True(t, *cfg.HelpCommand, "help_command should be true when explicitly set")
+	assert.True(t, cfg.IsHelpCommandEnabled(), "help command should be enabled when help_command is true")
 }
 
 func TestLoadRepoConfig_MaintenanceEmptyObject(t *testing.T) {
@@ -81,6 +104,17 @@ func TestLoadRepoConfig_ActionFailureIssueExpires(t *testing.T) {
 	require.NotNil(t, cfg.Maintenance, "maintenance config should be set")
 	assert.Equal(t, 72, cfg.Maintenance.ActionFailureIssueExpires, "action_failure_issue_expires should be parsed from aw.json")
 	assert.Equal(t, 72, cfg.ActionFailureIssueExpiresHours(), "accessor should return configured expiration")
+}
+
+func TestLoadRepoConfig_MaintenanceCompileConfig(t *testing.T) {
+	dir := t.TempDir()
+	writeAWJSON(t, dir, `{"maintenance": {"compile": {"create_pull_request_github_token": "MAINTENANCE_TOKEN"}}}`)
+
+	cfg, err := LoadRepoConfig(dir)
+	require.NoError(t, err, "valid aw.json should load without error")
+	require.NotNil(t, cfg.Maintenance, "maintenance config should be set")
+	require.NotNil(t, cfg.Maintenance.Compile, "compile config should be set")
+	assert.Equal(t, "MAINTENANCE_TOKEN", cfg.Maintenance.Compile.CreatePullRequestGitHubToken)
 }
 
 func TestLoadRepoConfig_InvalidJSON(t *testing.T) {
@@ -152,6 +186,14 @@ func TestLoadRepoConfig_InvalidActionFailureIssueExpires(t *testing.T) {
 	assert.Error(t, err, "action_failure_issue_expires must be >= 1")
 }
 
+func TestLoadRepoConfig_InvalidMaintenanceCompileGitHubTokenSecret(t *testing.T) {
+	dir := t.TempDir()
+	writeAWJSON(t, dir, `{"maintenance": {"compile": {"create_pull_request_github_token": "bad-secret"}}}`)
+
+	_, err := LoadRepoConfig(dir)
+	assert.Error(t, err, "create_pull_request_github_token must be a valid secret name")
+}
+
 func TestLoadRepoConfig_GHESTrue(t *testing.T) {
 	dir := t.TempDir()
 	writeAWJSON(t, dir, `{"ghes": true}`)
@@ -190,6 +232,24 @@ func TestLoadRepoConfig_GHESWithMaintenance(t *testing.T) {
 	assert.Equal(t, RunsOnValue{"self-hosted"}, cfg.Maintenance.RunsOn)
 }
 
+func TestLoadRepoConfig_UTC(t *testing.T) {
+	dir := t.TempDir()
+	writeAWJSON(t, dir, `{"utc": "-08:00"}`)
+
+	cfg, err := LoadRepoConfig(dir)
+	require.NoError(t, err, "valid aw.json with utc should load without error")
+	assert.Equal(t, "-08:00", cfg.UTC)
+}
+
+func TestLoadRepoConfig_InvalidUTC(t *testing.T) {
+	dir := t.TempDir()
+	writeAWJSON(t, dir, `{"utc": "+14:30"}`)
+
+	_, err := LoadRepoConfig(dir)
+	require.Error(t, err, "invalid timezone should return an error")
+	assert.Contains(t, err.Error(), "utc must be a numeric UTC offset")
+}
+
 // TestFormatRunsOn tests the YAML serialisation of runs-on values.
 func TestFormatRunsOn(t *testing.T) {
 	const def = "ubuntu-slim"
@@ -218,6 +278,94 @@ func TestFormatRunsOn(t *testing.T) {
 func TestActionFailureIssueExpiresHours_Default(t *testing.T) {
 	cfg := &RepoConfig{}
 	assert.Equal(t, DefaultActionFailureIssueExpiresHours, cfg.ActionFailureIssueExpiresHours(), "default should be returned when aw.json does not set action_failure_issue_expires")
+}
+
+func TestLoadRepoConfig_AutoUpgradeEnabled(t *testing.T) {
+	dir := t.TempDir()
+	writeAWJSON(t, dir, `{"auto_upgrade": true}`)
+
+	cfg, err := LoadRepoConfig(dir)
+	require.NoError(t, err, "valid aw.json should load without error")
+	require.NotNil(t, cfg.AutoUpgrade, "auto_upgrade should be set")
+	assert.True(t, *cfg.AutoUpgrade, "auto_upgrade should be true")
+	assert.True(t, cfg.IsAutoUpgradeEnabled(), "IsAutoUpgradeEnabled should return true")
+}
+
+func TestLoadRepoConfig_AutoUpgradeDisabled(t *testing.T) {
+	dir := t.TempDir()
+	writeAWJSON(t, dir, `{"auto_upgrade": false}`)
+
+	cfg, err := LoadRepoConfig(dir)
+	require.NoError(t, err, "valid aw.json should load without error")
+	require.NotNil(t, cfg.AutoUpgrade, "auto_upgrade should be set")
+	assert.False(t, *cfg.AutoUpgrade, "auto_upgrade should be false")
+	assert.False(t, cfg.IsAutoUpgradeEnabled(), "IsAutoUpgradeEnabled should return false")
+}
+
+func TestLoadRepoConfig_AutoUpgradeOmitted(t *testing.T) {
+	dir := t.TempDir()
+	writeAWJSON(t, dir, `{}`)
+
+	cfg, err := LoadRepoConfig(dir)
+	require.NoError(t, err, "valid aw.json should load without error")
+	assert.Nil(t, cfg.AutoUpgrade, "auto_upgrade should be nil when omitted")
+	assert.False(t, cfg.IsAutoUpgradeEnabled(), "IsAutoUpgradeEnabled should return false when omitted (opt-in)")
+}
+
+func TestIsAutoUpgradeEnabled_NilConfig(t *testing.T) {
+	var r *RepoConfig
+	assert.False(t, r.IsAutoUpgradeEnabled(), "IsAutoUpgradeEnabled should return false for nil RepoConfig")
+}
+
+func TestLoadRepoConfig_ActionPins(t *testing.T) {
+	t.Run("loads action_pins mapping", func(t *testing.T) {
+		dir := t.TempDir()
+		writeAWJSON(t, dir, `{"action_pins": {"actions/checkout@v4": "acme-corp/checkout@v4"}}`)
+
+		cfg, err := LoadRepoConfig(dir)
+		require.NoError(t, err, "valid aw.json with action_pins should load without error")
+		require.NotNil(t, cfg.ActionPins, "action_pins should be populated")
+		assert.Equal(t, "acme-corp/checkout@v4", cfg.ActionPins["actions/checkout@v4"])
+	})
+
+	t.Run("allows multiple mappings", func(t *testing.T) {
+		dir := t.TempDir()
+		writeAWJSON(t, dir, `{"action_pins": {
+			"actions/checkout@v4": "acme-corp/checkout@v4",
+			"actions/setup-node@v4": "acme-corp/setup-node@v4"
+		}}`)
+
+		cfg, err := LoadRepoConfig(dir)
+		require.NoError(t, err)
+		assert.Len(t, cfg.ActionPins, 2)
+		assert.Equal(t, "acme-corp/checkout@v4", cfg.ActionPins["actions/checkout@v4"])
+		assert.Equal(t, "acme-corp/setup-node@v4", cfg.ActionPins["actions/setup-node@v4"])
+	})
+
+	t.Run("action_pins absent results in nil map", func(t *testing.T) {
+		dir := t.TempDir()
+		writeAWJSON(t, dir, `{}`)
+
+		cfg, err := LoadRepoConfig(dir)
+		require.NoError(t, err)
+		assert.Nil(t, cfg.ActionPins, "action_pins should be nil when not specified")
+	})
+
+	t.Run("rejects key without version", func(t *testing.T) {
+		dir := t.TempDir()
+		writeAWJSON(t, dir, `{"action_pins": {"actions/checkout": "acme-corp/checkout@v4"}}`)
+
+		_, err := LoadRepoConfig(dir)
+		assert.Error(t, err, "key without @version should fail schema validation")
+	})
+
+	t.Run("rejects value without version", func(t *testing.T) {
+		dir := t.TempDir()
+		writeAWJSON(t, dir, `{"action_pins": {"actions/checkout@v4": "acme-corp/checkout"}}`)
+
+		_, err := LoadRepoConfig(dir)
+		assert.Error(t, err, "value without @version should fail schema validation")
+	})
 }
 
 // writeAWJSON creates .github/workflows/aw.json with the given JSON content.

@@ -1,6 +1,7 @@
 #!/bin/bash
 set +o histexpand
 
+# Script sync note: install-gh-aw.sh is canonical. actions/setup-cli/install.sh is copied from install-gh-aw.sh.
 
 # Script to download and install gh-aw binary for the current OS and architecture
 # Supports: Linux, macOS (Darwin), FreeBSD, Windows (Git Bash/MSYS/Cygwin)
@@ -53,6 +54,17 @@ GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
 BLUE='\033[0;34m'
 NC='\033[0m' # No Color
+
+# Disable colors when output is captured or color is explicitly disabled.
+# NO_COLOR is the no-color.org standard; NO_COLORS covers tools that use the non-standard variant.
+# Per the spec, NO_COLOR disables colors even when set to an empty string, so we test with +set.
+if [ -n "${CI:-}" ] || [ "${NO_COLOR+set}" = "set" ] || [ "${NO_COLORS+set}" = "set" ] || [ ! -t 1 ] || [ "${TERM:-}" = "dumb" ]; then
+    RED=""
+    GREEN=""
+    YELLOW=""
+    BLUE=""
+    NC=""
+fi
 
 # Function to print colored output
 print_info() {
@@ -262,6 +274,30 @@ fi
 if [ "$OS_NAME" = "windows" ]; then
     DOWNLOAD_URL="${DOWNLOAD_URL}.exe"
 fi
+
+# For latest installs, keep a versioned fallback URL in case the latest redirect
+# endpoint intermittently returns gateway errors.
+LATEST_TAG=""
+FALLBACK_DOWNLOAD_URL=""
+FALLBACK_CHECKSUMS_URL=""
+if [ "$VERSION" = "latest" ]; then
+    if LATEST_RELEASE_RESPONSE=$(curl -sLf --connect-timeout 15 --max-time 30 "https://api.github.com/repos/$REPO/releases/latest"); then
+        LATEST_TAG=$(printf '%s' "$LATEST_RELEASE_RESPONSE" | sed -n 's/.*"tag_name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -1)
+    else
+        print_warning "Failed to resolve latest release tag from GitHub API."
+    fi
+    if [ -n "$LATEST_TAG" ]; then
+        FALLBACK_DOWNLOAD_URL="https://github.com/$REPO/releases/download/$LATEST_TAG/$PLATFORM"
+        FALLBACK_CHECKSUMS_URL="https://github.com/$REPO/releases/download/$LATEST_TAG/checksums.txt"
+        if [ "$OS_NAME" = "windows" ]; then
+            FALLBACK_DOWNLOAD_URL="${FALLBACK_DOWNLOAD_URL}.exe"
+        fi
+        print_info "Prepared latest fallback URL for resolved tag: $LATEST_TAG"
+    else
+        print_warning "Could not resolve latest release tag; install will use latest redirect URL only."
+    fi
+fi
+
 INSTALL_DIR="$HOME/.local/share/gh/extensions/gh-aw"
 BINARY_PATH="$INSTALL_DIR/$BINARY_NAME"
 CHECKSUMS_PATH="$INSTALL_DIR/checksums.txt"
@@ -284,23 +320,42 @@ fi
 print_info "Downloading gh-aw binary..."
 MAX_RETRIES=3
 RETRY_DELAY=2
+download_binary_with_retry() {
+    local url="$1"
+    local delay="$RETRY_DELAY"
 
-for attempt in $(seq 1 $MAX_RETRIES); do
-    if curl -L -f --connect-timeout 15 --max-time 120 -o "$BINARY_PATH" "$DOWNLOAD_URL"; then
-        print_success "Binary downloaded successfully"
-        break
-    else
-        if [ "$attempt" -eq "$MAX_RETRIES" ]; then
+    for attempt in $(seq 1 $MAX_RETRIES); do
+        if curl -L -f --connect-timeout 15 --max-time 120 -o "$BINARY_PATH" "$url"; then
+            print_success "Binary downloaded successfully"
+            return 0
+        fi
+
+        if [ "$attempt" -lt "$MAX_RETRIES" ]; then
+            print_warning "Download attempt $attempt failed. Retrying in ${delay}s..."
+            sleep $delay
+            delay=$((delay * 2))
+        fi
+    done
+
+    return 1
+}
+
+if ! download_binary_with_retry "$DOWNLOAD_URL"; then
+    if [ -n "$FALLBACK_DOWNLOAD_URL" ]; then
+        print_warning "Failed to download from latest redirect URL. Retrying with resolved tag URL ($LATEST_TAG)."
+        DOWNLOAD_URL="$FALLBACK_DOWNLOAD_URL"
+        CHECKSUMS_URL="$FALLBACK_CHECKSUMS_URL"
+        if ! download_binary_with_retry "$DOWNLOAD_URL"; then
             print_error "Failed to download binary from $DOWNLOAD_URL after $MAX_RETRIES attempts"
             print_info "Please check if the version and platform combination exists in the releases."
             exit 1
-        else
-            print_warning "Download attempt $attempt failed. Retrying in ${RETRY_DELAY}s..."
-            sleep $RETRY_DELAY
-            RETRY_DELAY=$((RETRY_DELAY * 2))
         fi
+    else
+        print_error "Failed to download binary from $DOWNLOAD_URL after $MAX_RETRIES attempts"
+        print_info "Please check if the version and platform combination exists in the releases."
+        exit 1
     fi
-done
+fi
 
 # Download and verify checksums if not skipped
 if [ "$SKIP_CHECKSUM" = false ]; then

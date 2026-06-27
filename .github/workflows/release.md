@@ -1,4 +1,6 @@
 ---
+private: true
+emoji: "🚀"
 name: Release
 description: Build, test, and release gh-aw extension, then generate and prepend release highlights
 on:
@@ -33,22 +35,86 @@ safe-outputs:
   threat-detection: false
 imports:
   - shared/community-attribution.md
-  - shared/observability-otlp.md
+  - shared/otlp.md
 jobs:
-  config:
+  validate_container_pins:
     needs: ["pre_activation", "activation"]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7.0.0
+        with:
+          persist-credentials: false
+      - name: Validate container SHA pins in actions-lock.json files
+        run: |
+          echo "Validating container SHA pins in actions-lock.json files..."
+          LOCK_FILES=()
+          while IFS= read -r -d '' f; do
+            LOCK_FILES+=("$f")
+          done < <(find . -name "actions-lock.json" -not -path "*/node_modules/*" -print0)
+
+          if [ ${#LOCK_FILES[@]} -eq 0 ]; then
+            echo "❌ No actions-lock.json files found in the repository."
+            echo "   Run 'gh aw compile' to generate lock files with resolved container SHA pins."
+            exit 1
+          fi
+
+          FAILED=0
+          for lock_file in "${LOCK_FILES[@]}"; do
+            echo "Checking: $lock_file"
+            container_count=$(jq '.containers | length // 0' "$lock_file")
+            echo "  Found $container_count container entries"
+
+            if [ "$container_count" -eq 0 ]; then
+              echo "  ✓ No containers to validate"
+              continue
+            fi
+
+            missing_pins=$(jq -r '
+              .containers // {} |
+              to_entries[] |
+              select(
+                ((.value.digest // "") | test("^sha256:[a-f0-9]{64}$") | not) or
+                ((.value.pinned_image // "") | test("@sha256:[a-f0-9]{64}$") | not)
+              ) |
+              .key
+            ' "$lock_file")
+
+            if [ -n "$missing_pins" ]; then
+              echo "  ❌ Missing or invalid SHA pins for:"
+              echo "$missing_pins" | while read -r image; do
+                echo "    - $image"
+              done
+              FAILED=1
+            else
+              echo "  ✓ All $container_count containers have valid SHA pins"
+            fi
+          done
+
+          if [ "$FAILED" -eq 1 ]; then
+            echo ""
+            echo "❌ Validation failed: Some container images are missing SHA pins."
+            echo "   Run 'gh aw compile' to resolve and cache container SHA pins before releasing."
+            exit 1
+          fi
+
+          echo ""
+          echo "✓ All container SHA pins are resolved and cached in actions-lock.json files."
+
+  config:
+    needs: ["pre_activation", "activation", "validate_container_pins"]
     runs-on: ubuntu-latest
     outputs:
       release_tag: ${{ steps.compute_config.outputs.release_tag }}
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v6.0.2
+        uses: actions/checkout@v7.0.0
         with:
           fetch-depth: 0
           persist-credentials: false
       - name: Compute Release Config
         id: compute_config
-        uses: actions/github-script@v9
+        uses: actions/github-script@v9.0.0
         with:
           script: |
             const releaseType = context.payload.inputs.release_type;
@@ -169,7 +235,7 @@ jobs:
       contents: write
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v6.0.2
+        uses: actions/checkout@v7.0.0
         with:
           fetch-depth: 0
           persist-credentials: true
@@ -200,10 +266,10 @@ jobs:
           echo "✓ Binaries built successfully"
 
       - name: Setup Docker Buildx (pre-validation)
-        uses: docker/setup-buildx-action@v4
+        uses: docker/setup-buildx-action@v4.1.0
 
       - name: Build Docker image (validation only)
-        uses: docker/build-push-action@v7.1.0
+        uses: docker/build-push-action@v7.2.0
         with:
           context: .
           platforms: linux/amd64
@@ -240,8 +306,252 @@ jobs:
           echo "Sync actions instructions written for release: $RELEASE_TAG"
           echo "Ensure the sync-actions job has been run and the PR merged in github/gh-aw-actions before approving."
 
-  sync_actions:
+  defender:
     needs: ["pre_activation", "activation", "config", "push_tag"]
+    runs-on: windows-latest
+    steps:
+      - name: Download release binaries
+        uses: actions/download-artifact@v8.0.1
+        with:
+          name: release-binaries-${{ needs.config.outputs.release_tag }}
+          path: dist/
+
+      - name: Scan Windows binaries with Microsoft Defender
+        shell: pwsh
+        run: |
+          $binaries = Get-ChildItem -Path dist\ -Filter "windows-*.exe" -File
+          if ($binaries.Count -eq 0) {
+            Write-Error "No Windows binaries found in dist/"
+            exit 1
+          }
+          Write-Host "Found $($binaries.Count) Windows binaries to scan."
+
+          # Resolve MpCmdRun.exe path with fallback to ProgramFiles(x86).
+          $mpCmdRun = Join-Path $env:ProgramFiles "Windows Defender\MpCmdRun.exe"
+          if (-not (Test-Path $mpCmdRun)) {
+            $programFilesX86 = (Get-Item -Path "Env:ProgramFiles(x86)" -ErrorAction SilentlyContinue).Value
+            if ($programFilesX86) {
+              $mpCmdRun = Join-Path $programFilesX86 "Windows Defender\MpCmdRun.exe"
+            }
+          }
+          if (-not (Test-Path $mpCmdRun)) {
+            Write-Error "Microsoft Defender CLI not found (MpCmdRun.exe)"
+            exit 1
+          }
+
+          # Update Defender signatures before scanning.
+          $signatureUpdateAttempts = 3
+          $signatureUpdateDelaySeconds = 15
+          $signatureUpdateSucceeded = $false
+          $signatureUpdateExitCode = 1
+          $mpCmdRunLogPaths = @(
+            (Join-Path $env:TEMP "MpCmdRun.log"),
+            (Join-Path $env:LOCALAPPDATA "Temp\MpCmdRun.log")
+          ) | Select-Object -Unique
+          for ($attemptNumber = 1; $attemptNumber -le $signatureUpdateAttempts; $attemptNumber++) {
+            Write-Host "Updating Microsoft Defender signatures (attempt $attemptNumber/$signatureUpdateAttempts)..."
+            & $mpCmdRun -SignatureUpdate
+            $signatureUpdateExitCode = $LASTEXITCODE
+            if ($signatureUpdateExitCode -eq 0) {
+              $signatureUpdateSucceeded = $true
+              break
+            }
+
+            Write-Warning "Defender signature update attempt $attemptNumber failed with exit code $signatureUpdateExitCode"
+            foreach ($mpCmdRunLogPath in $mpCmdRunLogPaths) {
+              if (Test-Path $mpCmdRunLogPath) {
+                Write-Host "=== Tail of $mpCmdRunLogPath after attempt $attemptNumber ==="
+                Get-Content -Path $mpCmdRunLogPath -Tail 200
+              } else {
+                Write-Host "MpCmdRun log file not found at $mpCmdRunLogPath"
+              }
+            }
+
+            if ($attemptNumber -lt $signatureUpdateAttempts) {
+              Write-Host "Retrying Defender signature update in $signatureUpdateDelaySeconds seconds..."
+              Start-Sleep -Seconds $signatureUpdateDelaySeconds
+            }
+          }
+          if (-not $signatureUpdateSucceeded) {
+            Write-Error "Defender signature update failed after $signatureUpdateAttempts attempts (last exit code: $signatureUpdateExitCode)"
+            exit $signatureUpdateExitCode
+          }
+
+          # Log Defender status, preference, and execution details for diagnostics.
+          Write-Host "=== Microsoft Defender diagnostic info ==="
+          try {
+            $mpStatus = Get-MpComputerStatus
+          } catch {
+            $mpStatus = $null
+            Write-Host "Could not query Microsoft Defender status: $_"
+          }
+          if ($mpStatus) {
+            Write-Host "AntivirusEnabled:         $($mpStatus.AntivirusEnabled)"
+            Write-Host "RealTimeProtectionEnabled: $($mpStatus.RealTimeProtectionEnabled)"
+            Write-Host "AntivirusSignatureVersion: $($mpStatus.AntivirusSignatureVersion)"
+            Write-Host "AntivirusSignatureLastUpdated: $($mpStatus.AntivirusSignatureLastUpdated)"
+            Write-Host "AMProductVersion:          $($mpStatus.AMProductVersion)"
+            Write-Host "AMEngineVersion:           $($mpStatus.AMEngineVersion)"
+          } else {
+            Write-Host "(Get-MpComputerStatus unavailable)"
+          }
+          try {
+            $mpPreference = Get-MpPreference
+          } catch {
+            $mpPreference = $null
+            Write-Host "Could not query Microsoft Defender preferences: $_"
+          }
+          if ($mpPreference) {
+            Write-Host "ExclusionPath:             $(@($mpPreference.ExclusionPath) -join '; ')"
+            Write-Host "ExclusionExtension:        $(@($mpPreference.ExclusionExtension) -join '; ')"
+            Write-Host "ExclusionProcess:          $(@($mpPreference.ExclusionProcess) -join '; ')"
+            Write-Host "ExclusionIpAddress:        $(@($mpPreference.ExclusionIpAddress) -join '; ')"
+          } else {
+            Write-Host "(Get-MpPreference unavailable)"
+          }
+          $winDefendService = Get-Service -Name WinDefend -ErrorAction SilentlyContinue
+          if ($winDefendService) {
+            Write-Host "WinDefend service status:  $($winDefendService.Status)"
+            Write-Host "WinDefend service start:   $($winDefendService.StartType)"
+          } else {
+            Write-Host "(WinDefend service unavailable)"
+          }
+          if ($mpStatus) {
+            Write-Host "AMRunningMode:             $($mpStatus.AMRunningMode)"
+            Write-Host "IoavProtectionEnabled:     $($mpStatus.IoavProtectionEnabled)"
+          }
+          Write-Host "MpCmdRun.exe path: $mpCmdRun"
+          Write-Host "=========================================="
+
+          $scanBaseRoot = $env:TEMP
+          if (-not $scanBaseRoot) {
+            $scanBaseRoot = "C:\Temp"
+          }
+          $scanBasePath = Join-Path $scanBaseRoot "defender-scan"
+          New-Item -ItemType Directory -Path $scanBasePath -Force | Out-Null
+
+          $workspaceRoot = $null
+          if ($env:GITHUB_WORKSPACE -and (Test-Path -Path $env:GITHUB_WORKSPACE -PathType Container)) {
+            $workspaceRoot = (Resolve-Path -Path $env:GITHUB_WORKSPACE).Path
+          }
+
+          $failed = $false
+          foreach ($binary in $binaries) {
+            $workspaceBinaryPath = (Resolve-Path -Path $binary.FullName).Path
+
+            # Stabilize file before scanning to avoid transient races.
+            $stabilizationDelaySeconds = 3
+            $initialBinaryItem = Get-Item -LiteralPath $workspaceBinaryPath
+            Start-Sleep -Seconds $stabilizationDelaySeconds
+            $stableBinaryItem = Get-Item -LiteralPath $workspaceBinaryPath
+            if (
+              $initialBinaryItem.Length -ne $stableBinaryItem.Length -or
+              $initialBinaryItem.LastWriteTimeUtc -ne $stableBinaryItem.LastWriteTimeUtc
+            ) {
+              Write-Error "Binary changed during stabilization window (${stabilizationDelaySeconds}s): $workspaceBinaryPath"
+              Write-Error "Initial: size=$($initialBinaryItem.Length), lastWriteUtc=$($initialBinaryItem.LastWriteTimeUtc)"
+              Write-Error "Current: size=$($stableBinaryItem.Length), lastWriteUtc=$($stableBinaryItem.LastWriteTimeUtc)"
+              $failed = $true
+              continue
+            }
+            $workspaceBinaryHash = (Get-FileHash -LiteralPath $workspaceBinaryPath -Algorithm SHA256).Hash
+
+            # Copy to a dedicated scan directory instead of scanning directly under D:\a\ workspace.
+            $scanFileName = "scan-$([guid]::NewGuid().ToString('N')).exe"
+            $binaryPath = Join-Path $scanBasePath $scanFileName
+            Copy-Item -LiteralPath $workspaceBinaryPath -Destination $binaryPath -Force
+            if (-not (Test-Path -Path $binaryPath -PathType Leaf)) {
+              Write-Error "Copied scan target not found: $binaryPath"
+              $failed = $true
+              continue
+            }
+            $binaryPath = (Resolve-Path -Path $binaryPath).Path
+            if ($workspaceRoot -and $binaryPath.StartsWith($workspaceRoot, [System.StringComparison]::OrdinalIgnoreCase)) {
+              Write-Error "Refusing to scan from workspace path: $binaryPath"
+              $failed = $true
+              continue
+            }
+
+            # Validate copied file integrity before scanning.
+            $scanBinaryItem = Get-Item -LiteralPath $binaryPath
+            $scanBinaryHash = (Get-FileHash -LiteralPath $binaryPath -Algorithm SHA256).Hash
+            if ($scanBinaryItem.Length -ne $stableBinaryItem.Length) {
+              Write-Error "Copied file size mismatch: source=$($stableBinaryItem.Length), copy=$($scanBinaryItem.Length)"
+              $failed = $true
+              continue
+            }
+            if ($scanBinaryHash -ne $workspaceBinaryHash) {
+              Write-Error "Copied file hash mismatch: source=$workspaceBinaryHash, copy=$scanBinaryHash"
+              $failed = $true
+              continue
+            }
+
+            Write-Host "Workspace binary:  $workspaceBinaryPath"
+            Write-Host "Workspace size:    $($stableBinaryItem.Length) bytes"
+            Write-Host "Workspace SHA256:  $workspaceBinaryHash"
+            Write-Host "Binary to scan:    $binaryPath"
+            Write-Host "Binary size:       $($scanBinaryItem.Length) bytes"
+            Write-Host "Binary SHA256:     $scanBinaryHash"
+
+            # ScanType 3 = custom scan. Use -File to scan only the copied binary.
+            # Capture output (2>&1 merges stderr into the output stream so all
+            # MpCmdRun messages are available for strict failure checks below.
+            # Retry on transient service errors (e.g. WinDefend in StopPending state,
+            # hr = 0x800106ba) which can occur transiently on Windows runners.
+            $scanAttempts = 3
+            $scanDelaySeconds = 15
+            $output = $null
+            $scanExitCode = 0
+            $outputText = ""
+            for ($scanAttempt = 1; $scanAttempt -le $scanAttempts; $scanAttempt++) {
+              if ($scanAttempt -gt 1) {
+                Write-Host "Retrying Microsoft Defender scan for $($binary.Name) (attempt $scanAttempt/$scanAttempts)..."
+              }
+              $output = & $mpCmdRun -Scan -ScanType 3 -File $binaryPath -DisableRemediation 2>&1 | ForEach-Object { "$_" }
+              $scanExitCode = $LASTEXITCODE
+              $outputText = @($output) -join "`n"
+              $isTransientError = $scanExitCode -ne 0 -and $outputText -imatch "0x800106ba"
+              if (-not $isTransientError -or $scanAttempt -eq $scanAttempts) {
+                break
+              }
+              Write-Warning "Defender scan failed with a transient service error (attempt $scanAttempt/$scanAttempts). Retrying in $scanDelaySeconds seconds..."
+              Start-Sleep -Seconds $scanDelaySeconds
+            }
+
+            Write-Host "=== MpCmdRun output ==="
+            $output | ForEach-Object { Write-Host $_ }
+            Write-Host "Exit code: $scanExitCode"
+            Write-Host "======================="
+
+            # Exit code alone is not enough: explicitly parse output to confirm scan execution.
+            $skipped = $output | Where-Object { $_ -imatch "\bwas skipped\b|\bcannot be scanned\b|\bnot performed\b|\b(?:file|scan).*\bexcluded\b" }
+            $threatLines = $output | Where-Object { $_ -match "\bThreat\b" }
+            $scanStarted = $outputText -imatch "\bScan starting\b"
+            $scanFinished = $outputText -imatch "\bScan finished\b"
+            if ($scanExitCode -ne 0) {
+              Write-Error "Microsoft Defender scan failed for $($binary.Name) with exit code $scanExitCode"
+              $failed = $true
+            } elseif ($skipped) {
+              Write-Error "Microsoft Defender scan was skipped for $binaryPath - the binary was NOT scanned."
+              Write-Error "Possible causes: file/path exclusion, stale signatures, or protection disabled."
+              # Wrap with @() so a single matched line is joined as one line, not character-by-character.
+              Write-Error "Skipped output: $(@($skipped) -join '; ')"
+              $failed = $true
+            } elseif ($threatLines) {
+              Write-Error "Microsoft Defender reported threat indicators in scan output for $($binary.Name)."
+              Write-Error "Threat output: $(@($threatLines) -join '; ')"
+              $failed = $true
+            } elseif (-not ($scanStarted -and $scanFinished)) {
+              Write-Error "Could not confirm scan completion from MpCmdRun output for $($binary.Name) (expected both 'Scan starting' and 'Scan finished')."
+              $failed = $true
+            } else {
+              Write-Host "✅ Microsoft Defender scan completed successfully for $($binary.Name)"
+            }
+          }
+          if ($failed) { exit 1 }
+
+  sync_actions:
+    needs: ["pre_activation", "activation", "config", "push_tag", "defender"]
     runs-on: ubuntu-latest
     environment: gh-aw-actions-release
     steps:
@@ -273,7 +583,7 @@ jobs:
           fi
 
       - name: Checkout repository
-        uses: actions/checkout@v6.0.2
+        uses: actions/checkout@v7.0.0
         with:
           fetch-depth: 0
           persist-credentials: true
@@ -366,10 +676,10 @@ jobs:
           retention-days: 90  # Long retention since SBOMs are not attached to the release
 
       - name: Setup Docker Buildx
-        uses: docker/setup-buildx-action@v4
+        uses: docker/setup-buildx-action@v4.1.0
 
       - name: Log in to GitHub Container Registry
-        uses: docker/login-action@v4.1.0
+        uses: docker/login-action@v4.2.0
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
@@ -377,7 +687,7 @@ jobs:
 
       - name: Extract metadata for Docker
         id: meta
-        uses: docker/metadata-action@v6
+        uses: docker/metadata-action@v6.1.0
         with:
           images: ghcr.io/${{ github.repository }}
           tags: |
@@ -389,7 +699,7 @@ jobs:
 
       - name: Build and push Docker image (amd64)
         id: build
-        uses: docker/build-push-action@v7.1.0
+        uses: docker/build-push-action@v7.2.0
         with:
           context: .
           platforms: linux/amd64
@@ -403,6 +713,132 @@ jobs:
           sbom: true
           provenance: mode=max
 
+  comment_release_prs:
+    needs: ["agent", "config", "release"]
+    runs-on: ubuntu-latest
+    permissions:
+      pull-requests: write
+      issues: write
+    steps:
+      - name: Comment on pull requests included in release
+        uses: actions/github-script@v9.0.0
+        env:
+          RELEASE_TAG: ${{ needs.config.outputs.release_tag }}
+          RELEASE_ID: ${{ needs.release.outputs.release_id }}
+        with:
+          script: |
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+            const releaseTag = process.env.RELEASE_TAG;
+            const releaseId = Number(process.env.RELEASE_ID);
+
+            if (!releaseTag || Number.isNaN(releaseId)) {
+              core.setFailed(`Missing or invalid release context: RELEASE_TAG=${releaseTag}, RELEASE_ID=${process.env.RELEASE_ID}`);
+              return;
+            }
+
+            const { data: currentRelease } = await github.rest.repos.getRelease({
+              owner,
+              repo,
+              release_id: releaseId
+            });
+
+            const { data: releases } = await github.rest.repos.listReleases({
+              owner,
+              repo,
+              per_page: 100
+            });
+
+            const currentPublishedAt = new Date(currentRelease.published_at);
+            const previousRelease = releases.find((release) =>
+              release.id !== currentRelease.id &&
+              !release.draft &&
+              release.published_at &&
+              new Date(release.published_at) < currentPublishedAt
+            );
+
+            if (!previousRelease) {
+              core.info(`No previous release found before ${releaseTag}; skipping PR comments.`);
+              return;
+            }
+
+            const query = [
+              `repo:${owner}/${repo}`,
+              "is:pr",
+              "is:merged",
+              `merged:${previousRelease.published_at}..${currentRelease.published_at}`
+            ].join(" ");
+
+            const mergedPrs = await github.paginate(github.rest.search.issuesAndPullRequests, {
+              q: query,
+              per_page: 100
+            });
+
+            if (mergedPrs.length === 0) {
+              core.info(`No merged PRs found between ${previousRelease.tag_name} and ${releaseTag}.`);
+              return;
+            }
+
+            const marker = `<!-- gh-aw-release:${releaseTag} -->`;
+            const releaseUrl = currentRelease.html_url;
+            const commentBody = [
+              "🎉 This pull request is included in a new release.",
+              "",
+              `Release: [\`${releaseTag}\`](${releaseUrl})`,
+              "",
+              marker
+            ].join("\n");
+
+            const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+            const withRetry = async (fn, label) => {
+              const maxAttempts = 3;
+              for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+                try {
+                  return await fn();
+                } catch (error) {
+                  if (attempt === maxAttempts) throw error;
+                  core.warning(`${label} failed on attempt ${attempt}/${maxAttempts}: ${error.message}`);
+                  await sleep(attempt * 1000);
+                }
+              }
+            };
+
+            let commentedCount = 0;
+            let skippedCount = 0;
+
+            for (const pr of mergedPrs) {
+              const comments = await withRetry(
+                () =>
+                  github.paginate(github.rest.issues.listComments, {
+                    owner,
+                    repo,
+                    issue_number: pr.number,
+                    per_page: 100
+                  }),
+                `Listing comments for #${pr.number}`
+              );
+
+              const alreadyCommented = comments.some((comment) => comment.body?.includes(marker));
+              if (alreadyCommented) {
+                skippedCount += 1;
+                continue;
+              }
+
+              await withRetry(
+                () =>
+                  github.rest.issues.createComment({
+                    owner,
+                    repo,
+                    issue_number: pr.number,
+                    body: commentBody
+                  }),
+                `Creating release comment for #${pr.number}`
+              );
+              commentedCount += 1;
+            }
+
+            core.info(`Release PR commenting complete: commented=${commentedCount}, skipped=${skippedCount}, total=${mergedPrs.length}`);
+
 steps:
   - name: Setup release environment
     env:
@@ -411,10 +847,10 @@ steps:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
     run: |
       set -e
-      mkdir -p /tmp/gh-aw/release-data
-      mkdir -p /tmp/gh-aw/community-data
+      mkdir -p /tmp/gh-aw/agent/release-data
+      mkdir -p /tmp/gh-aw/agent/community-data
       # Copy community issues from the agent/community-data path (written by community-attribution import step)
-      cp /tmp/gh-aw/agent/community-data/community_issues.json /tmp/gh-aw/community-data/community_issues.json 2>/dev/null || echo "[]" > /tmp/gh-aw/community-data/community_issues.json
+      cp /tmp/gh-aw/agent/community-data/community_issues.json /tmp/gh-aw/agent/community-data/community_issues.json 2>/dev/null || echo "[]" > /tmp/gh-aw/agent/community-data/community_issues.json
       
       # Use the release ID and tag from the release job
       echo "Release ID from release job: $RELEASE_ID"
@@ -425,7 +861,7 @@ steps:
       
       # Get the current release information
       # Use release ID to fetch release data
-      gh api "/repos/$GITHUB_REPOSITORY/releases/$RELEASE_ID" > /tmp/gh-aw/release-data/current_release.json
+      gh api "/repos/$GITHUB_REPOSITORY/releases/$RELEASE_ID" > /tmp/gh-aw/agent/release-data/current_release.json
       echo "✓ Fetched current release information"
       
       # Get the previous release to determine the range
@@ -434,8 +870,8 @@ steps:
       if [ -z "$PREV_RELEASE_TAG" ]; then
         echo "No previous release found. This appears to be the first release."
         echo "PREV_RELEASE_TAG=" >> "$GITHUB_ENV"
-        touch /tmp/gh-aw/release-data/pull_requests.json
-        echo "[]" > /tmp/gh-aw/release-data/pull_requests.json
+        touch /tmp/gh-aw/agent/release-data/pull_requests.json
+        echo "[]" > /tmp/gh-aw/agent/release-data/pull_requests.json
       else
         echo "Previous release: $PREV_RELEASE_TAG"
         echo "PREV_RELEASE_TAG=$PREV_RELEASE_TAG" >> "$GITHUB_ENV"
@@ -453,9 +889,9 @@ steps:
           --limit 1000 \
           --json number,title,author,labels,mergedAt,url,body,closingIssuesReferences \
           --jq "[.[] | select(.mergedAt >= \"$PREV_PUBLISHED_AT\" and .mergedAt <= \"$CURR_PUBLISHED_AT\")]" \
-          > /tmp/gh-aw/release-data/pull_requests.json
+          > /tmp/gh-aw/agent/release-data/pull_requests.json
         
-        PR_COUNT=$(jq length "/tmp/gh-aw/release-data/pull_requests.json")
+        PR_COUNT=$(jq length "/tmp/gh-aw/agent/release-data/pull_requests.json")
         echo "✓ Fetched $PR_COUNT pull requests"
       fi
       
@@ -473,44 +909,44 @@ steps:
             .[$key] = (.[$key] // []) + [$pr.number]
           )
         )
-      ' /tmp/gh-aw/release-data/pull_requests.json \
-        > /tmp/gh-aw/release-data/closing_refs_by_issue.json 2>/dev/null \
-        || echo "{}" > /tmp/gh-aw/release-data/closing_refs_by_issue.json
+      ' /tmp/gh-aw/agent/release-data/pull_requests.json \
+        > /tmp/gh-aw/agent/release-data/closing_refs_by_issue.json 2>/dev/null \
+        || echo "{}" > /tmp/gh-aw/agent/release-data/closing_refs_by_issue.json
       # Also expose to community-data dir so shared attribution strategy can reference it
-      cp /tmp/gh-aw/release-data/closing_refs_by_issue.json /tmp/gh-aw/community-data/closing_refs_by_issue.json
-      cp /tmp/gh-aw/release-data/pull_requests.json /tmp/gh-aw/community-data/pull_requests.json
+      cp /tmp/gh-aw/agent/release-data/closing_refs_by_issue.json /tmp/gh-aw/agent/community-data/closing_refs_by_issue.json
+      cp /tmp/gh-aw/agent/release-data/pull_requests.json /tmp/gh-aw/agent/community-data/pull_requests.json
       
-      DIRECT_CLOSE_COUNT=$(jq 'keys | length' /tmp/gh-aw/release-data/closing_refs_by_issue.json)
+      DIRECT_CLOSE_COUNT=$(jq 'keys | length' /tmp/gh-aw/agent/release-data/closing_refs_by_issue.json)
       echo "✓ Found $DIRECT_CLOSE_COUNT issues with GitHub-native closing PR references"
       
       # Find community issues closed during this release window (candidates for attribution review)
       if [ -n "$PREV_PUBLISHED_AT" ]; then
         jq --arg prev "$PREV_PUBLISHED_AT" --arg curr "$CURR_PUBLISHED_AT" \
           '[.[] | select(.closedAt != null and .closedAt >= $prev and .closedAt <= $curr)]' \
-          /tmp/gh-aw/community-data/community_issues.json \
-          > /tmp/gh-aw/release-data/community_issues_closed_in_window.json 2>/dev/null \
-          || echo "[]" > /tmp/gh-aw/release-data/community_issues_closed_in_window.json
+          /tmp/gh-aw/agent/community-data/community_issues.json \
+          > /tmp/gh-aw/agent/release-data/community_issues_closed_in_window.json 2>/dev/null \
+          || echo "[]" > /tmp/gh-aw/agent/release-data/community_issues_closed_in_window.json
         
-        CLOSED_IN_WINDOW=$(jq length /tmp/gh-aw/release-data/community_issues_closed_in_window.json)
+        CLOSED_IN_WINDOW=$(jq length /tmp/gh-aw/agent/release-data/community_issues_closed_in_window.json)
         echo "✓ Found $CLOSED_IN_WINDOW community issues closed in this release window"
       else
-        echo "[]" > /tmp/gh-aw/release-data/community_issues_closed_in_window.json
+        echo "[]" > /tmp/gh-aw/agent/release-data/community_issues_closed_in_window.json
       fi
       
       # Get the CHANGELOG.md content around this version
       if [ -f "CHANGELOG.md" ]; then
-        cp CHANGELOG.md /tmp/gh-aw/release-data/CHANGELOG.md
+        cp CHANGELOG.md /tmp/gh-aw/agent/release-data/CHANGELOG.md
         echo "✓ Copied CHANGELOG.md for reference"
       fi
       
       # List documentation files for linking
-      find docs -type f -name "*.md" 2>/dev/null > /tmp/gh-aw/release-data/docs_files.txt || echo "No docs directory found"
+      find docs -type f -name "*.md" 2>/dev/null > /tmp/gh-aw/agent/release-data/docs_files.txt || echo "No docs directory found"
       
       echo "✓ Setup complete."
-      echo "  Release data: /tmp/gh-aw/release-data/ (current_release.json, pull_requests.json,"
+      echo "  Release data: /tmp/gh-aw/agent/release-data/ (current_release.json, pull_requests.json,"
       echo "    closing_refs_by_issue.json, community_issues_closed_in_window.json,"
       echo "    CHANGELOG.md (if exists), docs_files.txt)"
-      echo "  Community data: /tmp/gh-aw/community-data/ (community_issues.json,"
+      echo "  Community data: /tmp/gh-aw/agent/community-data/ (community_issues.json,"
       echo "    closing_refs_by_issue.json, pull_requests.json)"
 
 tools:
@@ -531,7 +967,7 @@ Generate an engaging release highlights summary for **$GITHUB_REPOSITORY** relea
 
 ## Data Available
 
-Release-specific data is pre-fetched in `/tmp/gh-aw/release-data/`:
+Release-specific data is pre-fetched in `/tmp/gh-aw/agent/release-data/`:
 - `current_release.json` - Release metadata (tag, name, dates, existing body)
 - `pull_requests.json` - PRs merged between `${PREV_RELEASE_TAG}` and `${RELEASE_TAG}` (includes `closingIssuesReferences` for each PR; empty array if first release)
 - `closing_refs_by_issue.json` - Map of `{issue_number: [pr_numbers]}` built from GitHub-native closing references in merged PRs
@@ -539,7 +975,7 @@ Release-specific data is pre-fetched in `/tmp/gh-aw/release-data/`:
 - `CHANGELOG.md` - Full changelog for context (if exists)
 - `docs_files.txt` - Available documentation files for linking
 
-Community data is pre-fetched in `/tmp/gh-aw/community-data/` (by the shared community-attribution step):
+Community data is pre-fetched in `/tmp/gh-aw/agent/community-data/` (by the shared community-attribution step):
 - `community_issues.json` - All issues labeled `community` (issue number, title, author, closedAt, createdAt, url)
 - `closing_refs_by_issue.json` - Same closing references index, mirrored for the shared attribution strategy
 - `pull_requests.json` - Same PR list, mirrored for the shared attribution strategy
@@ -559,25 +995,25 @@ Create a **"🌟 Release Highlights"** section that:
 
 ```bash
 # View release metadata
-cat /tmp/gh-aw/release-data/current_release.json | jq
+cat /tmp/gh-aw/agent/release-data/current_release.json | jq
 
 # List PRs (empty if first release)
-cat /tmp/gh-aw/release-data/pull_requests.json | jq -r '.[] | "- #\(.number): \(.title) by @\(.author.login)"'
+cat /tmp/gh-aw/agent/release-data/pull_requests.json | jq -r '.[] | "- #\(.number): \(.title) by @\(.author.login)"'
 
 # List community issues (fetched by shared community-attribution step)
-cat /tmp/gh-aw/community-data/community_issues.json | jq -r '.[] | "- #\(.number): \(.title) by @\(.author.login)"'
+cat /tmp/gh-aw/agent/community-data/community_issues.json | jq -r '.[] | "- #\(.number): \(.title) by @\(.author.login)"'
 
 # View GitHub-native closing references (issue -> [PRs])
-cat /tmp/gh-aw/release-data/closing_refs_by_issue.json | jq
+cat /tmp/gh-aw/agent/release-data/closing_refs_by_issue.json | jq
 
 # List community issues closed in this release window (attribution candidates)
-cat /tmp/gh-aw/release-data/community_issues_closed_in_window.json | jq -r '.[] | "- #\(.number): \(.title) by @\(.author.login) (closed: \(.closedAt))"'
+cat /tmp/gh-aw/agent/release-data/community_issues_closed_in_window.json | jq -r '.[] | "- #\(.number): \(.title) by @\(.author.login) (closed: \(.closedAt))"'
 
 # Check CHANGELOG context
-head -100 /tmp/gh-aw/release-data/CHANGELOG.md 2>/dev/null || echo "No CHANGELOG"
+head -100 /tmp/gh-aw/agent/release-data/CHANGELOG.md 2>/dev/null || echo "No CHANGELOG"
 
 # View available docs
-cat /tmp/gh-aw/release-data/docs_files.txt
+cat /tmp/gh-aw/agent/release-data/docs_files.txt
 ```
 
 ### 2. Identify Community Contributions
@@ -585,8 +1021,8 @@ cat /tmp/gh-aw/release-data/docs_files.txt
 The `community` label is the **primary attribution signal** — apply the
 four-tier Community Attribution Strategy from the imported shared component
 (`shared/community-attribution.md`) to attribute all community-labeled issues
-that were closed in this release window.  Use `/tmp/gh-aw/release-data/community_issues_closed_in_window.json`
-as the set of candidates and `/tmp/gh-aw/release-data/closing_refs_by_issue.json`
+that were closed in this release window.  Use `/tmp/gh-aw/agent/release-data/community_issues_closed_in_window.json`
+as the set of candidates and `/tmp/gh-aw/agent/release-data/closing_refs_by_issue.json`
 as the attribution index.
 
 ### 3. Categorize & Prioritize
@@ -631,8 +1067,6 @@ The following community issues were closed during this release window but could 
 - **@[author]** for [issue title] ([#number](url)) — closed [date], no confirmed PR linkage found
 [Omit this section entirely if all closed community issues have confirmed attribution.]
 
----
-For complete details, see [CHANGELOG](https://github.com/github/gh-aw/blob/main/CHANGELOG.md).
 ```
 
 **Writing Guidelines:**
@@ -680,7 +1114,7 @@ safeoutputs/update_release(
 ```
 
 **❌ INCORRECT - DO NOT:**
-- Write JSON files manually (e.g., `/tmp/gh-aw/safeoutputs/update_release_001.json`)
+- Write JSON files manually (e.g., `/tmp/gh-aw/agent/safeoutputs/update_release_001.json`)
 - Use bash to simulate tool calls
 - Create scripts that write to outputs.jsonl
 - Use any file operations - the MCP tool handles everything

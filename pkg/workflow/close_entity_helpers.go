@@ -15,8 +15,8 @@
 //
 // # Why Grouped Here vs. Split Like Update-Entity Files
 //
-// The update-entity operations (update_issue_helpers.go,
-// update_discussion_helpers.go, update_pull_request_helpers.go) are split
+// The update-entity operations (update_issue.go,
+// update_discussion.go, update_pull_request.go) are split
 // into one file per entity type because each file owns a distinct type
 // definition (UpdateIssuesConfig, UpdateDiscussionsConfig,
 // UpdatePullRequestsConfig) with different fields per entity.
@@ -83,6 +83,7 @@ type CloseEntityConfig struct {
 	SafeOutputFilterConfig           `yaml:",inline"`
 	SafeOutputDiscussionFilterConfig `yaml:",inline"` // Only used for discussions
 	StateReason                      string           `yaml:"state-reason,omitempty"` // Only used for issues
+	AllowBody                        *bool            `yaml:"allow-body,omitempty"`   // If false, any body provided by the agent is dropped with a warning; close proceeds without a comment
 }
 
 // CloseEntityJobParams holds the parameters needed to build a close entity job
@@ -128,6 +129,11 @@ func (c *Compiler) parseCloseEntityConfig(outputMap map[string]any, params Close
 	if config.Max == nil {
 		config.Max = defaultIntStr(1)
 		logger.Printf("Set default max to 1 for %s", params.ConfigKey)
+	}
+
+	// Backward compatibility: map deprecated title-prefix to required-title-prefix.
+	if config.RequiredTitlePrefix == "" && config.TitlePrefix != "" {
+		config.RequiredTitlePrefix = config.TitlePrefix
 	}
 
 	logger.Printf("Parsed %s configuration: max=%s, target=%s", params.ConfigKey, *config.Max, config.Target)

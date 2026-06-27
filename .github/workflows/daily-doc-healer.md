@@ -1,67 +1,85 @@
 ---
-name: Daily Documentation Healer
-description: Self-healing companion to the Daily Documentation Updater that detects documentation gaps missed by DDUw and proposes corrections
+private: true
 on:
   schedule:
-    - cron: daily
-  workflow_dispatch:
-
+  - cron: daily
+  workflow_dispatch: null
+max-daily-ai-credits: 10000
 permissions:
   contents: read
   issues: read
   pull-requests: read
-
-tracker-id: daily-doc-healer
-engine: claude
-strict: true
-
 network:
   allowed:
-    - defaults
-    - github
-
-safe-outputs:
-  create-pull-request:
-    expires: 3d
-    title-prefix: "[docs] "
-    labels: [documentation, automation]
-
-  create-issue:
+  - defaults
+  - github
+imports:
+- uses: shared/daily-audit-base.md
+  with:
     expires: 3d
     title-prefix: "[doc-healer] "
-    labels: [documentation, automation]
-    assignees: [copilot]
-  noop:
-
+- shared/otlp.md
+safe-outputs:
+  create-issue:
+    assignees:
+    - copilot
+    expires: 3d
+    labels:
+    - documentation
+    - automation
+    title-prefix: "[doc-healer] "
+  create-pull-request:
+    expires: 3d
+    labels:
+    - documentation
+    - automation
+    title-prefix: "[docs] "
+  noop: null
+description: Self-healing companion to the Daily Documentation Updater that detects documentation gaps missed by DDUw and proposes corrections
+emoji: 📝
+engine:
+  id: claude
+  model: "${{ needs.activation.outputs.model_size }}"
+name: Daily Documentation Healer
+strict: true
+experiments:
+  model_size:
+    variants: [claude-sonnet-4.6, claude-haiku-4.5]
+    description: "Tests whether Claude Haiku detects and corrects documentation gaps with equivalent quality at lower token cost versus Claude Sonnet."
+    hypothesis: "H0: no change in issue/PR creation rate or run success rate. H1: Claude Haiku reduces AI credit usage >=30% with equivalent run success rate (>=0.90)."
+    metric: ai_credits_total
+    secondary_metrics: [run_success_rate, run_duration_ms]
+    guardrail_metrics:
+      - name: run_success_rate
+        threshold: ">=0.90"
+      - name: empty_output_rate
+        threshold: "<=0.10"
+    min_samples: 20
+    weight: [50, 50]
+    start_date: "2026-06-04"
+timeout-minutes: 45
 tools:
-  cli-proxy: true
+  bash:
+  - find docs -name "*.md" -o -name "*.mdx"
+  - cat .github/workflows/daily-doc-updater.md
+  - git log:*
+  - git diff:*
+  - git show:*
+  - grep:*
   cache-memory: true
+  cli-proxy: true
+  edit: null
   github:
     mode: gh-proxy
-    toolsets: [default]
-  edit:
-  bash:
-    - "find docs -name '*.md' -o -name '*.mdx'"
-    - "cat .github/workflows/daily-doc-updater.md"
-    - "git log:*"
-    - "git diff:*"
-    - "git show:*"
-    - "grep:*"
-
-timeout-minutes: 45
-
-imports:
-  - uses: shared/daily-audit-base.md
-    with:
-      title-prefix: "[doc-healer] "
-      expires: 3d
-
-
-  - shared/observability-otlp.md
-firewall:
-  effective-token-steering: true
+    toolsets:
+    - default
+tracker-id: daily-doc-healer
+features:
+  gh-aw-detection: true
+sandbox:
+  agent:
+    sudo: false
 ---
-
 {{#runtime-import? .github/shared-instructions.md}}
 
 # Daily Documentation Healer
@@ -95,7 +113,20 @@ repo:${{ github.repository }} is:issue is:closed label:documentation closed:>=YY
 For each issue found:
 - Record the issue number, title, body, and closing date.
 - Check whether a DDUw-created PR (label `documentation automation`, title prefix `[docs]`) was merged that references or addresses the issue in the same time window. If such a PR exists, DDUw likely already handled it — skip this issue.
-- If no DDUw `[docs]` PR references the issue, also search for any merged PR that closes or fixes the issue by number (e.g. `closes #NNN`, `fixes #NNN`, `resolves #NNN` in the PR body). If such a PR is found, verify the documentation change it made is complete and skip the issue.
+- After the merged-PR check, use the GitHub MCP search tool to find DDUw `[docs]` PR candidates (label `documentation`, label `automation`, and known bot authors such as `github-actions[bot]` or `copilot-swe-agent`) that were closed in the last 30 days and reference the same issue or drift keyword/file path. Query pattern:
+
+  `repo:<OWNER/REPO> is:pr is:closed (author:github-actions[bot] OR author:copilot-swe-agent) label:documentation label:automation <DRIFT_KEYWORD>`
+
+  Replace `<OWNER/REPO>` with the repository from the Context section (`${{ github.repository }}` at runtime), and replace `<DRIFT_KEYWORD>` with a stable term tied to the drift (for example: `#NNN`, `"reference/engines.md"`, or a unique feature term from the issue body).
+- For each candidate PR returned by search, use `pull_request_read` (`method: get`) and keep only PRs where `merged` is false.
+- Before treating it as rejection, inspect closure context with `issue_read` (`method: get` and `method: get_comments`): treat as rejected only when `closed_by` appears in GitHub MCP `list_repository_collaborators` results and comments/reviews indicate intentional direction (or explicit lack of acceptance), not an obvious transient/accidental closure.
+
+- A closed-unmerged DDUw `[docs]` PR is a strong rejection signal for that fix direction. Do **not** re-attempt the same docs fix.
+- Instead, create a `[doc-healer]` improvement issue that:
+  1. Names the rejected PR and the unresolved drift.
+  2. Proposes the inverse fix direction (for example, code change instead of docs-only change).
+  3. Tags `@<closed_by.login>` (login extracted from the `closed_by` user object in rejected PR issue data) for an explicit next-step decision. If `closed_by` is unavailable, do not suppress retries automatically; escalate uncertainty in the improvement issue body.
+- If there is no merged DDUw `[docs]` PR and no closed-unmerged rejection signal, also search for any merged PR that closes or fixes the issue by number (e.g. `closes #NNN`, `fixes #NNN`, `resolves #NNN` in the PR body). If such a PR is found, verify the documentation change it made is complete and skip the issue.
 
 If no unaddressed documentation issues are found, call `noop` and stop.
 

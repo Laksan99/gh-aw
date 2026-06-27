@@ -10,6 +10,7 @@ import (
 
 	"github.com/github/gh-aw/pkg/console"
 	"github.com/github/gh-aw/pkg/logger"
+	"github.com/github/gh-aw/pkg/setutil"
 	"github.com/github/gh-aw/pkg/stringutil"
 )
 
@@ -59,8 +60,10 @@ func parseSquidAccessLog(logPath string, verbose bool) (*DomainAnalysis, error) 
 
 	analysis := &DomainAnalysis{}
 
-	allowedDomainsSet := make(map[string]bool)
-	blockedDomainsSet := make(map[string]bool)
+	allowedDomainsSet := make(map[string]struct {
+	})
+	blockedDomainsSet := make(map[string]struct {
+	})
 
 	scanner := bufio.NewScanner(file)
 	for scanner.Scan() {
@@ -99,14 +102,16 @@ func parseSquidAccessLog(logPath string, verbose bool) (*DomainAnalysis, error) 
 
 		if isAllowed {
 			analysis.AllowedCount++
-			if !allowedDomainsSet[domain] {
-				allowedDomainsSet[domain] = true
+			if !setutil.Contains(allowedDomainsSet, domain) {
+				allowedDomainsSet[domain] = struct {
+				}{}
 				analysis.AllowedDomains = append(analysis.AllowedDomains, domain)
 			}
 		} else {
 			analysis.BlockedCount++
-			if !blockedDomainsSet[domain] {
-				blockedDomainsSet[domain] = true
+			if !setutil.Contains(blockedDomainsSet, domain) {
+				blockedDomainsSet[domain] = struct {
+				}{}
 				analysis.BlockedDomains = append(analysis.BlockedDomains, domain)
 			}
 		}

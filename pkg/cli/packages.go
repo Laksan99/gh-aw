@@ -9,6 +9,7 @@ import (
 	"strings"
 
 	"github.com/github/gh-aw/pkg/constants"
+	"github.com/github/gh-aw/pkg/setutil"
 
 	"github.com/github/gh-aw/pkg/console"
 	"github.com/github/gh-aw/pkg/logger"
@@ -26,7 +27,8 @@ var (
 func collectLocalIncludeDependencies(content, packagePath string, verbose bool) ([]IncludeDependency, error) {
 	packagesLog.Printf("Collecting include dependencies: packagePath=%s, content_size=%d", packagePath, len(content))
 	var dependencies []IncludeDependency
-	seen := make(map[string]bool)
+	seen := make(map[string]struct {
+	})
 
 	if verbose {
 		fmt.Fprintln(os.Stderr, console.FormatInfoMessage("Collecting package dependencies from: "+packagePath))
@@ -38,7 +40,8 @@ func collectLocalIncludeDependencies(content, packagePath string, verbose bool) 
 }
 
 // collectLocalIncludeDependenciesRecursive recursively processes @include directives in package content
-func collectLocalIncludeDependenciesRecursive(content, baseDir string, dependencies *[]IncludeDependency, seen map[string]bool, verbose bool) error {
+func collectLocalIncludeDependenciesRecursive(content, baseDir string, dependencies *[]IncludeDependency, seen map[string]struct {
+}, verbose bool) error {
 	scanner := bufio.NewScanner(strings.NewReader(content))
 	for scanner.Scan() {
 		line := scanner.Text()
@@ -59,10 +62,11 @@ func collectLocalIncludeDependenciesRecursive(content, baseDir string, dependenc
 			fullSourcePath := filepath.Join(baseDir, filePath)
 
 			// Skip if we've already processed this file
-			if seen[fullSourcePath] {
+			if setutil.Contains(seen, fullSourcePath) {
 				continue
 			}
-			seen[fullSourcePath] = true
+			seen[fullSourcePath] = struct {
+			}{}
 
 			// Add dependency
 			dep := IncludeDependency{
@@ -230,20 +234,30 @@ func ExtractWorkflowEngine(content string) string {
 	return ""
 }
 
-// ExtractWorkflowPrivate extracts the private field from workflow content string.
-// Returns true if the workflow has private: true in its frontmatter.
-func ExtractWorkflowPrivate(content string) bool {
+// ExtractWorkflowPrivateSetting extracts the private field from workflow content string.
+// Returns the boolean value and whether the field was explicitly present.
+func ExtractWorkflowPrivateSetting(content string) (bool, bool) {
 	result, err := parser.ExtractFrontmatterFromContent(content)
 	if err != nil {
-		return false
+		return false, false
 	}
 
 	if private, ok := result.Frontmatter["private"]; ok {
 		if privateBool, ok := private.(bool); ok {
-			return privateBool
+			return privateBool, true
 		}
 	}
 
+	return false, false
+}
+
+// ExtractWorkflowPrivate extracts the private field from workflow content string.
+// Returns true if the workflow has private: true in its frontmatter.
+func ExtractWorkflowPrivate(content string) bool {
+	privateBool, ok := ExtractWorkflowPrivateSetting(content)
+	if ok {
+		return privateBool
+	}
 	return false
 }
 

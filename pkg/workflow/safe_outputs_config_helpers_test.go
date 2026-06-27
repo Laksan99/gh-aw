@@ -3,9 +3,11 @@
 package workflow
 
 import (
+	"encoding/json"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 func TestUsesPatchesAndCheckouts(t *testing.T) {
@@ -87,7 +89,7 @@ func TestUsesPatchesAndCheckouts(t *testing.T) {
 		{
 			name: "returns false when CreatePullRequests is globally staged",
 			safeOutputs: &SafeOutputsConfig{
-				Staged:             true,
+				Staged:             templatableBoolPtr("true"),
 				CreatePullRequests: &CreatePullRequestsConfig{},
 			},
 			expected: false,
@@ -95,7 +97,7 @@ func TestUsesPatchesAndCheckouts(t *testing.T) {
 		{
 			name: "returns false when PushToPullRequestBranch is globally staged",
 			safeOutputs: &SafeOutputsConfig{
-				Staged:                  true,
+				Staged:                  templatableBoolPtr("true"),
 				PushToPullRequestBranch: &PushToPullRequestBranchConfig{},
 			},
 			expected: false,
@@ -103,7 +105,7 @@ func TestUsesPatchesAndCheckouts(t *testing.T) {
 		{
 			name: "returns false when both PR handlers are globally staged",
 			safeOutputs: &SafeOutputsConfig{
-				Staged:                  true,
+				Staged:                  templatableBoolPtr("true"),
 				CreatePullRequests:      &CreatePullRequestsConfig{},
 				PushToPullRequestBranch: &PushToPullRequestBranchConfig{},
 			},
@@ -112,15 +114,15 @@ func TestUsesPatchesAndCheckouts(t *testing.T) {
 		{
 			name: "returns false when CreatePullRequests is per-handler staged",
 			safeOutputs: &SafeOutputsConfig{
-				CreatePullRequests: &CreatePullRequestsConfig{BaseSafeOutputConfig: BaseSafeOutputConfig{Staged: true}},
+				CreatePullRequests: &CreatePullRequestsConfig{BaseSafeOutputConfig: BaseSafeOutputConfig{Staged: templatableBoolPtr("true")}},
 			},
 			expected: false,
 		},
 		{
 			name: "returns false when both PR handlers are per-handler staged",
 			safeOutputs: &SafeOutputsConfig{
-				CreatePullRequests:      &CreatePullRequestsConfig{BaseSafeOutputConfig: BaseSafeOutputConfig{Staged: true}},
-				PushToPullRequestBranch: &PushToPullRequestBranchConfig{BaseSafeOutputConfig: BaseSafeOutputConfig{Staged: true}},
+				CreatePullRequests:      &CreatePullRequestsConfig{BaseSafeOutputConfig: BaseSafeOutputConfig{Staged: templatableBoolPtr("true")}},
+				PushToPullRequestBranch: &PushToPullRequestBranchConfig{BaseSafeOutputConfig: BaseSafeOutputConfig{Staged: templatableBoolPtr("true")}},
 			},
 			expected: false,
 		},
@@ -128,14 +130,14 @@ func TestUsesPatchesAndCheckouts(t *testing.T) {
 			name: "returns true when CreatePullRequests is not staged but PushToPullRequestBranch is staged",
 			safeOutputs: &SafeOutputsConfig{
 				CreatePullRequests:      &CreatePullRequestsConfig{},
-				PushToPullRequestBranch: &PushToPullRequestBranchConfig{BaseSafeOutputConfig: BaseSafeOutputConfig{Staged: true}},
+				PushToPullRequestBranch: &PushToPullRequestBranchConfig{BaseSafeOutputConfig: BaseSafeOutputConfig{Staged: templatableBoolPtr("true")}},
 			},
 			expected: true,
 		},
 		{
 			name: "returns true when PushToPullRequestBranch is not staged but CreatePullRequests is staged",
 			safeOutputs: &SafeOutputsConfig{
-				CreatePullRequests:      &CreatePullRequestsConfig{BaseSafeOutputConfig: BaseSafeOutputConfig{Staged: true}},
+				CreatePullRequests:      &CreatePullRequestsConfig{BaseSafeOutputConfig: BaseSafeOutputConfig{Staged: templatableBoolPtr("true")}},
 				PushToPullRequestBranch: &PushToPullRequestBranchConfig{},
 			},
 			expected: true,
@@ -148,4 +150,29 @@ func TestUsesPatchesAndCheckouts(t *testing.T) {
 			assert.Equal(t, tt.expected, result, "usesPatchesAndCheckouts should return expected value")
 		})
 	}
+}
+
+func TestBuildCustomSafeOutputJobsJSON(t *testing.T) {
+	data := &WorkflowData{
+		SafeOutputs: &SafeOutputsConfig{
+			Jobs: map[string]*SafeJobConfig{
+				"z-job": {},
+				"a-job": {},
+			},
+		},
+	}
+
+	jsonStr := buildCustomSafeOutputJobsJSON(data)
+	require.NotEmpty(t, jsonStr)
+	assert.JSONEq(t, `{"a_job":"","z_job":""}`, jsonStr)
+
+	var result map[string]string
+	require.NoError(t, json.Unmarshal([]byte(jsonStr), &result))
+	assert.Empty(t, result["a_job"])
+	assert.Empty(t, result["z_job"])
+}
+
+func TestBuildCustomSafeOutputJobsJSONEmpty(t *testing.T) {
+	assert.Empty(t, buildCustomSafeOutputJobsJSON(&WorkflowData{SafeOutputs: &SafeOutputsConfig{}}))
+	assert.Empty(t, buildCustomSafeOutputJobsJSON(&WorkflowData{SafeOutputs: nil}))
 }

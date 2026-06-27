@@ -7,6 +7,7 @@ import (
 	"testing"
 
 	"github.com/github/gh-aw/pkg/constants"
+	"github.com/github/gh-aw/pkg/workflow/compilerenv"
 )
 
 func TestParseThreatDetectionConfig(t *testing.T) {
@@ -152,7 +153,32 @@ func TestParseThreatDetectionConfig(t *testing.T) {
 				},
 			},
 			expectedConfig: &ThreatDetectionConfig{
-				RunsOn: "self-hosted",
+				RunsOn: "runs-on: self-hosted",
+			},
+		},
+		{
+			name: "object with runs-on array override",
+			outputMap: map[string]any{
+				"threat-detection": map[string]any{
+					"runs-on": []any{"self-hosted", "linux", "x64"},
+				},
+			},
+			expectedConfig: &ThreatDetectionConfig{
+				RunsOn: "runs-on:\n  - self-hosted\n  - linux\n  - x64",
+			},
+		},
+		{
+			name: "object with runs-on group+labels override",
+			outputMap: map[string]any{
+				"threat-detection": map[string]any{
+					"runs-on": map[string]any{
+						"group":  "runner-group",
+						"labels": []any{"linux", "x64"},
+					},
+				},
+			},
+			expectedConfig: &ThreatDetectionConfig{
+				RunsOn: "runs-on:\n  group: runner-group\n  labels:\n    - linux\n    - x64",
 			},
 		},
 		{
@@ -175,6 +201,28 @@ func TestParseThreatDetectionConfig(t *testing.T) {
 			},
 			expectedConfig: &ThreatDetectionConfig{
 				ContinueOnError: boolPtr(false),
+			},
+		},
+		{
+			name: "object with max-ai-credits override",
+			outputMap: map[string]any{
+				"threat-detection": map[string]any{
+					"max-ai-credits": 777,
+				},
+			},
+			expectedConfig: &ThreatDetectionConfig{
+				MaxAICredits: 777,
+			},
+		},
+		{
+			name: "expression string for max-ai-credits is treated as unset (schema disallows expressions; parser returns 0)",
+			outputMap: map[string]any{
+				"threat-detection": map[string]any{
+					"max-ai-credits": "${{ inputs.detection-max-ai-credits }}",
+				},
+			},
+			expectedConfig: &ThreatDetectionConfig{
+				MaxAICredits: 0, // parseMaxAICreditsValue returns 0 for non-numeric strings
 			},
 		},
 	}
@@ -207,6 +255,9 @@ func TestParseThreatDetectionConfig(t *testing.T) {
 
 			if result.RunsOn != tt.expectedConfig.RunsOn {
 				t.Errorf("Expected RunsOn %q, got %q", tt.expectedConfig.RunsOn, result.RunsOn)
+			}
+			if result.MaxAICredits != tt.expectedConfig.MaxAICredits {
+				t.Errorf("Expected MaxAICredits %d, got %d", tt.expectedConfig.MaxAICredits, result.MaxAICredits)
 			}
 
 			if (result.ContinueOnError == nil) != (tt.expectedConfig.ContinueOnError == nil) {
@@ -638,6 +689,7 @@ func TestBuildDetectionEngineExecutionStepWithThreatDetectionEngine(t *testing.T
 	tests := []struct {
 		name           string
 		data           *WorkflowData
+		env            map[string]string
 		expectContains string
 	}{
 		{
@@ -686,6 +738,9 @@ func TestBuildDetectionEngineExecutionStepWithThreatDetectionEngine(t *testing.T
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
+			for key, value := range tt.env {
+				t.Setenv(key, value)
+			}
 			steps := compiler.buildDetectionEngineExecutionStep(tt.data)
 
 			if len(steps) == 0 {
@@ -703,6 +758,79 @@ func TestBuildDetectionEngineExecutionStepWithThreatDetectionEngine(t *testing.T
 				// The key is that the engine configuration is being used
 			}
 		})
+	}
+}
+
+func TestBuildDetectionEngineExecutionStepMaxAICredits(t *testing.T) {
+	compiler := NewCompiler()
+
+	t.Run("uses detection runtime default expression when threat-detection max-ai-credits is unset", func(t *testing.T) {
+		data := &WorkflowData{
+			AI: "claude",
+			SafeOutputs: &SafeOutputsConfig{
+				ThreatDetection: &ThreatDetectionConfig{},
+			},
+		}
+
+		steps := compiler.buildDetectionEngineExecutionStep(data)
+		allSteps := strings.Join(steps, "")
+		if !strings.Contains(allSteps, "vars."+compilerenv.DefaultDetectionMaxAICredits) {
+			t.Fatalf("expected detection steps to reference vars.%s, got:\n%s", compilerenv.DefaultDetectionMaxAICredits, allSteps)
+		}
+		if !strings.Contains(allSteps, "'400'") {
+			t.Fatalf("expected detection steps to include default fallback '400', got:\n%s", allSteps)
+		}
+	})
+
+	t.Run("uses explicit threat-detection max-ai-credits when provided", func(t *testing.T) {
+		data := &WorkflowData{
+			AI: "claude",
+			SafeOutputs: &SafeOutputsConfig{
+				ThreatDetection: &ThreatDetectionConfig{
+					MaxAICredits: 777,
+				},
+			},
+		}
+
+		steps := compiler.buildDetectionEngineExecutionStep(data)
+		allSteps := strings.Join(steps, "")
+		if strings.Contains(allSteps, "vars."+compilerenv.DefaultDetectionMaxAICredits) {
+			t.Fatalf("expected detection steps not to reference vars.%s when explicit max-ai-credits is set, got:\n%s", compilerenv.DefaultDetectionMaxAICredits, allSteps)
+		}
+		if !strings.Contains(allSteps, `"maxAiCredits":777`) {
+			t.Fatalf("expected detection steps to include maxAiCredits 777, got:\n%s", allSteps)
+		}
+	})
+}
+
+func TestBuildDetectionEngineExecutionStepMaxAICreditsNotInheritedFromMainAgent(t *testing.T) {
+	compiler := NewCompiler()
+
+	// When the main agent has an explicit MaxAICredits budget but
+	// safe-outputs.threat-detection.max-ai-credits is not set, the detection run
+	// must use its own runtime default expression rather than silently inheriting
+	// the agent budget.
+	data := &WorkflowData{
+		AI: "claude",
+		EngineConfig: &EngineConfig{
+			MaxAICredits: 500, // explicit agent budget
+		},
+		SafeOutputs: &SafeOutputsConfig{
+			ThreatDetection: &ThreatDetectionConfig{
+				// max-ai-credits intentionally omitted
+			},
+		},
+	}
+
+	steps := compiler.buildDetectionEngineExecutionStep(data)
+	allSteps := strings.Join(steps, "")
+
+	if !strings.Contains(allSteps, "vars."+compilerenv.DefaultDetectionMaxAICredits) {
+		t.Fatalf("expected detection steps to use runtime default expression vars.%s when detection max-ai-credits is unset, got:\n%s",
+			compilerenv.DefaultDetectionMaxAICredits, allSteps)
+	}
+	if strings.Contains(allSteps, `"maxAiCredits":500`) {
+		t.Fatalf("expected detection steps NOT to inherit agent maxAiCredits=500, got:\n%s", allSteps)
 	}
 }
 
@@ -950,10 +1078,33 @@ func TestDetectionGuardStepCondition(t *testing.T) {
 	}
 }
 
+func TestPrepareDetectionFilesStepWarnsWhenPromptContextMissingOrEmpty(t *testing.T) {
+	compiler := NewCompiler()
+
+	steps := compiler.buildPrepareDetectionFilesStep()
+	if len(steps) == 0 {
+		t.Fatal("Expected non-empty prepare detection files steps")
+	}
+
+	joined := strings.Join(steps, "")
+	if !strings.Contains(joined, "rm -f /tmp/gh-aw/agent_usage.json") {
+		t.Error("Expected prepare step to remove stale downloaded agent_usage.json before detection writes its own token usage")
+	}
+	if !strings.Contains(joined, "if [ ! -s /tmp/gh-aw/threat-detection/aw-prompts/prompt.txt ]; then") {
+		t.Error("Expected prepare step to check for missing or empty detection context prompt")
+	}
+	if !strings.Contains(joined, "ERR_VALIDATION: Missing or empty detection context prompt") {
+		t.Error("Expected prepare step to emit actionable ERR_VALIDATION warning when prompt context is missing")
+	}
+	if !strings.Contains(joined, "Detection will continue with fallback workflow context.") {
+		t.Error("Expected prepare step warning to document fallback behavior")
+	}
+}
+
 // TestDetectionJobLevelCondition verifies that the detection job-level `if:` condition
-// skips the job entirely when the agent produced no outputs and no patch.
-// This prevents the detection job from wasting a runner and ensures safe_outputs is
-// also correctly skipped (since it gates on needs.detection.result == 'success').
+// always runs the detection job when the agent ran (not skipped), regardless of whether
+// the agent produced any outputs. This ensures detection is never bypassed for noop/boop runs;
+// the detection_guard step inside the job handles the no-output case.
 func TestDetectionJobLevelCondition(t *testing.T) {
 	compiler := NewCompiler()
 
@@ -991,14 +1142,13 @@ func TestDetectionJobLevelCondition(t *testing.T) {
 		t.Errorf("Expected detection job condition to check for skipped status, got: %q", condition)
 	}
 
-	// Must check output_types and has_patch so the job is skipped at job-level
-	// when the agent produced nothing (avoiding unnecessary runner usage and
-	// preventing safe_outputs from running when there is nothing to publish).
-	if !strings.Contains(condition, "needs."+string(constants.AgentJobName)+".outputs.output_types") {
-		t.Errorf("Expected detection job condition to check output_types, got: %q", condition)
+	// Must NOT require output_types or has_patch — detection runs unconditionally when the agent ran,
+	// and the detection_guard step inside the job handles the no-output case.
+	if strings.Contains(condition, "outputs.output_types") {
+		t.Errorf("Detection job condition must not gate on output_types; got: %q", condition)
 	}
-	if !strings.Contains(condition, "needs."+string(constants.AgentJobName)+".outputs.has_patch") {
-		t.Errorf("Expected detection job condition to check has_patch, got: %q", condition)
+	if strings.Contains(condition, "outputs.has_patch") {
+		t.Errorf("Detection job condition must not gate on has_patch; got: %q", condition)
 	}
 }
 
@@ -1073,6 +1223,7 @@ func TestCopilotDetectionDefaultModel(t *testing.T) {
 	tests := []struct {
 		name               string
 		data               *WorkflowData
+		env                map[string]string
 		shouldContainModel bool
 		expectedModel      string
 	}{
@@ -1087,7 +1238,21 @@ func TestCopilotDetectionDefaultModel(t *testing.T) {
 			shouldContainModel: true,
 			// Detection uses env var fallback (same pattern as main agent), allowing
 			// the Copilot CLI to pick its native default (currently claude-sonnet-4.6)
-			expectedModel: "${{ vars." + constants.EnvVarModelDetectionCopilot + " || '" + constants.CopilotBYOKDefaultModel + "' }}",
+			expectedModel: "${{ vars." + constants.EnvVarModelDetectionCopilot + " || vars.GH_AW_DEFAULT_MODEL_COPILOT || '" + constants.CopilotBYOKDefaultModel + "' }}",
+		},
+		{
+			name: "detection model uses enterprise default override when configured",
+			data: &WorkflowData{
+				AI: "copilot",
+				SafeOutputs: &SafeOutputsConfig{
+					ThreatDetection: &ThreatDetectionConfig{},
+				},
+			},
+			env: map[string]string{
+				compilerenv.DefaultDetectionModel: "gpt-5.5-mini",
+			},
+			shouldContainModel: true,
+			expectedModel:      "gpt-5.5-mini",
 		},
 		{
 			name: "copilot engine with custom model uses specified model",
@@ -1103,6 +1268,21 @@ func TestCopilotDetectionDefaultModel(t *testing.T) {
 			},
 			shouldContainModel: true,
 			expectedModel:      "gpt-4",
+		},
+		{
+			name: "pi engine threat detection normalizes provider-scoped model for copilot fallback",
+			data: &WorkflowData{
+				AI: "pi",
+				EngineConfig: &EngineConfig{
+					ID:    "pi",
+					Model: "copilot/gpt-5.4",
+				},
+				SafeOutputs: &SafeOutputsConfig{
+					ThreatDetection: &ThreatDetectionConfig{},
+				},
+			},
+			shouldContainModel: true,
+			expectedModel:      "gpt-5.4",
 		},
 		{
 			name: "copilot engine with threat detection engine config with custom model",
@@ -1133,7 +1313,7 @@ func TestCopilotDetectionDefaultModel(t *testing.T) {
 				},
 			},
 			shouldContainModel: true,
-			expectedModel:      "${{ vars." + constants.EnvVarModelDetectionCopilot + " || '" + constants.CopilotBYOKDefaultModel + "' }}",
+			expectedModel:      "${{ vars." + constants.EnvVarModelDetectionCopilot + " || vars.GH_AW_DEFAULT_MODEL_COPILOT || '" + constants.CopilotBYOKDefaultModel + "' }}",
 		},
 		{
 			name: "claude engine does not add model parameter",
@@ -1150,6 +1330,9 @@ func TestCopilotDetectionDefaultModel(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
+			for key, value := range tt.env {
+				t.Setenv(key, value)
+			}
 			steps := compiler.buildDetectionEngineExecutionStep(tt.data)
 
 			if len(steps) == 0 {
@@ -1262,7 +1445,7 @@ func TestBuildDetectionEngineExecutionStepPropagatesAPITarget(t *testing.T) {
 
 			if tt.expectedTarget != "" {
 				// With config file support, copilot API target is in the JSON config
-				if !strings.Contains(allSteps, `"copilot"`) {
+				if !strings.Contains(allSteps, `\"copilot\"`) {
 					t.Errorf("Expected detection steps to contain copilot target in config JSON.\nGenerated steps:\n%s", allSteps)
 				}
 				if !strings.Contains(allSteps, tt.expectedTarget) {
@@ -1274,6 +1457,66 @@ func TestBuildDetectionEngineExecutionStepPropagatesAPITarget(t *testing.T) {
 				if strings.Contains(allSteps, tt.unexpectedTarget) {
 					t.Errorf("Expected detection steps to NOT contain api-target %q, but found it.\nGenerated steps:\n%s", tt.unexpectedTarget, allSteps)
 				}
+			}
+		})
+	}
+}
+
+func TestBuildDetectionEngineExecutionStepPropagatesBYOKProviderHost(t *testing.T) {
+	compiler := NewCompiler()
+
+	tests := []struct {
+		name         string
+		data         *WorkflowData
+		wantHost     string
+		unwantedHost string
+	}{
+		{
+			name: "detection allow-domains includes BYOK provider host",
+			data: &WorkflowData{
+				AI: "copilot",
+				EngineConfig: &EngineConfig{
+					ID: "copilot",
+					Env: map[string]string{
+						constants.CopilotProviderBaseURL: "${{ secrets.PROVIDER_BASE_URL }}",
+					},
+				},
+				SafeOutputs: &SafeOutputsConfig{
+					ThreatDetection: &ThreatDetectionConfig{},
+				},
+				NetworkPermissions: &NetworkPermissions{
+					Firewall: &FirewallConfig{Enabled: true},
+					Allowed:  []string{"defaults", "llm.corp.example.com"},
+				},
+			},
+			wantHost: "llm.corp.example.com",
+		},
+		{
+			name: "detection allow-domains stays minimal without BYOK provider host",
+			data: &WorkflowData{
+				AI: "copilot",
+				EngineConfig: &EngineConfig{
+					ID: "copilot",
+				},
+				SafeOutputs: &SafeOutputsConfig{
+					ThreatDetection: &ThreatDetectionConfig{},
+				},
+				NetworkPermissions: &NetworkPermissions{
+					Firewall: &FirewallConfig{Enabled: true},
+				},
+			},
+			unwantedHost: "llm.corp.example.com",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			allSteps := strings.Join(compiler.buildDetectionEngineExecutionStep(tt.data), "")
+			if tt.wantHost != "" && !strings.Contains(allSteps, tt.wantHost) {
+				t.Errorf("Expected detection steps to contain BYOK provider host %q.\nGenerated steps:\n%s", tt.wantHost, allSteps)
+			}
+			if tt.unwantedHost != "" && strings.Contains(allSteps, tt.unwantedHost) {
+				t.Errorf("Expected detection steps to exclude BYOK provider host %q.\nGenerated steps:\n%s", tt.unwantedHost, allSteps)
 			}
 		})
 	}
@@ -1292,28 +1535,28 @@ func TestDetectionJobPermissionsIndentation(t *testing.T) {
 		wantNotContains []string
 	}{
 		{
-			name: "copilot-requests feature produces correctly indented permissions",
+			name: "copilot-requests permission produces correctly indented permissions",
 			data: &WorkflowData{
 				Name: "test-workflow",
 				AI:   "copilot",
 				SafeOutputs: &SafeOutputsConfig{
 					ThreatDetection: &ThreatDetectionConfig{},
 				},
-				Features: map[string]any{
-					string(constants.CopilotRequestsFeatureFlag): true,
-				},
+				Permissions: "permissions:\n  copilot-requests: write",
 			},
 			// permission values must be indented by exactly 6 spaces (4 for job key + 2 for sub-key)
 			wantContains: []string{
 				"      copilot-requests: write",
+				"COPILOT_GITHUB_TOKEN: ${{ github.token }}",
 			},
 			// Over-indented value (10 spaces) must not appear - this was the bug
 			wantNotContains: []string{
 				"          copilot-requests: write",
+				"COPILOT_GITHUB_TOKEN: ${{ secrets.COPILOT_GITHUB_TOKEN }}",
 			},
 		},
 		{
-			name: "permissions block absent when copilot-requests feature disabled and no contents read needed",
+			name: "copilot-requests permission omitted from output when not configured",
 			data: &WorkflowData{
 				Name: "test-workflow",
 				AI:   "copilot",
@@ -1321,9 +1564,45 @@ func TestDetectionJobPermissionsIndentation(t *testing.T) {
 					ThreatDetection: &ThreatDetectionConfig{},
 				},
 			},
-			// copilot-requests should not be in the output when the feature is not enabled
+			// copilot-requests should not be in the output when the permission is not set
 			wantContains:    []string{},
 			wantNotContains: []string{"copilot-requests: write"},
+		},
+		{
+			name: "github-oidc engine auth adds id-token: write to detection job",
+			data: &WorkflowData{
+				Name: "test-workflow",
+				AI:   "claude",
+				EngineConfig: &EngineConfig{
+					ID:   "claude",
+					Auth: &EngineAuthConfig{Type: "github-oidc"},
+				},
+				SafeOutputs: &SafeOutputsConfig{
+					ThreatDetection: &ThreatDetectionConfig{},
+				},
+				Permissions: "permissions:\n  id-token: write",
+			},
+			wantContains:    []string{"      id-token: write"},
+			wantNotContains: []string{},
+		},
+		{
+			name: "observability.otlp.github-app auth adds id-token: write to detection job",
+			data: &WorkflowData{
+				Name: "test-workflow",
+				AI:   "copilot",
+				SafeOutputs: &SafeOutputsConfig{
+					ThreatDetection: &ThreatDetectionConfig{},
+				},
+				RawFrontmatter: map[string]any{
+					"observability": map[string]any{
+						"otlp": map[string]any{
+							"github-app": map[string]any{},
+						},
+					},
+				},
+			},
+			wantContains:    []string{"      id-token: write"},
+			wantNotContains: []string{},
 		},
 	}
 
@@ -1571,6 +1850,67 @@ func TestCleanFirewallDirsStepOrdering(t *testing.T) {
 	}
 }
 
+func TestBuildDetectionJobStepsCodexExternalDetectorIncludesContainerDownload(t *testing.T) {
+	// Regression test: when engine=codex and gh-aw-detection feature is enabled (external
+	// detector path), the detection job must include a "Download container images" step.
+	// Previously the step was omitted under the incorrect assumption that MCP setup generation
+	// would emit it — MCP setup is only called for the inline codex detection path.
+	compiler := NewCompiler()
+
+	t.Run("codex with gh-aw-detection includes Download container images", func(t *testing.T) {
+		data := &WorkflowData{
+			AI: "codex",
+			SafeOutputs: &SafeOutputsConfig{
+				ThreatDetection: &ThreatDetectionConfig{},
+			},
+			Features: map[string]any{
+				string(constants.GHAWDetectionFeatureFlag): true,
+			},
+			SandboxConfig: &SandboxConfig{
+				Agent: &AgentSandboxConfig{
+					Type: SandboxTypeAWF,
+				},
+			},
+		}
+
+		steps := compiler.buildDetectionJobSteps(data)
+		joined := strings.Join(steps, "")
+
+		if !strings.Contains(joined, "Download container images") {
+			t.Errorf("expected 'Download container images' step in codex external detector detection job steps\ngot:\n%s", joined)
+		}
+		if !strings.Contains(joined, "download_docker_images.sh") {
+			t.Errorf("expected 'download_docker_images.sh' in detection job steps\ngot:\n%s", joined)
+		}
+	})
+
+	t.Run("codex without gh-aw-detection emits exactly one container download (inline path via MCP setup)", func(t *testing.T) {
+		data := &WorkflowData{
+			AI: "codex",
+			SafeOutputs: &SafeOutputsConfig{
+				ThreatDetection: &ThreatDetectionConfig{},
+			},
+			Features: map[string]any{},
+			SandboxConfig: &SandboxConfig{
+				Agent: &AgentSandboxConfig{
+					Type: SandboxTypeAWF,
+				},
+			},
+		}
+
+		steps := compiler.buildDetectionJobSteps(data)
+		joined := strings.Join(steps, "")
+
+		// For the inline codex path, MCP setup generation (inside buildDetectionEngineExecutionStep)
+		// emits the "Download container images" step exactly once. buildPullAWFContainersStep must
+		// NOT also emit it, or the step would appear twice and trip duplicate-step validation.
+		downloadCount := strings.Count(joined, "Download container images")
+		if downloadCount != 1 {
+			t.Errorf("expected exactly one 'Download container images' step for inline codex path, got %d\n%s", downloadCount, joined)
+		}
+	})
+}
+
 func TestBuildPullAWFContainersStepPropagatesFeatures(t *testing.T) {
 	compiler := NewCompiler()
 
@@ -1776,5 +2116,135 @@ func TestBuildDetectionEngineExecutionStepPropagatesHarnessScriptOverride(t *tes
 	}
 	if strings.Contains(s, "actions/copilot_harness.cjs") {
 		t.Errorf("expected default harness to be replaced by custom override, got:\n%s", s)
+	}
+}
+
+func TestBuildDetectionEngineExecutionStepUsesCopilotForPi(t *testing.T) {
+	compiler := NewCompiler()
+
+	data := &WorkflowData{
+		AI: "pi",
+		EngineConfig: &EngineConfig{
+			ID: "pi",
+		},
+		SafeOutputs: &SafeOutputsConfig{
+			ThreatDetection: &ThreatDetectionConfig{},
+		},
+	}
+
+	steps := compiler.buildDetectionEngineExecutionStep(data)
+	if len(steps) == 0 {
+		t.Fatal("expected non-empty steps")
+	}
+
+	rendered := strings.Join(steps, "")
+	if !strings.Contains(rendered, "Install GitHub Copilot CLI") {
+		t.Fatal("expected detection steps to include the Copilot install step for pi workflows")
+	}
+	if strings.Contains(rendered, "Install Pi CLI") {
+		t.Fatal("expected detection steps to avoid Pi install step")
+	}
+}
+
+// TestDetectionJobEnvironmentInheritance verifies that the detection job correctly
+// handles all three environment wiring scenarios:
+//  1. No environment configured → detection job has no environment field.
+//  2. Top-level data.Environment is set → detection job inherits it unconditionally.
+//  3. ThreatDetectionConfig.Environment override is set → raw name is normalised to
+//     "environment: <name>" and takes precedence over data.Environment.
+//
+// Also verifies that multi-line environment blocks (environment:\n  name: …\n  url: …)
+// are indented correctly so the compiled YAML remains valid.
+func TestDetectionJobEnvironmentInheritance(t *testing.T) {
+	tests := []struct {
+		name            string
+		topLevelEnv     string
+		detectionEnv    string
+		wantContains    []string
+		wantNotContains []string
+	}{
+		{
+			name:            "no environment configured",
+			topLevelEnv:     "",
+			detectionEnv:    "",
+			wantNotContains: []string{"environment:"},
+		},
+		{
+			name:            "inherits top-level simple environment",
+			topLevelEnv:     "environment: production",
+			detectionEnv:    "",
+			wantContains:    []string{"    environment: production"},
+			wantNotContains: []string{},
+		},
+		{
+			name:         "inherits top-level multi-line environment and indents correctly",
+			topLevelEnv:  "environment:\n  name: production\n  url: https://example.com",
+			detectionEnv: "",
+			// After indentYAMLLines("    "), lines 2+ gain 4 extra spaces.
+			wantContains: []string{
+				"    environment:",
+				"      name: production",
+				"      url: https://example.com",
+			},
+			wantNotContains: []string{},
+		},
+		{
+			name:            "threat-detection environment override normalises raw name",
+			topLevelEnv:     "",
+			detectionEnv:    "aoai-model",
+			wantContains:    []string{"    environment: aoai-model"},
+			wantNotContains: []string{},
+		},
+		{
+			name:            "threat-detection environment override takes precedence over top-level",
+			topLevelEnv:     "environment: production",
+			detectionEnv:    "aoai-model",
+			wantContains:    []string{"    environment: aoai-model"},
+			wantNotContains: []string{"environment: production"},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			compiler := NewCompiler()
+
+			data := &WorkflowData{
+				Name:        "test-workflow",
+				AI:          "copilot",
+				Environment: tt.topLevelEnv,
+				SafeOutputs: &SafeOutputsConfig{
+					ThreatDetection: &ThreatDetectionConfig{
+						Environment: tt.detectionEnv,
+					},
+				},
+			}
+
+			job, err := compiler.buildDetectionJob(data)
+			if err != nil {
+				t.Fatalf("buildDetectionJob() error: %v", err)
+			}
+			if job == nil {
+				t.Fatal("buildDetectionJob() returned nil job")
+			}
+
+			if err := compiler.jobManager.AddJob(job); err != nil {
+				t.Fatalf("AddJob() error: %v", err)
+			}
+
+			var yamlBuf strings.Builder
+			compiler.jobManager.WriteJobsYAML(&yamlBuf)
+			yamlOutput := yamlBuf.String()
+
+			for _, want := range tt.wantContains {
+				if !strings.Contains(yamlOutput, want) {
+					t.Errorf("YAML output should contain %q\ngot:\n%s", want, yamlOutput)
+				}
+			}
+			for _, notWant := range tt.wantNotContains {
+				if strings.Contains(yamlOutput, notWant) {
+					t.Errorf("YAML output should NOT contain %q\ngot:\n%s", notWant, yamlOutput)
+				}
+			}
+		})
 	}
 }

@@ -192,7 +192,7 @@ Test workflow.
 			},
 		},
 		{
-			name: "cache-memory + threat-detection: true → update_cache_memory depends on detection",
+			name: "cache-memory + threat-detection: true → update_cache_memory requires detection success",
 			frontmatter: `---
 on: workflow_dispatch
 permissions: read-all
@@ -209,7 +209,7 @@ Test workflow.
 			wantJobs:    []string{"safe_outputs", "detection", "update_cache_memory"},
 			wantNotJobs: []string{"push_repo_memory"},
 			wantInJobIf: map[string][]string{
-				"update_cache_memory": {"always()", "'skipped'"},
+				"update_cache_memory": {"always()", "needs.detection.result == 'success'"},
 			},
 		},
 		{
@@ -231,7 +231,7 @@ Test workflow.
 			wantNotJobs: []string{"detection", "update_cache_memory", "push_repo_memory"},
 		},
 		{
-			name: "cache-memory + expression detection → update_cache_memory condition accepts skipped",
+			name: "cache-memory + expression detection → update_cache_memory requires detection success",
 			frontmatter: `---
 on:
   workflow_call:
@@ -254,7 +254,7 @@ Test workflow.
 			wantNotJobs: []string{"push_repo_memory"},
 			wantInJobIf: map[string][]string{
 				"detection":           {"inputs.enable-threat-detection"},
-				"update_cache_memory": {"always()", "'skipped'"},
+				"update_cache_memory": {"always()", "needs.detection.result == 'success'"},
 			},
 		},
 		{
@@ -312,7 +312,7 @@ Test workflow.
 			wantInJobIf: map[string][]string{
 				"detection":           {"inputs.enable-threat-detection"},
 				"push_repo_memory":    {"always()", "'skipped'"},
-				"update_cache_memory": {"always()", "'skipped'"},
+				"update_cache_memory": {"always()", "needs.detection.result == 'success'"},
 			},
 		},
 	}
@@ -365,6 +365,7 @@ func TestWorkflowFilesCompile(t *testing.T) {
 
 	threatFiles := []string{
 		"test-copilot-threat-detection-expression.md",
+		"test-copilot-threat-detection-environment.md",
 		"test-copilot-repo-memory-threat-detection.md",
 		"test-copilot-repo-memory-threat-detection-expression.md",
 		"test-copilot-cache-memory-threat-detection.md",
@@ -408,6 +409,14 @@ func TestWorkflowFilesCompile(t *testing.T) {
 			if strings.Contains(filename, "threat-detection") && !strings.Contains(filename, "expression") {
 				assert.Contains(t, yaml, "  detection:",
 					"file %s should produce a detection job", filename)
+			}
+
+			// Environment fixture must propagate top-level environment to detection.
+			if filename == "test-copilot-threat-detection-environment.md" {
+				detectionSection := extractJobSection(yaml, string(constants.DetectionJobName))
+				require.NotEmpty(t, detectionSection, "detection job section should be present")
+				assert.Contains(t, detectionSection, "environment: production",
+					"detection job in %s should inherit top-level environment", filename)
 			}
 
 			// Repo-memory files should produce push_repo_memory job
@@ -533,8 +542,8 @@ Test workflow.
 
 // TestCacheMemoryWithThreatDetectionNeedsAndConditions tests update_cache_memory job
 // graph position across all three detection modes.
-// The job exists only when detection is enabled; its condition uses always() + 'skipped'
-// so it runs even when expression-controlled detection is skipped at runtime.
+// The job exists only when detection is enabled; its condition uses always()
+// and requires detection success.
 func TestCacheMemoryWithThreatDetectionNeedsAndConditions(t *testing.T) {
 	cases := []struct {
 		name              string
@@ -552,7 +561,7 @@ func TestCacheMemoryWithThreatDetectionNeedsAndConditions(t *testing.T) {
 			wantCacheMemJob:   true,
 			wantDetectionDep:  true,
 			wantAlwaysInCond:  true,
-			wantSkippedInCond: true,
+			wantSkippedInCond: false,
 		},
 		{
 			name:             "boolean false",
@@ -567,7 +576,7 @@ func TestCacheMemoryWithThreatDetectionNeedsAndConditions(t *testing.T) {
 			wantCacheMemJob:   true,
 			wantDetectionDep:  true,
 			wantAlwaysInCond:  true,
-			wantSkippedInCond: true,
+			wantSkippedInCond: false,
 		},
 	}
 
@@ -631,6 +640,9 @@ Test workflow.
 			if tc.wantSkippedInCond {
 				assert.Contains(t, cacheSection, "'skipped'",
 					"update_cache_memory if: should accept skipped detection for threat-detection=%s", tc.threatDetection)
+			} else {
+				assert.NotContains(t, cacheSection, "'skipped'",
+					"update_cache_memory if: should not accept skipped detection for threat-detection=%s", tc.threatDetection)
 			}
 		})
 	}

@@ -1,4 +1,6 @@
 ---
+private: true
+emoji: "📝"
 description: Creates issue summaries and syncs them to Notion for project management and tracking
 timeout-minutes: 5
 on:
@@ -17,7 +19,7 @@ tools:
   github:
 imports:
   - shared/mcp/notion.md
-  - shared/observability-otlp.md
+  - shared/otlp.md
 strict: true
 
 

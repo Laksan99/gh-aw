@@ -2,6 +2,8 @@ package workflow
 
 import (
 	"encoding/json"
+	"fmt"
+	"maps"
 	"strings"
 
 	"github.com/github/gh-aw/pkg/logger"
@@ -34,15 +36,19 @@ func (c *Compiler) buildInitialWorkflowData(
 	workflowData := &WorkflowData{
 		Name:                  toolsResult.workflowName,
 		FrontmatterName:       toolsResult.frontmatterName,
+		FrontmatterEmoji:      toolsResult.frontmatterEmoji,
 		FrontmatterYAML:       strings.Join(result.FrontmatterLines, "\n"),
+		FrontmatterFieldLines: result.FieldLines,
 		RawMarkdown:           result.Markdown,
 		Description:           c.extractDescription(result.Frontmatter),
 		Source:                c.extractSource(result.Frontmatter),
 		Redirect:              c.extractRedirect(result.Frontmatter),
 		TrackerID:             toolsResult.trackerID,
+		MaxDailyAICredits:     resolveMaxDailyAIC(result.Frontmatter, importsResult.MergedMaxDailyAICredits),
 		ImportedFiles:         importsResult.ImportedFiles,
 		ImportedMarkdown:      toolsResult.importedMarkdown, // Only imports WITH inputs
 		ImportPaths:           toolsResult.importPaths,      // Import paths for runtime-import macros (imports without inputs)
+		PromptImports:         toolsResult.promptImports,    // Ordered prompt contributions from imports
 		MainWorkflowMarkdown:  toolsResult.mainWorkflowMarkdown,
 		IncludedFiles:         toolsResult.allIncludedFiles,
 		ImportInputs:          importsResult.ImportInputs,
@@ -63,8 +69,10 @@ func (c *Compiler) buildInitialWorkflowData(
 		ToolsStartupTimeout:   toolsResult.toolsStartupTimeout,
 		TrialMode:             c.trialMode,
 		TrialLogicalRepo:      c.trialLogicalRepoSlug,
+		UseSamples:            c.useSamples,
 		StrictMode:            c.strictMode,
 		AllowActionRefs:       c.allowActionRefs,
+		ValidateAWFConfig:     !c.skipValidation,
 		SecretMasking:         toolsResult.secretMasking,
 		ParsedFrontmatter:     toolsResult.parsedFrontmatter,
 		RawFrontmatter:        result.Frontmatter,
@@ -121,38 +129,122 @@ func (c *Compiler) buildInitialWorkflowData(
 		}
 	}
 
-	// Populate inline-sub-agents disable flag: explicit false is rejected during validation.
-	if toolsResult.parsedFrontmatter != nil && toolsResult.parsedFrontmatter.InlineSubAgents != nil {
-		workflowData.InlineSubAgentsDisabled = !*toolsResult.parsedFrontmatter.InlineSubAgents
-	} else if rawVal, ok := result.Frontmatter["inline-sub-agents"]; ok {
-		// Fall back to raw frontmatter parsing when full ParseFrontmatterConfig fails
-		// (e.g. due to unrecognized config shapes in other frontmatter sections).
-		if boolVal, ok := rawVal.(bool); ok {
-			workflowData.InlineSubAgentsDisabled = !boolVal
-		}
-	}
-
-	// Populate stale-check flag: disabled when on.stale-check: false is set in frontmatter.
+	// Populate stale-check flag: disabled when on.stale-check: false is set in frontmatter;
+	// full mode when on.stale-check: full is set.
 	if onVal, ok := result.Frontmatter["on"]; ok {
 		if onMap, ok := onVal.(map[string]any); ok {
 			if staleCheck, ok := onMap["stale-check"]; ok {
 				if boolVal, ok := staleCheck.(bool); ok && !boolVal {
 					workflowData.StaleCheckDisabled = true
+				} else if strVal, ok := staleCheck.(string); ok && strVal == "full" {
+					workflowData.StaleCheckFull = true
 				}
 			}
 		}
 	}
 
-	// Populate model mappings: merge builtin aliases, any imported-workflow aliases, and
-	// main-workflow frontmatter overrides.  Priority (highest last):
-	//   builtins → imported workflow aliases → main workflow frontmatter (main wins).
-	var frontmatterModels map[string][]string
-	if toolsResult.parsedFrontmatter != nil {
-		frontmatterModels = toolsResult.parsedFrontmatter.Models
+	// Populate model mappings: merge builtin aliases with any imported-workflow aliases.
+	workflowData.ModelMappings = MergeImportedModelAliases(importsResult.MergedModels, nil)
+
+	mainModelCosts := extractMainModelCostsOverlay(toolsResult, result.Frontmatter)
+	mergedModelCosts := mergeModelCostOverlays(importsResult.MergedModelCosts, mainModelCosts)
+	if len(mergedModelCosts) > 0 {
+		workflowData.ModelCosts = mergedModelCosts
 	}
-	workflowData.ModelMappings = MergeImportedModelAliases(importsResult.MergedModels, frontmatterModels)
 
 	return workflowData
+}
+
+func extractMainModelCostsOverlay(toolsResult *toolsProcessingResult, frontmatter map[string]any) map[string]any {
+	// Fall back to raw frontmatter when ParseFrontmatterConfig failed (e.g. due to unrecognized
+	// tool config shapes like bash: ["*"]).
+	if toolsResult.parsedFrontmatter != nil && len(toolsResult.parsedFrontmatter.ModelCosts) > 0 {
+		return toolsResult.parsedFrontmatter.ModelCosts
+	}
+
+	rawModels, ok := frontmatter["models"]
+	if !ok {
+		return nil
+	}
+	modelsMap, ok := rawModels.(map[string]any)
+	if !ok {
+		return nil
+	}
+	if _, hasProviders := modelsMap["providers"]; !hasProviders {
+		return nil
+	}
+	return modelsMap
+}
+
+func mergeModelCostOverlays(importedOverlays []map[string]any, mainOverlay map[string]any) map[string]any {
+	capacity := len(importedOverlays)
+	if len(mainOverlay) > 0 {
+		capacity++
+	}
+	overlays := make([]map[string]any, 0, capacity)
+	overlays = append(overlays, importedOverlays...)
+	if len(mainOverlay) > 0 {
+		overlays = append(overlays, mainOverlay)
+	}
+	if len(overlays) == 0 {
+		return nil
+	}
+
+	merged := maps.Clone(overlays[0])
+	for i := 1; i < len(overlays); i++ {
+		merged = mergeModelCostOverlayPair(merged, overlays[i])
+	}
+	return merged
+}
+
+func mergeModelCostOverlayPair(base, overlay map[string]any) map[string]any {
+	result := maps.Clone(base)
+	baseProviders, _ := base["providers"].(map[string]any)
+	overlayProviders, _ := overlay["providers"].(map[string]any)
+
+	if len(overlayProviders) == 0 {
+		return result
+	}
+
+	var mergedProviders map[string]any
+	if baseProviders == nil {
+		mergedProviders = make(map[string]any)
+	} else {
+		mergedProviders = maps.Clone(baseProviders)
+	}
+	for providerName, overlayProviderAny := range overlayProviders {
+		overlayProvider, ok := overlayProviderAny.(map[string]any)
+		if !ok {
+			mergedProviders[providerName] = overlayProviderAny
+			continue
+		}
+
+		baseProvider, _ := baseProviders[providerName].(map[string]any)
+		baseModels, _ := baseProvider["models"].(map[string]any)
+		overlayModels, _ := overlayProvider["models"].(map[string]any)
+
+		var mergedProvider map[string]any
+		if baseProvider == nil {
+			mergedProvider = make(map[string]any)
+		} else {
+			mergedProvider = maps.Clone(baseProvider)
+		}
+		overlayProviderNonModels := maps.Clone(overlayProvider)
+		delete(overlayProviderNonModels, "models")
+		maps.Copy(mergedProvider, overlayProviderNonModels)
+		var mergedModels map[string]any
+		if baseModels == nil {
+			mergedModels = make(map[string]any)
+		} else {
+			mergedModels = maps.Clone(baseModels)
+		}
+		maps.Copy(mergedModels, overlayModels)
+		mergedProvider["models"] = mergedModels
+		mergedProviders[providerName] = mergedProvider
+	}
+
+	result["providers"] = mergedProviders
+	return result
 }
 
 // resolveInlinedImports returns true if inlined-imports is enabled.
@@ -186,11 +278,8 @@ func (c *Compiler) extractYAMLSections(frontmatter map[string]any, workflowData 
 	workflowData.TimeoutMinutes = c.extractTopLevelYAMLSection(frontmatter, "timeout-minutes")
 
 	workflowData.RunsOn = c.extractTopLevelYAMLSection(frontmatter, "runs-on")
-	// Extract runs-on-slim as a plain string (no YAML formatting needed)
-	if v, ok := frontmatter["runs-on-slim"]; ok {
-		if s, ok := v.(string); ok {
-			workflowData.RunsOnSlim = s
-		}
+	if v, ok := frontmatter["runs-on-slim"]; ok && !isEmptyRunsOnValue(v) {
+		workflowData.RunsOnSlim = c.extractTopLevelYAMLSection(map[string]any{"runs-on": v}, "runs-on")
 	}
 	workflowData.Environment = c.extractTopLevelYAMLSection(frontmatter, "environment")
 	workflowData.Container = c.extractTopLevelYAMLSection(frontmatter, "container")
@@ -294,7 +383,7 @@ func extractDispatchItemNumber(frontmatter map[string]any) bool {
 }
 
 // processAndMergeSteps handles the merging of imported steps with main workflow steps
-func (c *Compiler) processAndMergeSteps(frontmatter map[string]any, workflowData *WorkflowData, importsResult *parser.ImportsResult) {
+func (c *Compiler) processAndMergeSteps(frontmatter map[string]any, workflowData *WorkflowData, importsResult *parser.ImportsResult) error {
 	workflowBuilderLog.Print("Processing and merging custom steps")
 
 	workflowData.CustomSteps = c.extractTopLevelYAMLSection(frontmatter, "steps")
@@ -311,7 +400,10 @@ func (c *Compiler) processAndMergeSteps(frontmatter map[string]any, workflowData
 				workflowBuilderLog.Printf("Failed to convert copilot-setup steps to typed steps: %v", err)
 			} else {
 				// Apply action pinning to copilot-setup steps
-				typedCopilotSteps = applyActionPinsToTypedSteps(typedCopilotSteps, workflowData)
+				typedCopilotSteps, err = applyActionPinsToTypedSteps(typedCopilotSteps, workflowData)
+				if err != nil {
+					return fmt.Errorf("copilot-setup steps: %w", err)
+				}
 				// Convert back to []any for YAML marshaling
 				copilotSetupSteps = StepsToSlice(typedCopilotSteps)
 			}
@@ -321,39 +413,45 @@ func (c *Compiler) processAndMergeSteps(frontmatter map[string]any, workflowData
 	// Parse other imported steps if present (these go after copilot-setup but before main steps)
 	var otherImportedSteps []any
 	if importsResult.MergedSteps != "" {
-		if err := yaml.Unmarshal([]byte(importsResult.MergedSteps), &otherImportedSteps); err == nil {
-			// Convert to typed steps for action pinning
-			typedOtherSteps, err := SliceToSteps(otherImportedSteps)
-			if err != nil {
-				workflowBuilderLog.Printf("Failed to convert other imported steps to typed steps: %v", err)
-			} else {
-				// Apply action pinning to other imported steps
-				typedOtherSteps = applyActionPinsToTypedSteps(typedOtherSteps, workflowData)
-				// Convert back to []any for YAML marshaling
-				otherImportedSteps = StepsToSlice(typedOtherSteps)
-			}
+		if err := yaml.Unmarshal([]byte(importsResult.MergedSteps), &otherImportedSteps); err != nil {
+			return fmt.Errorf("failed to parse imported steps: %w", err)
 		}
+		// Convert to typed steps for action pinning
+		typedOtherSteps, err := SliceToSteps(otherImportedSteps)
+		if err != nil {
+			return fmt.Errorf("failed to convert imported steps: %w", err)
+		}
+		// Apply action pinning to other imported steps
+		typedOtherSteps, err = applyActionPinsToTypedSteps(typedOtherSteps, workflowData)
+		if err != nil {
+			return fmt.Errorf("imported steps: %w", err)
+		}
+		// Convert back to []any for YAML marshaling
+		otherImportedSteps = StepsToSlice(typedOtherSteps)
 	}
 
 	// If there are main workflow steps, parse them
 	var mainSteps []any
 	if workflowData.CustomSteps != "" {
 		var mainStepsWrapper map[string]any
-		if err := yaml.Unmarshal([]byte(workflowData.CustomSteps), &mainStepsWrapper); err == nil {
-			if mainStepsVal, hasSteps := mainStepsWrapper["steps"]; hasSteps {
-				if steps, ok := mainStepsVal.([]any); ok {
-					mainSteps = steps
-					// Convert to typed steps for action pinning
-					typedMainSteps, err := SliceToSteps(mainSteps)
-					if err != nil {
-						workflowBuilderLog.Printf("Failed to convert main steps to typed steps: %v", err)
-					} else {
-						// Apply action pinning to main steps
-						typedMainSteps = applyActionPinsToTypedSteps(typedMainSteps, workflowData)
-						// Convert back to []any for YAML marshaling
-						mainSteps = StepsToSlice(typedMainSteps)
-					}
+		if err := yaml.Unmarshal([]byte(workflowData.CustomSteps), &mainStepsWrapper); err != nil {
+			return fmt.Errorf("failed to parse custom steps: %w", err)
+		}
+		if mainStepsVal, hasSteps := mainStepsWrapper["steps"]; hasSteps {
+			if steps, ok := mainStepsVal.([]any); ok {
+				mainSteps = steps
+				// Convert to typed steps for action pinning
+				typedMainSteps, err := SliceToSteps(mainSteps)
+				if err != nil {
+					return fmt.Errorf("failed to convert main steps: %w", err)
 				}
+				// Apply action pinning to main steps
+				typedMainSteps, err = applyActionPinsToTypedSteps(typedMainSteps, workflowData)
+				if err != nil {
+					return fmt.Errorf("steps: %w", err)
+				}
+				// Convert back to []any for YAML marshaling
+				mainSteps = StepsToSlice(typedMainSteps)
 			}
 		}
 	}
@@ -376,6 +474,7 @@ func (c *Compiler) processAndMergeSteps(frontmatter map[string]any, workflowData
 			workflowData.CustomSteps = unquoteUsesWithComments(string(stepsYAML))
 		}
 	}
+	return nil
 }
 
 // processAndMergePreSteps handles the processing and merging of pre-steps with action pinning.
@@ -383,7 +482,7 @@ func (c *Compiler) processAndMergeSteps(frontmatter map[string]any, workflowData
 // built-in steps, allowing users to mint tokens or perform other setup that must happen
 // before the repository is checked out. Imported pre-steps are merged before the main
 // workflow's pre-steps so that the main workflow can override or extend the imports.
-func (c *Compiler) processAndMergePreSteps(frontmatter map[string]any, workflowData *WorkflowData, importsResult *parser.ImportsResult) {
+func (c *Compiler) processAndMergePreSteps(frontmatter map[string]any, workflowData *WorkflowData, importsResult *parser.ImportsResult) error {
 	workflowBuilderLog.Print("Processing and merging pre-steps")
 
 	mainPreStepsYAML := c.extractTopLevelYAMLSection(frontmatter, "pre-steps")
@@ -392,34 +491,38 @@ func (c *Compiler) processAndMergePreSteps(frontmatter map[string]any, workflowD
 	var importedPreSteps []any
 	if importsResult.MergedPreSteps != "" {
 		if err := yaml.Unmarshal([]byte(importsResult.MergedPreSteps), &importedPreSteps); err != nil {
-			workflowBuilderLog.Printf("Failed to unmarshal imported pre-steps: %v", err)
-		} else {
-			typedImported, err := SliceToSteps(importedPreSteps)
-			if err != nil {
-				workflowBuilderLog.Printf("Failed to convert imported pre-steps to typed steps: %v", err)
-			} else {
-				typedImported = applyActionPinsToTypedSteps(typedImported, workflowData)
-				importedPreSteps = StepsToSlice(typedImported)
-			}
+			return fmt.Errorf("failed to parse imported pre-steps: %w", err)
 		}
+		typedImported, err := SliceToSteps(importedPreSteps)
+		if err != nil {
+			return fmt.Errorf("failed to convert imported pre-steps: %w", err)
+		}
+		typedImported, err = applyActionPinsToTypedSteps(typedImported, workflowData)
+		if err != nil {
+			return fmt.Errorf("imported pre-steps: %w", err)
+		}
+		importedPreSteps = StepsToSlice(typedImported)
 	}
 
 	// Parse main workflow pre-steps if present
 	var mainPreSteps []any
 	if mainPreStepsYAML != "" {
 		var mainWrapper map[string]any
-		if err := yaml.Unmarshal([]byte(mainPreStepsYAML), &mainWrapper); err == nil {
-			if mainVal, ok := mainWrapper["pre-steps"]; ok {
-				if steps, ok := mainVal.([]any); ok {
-					mainPreSteps = steps
-					typedMain, err := SliceToSteps(mainPreSteps)
-					if err != nil {
-						workflowBuilderLog.Printf("Failed to convert main pre-steps to typed steps: %v", err)
-					} else {
-						typedMain = applyActionPinsToTypedSteps(typedMain, workflowData)
-						mainPreSteps = StepsToSlice(typedMain)
-					}
+		if err := yaml.Unmarshal([]byte(mainPreStepsYAML), &mainWrapper); err != nil {
+			return fmt.Errorf("failed to parse pre-steps: %w", err)
+		}
+		if mainVal, ok := mainWrapper["pre-steps"]; ok {
+			if steps, ok := mainVal.([]any); ok {
+				mainPreSteps = steps
+				typedMain, err := SliceToSteps(mainPreSteps)
+				if err != nil {
+					return fmt.Errorf("failed to convert pre-steps: %w", err)
 				}
+				typedMain, err = applyActionPinsToTypedSteps(typedMain, workflowData)
+				if err != nil {
+					return fmt.Errorf("pre-steps: %w", err)
+				}
+				mainPreSteps = StepsToSlice(typedMain)
 			}
 		}
 	}
@@ -436,11 +539,12 @@ func (c *Compiler) processAndMergePreSteps(frontmatter map[string]any, workflowD
 			workflowData.PreSteps = unquoteUsesWithComments(string(stepsYAML))
 		}
 	}
+	return nil
 }
 
 // processAndMergePreAgentSteps handles processing and merging of pre-agent-steps with action pinning.
 // Imported pre-agent-steps are prepended so main workflow pre-agent-steps run last.
-func (c *Compiler) processAndMergePreAgentSteps(frontmatter map[string]any, workflowData *WorkflowData, importsResult *parser.ImportsResult) {
+func (c *Compiler) processAndMergePreAgentSteps(frontmatter map[string]any, workflowData *WorkflowData, importsResult *parser.ImportsResult) error {
 	workflowBuilderLog.Print("Processing and merging pre-agent-steps")
 
 	mainPreAgentStepsYAML := c.extractTopLevelYAMLSection(frontmatter, "pre-agent-steps")
@@ -448,33 +552,37 @@ func (c *Compiler) processAndMergePreAgentSteps(frontmatter map[string]any, work
 	var importedPreAgentSteps []any
 	if importsResult.MergedPreAgentSteps != "" {
 		if err := yaml.Unmarshal([]byte(importsResult.MergedPreAgentSteps), &importedPreAgentSteps); err != nil {
-			workflowBuilderLog.Printf("Failed to unmarshal imported pre-agent-steps: %v", err)
-		} else {
-			typedImported, err := SliceToSteps(importedPreAgentSteps)
-			if err != nil {
-				workflowBuilderLog.Printf("Failed to convert imported pre-agent-steps to typed steps: %v", err)
-			} else {
-				typedImported = applyActionPinsToTypedSteps(typedImported, workflowData)
-				importedPreAgentSteps = StepsToSlice(typedImported)
-			}
+			return fmt.Errorf("failed to parse imported pre-agent-steps: %w", err)
 		}
+		typedImported, err := SliceToSteps(importedPreAgentSteps)
+		if err != nil {
+			return fmt.Errorf("failed to convert imported pre-agent-steps: %w", err)
+		}
+		typedImported, err = applyActionPinsToTypedSteps(typedImported, workflowData)
+		if err != nil {
+			return fmt.Errorf("imported pre-agent-steps: %w", err)
+		}
+		importedPreAgentSteps = StepsToSlice(typedImported)
 	}
 
 	var mainPreAgentSteps []any
 	if mainPreAgentStepsYAML != "" {
 		var mainWrapper map[string]any
-		if err := yaml.Unmarshal([]byte(mainPreAgentStepsYAML), &mainWrapper); err == nil {
-			if mainVal, ok := mainWrapper["pre-agent-steps"]; ok {
-				if steps, ok := mainVal.([]any); ok {
-					mainPreAgentSteps = steps
-					typedMain, err := SliceToSteps(mainPreAgentSteps)
-					if err != nil {
-						workflowBuilderLog.Printf("Failed to convert main pre-agent-steps to typed steps: %v", err)
-					} else {
-						typedMain = applyActionPinsToTypedSteps(typedMain, workflowData)
-						mainPreAgentSteps = StepsToSlice(typedMain)
-					}
+		if err := yaml.Unmarshal([]byte(mainPreAgentStepsYAML), &mainWrapper); err != nil {
+			return fmt.Errorf("failed to parse pre-agent-steps: %w", err)
+		}
+		if mainVal, ok := mainWrapper["pre-agent-steps"]; ok {
+			if steps, ok := mainVal.([]any); ok {
+				mainPreAgentSteps = steps
+				typedMain, err := SliceToSteps(mainPreAgentSteps)
+				if err != nil {
+					return fmt.Errorf("failed to convert pre-agent-steps: %w", err)
 				}
+				typedMain, err = applyActionPinsToTypedSteps(typedMain, workflowData)
+				if err != nil {
+					return fmt.Errorf("pre-agent-steps: %w", err)
+				}
+				mainPreAgentSteps = StepsToSlice(typedMain)
 			}
 		}
 	}
@@ -490,11 +598,12 @@ func (c *Compiler) processAndMergePreAgentSteps(frontmatter map[string]any, work
 			workflowData.PreAgentSteps = unquoteUsesWithComments(string(stepsYAML))
 		}
 	}
+	return nil
 }
 
 // processAndMergePostSteps handles the processing and merging of post-steps with action pinning.
 // Imported post-steps are appended after the main workflow's post-steps.
-func (c *Compiler) processAndMergePostSteps(frontmatter map[string]any, workflowData *WorkflowData, importsResult *parser.ImportsResult) {
+func (c *Compiler) processAndMergePostSteps(frontmatter map[string]any, workflowData *WorkflowData, importsResult *parser.ImportsResult) error {
 	workflowBuilderLog.Print("Processing and merging post-steps")
 
 	mainPostStepsYAML := c.extractTopLevelYAMLSection(frontmatter, "post-steps")
@@ -503,34 +612,38 @@ func (c *Compiler) processAndMergePostSteps(frontmatter map[string]any, workflow
 	var importedPostSteps []any
 	if importsResult.MergedPostSteps != "" {
 		if err := yaml.Unmarshal([]byte(importsResult.MergedPostSteps), &importedPostSteps); err != nil {
-			workflowBuilderLog.Printf("Failed to unmarshal imported post-steps: %v", err)
-		} else {
-			typedImported, err := SliceToSteps(importedPostSteps)
-			if err != nil {
-				workflowBuilderLog.Printf("Failed to convert imported post-steps to typed steps: %v", err)
-			} else {
-				typedImported = applyActionPinsToTypedSteps(typedImported, workflowData)
-				importedPostSteps = StepsToSlice(typedImported)
-			}
+			return fmt.Errorf("failed to parse imported post-steps: %w", err)
 		}
+		typedImported, err := SliceToSteps(importedPostSteps)
+		if err != nil {
+			return fmt.Errorf("failed to convert imported post-steps: %w", err)
+		}
+		typedImported, err = applyActionPinsToTypedSteps(typedImported, workflowData)
+		if err != nil {
+			return fmt.Errorf("imported post-steps: %w", err)
+		}
+		importedPostSteps = StepsToSlice(typedImported)
 	}
 
 	// Parse main workflow post-steps if present
 	var mainPostSteps []any
 	if mainPostStepsYAML != "" {
 		var mainWrapper map[string]any
-		if err := yaml.Unmarshal([]byte(mainPostStepsYAML), &mainWrapper); err == nil {
-			if mainVal, ok := mainWrapper["post-steps"]; ok {
-				if steps, ok := mainVal.([]any); ok {
-					mainPostSteps = steps
-					typedMain, err := SliceToSteps(mainPostSteps)
-					if err != nil {
-						workflowBuilderLog.Printf("Failed to convert main post-steps to typed steps: %v", err)
-					} else {
-						typedMain = applyActionPinsToTypedSteps(typedMain, workflowData)
-						mainPostSteps = StepsToSlice(typedMain)
-					}
+		if err := yaml.Unmarshal([]byte(mainPostStepsYAML), &mainWrapper); err != nil {
+			return fmt.Errorf("failed to parse post-steps: %w", err)
+		}
+		if mainVal, ok := mainWrapper["post-steps"]; ok {
+			if steps, ok := mainVal.([]any); ok {
+				mainPostSteps = steps
+				typedMain, err := SliceToSteps(mainPostSteps)
+				if err != nil {
+					return fmt.Errorf("failed to convert post-steps: %w", err)
 				}
+				typedMain, err = applyActionPinsToTypedSteps(typedMain, workflowData)
+				if err != nil {
+					return fmt.Errorf("post-steps: %w", err)
+				}
+				mainPostSteps = StepsToSlice(typedMain)
 			}
 		}
 	}
@@ -547,4 +660,5 @@ func (c *Compiler) processAndMergePostSteps(frontmatter map[string]any, workflow
 			workflowData.PostSteps = unquoteUsesWithComments(string(stepsYAML))
 		}
 	}
+	return nil
 }

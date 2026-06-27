@@ -7,8 +7,10 @@ const {
   generatePlainTextLegacySummary,
   parseGatewayJsonlForDifcFiltered,
   parseGatewayJsonlForTokenSteering,
+  parseGatewayJsonlForModelAliasResolution,
   generateDifcFilteredSummary,
   generateTokenSteeringSummary,
+  generateModelAliasResolutionSummary,
   parseRpcMessagesJsonl,
   getRpcRequestLabel,
   generateRpcMessagesSummary,
@@ -16,7 +18,6 @@ const {
   parseTokenUsageJsonl,
   generateTokenUsageSummary,
   formatDurationMs,
-  hasEffectiveTokensRateLimitError,
 } = require("./parse_mcp_gateway_log.cjs");
 
 describe("parse_mcp_gateway_log", () => {
@@ -339,6 +340,69 @@ Some content here.`;
       }
     });
 
+    test("strips leading null bytes from gateway.md before writing to step summary", async () => {
+      const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "mcp-test-"));
+      const gatewayMdPath = path.join(tmpDir, "gateway.md");
+
+      // Simulate MCPG's behaviour: pre-allocate a fixed-size header region filled
+      // with null bytes (1444 bytes, as seen in production runs) before real content.
+      const nullBytes = "\x00".repeat(1444);
+      const realContent = "- ✓ **backend**\n  Successfully connected to MCP backend server.\n";
+      fs.writeFileSync(gatewayMdPath, nullBytes + realContent);
+
+      const mockCore = {
+        info: vi.fn(),
+        debug: vi.fn(),
+        startGroup: vi.fn(),
+        endGroup: vi.fn(),
+        notice: vi.fn(),
+        warning: vi.fn(),
+        error: vi.fn(),
+        setFailed: vi.fn(),
+        exportVariable: vi.fn(),
+        setOutput: vi.fn(),
+        summary: {
+          addRaw: vi.fn().mockReturnThis(),
+          addDetails: vi.fn().mockReturnThis(),
+          write: vi.fn(),
+        },
+      };
+
+      const originalExistsSync = fs.existsSync;
+      const originalReadFileSync = fs.readFileSync;
+
+      fs.existsSync = vi.fn(filepath => {
+        if (filepath === "/tmp/gh-aw/mcp-logs/gateway.md") return true;
+        return originalExistsSync(filepath);
+      });
+
+      fs.readFileSync = vi.fn((filepath, encoding) => {
+        if (filepath === "/tmp/gh-aw/mcp-logs/gateway.md") {
+          return originalReadFileSync(gatewayMdPath, encoding);
+        }
+        return originalReadFileSync(filepath, encoding);
+      });
+
+      global.core = mockCore;
+
+      try {
+        const { main } = require("./parse_mcp_gateway_log.cjs");
+        await main();
+
+        // Step summary must contain the real content without any null bytes
+        const addRawCalls = mockCore.summary.addRaw.mock.calls;
+        expect(addRawCalls.length).toBeGreaterThan(0);
+        const writtenContent = addRawCalls.map(call => call[0]).join("");
+        expect(writtenContent).not.toContain("\x00");
+        expect(writtenContent).toContain("backend");
+      } finally {
+        fs.existsSync = originalExistsSync;
+        fs.readFileSync = originalReadFileSync;
+        delete global.core;
+        fs.rmSync(tmpDir, { recursive: true, force: true });
+      }
+    });
+
     test("does not append token usage details when token usage file exists", async () => {
       const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "mcp-test-"));
       const gatewayMdPath = path.join(tmpDir, "gateway.md");
@@ -401,7 +465,8 @@ Some content here.`;
 
         expect(mockCore.summary.addRaw).toHaveBeenCalledWith(expect.stringContaining("Gateway Summary"));
         expect(mockCore.summary.addDetails).not.toHaveBeenCalledWith("Token Usage", expect.any(String));
-        expect(mockCore.exportVariable).toHaveBeenCalledWith("GH_AW_EFFECTIVE_TOKENS", expect.any(String));
+        expect(mockCore.exportVariable).toHaveBeenCalledWith("GH_AW_AIC", expect.any(String));
+        expect(mockCore.exportVariable).toHaveBeenCalledWith("GH_AW_AMBIENT_CONTEXT", expect.any(String));
         expect(mockCore.summary.write).toHaveBeenCalled();
       } finally {
         fs.existsSync = originalExistsSync;
@@ -553,6 +618,147 @@ Some content here.`;
         expect(summaryOutput).toContain("Token Steering Events (1)");
         expect(summaryOutput).toContain("req-123");
         expect(summaryOutput).toContain("[AWF TOKEN WARNING]");
+        expect(mockCore.summary.write).toHaveBeenCalled();
+      } finally {
+        fs.existsSync = originalExistsSync;
+        fs.readFileSync = originalReadFileSync;
+        delete global.core;
+        fs.rmSync(tmpDir, { recursive: true, force: true });
+      }
+    });
+
+    test("renders model alias resolution events from rpc-messages.jsonl when gateway.md and gateway.jsonl are absent", async () => {
+      const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "mcp-test-"));
+      const rpcMessagesPath = path.join(tmpDir, "rpc-messages.jsonl");
+      const originalExistsSync = fs.existsSync;
+      const originalReadFileSync = fs.readFileSync;
+
+      try {
+        fs.writeFileSync(
+          rpcMessagesPath,
+          [
+            JSON.stringify({
+              timestamp: "2026-03-18T17:30:00.123456789Z",
+              direction: "OUT",
+              type: "REQUEST",
+              server_id: "github",
+              payload: { method: "tools/call", params: { name: "list_issues", arguments: {} } },
+            }),
+            JSON.stringify({
+              timestamp: "2026-03-18T17:30:01.123456789Z",
+              event: "MODEL_ALIAS_REWRITE",
+              data: {
+                request_id: "req-900",
+                provider: "copilot",
+                original_model: "sonnet",
+                resolved_model: "claude-sonnet-4.6",
+                fallback_index: 0,
+              },
+            }),
+          ].join("\n")
+        );
+
+        const mockCore = {
+          info: vi.fn(),
+          debug: vi.fn(),
+          startGroup: vi.fn(),
+          endGroup: vi.fn(),
+          notice: vi.fn(),
+          warning: vi.fn(),
+          error: vi.fn(),
+          setFailed: vi.fn(),
+          exportVariable: vi.fn(),
+          setOutput: vi.fn(),
+          summary: {
+            addRaw: vi.fn().mockReturnThis(),
+            addDetails: vi.fn().mockReturnThis(),
+            write: vi.fn(),
+          },
+        };
+
+        fs.existsSync = vi.fn(filepath => {
+          if (filepath === "/tmp/gh-aw/mcp-logs/rpc-messages.jsonl") return true;
+          if (filepath === "/tmp/gh-aw/mcp-logs/gateway.md") return false;
+          if (filepath === "/tmp/gh-aw/mcp-logs/gateway.jsonl") return false;
+          return originalExistsSync(filepath);
+        });
+
+        fs.readFileSync = vi.fn((filepath, encoding) => {
+          if (filepath === "/tmp/gh-aw/mcp-logs/rpc-messages.jsonl") {
+            return originalReadFileSync(rpcMessagesPath, encoding);
+          }
+          return originalReadFileSync(filepath, encoding);
+        });
+
+        global.core = mockCore;
+
+        const { main } = require("./parse_mcp_gateway_log.cjs");
+        await main();
+
+        const summaryOutput = mockCore.summary.addRaw.mock.calls.map(call => call[0]).join("\n");
+        expect(summaryOutput).toContain("Model Alias Resolution Events (1)");
+        expect(summaryOutput).toContain("| Time | Provider | Request ID | Alias | Resolved model |");
+        expect(summaryOutput).toContain("req-900");
+        expect(summaryOutput).toContain("sonnet");
+        expect(summaryOutput).toContain("claude-sonnet-4.6");
+        expect(summaryOutput).toContain('"event": "MODEL_ALIAS_REWRITE"');
+        expect(mockCore.summary.write).toHaveBeenCalled();
+      } finally {
+        fs.existsSync = originalExistsSync;
+        fs.readFileSync = originalReadFileSync;
+        delete global.core;
+        fs.rmSync(tmpDir, { recursive: true, force: true });
+      }
+    });
+
+    test("warns and continues when rpc-messages.jsonl is zero bytes", async () => {
+      const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "mcp-test-"));
+      const rpcMessagesPath = path.join(tmpDir, "rpc-messages.jsonl");
+      const originalExistsSync = fs.existsSync;
+      const originalReadFileSync = fs.readFileSync;
+
+      try {
+        fs.writeFileSync(rpcMessagesPath, "");
+
+        const mockCore = {
+          info: vi.fn(),
+          debug: vi.fn(),
+          startGroup: vi.fn(),
+          endGroup: vi.fn(),
+          notice: vi.fn(),
+          warning: vi.fn(),
+          error: vi.fn(),
+          setFailed: vi.fn(),
+          exportVariable: vi.fn(),
+          setOutput: vi.fn(),
+          summary: {
+            addRaw: vi.fn().mockReturnThis(),
+            addDetails: vi.fn().mockReturnThis(),
+            write: vi.fn(),
+          },
+        };
+
+        fs.existsSync = vi.fn(filepath => {
+          if (filepath === "/tmp/gh-aw/mcp-logs/rpc-messages.jsonl") return true;
+          if (filepath === "/tmp/gh-aw/mcp-logs/gateway.md") return false;
+          if (filepath === "/tmp/gh-aw/mcp-logs/gateway.jsonl") return false;
+          return originalExistsSync(filepath);
+        });
+
+        fs.readFileSync = vi.fn((filepath, encoding) => {
+          if (filepath === "/tmp/gh-aw/mcp-logs/rpc-messages.jsonl") {
+            return originalReadFileSync(rpcMessagesPath, encoding);
+          }
+          return originalReadFileSync(filepath, encoding);
+        });
+
+        global.core = mockCore;
+
+        const { main } = require("./parse_mcp_gateway_log.cjs");
+        await main();
+
+        expect(mockCore.warning).toHaveBeenCalledWith("rpc-messages.jsonl is present but zero bytes; continuing without RPC summary");
+        expect(mockCore.setFailed).not.toHaveBeenCalled();
         expect(mockCore.summary.write).toHaveBeenCalled();
       } finally {
         fs.existsSync = originalExistsSync;
@@ -913,6 +1119,62 @@ Some content here.`;
     });
   });
 
+  describe("parseGatewayJsonlForModelAliasResolution", () => {
+    test("extracts model alias rewrite/resolution events from gateway.jsonl content", () => {
+      const jsonlContent = [
+        JSON.stringify({
+          timestamp: "2026-03-18T17:30:02Z",
+          event: "model_alias_resolution",
+          request_id: "req-200",
+          provider: "copilot",
+          alias: "sonnet",
+          resolved_model: "claude-sonnet-4.6",
+        }),
+        JSON.stringify({ timestamp: "2026-03-18T17:30:03Z", event: "request_start", request_id: "req-201" }),
+        JSON.stringify({
+          timestamp: "2026-03-18T17:30:04Z",
+          type: "model_alias_resolution",
+          request_id: "req-202",
+          provider: "openai",
+          model_alias: "mini",
+          resolved_model: "gpt-5-mini",
+        }),
+        JSON.stringify({
+          timestamp: "2026-03-18T17:30:05Z",
+          event: "MODEL_ALIAS_REWRITE",
+          data: {
+            provider: "anthropic",
+            request_id: "req-203",
+            original_model: "sonnet",
+            resolved_model: "claude-sonnet-4.6",
+          },
+        }),
+        JSON.stringify({
+          timestamp: "2026-03-18T17:30:06Z",
+          event: "model_rewrite",
+          request_id: "req-204",
+          provider: "copilot",
+          original_model: "gpt-5-mini",
+          resolved_model: "gpt-5.4-mini",
+        }),
+      ].join("\n");
+
+      const events = parseGatewayJsonlForModelAliasResolution(jsonlContent);
+
+      expect(events).toHaveLength(4);
+      expect(events[0].request_id).toBe("req-200");
+      expect(events[1].request_id).toBe("req-202");
+      expect(events[2].data.request_id).toBe("req-203");
+      expect(events[3].request_id).toBe("req-204");
+    });
+
+    test("returns empty array when no model alias resolution events are present", () => {
+      const jsonlContent = [JSON.stringify({ event: "request_start" }), JSON.stringify({ type: "RESPONSE" })].join("\n");
+
+      expect(parseGatewayJsonlForModelAliasResolution(jsonlContent)).toHaveLength(0);
+    });
+  });
+
   describe("generateDifcFilteredSummary", () => {
     const sampleEvents = [
       {
@@ -1031,6 +1293,50 @@ Some content here.`;
       expect(summary).toContain("copilot");
       expect(summary).toContain("req-123");
       expect(summary).toContain("[AWF TOKEN WARNING] You have used 90% of your effective token budget.");
+    });
+  });
+
+  describe("generateModelAliasResolutionSummary", () => {
+    test("returns empty string for empty events array", () => {
+      expect(generateModelAliasResolutionSummary([])).toBe("");
+    });
+
+    test("renders a model alias resolution summary table and raw event JSON", () => {
+      const summary = generateModelAliasResolutionSummary([
+        {
+          timestamp: "2026-03-18T17:30:02.123456789Z",
+          event: "model_alias_resolution",
+          provider: "copilot",
+          request_id: "req-200",
+          alias: "sonnet",
+          resolved_model: "claude-sonnet-4.6",
+          candidates: ["claude-sonnet-4.6", "gpt-4o"],
+        },
+        {
+          timestamp: "2026-03-18T17:30:03.123456789Z",
+          event: "MODEL_ALIAS_REWRITE",
+          data: {
+            provider: "anthropic",
+            request_id: "req-201",
+            original_model: "sonnet",
+            resolved_model: "claude-sonnet-4.6",
+          },
+        },
+      ]);
+
+      expect(summary).toContain("Model Alias Resolution Events (2)");
+      expect(summary).toContain("| Time | Provider | Request ID | Alias | Resolved model |");
+      expect(summary).toContain("2026-03-18 17:30:02Z");
+      expect(summary).toContain("copilot");
+      expect(summary).toContain("req-200");
+      expect(summary).toContain("sonnet");
+      expect(summary).toContain("claude-sonnet-4.6");
+      expect(summary).toContain("anthropic");
+      expect(summary).toContain("req-201");
+      expect(summary).toContain("Raw events");
+      expect(summary).toContain('"event": "model_alias_resolution"');
+      expect(summary).toContain('"event": "MODEL_ALIAS_REWRITE"');
+      expect(summary).toContain('"candidates"');
     });
   });
 
@@ -1267,6 +1573,7 @@ Some content here.`;
       expect(summary.totalCacheWriteTokens).toBe(3000);
       expect(summary.totalRequests).toBe(1);
       expect(summary.totalDurationMs).toBe(2500);
+      expect(summary.ambientContextTokens).toBe(900);
     });
 
     test("aggregates multiple entries across models", () => {
@@ -1286,6 +1593,7 @@ Some content here.`;
       expect(summary.byModel["claude-sonnet-4-6"].requests).toBe(2);
       expect(summary.byModel["claude-sonnet-4-6"].inputTokens).toBe(15);
       expect(summary.byModel["gpt-4o"].requests).toBe(1);
+      expect(summary.ambientContextTokens).toBe(25);
     });
 
     test("skips malformed lines and still parses valid ones", () => {
@@ -1311,6 +1619,19 @@ not-json
       expect(summary).not.toBeNull();
       expect(summary).not.toHaveProperty("cacheEfficiency");
     });
+
+    test("populates per-turn entries array in order", () => {
+      const lines = [
+        JSON.stringify({ model: "m1", input_tokens: 10, output_tokens: 5, cache_read_tokens: 0, cache_write_tokens: 0, duration_ms: 100 }),
+        JSON.stringify({ model: "m2", input_tokens: 20, output_tokens: 10, cache_read_tokens: 0, cache_write_tokens: 0, duration_ms: 200 }),
+      ];
+      const summary = parseTokenUsageJsonl(lines.join("\n"));
+      expect(summary.entries).toHaveLength(2);
+      expect(summary.entries[0].model).toBe("m1");
+      expect(summary.entries[0].inputTokens).toBe(10);
+      expect(summary.entries[0].durationMs).toBe(100);
+      expect(summary.entries[1].model).toBe("m2");
+    });
   });
 
   describe("generateTokenUsageSummary", () => {
@@ -1322,8 +1643,8 @@ not-json
     test("renders header and table columns", () => {
       const summary = parseTokenUsageJsonl(JSON.stringify({ model: "claude-sonnet-4-6", provider: "anthropic", input_tokens: 100, output_tokens: 200, cache_read_tokens: 5000, cache_write_tokens: 3000, duration_ms: 2500 }));
       const md = generateTokenUsageSummary(summary);
-      expect(md).toContain("| Model | Input | Output | Cache Read | Cache Write | ET | Requests | Duration |");
-      expect(md).toContain("claude-sonnet-4-6");
+      expect(md).toContain("| # | Alias | Input | Output | Cache Read | Cache Write | ΔAI Credits | AI Credits | Duration |");
+      expect(md).toContain("sonnet46");
     });
 
     test("includes totals row", () => {
@@ -1339,86 +1660,74 @@ not-json
       expect(md).not.toContain("Cache efficiency");
     });
 
-    test("sorts models by total tokens descending", () => {
+    test("renders rows in chronological (input) order", () => {
       const lines = [
-        JSON.stringify({ model: "small-model", input_tokens: 5, output_tokens: 5, cache_read_tokens: 0, cache_write_tokens: 0, duration_ms: 100 }),
-        JSON.stringify({ model: "large-model", input_tokens: 1000, output_tokens: 500, cache_read_tokens: 0, cache_write_tokens: 0, duration_ms: 500 }),
+        JSON.stringify({ model: "first-model", input_tokens: 5, output_tokens: 5, cache_read_tokens: 0, cache_write_tokens: 0, duration_ms: 100 }),
+        JSON.stringify({ model: "second-model", input_tokens: 1000, output_tokens: 500, cache_read_tokens: 0, cache_write_tokens: 0, duration_ms: 500 }),
       ];
       const summary = parseTokenUsageJsonl(lines.join("\n"));
       const md = generateTokenUsageSummary(summary);
-      const largeIdx = md.indexOf("large-model");
-      const smallIdx = md.indexOf("small-model");
-      expect(largeIdx).toBeLessThan(smallIdx);
+      const { formatModelEmojiAlias } = require("./model_aliases.cjs");
+      const firstIdx = md.indexOf(formatModelEmojiAlias("first-model"));
+      const secondIdx = md.indexOf(formatModelEmojiAlias("second-model"));
+      expect(firstIdx).toBeLessThan(secondIdx);
     });
 
-    test("includes ET column in table", () => {
+    test("does not include effective token columns in table", () => {
       const content = JSON.stringify({ model: "m", input_tokens: 100, output_tokens: 200, cache_read_tokens: 0, cache_write_tokens: 0, duration_ms: 1000 });
       const summary = parseTokenUsageJsonl(content);
       const md = generateTokenUsageSummary(summary);
-      expect(md).toContain("| ET |");
+      expect(md).not.toContain("| ΔET |");
+      expect(md).not.toContain("| ET |");
     });
 
-    test("shows ● footer line when effective tokens > 0", () => {
+    test("includes AI credits columns in table header", () => {
       const content = JSON.stringify({ model: "m", input_tokens: 100, output_tokens: 200, cache_read_tokens: 0, cache_write_tokens: 0, duration_ms: 1000 });
       const summary = parseTokenUsageJsonl(content);
-      expect(summary.totalEffectiveTokens).toBeGreaterThan(0);
       const md = generateTokenUsageSummary(summary);
-      // Column header still says ET; footer uses compact ● symbol only
-      expect(md).toContain("| ET |");
-      expect(md).toContain("●");
+      expect(md).toContain("| ΔAI Credits |");
+      expect(md).toContain("| AI Credits |");
+      expect(md).not.toContain("effective token");
     });
 
-    test("includes ● ET in footer line without cache efficiency", () => {
+    test("renders AIC value in totals row for known model with pricing", () => {
+      const content = JSON.stringify({ model: "claude-sonnet-4-6", provider: "anthropic", input_tokens: 100, output_tokens: 200, cache_read_tokens: 0, cache_write_tokens: 0, duration_ms: 1000 });
+      const summary = parseTokenUsageJsonl(content);
+      const md = generateTokenUsageSummary(summary);
+      if (summary.totalAIC > 0) {
+        // When pricing is available the totals row should contain a bold AIC value
+        expect(md).toContain("**Total**");
+        const { formatAIC } = require("./model_costs.cjs");
+        expect(md).toContain(formatAIC(summary.totalAIC));
+      }
+    });
+
+    test("compounded AIC equals sum of per-turn delta AIC values", () => {
+      const lines = [
+        JSON.stringify({ model: "claude-sonnet-4-6", provider: "anthropic", input_tokens: 100, output_tokens: 50, cache_read_tokens: 0, cache_write_tokens: 0, duration_ms: 100 }),
+        JSON.stringify({ model: "claude-sonnet-4-6", provider: "anthropic", input_tokens: 200, output_tokens: 100, cache_read_tokens: 0, cache_write_tokens: 0, duration_ms: 200 }),
+      ];
+      const summary = parseTokenUsageJsonl(lines.join("\n"));
+      const totalAIC = summary.entries.reduce((sum, e) => sum + (e.deltaAIC || 0), 0);
+      expect(Math.abs(totalAIC - summary.totalAIC)).toBeLessThan(0.0001);
+    });
+
+    test("includes an AI credits legend", () => {
+      const content = JSON.stringify({ model: "m", input_tokens: 100, output_tokens: 200, cache_read_tokens: 0, cache_write_tokens: 0, duration_ms: 1000 });
+      const summary = parseTokenUsageJsonl(content);
+      const md = generateTokenUsageSummary(summary);
+      expect(md).toContain("Legend:");
+      expect(md).toContain("current AI credits pricing model");
+      expect(md).not.toContain("effective token");
+    });
+
+    test("does not include cache efficiency or effective token wording", () => {
       const content = JSON.stringify({ model: "m", input_tokens: 100, output_tokens: 10, cache_read_tokens: 900, cache_write_tokens: 0, duration_ms: 100 });
       const summary = parseTokenUsageJsonl(content);
       const md = generateTokenUsageSummary(summary);
-      expect(md).toContain("●");
+      expect(md).not.toContain("●");
       expect(md).not.toContain("Cache efficiency");
-    });
-  });
-
-  describe("parseTokenUsageJsonl - effective tokens", () => {
-    test("computes effectiveTokens per model", () => {
-      const content = JSON.stringify({ model: "m", input_tokens: 100, output_tokens: 200, cache_read_tokens: 0, cache_write_tokens: 0, duration_ms: 1000 });
-      const summary = parseTokenUsageJsonl(content);
-      expect(summary).not.toBeNull();
-      expect(summary.byModel["m"].effectiveTokens).toBeGreaterThan(0);
-    });
-
-    test("includes totalEffectiveTokens in summary", () => {
-      const content = JSON.stringify({ model: "m", input_tokens: 100, output_tokens: 200, cache_read_tokens: 0, cache_write_tokens: 0, duration_ms: 1000 });
-      const summary = parseTokenUsageJsonl(content);
-      expect(summary).not.toBeNull();
-      expect(typeof summary.totalEffectiveTokens).toBe("number");
-      expect(summary.totalEffectiveTokens).toBeGreaterThan(0);
-    });
-
-    test("totalEffectiveTokens is sum of per-model ET", () => {
-      const lines = [
-        JSON.stringify({ model: "m1", input_tokens: 100, output_tokens: 50, cache_read_tokens: 0, cache_write_tokens: 0, duration_ms: 100 }),
-        JSON.stringify({ model: "m2", input_tokens: 200, output_tokens: 100, cache_read_tokens: 0, cache_write_tokens: 0, duration_ms: 200 }),
-      ];
-      const summary = parseTokenUsageJsonl(lines.join("\n"));
-      const m1ET = summary.byModel["m1"].effectiveTokens;
-      const m2ET = summary.byModel["m2"].effectiveTokens;
-      expect(summary.totalEffectiveTokens).toBe(m1ET + m2ET);
-    });
-  });
-
-  describe("hasEffectiveTokensRateLimitError", () => {
-    test("detects explicit ET budget exhaustion message", () => {
-      const hasError = hasEffectiveTokensRateLimitError(["effective_tokens limit exceeded for this run"]);
-      expect(hasError).toBe(true);
-    });
-
-    test("detects HTTP 429 rate-limit text tied to ET", () => {
-      const hasError = hasEffectiveTokensRateLimitError(["429 too many requests while enforcing ET budget"]);
-      expect(hasError).toBe(true);
-    });
-
-    test("returns false for unrelated logs", () => {
-      const hasError = hasEffectiveTokensRateLimitError(["gateway started", "request succeeded"]);
-      expect(hasError).toBe(false);
+      expect(md).not.toContain("effective token");
     });
   });
 });

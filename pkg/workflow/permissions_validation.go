@@ -10,6 +10,10 @@ import (
 	"strings"
 
 	"github.com/github/gh-aw/pkg/constants"
+	"github.com/github/gh-aw/pkg/setutil"
+	"github.com/github/gh-aw/pkg/sliceutil"
+	"github.com/github/gh-aw/pkg/stringutil"
+	"github.com/goccy/go-yaml"
 )
 
 // PermissionsValidationResult contains the result of permissions validation
@@ -112,6 +116,9 @@ func checkMissingPermissions(permissions *Permissions, required map[PermissionSc
 	if permissionsValidationLog.Enabled() {
 		permissionsValidationLog.Printf("Checking missing permissions: required_count=%d, toolsets=%v", len(required), toolsets)
 	}
+	// toolsetPerms is cached on first missing permission to avoid the accessor
+	// overhead on the happy path (all permissions granted).
+	var toolsetPerms map[string]GitHubToolsetPermissions
 	for scope, requiredLevel := range required {
 		grantedLevel, granted := permissions.Get(scope)
 
@@ -133,9 +140,12 @@ func checkMissingPermissions(permissions *Permissions, required map[PermissionSc
 			if result.MissingToolsetDetails == nil {
 				result.MissingToolsetDetails = make(map[string][]PermissionScope)
 			}
+			if toolsetPerms == nil {
+				toolsetPerms = getToolsetPermissionsMap()
+			}
 			// Track which toolsets require this permission
 			for _, toolset := range toolsets {
-				perms, exists := toolsetPermissionsMap[toolset]
+				perms, exists := toolsetPerms[toolset]
 				if !exists {
 					continue
 				}
@@ -226,15 +236,13 @@ func formatMissingPermissionsMessage(result *PermissionsValidationResult) string
 		lines = append(lines, "Remove or adjust toolsets that require these permissions:")
 
 		// Get unique toolsets from MissingToolsetDetails
-		toolsetsMap := make(map[string]bool)
+		toolsetsMap := make(map[string]struct {
+		})
 		for toolset := range result.MissingToolsetDetails {
-			toolsetsMap[toolset] = true
+			toolsetsMap[toolset] = struct {
+			}{}
 		}
-		var toolsetsList []string
-		for toolset := range toolsetsMap {
-			toolsetsList = append(toolsetsList, toolset)
-		}
-		sort.Strings(toolsetsList)
+		toolsetsList := sliceutil.SortedKeys(toolsetsMap)
 
 		for _, toolset := range toolsetsList {
 			lines = append(lines, "  - "+toolset)
@@ -384,5 +392,100 @@ func (c *Compiler) ValidateIncludedPermissions(topPermissionsYAML string, import
 	}
 
 	permissionsValidationLog.Print("All included workflow permissions are satisfied by main workflow")
+	return nil
+}
+
+// ValidatePermissionScopeNames validates that all permission scope names in the
+// permissions YAML are recognized GitHub Actions permission scopes. When an
+// unrecognized scope that closely resembles a valid scope is found, a "Did you
+// mean?" suggestion is returned so users can quickly fix typos.
+//
+// Example: "contnts: read" → suggests "contents"
+func ValidatePermissionScopeNames(permissionsYAML string) error {
+	if permissionsYAML == "" {
+		return nil
+	}
+
+	permissionsValidationLog.Print("Validating permission scope names")
+
+	// Collect all valid scope names for fuzzy matching
+	ghTokenScopes := GetAllPermissionScopes()
+	appOnlyScopes := GetAllGitHubAppOnlyScopes()
+	// +1 for copilot-requests which is not in GetAllPermissionScopes
+	allScopes := make([]string, 0, safeAllocationCapacity(len(ghTokenScopes), len(appOnlyScopes), 1))
+	for _, scope := range ghTokenScopes {
+		allScopes = append(allScopes, string(scope))
+	}
+	for _, scope := range appOnlyScopes {
+		allScopes = append(allScopes, string(scope))
+	}
+	// copilot-requests is valid even though not in GetAllPermissionScopes
+	allScopes = append(allScopes, string(PermissionCopilotRequests))
+	// "all" is a meta-key that is always valid in shorthand contexts
+	validMeta := map[string]struct {
+	}{
+		"all":       {},
+		"read-all":  {},
+		"write-all": {},
+		"none":      {},
+	}
+
+	// Strip optional "permissions:" prefix so we can parse just the map content
+	content := strings.TrimSpace(permissionsYAML)
+	if strings.HasPrefix(content, "permissions:") {
+		lines := strings.SplitN(content, "\n", 2)
+		if len(lines) == 2 {
+			content = lines[1]
+		} else {
+			// Single-line shorthand like "permissions: read-all" – no scope keys to check
+			return nil
+		}
+	}
+
+	// Try to parse the content as a YAML map of scope → level
+	var permsMap map[string]any
+	if err := yaml.Unmarshal([]byte(content), &permsMap); err != nil {
+		// Not a map (e.g., a shorthand like "read-all"); nothing to validate
+		return nil
+	}
+
+	for scopeKey := range permsMap {
+		if setutil.Contains(validMeta, scopeKey) {
+			continue
+		}
+		if _, ok := validPermissionScopes[scopeKey]; ok {
+			continue
+		}
+
+		// Unknown scope key — check for a case-only difference first (e.g. "Contents" → "contents")
+		lowerScopeKey := strings.ToLower(scopeKey)
+		if lowerScopeKey != scopeKey {
+			if _, ok := validPermissionScopes[lowerScopeKey]; ok {
+				return fmt.Errorf(
+					"unknown permission scope %q.\n\nDid you mean: %s?\n\nValid permission scopes include: %s\n\nSee: %s",
+					scopeKey,
+					lowerScopeKey,
+					strings.Join(allScopes[:min(10, len(allScopes))], ", ")+"...",
+					constants.DocsPermissionsURL,
+				)
+			}
+		}
+
+		// Check for a close fuzzy match
+		permissionsValidationLog.Printf("Unknown permission scope key: %q", scopeKey)
+		suggestions := stringutil.FindClosestMatches(scopeKey, allScopes, 3)
+		if len(suggestions) == 0 {
+			continue // too different to be a typo, ignore silently
+		}
+
+		return fmt.Errorf(
+			"unknown permission scope %q.\n\nDid you mean: %s?\n\nValid permission scopes include: %s\n\nSee: %s",
+			scopeKey,
+			strings.Join(suggestions, ", "),
+			strings.Join(allScopes[:min(10, len(allScopes))], ", ")+"...",
+			constants.DocsPermissionsURL,
+		)
+	}
+
 	return nil
 }

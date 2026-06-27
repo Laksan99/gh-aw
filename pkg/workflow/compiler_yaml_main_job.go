@@ -59,6 +59,10 @@ func (c *Compiler) generateInitialAndCheckoutSteps(yaml *strings.Builder, data *
 	if isOTLPHeadersPresent(data) {
 		yaml.WriteString(generateOTLPHeadersMaskStep())
 	}
+	// Mask custom OTLP attribute values so user-supplied values cannot leak into runner logs.
+	if isOTLPAttributesPresent(data) {
+		yaml.WriteString(generateOTLPAttributesMaskStep())
+	}
 
 	// Add pre-steps before checkout and the subsequent built-in steps in this agent job.
 	// This allows users to mint short-lived tokens (via custom actions) in the same
@@ -92,15 +96,7 @@ func (c *Compiler) generateInitialAndCheckoutSteps(yaml *strings.Builder, data *
 	// within the same job, just like the github-mcp-app-token pattern.
 	if checkoutMgr.HasAppAuth() {
 		compilerYamlLog.Print("Generating checkout app token minting steps in agent job")
-		var checkoutPermissions *Permissions
-		if data.CachedPermissions != nil {
-			checkoutPermissions = data.CachedPermissions
-		} else if data.Permissions != "" {
-			checkoutPermissions = NewPermissionsParser(data.Permissions).ToPermissions()
-		} else {
-			checkoutPermissions = NewPermissions()
-		}
-		for _, step := range checkoutMgr.GenerateCheckoutAppTokenSteps(c, checkoutPermissions) {
+		for _, step := range checkoutMgr.GenerateCheckoutAppTokenSteps(c, resolveCheckoutPermissions(data)) {
 			yaml.WriteString(step)
 		}
 	}
@@ -133,6 +129,13 @@ func (c *Compiler) generateInitialAndCheckoutSteps(yaml *strings.Builder, data *
 	// Emit additional (non-default) user-configured checkouts
 	additionalLines := checkoutMgr.GenerateAdditionalCheckoutSteps(c.getActionPin)
 	for _, line := range additionalLines {
+		yaml.WriteString(line)
+	}
+
+	// Emit a manifest step that records the path and resolved default branch for each
+	// non-default cross-repo checkout. The safe-outputs MCP server reads this file to
+	// resolve base branches without making any credentialed network calls.
+	for _, line := range checkoutMgr.GenerateCheckoutManifestStep(c.getActionPin) {
 		yaml.WriteString(line)
 	}
 
@@ -211,7 +214,7 @@ func (c *Compiler) generateRuntimeAndWorkspaceSetupSteps(yaml *strings.Builder, 
 	}
 
 	// Generate runtime setup steps (after filtering out user-customized ones)
-	runtimeSetupSteps := GenerateRuntimeSetupSteps(runtimeRequirements)
+	runtimeSetupSteps := GenerateRuntimeSetupSteps(runtimeRequirements, data)
 	compilerYamlLog.Printf("Detected runtime requirements: %d runtimes, %d setup steps", len(runtimeRequirements), len(runtimeSetupSteps))
 
 	// Decision logic for where to place runtime steps:
@@ -421,6 +424,7 @@ func (c *Compiler) generateEngineInstallAndPreAgentSteps(yaml *strings.Builder, 
 	// is not clobbered. Inline sub-agents are enabled by default.
 	if isFeatureEnabled(constants.FeatureFlag("inline-agents"), data) {
 		generateRestoreInlineSubAgentsStep(yaml, data)
+		generateRestoreInlineSkillsStep(yaml, data)
 	}
 
 	// Add pre-agent-steps (if any) after base-branch restore but before MCP setup.
@@ -450,9 +454,9 @@ func (c *Compiler) generateEngineInstallAndPreAgentSteps(yaml *strings.Builder, 
 func (c *Compiler) generateAgentRunSteps(yaml *strings.Builder, data *WorkflowData, engine CodingAgentEngine, needsGitConfig bool) ([]string, string, error) {
 	// Collect artifact paths for unified upload at the end
 	var artifactPaths []string
-	artifactPaths = append(artifactPaths, "/tmp/gh-aw/aw-prompts/prompt.txt")
+	artifactPaths = append(artifactPaths, constants.AwPromptsFile)
 
-	logFileFull := "/tmp/gh-aw/agent-stdio.log"
+	logFileFull := constants.AgentStdioLogPath
 
 	// Clean credentials before executing the agentic engine.
 	// This removes git credentials from .git/config and, when known credential-leaking
@@ -494,16 +498,11 @@ func (c *Compiler) generateAgentRunSteps(yaml *strings.Builder, data *WorkflowDa
 	// Stop CLI proxy after AWF execution (always runs to ensure cleanup)
 	c.generateStopCliProxyStep(yaml, data)
 
-	// Add Copilot error detection step (inference access + MCP policy)
-	// This single step detects both inference access errors and MCP policy errors
-	// It must run in the main job (not threat detection job) to avoid step ID conflicts
-	if _, ok := engine.(*CopilotEngine); ok {
-		detectionStep := generateCopilotErrorDetectionStep()
-		for _, line := range detectionStep {
-			yaml.WriteString(line)
-			yaml.WriteByte('\n')
-		}
-	}
+	// Detect agent errors on the host runner immediately after the AWF container exits.
+	// GITHUB_OUTPUT is not accessible inside the AWF sandbox, so this step must run here
+	// (on the host runner) rather than from within the container. Engines that provide a
+	// detection script via GetErrorDetectionScriptId will emit this step.
+	c.generateDetectAgentErrorsStep(yaml, data, engine)
 
 	// Mark that we've completed agent execution - step order validation starts from here
 	compilerYamlLog.Print("Marking agent execution as complete for step order tracking")
@@ -573,22 +572,22 @@ func (c *Compiler) collectArtifactPaths(data *WorkflowData, engine CodingAgentEn
 	// separate agent_outputs artifact.
 	paths = append(paths, getEngineArtifactPaths(engine)...)
 
-	// Collect MCP logs path if any MCP tools were used
-	paths = append(paths, "/tmp/gh-aw/mcp-logs/")
+	// Collect MCP logs.
+	paths = append(paths, constants.TmpMcpLogsDir)
 
 	// Collect DIFC proxy logs (proxy-tls certs + container stderr) when proxy was injected
 	paths = append(paths, difcProxyLogPaths(data)...)
 
 	// Collect MCPScripts logs path if mcp-scripts is enabled
 	if IsMCPScriptsEnabled(data.MCPScripts) {
-		paths = append(paths, "/tmp/gh-aw/mcp-scripts/logs/")
+		paths = append(paths, constants.TmpMcpScriptsLogsDir)
 	}
 
 	// Include the aggregated agent_usage.json in the agent artifact so third-party
 	// tools can consume structured token data without parsing the step summary.
 	// Requires AWF v0.25.8+
 	if isFirewallEnabled(data) {
-		paths = append(paths, "/tmp/gh-aw/"+constants.TokenUsageFilename)
+		paths = append(paths, constants.TmpGhAwDirSlash+constants.TokenUsageFilename)
 	}
 
 	// Collect agent stdio logs path for unified upload
@@ -601,29 +600,29 @@ func (c *Compiler) collectArtifactPaths(data *WorkflowData, engine CodingAgentEn
 	// Collect agent-generated files path for unified upload
 	// This directory is used by workflows that instruct the agent to write files
 	// (e.g., smoke-claude status summaries)
-	paths = append(paths, "/tmp/gh-aw/agent/")
+	paths = append(paths, constants.TmpGhAwAgentDir)
 
 	// Collect GitHub API rate-limit log for observability.
 	// Written by github_rate_limit_logger.cjs during REST API calls.
-	paths = append(paths, "/tmp/gh-aw/"+constants.GithubRateLimitsFilename)
+	paths = append(paths, constants.TmpGhAwDirSlash+constants.GithubRateLimitsFilename)
 
 	// Collect OTLP span mirror — enables post-hoc trace debugging without a live collector.
 	// Written by send_otlp_span.cjs; each line is a full OTLP/HTTP JSON traces payload.
 	// Only included when OTLP is configured for this workflow.
 	if isOTLPEnabled(data) {
-		paths = append(paths, "/tmp/gh-aw/"+constants.OtelJsonlFilename)
-		paths = append(paths, "/tmp/gh-aw/"+constants.CopilotOtelJsonlFilename)
+		paths = append(paths, constants.TmpGhAwDirSlash+constants.OtelJsonlFilename)
+		paths = append(paths, constants.TmpGhAwDirSlash+constants.OtlpExportErrorsFilename)
 	}
 
 	// Collect safe outputs and agent output paths for the unified artifact.
 	// These were previously uploaded as separate safe-output and agent-output artifacts.
 	if data.SafeOutputs != nil {
 		// Raw safe-output NDJSON (copied to /tmp/gh-aw/ by generateOutputCollectionStep)
-		paths = append(paths, "/tmp/gh-aw/"+constants.SafeOutputsFilename)
+		paths = append(paths, constants.TmpGhAwDirSlash+constants.SafeOutputsFilename)
 		// Processed agent output JSON produced by collect_ndjson_output.cjs
-		paths = append(paths, "/tmp/gh-aw/"+constants.AgentOutputFilename)
+		paths = append(paths, constants.TmpGhAwDirSlash+constants.AgentOutputFilename)
 		if data.SafeOutputs.CommentMemory != nil {
-			paths = append(paths, "/tmp/gh-aw/comment-memory/")
+			paths = append(paths, constants.TmpCommentMemoryDir)
 		}
 	}
 
@@ -637,13 +636,13 @@ func (c *Compiler) collectArtifactPaths(data *WorkflowData, engine CodingAgentEn
 	//    safe-output handler is staged and doesn't need checkout itself)
 	threatDetectionNeedsPatches := IsDetectionJobEnabled(data.SafeOutputs)
 	if usesPatchesAndCheckouts(data.SafeOutputs) || threatDetectionNeedsPatches {
-		paths = append(paths, "/tmp/gh-aw/aw-*.patch")
+		paths = append(paths, constants.TmpAwPatchGlob)
 		// Bundle files are generated when patch-format: bundle is configured.
 		// Both formats use the same download path in the safe_outputs job, so
 		// include the bundle glob unconditionally alongside the patch glob.
 		// The artifact upload step already sets if-no-files-found: ignore, so
 		// this is safe even when no bundle files exist.
-		paths = append(paths, "/tmp/gh-aw/aw-*.bundle")
+		paths = append(paths, constants.TmpAwBundleGlob)
 	}
 
 	// Include firewall audit/observability logs in the unified agent artifact
@@ -681,7 +680,7 @@ func (c *Compiler) generateSummarySteps(yaml *strings.Builder, data *WorkflowDat
 	// This replaces the previous per-engine blocks (Copilot, Codex, Claude) and extends
 	// support to all engines (including Gemini) so every agentic workflow uploads audit logs.
 	if isFirewallEnabled(data) {
-		firewallLogParsing := generateFirewallLogParsingStep(data.Name)
+		firewallLogParsing := generateFirewallLogParsingStep(data.Name, data)
 		for _, line := range firewallLogParsing {
 			yaml.WriteString(line)
 			yaml.WriteByte('\n')
@@ -774,18 +773,6 @@ func (c *Compiler) generatePostAgentCollectionAndUpload(yaml *strings.Builder, d
 	// In workflow_call context, apply the per-invocation prefix to avoid name clashes.
 	agentArtifactPrefix := artifactPrefixExprForDownstreamJob(data)
 	c.generateUnifiedArtifactUpload(yaml, artifactPaths, agentArtifactPrefix)
-
-	// Add GitHub MCP app token invalidation step if configured (runs always, even on failure)
-	c.generateGitHubMCPAppTokenInvalidationStep(yaml, data)
-
-	// Add checkout app token invalidation steps if configured (runs always, even on failure)
-	if checkoutMgr.HasAppAuth() {
-		compilerYamlLog.Print("Generating checkout app token invalidation steps")
-		invalidationSteps := checkoutMgr.GenerateCheckoutAppTokenInvalidationSteps(c)
-		for _, step := range invalidationSteps {
-			yaml.WriteString(step)
-		}
-	}
 
 	// In dev mode the setup action is referenced via a local path (./actions/setup), so its files
 	// live in the workspace. When a checkout: entry targets an external repository without a path

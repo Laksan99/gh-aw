@@ -23,7 +23,7 @@ func TestAuditCommandDescriptionsAreConsistent(t *testing.T) {
 func TestTrialCommandUsesStandardExamplesHeading(t *testing.T) {
 	cmd := NewTrialCommand(func(string) error { return nil })
 
-	assert.Contains(t, cmd.Long, "Examples:", "trial long help should use the standard examples heading")
+	assert.NotEmpty(t, cmd.Example, "trial command should use cobra's Example field for examples")
 	assert.NotContains(t, cmd.Long, "Single workflow:", "trial long help should avoid custom example section headings")
 	assert.NotContains(t, cmd.Long, "Multiple workflows (for comparison):", "trial long help should avoid custom example section headings")
 	assert.NotContains(t, cmd.Long, "Workflows from different repositories:", "trial long help should avoid custom example section headings")
@@ -66,4 +66,13 @@ func TestSubcommandListingsUseHyphenBullets(t *testing.T) {
 			assert.NotContains(t, tt.longDoc, "  • ", "subcommand list should use '-' bullet style consistently")
 		})
 	}
+}
+
+func TestHelpTextUsesStandardEgPunctuation(t *testing.T) {
+	assert.Contains(t, coolDownFlagUsage, "(e.g., 7d", "--cool-down help should use e.g., punctuation")
+	assert.Contains(t, NewEnvCommand().Long, "(e.g., default_max_turns)", "env help should use e.g., punctuation")
+	assert.Contains(t, NewDomainsCommand().Long, "(e.g., \"node\", \"python\", \"github\")", "domains help should use e.g., punctuation")
+	assert.Contains(t, NewChecksCommand().Long, "(e.g., Vercel,", "checks help should use e.g., punctuation")
+	assert.Contains(t, NewViewCommand().Long, "(e.g., issues,", "view help should use e.g., punctuation")
+	assert.Contains(t, NewExperimentsAnalyzeSubcommand().Long, "e.g., \"my-workflow\"", "experiments analyze help should use e.g., punctuation")
 }

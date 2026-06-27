@@ -10,10 +10,11 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"sort"
+	"slices"
 	"strings"
 	"time"
 
+	"github.com/github/gh-aw/pkg/errorutil"
 	"github.com/github/gh-aw/pkg/timeutil"
 )
 
@@ -25,7 +26,7 @@ func extractMCPToolUsageData(logDir string, verbose bool) (*MCPToolUsageData, er
 	gatewayMetrics, err := parseGatewayLogs(logDir, verbose)
 	if err != nil {
 		// Return nil if no log file exists (not an error for workflows without MCP)
-		if strings.Contains(err.Error(), "not found") {
+		if errorutil.IsNotFoundError(err) {
 			gatewayLogsLog.Print("No gateway log file found, skipping MCP tool usage extraction")
 			return nil, nil
 		}
@@ -77,6 +78,9 @@ func extractMCPToolUsageData(logDir string, verbose bool) (*MCPToolUsageData, er
 		if err != nil {
 			return nil, fmt.Errorf("failed to read rpc-messages.jsonl: %w", err)
 		}
+		// Correlate tool calls with effective-token deltas from token-usage.jsonl
+		tokenUsageFile := findTokenUsageFile(logDir)
+		toolCalls = correlateToolCallsWithTokenDelta(toolCalls, tokenUsageFile)
 		mcpData.ToolCalls = toolCalls
 		gatewayLogsLog.Printf("Loaded %d tool calls from rpc-messages.jsonl", len(toolCalls))
 	} else {
@@ -84,6 +88,9 @@ func extractMCPToolUsageData(logDir string, verbose bool) (*MCPToolUsageData, er
 		if err := extractToolCallsFromGatewayLog(gatewayLogPath, mcpData); err != nil {
 			return nil, err
 		}
+		// Correlate tool calls with effective-token deltas from token-usage.jsonl
+		tokenUsageFile := findTokenUsageFile(logDir)
+		mcpData.ToolCalls = correlateToolCallsWithTokenDelta(mcpData.ToolCalls, tokenUsageFile)
 		gatewayLogsLog.Printf("Loaded %d tool calls from gateway.jsonl", len(mcpData.ToolCalls))
 	}
 
@@ -128,6 +135,18 @@ func extractToolCallsFromGatewayLog(gatewayLogPath string, mcpData *MCPToolUsage
 				continue
 			}
 
+			// Derive status from available fields when not explicitly set.
+			// Post-OTel-collector migrations may omit the "status" string field,
+			// relying instead on "error" or "level" to signal failures.
+			status := entry.Status
+			if status == "" {
+				if entry.Error != "" || entry.Level == "error" {
+					status = "error"
+				} else {
+					status = "success"
+				}
+			}
+
 			// Create individual tool call record
 			toolCall := MCPToolCall{
 				Timestamp:  entry.Timestamp,
@@ -136,7 +155,7 @@ func extractToolCallsFromGatewayLog(gatewayLogPath string, mcpData *MCPToolUsage
 				Method:     entry.Method,
 				InputSize:  entry.InputSize,
 				OutputSize: entry.OutputSize,
-				Status:     entry.Status,
+				Status:     status,
 				Error:      entry.Error,
 			}
 
@@ -215,15 +234,32 @@ func buildMCPSummaryStats(gatewayMetrics *GatewayMetrics, mcpData *MCPToolUsageD
 	}
 
 	// Sort summaries by server name, then tool name
-	sort.Slice(mcpData.Summary, func(i, j int) bool {
-		if mcpData.Summary[i].ServerName != mcpData.Summary[j].ServerName {
-			return mcpData.Summary[i].ServerName < mcpData.Summary[j].ServerName
+	slices.SortFunc(mcpData.Summary, func(a, b MCPToolSummary) int {
+		if a.ServerName != b.ServerName {
+			if a.ServerName < b.ServerName {
+				return -1
+			}
+			return 1
 		}
-		return mcpData.Summary[i].ToolName < mcpData.Summary[j].ToolName
+		switch {
+		case a.ToolName < b.ToolName:
+			return -1
+		case a.ToolName > b.ToolName:
+			return 1
+		default:
+			return 0
+		}
 	})
 
 	// Sort servers by name
-	sort.Slice(mcpData.Servers, func(i, j int) bool {
-		return mcpData.Servers[i].ServerName < mcpData.Servers[j].ServerName
+	slices.SortFunc(mcpData.Servers, func(a, b MCPServerStats) int {
+		switch {
+		case a.ServerName < b.ServerName:
+			return -1
+		case a.ServerName > b.ServerName:
+			return 1
+		default:
+			return 0
+		}
 	})
 }

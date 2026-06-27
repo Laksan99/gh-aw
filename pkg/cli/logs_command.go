@@ -27,16 +27,24 @@ var logsCommandLog = logger.New("cli:logs_command")
 
 // NewLogsCommand creates the logs command
 func NewLogsCommand() *cobra.Command {
+	validArtifactSets := strings.Join(ValidArtifactSetNames(), ", ")
+
 	logsCmd := &cobra.Command{
 		Use:   "logs [workflow]",
-		Short: "Download and analyze agentic workflow logs with aggregated metrics",
-		Long: `Download and analyze agentic workflow logs and artifacts from GitHub Actions.
+		Short: "Download and analyze agentic workflow logs and artifacts",
+		Long: fmt.Sprintf(`Download and analyze agentic workflow logs and artifacts from GitHub Actions.
 
 This command fetches workflow runs, downloads their artifacts, and extracts them into
 organized folders named by run ID. It also provides an overview table with aggregate
 metrics including duration, token usage, and cost information.
 
-Downloaded artifacts include:
+By default only the compact usage artifact is downloaded (token usage, run metadata).
+Use --artifacts all to download all artifacts, or specify individual sets such as
+--artifacts agent,firewall to fetch only what you need.
+
+All available artifact sets: %s.
+
+Downloaded artifacts include (when using --artifacts all):
 - Workflow metadata: Engine configuration and run metadata
 - safe_output.jsonl: Agent's final output content (available when non-empty)
 - agent_output/: Agent logs directory (if the workflow produced logs)
@@ -45,11 +53,8 @@ Downloaded artifacts include:
 - aw-{branch}.patch: Git patch of changes for each branch (one file per PR/push)
 - workflow-logs/: GitHub Actions workflow run logs (job logs organized in subdirectory)
 - summary.json: Complete metrics and run data for all downloaded runs
-
-` + WorkflowIDExplanation + `
-
-Examples:
-  # Basic usage
+`, validArtifactSets) + WorkflowIDExplanation,
+		Example: `  # Basic usage
   ` + string(constants.CLIExtensionPrefix) + ` logs                           # Download logs for all workflows
   ` + string(constants.CLIExtensionPrefix) + ` logs weekly-research           # Download logs for specific workflow
   ` + string(constants.CLIExtensionPrefix) + ` logs weekly-research.md        # Download logs (alternative format)
@@ -84,14 +89,23 @@ Examples:
   ` + string(constants.CLIExtensionPrefix) + ` logs --before-run-id 2000      # Filter runs before run ID 2000
   ` + string(constants.CLIExtensionPrefix) + ` logs --after-run-id 1000 --before-run-id 2000  # Filter runs in range
 
-  # Output options
+  # Artifact selection (default: usage only - the compact conclusion artifact)
+  ` + string(constants.CLIExtensionPrefix) + ` logs --artifacts all           # Download all artifacts (agent logs, firewall, etc.)
+  ` + string(constants.CLIExtensionPrefix) + ` logs --artifacts agent         # Download only agent logs
+  ` + string(constants.CLIExtensionPrefix) + ` logs --artifacts agent,firewall # Download agent and firewall artifacts
+  ` + string(constants.CLIExtensionPrefix) + ` logs --artifacts mcp           # Download only MCP gateway logs
+
+  # Output options (default output is compact format optimized for agents)
   ` + string(constants.CLIExtensionPrefix) + ` logs -o ./my-logs              # Custom output directory
   ` + string(constants.CLIExtensionPrefix) + ` logs --tool-graph              # Generate Mermaid tool sequence graph
   ` + string(constants.CLIExtensionPrefix) + ` logs --parse                   # Parse logs and generate Markdown reports
-  ` + string(constants.CLIExtensionPrefix) + ` logs --json                    # Output metrics in JSON format
-  ` + string(constants.CLIExtensionPrefix) + ` logs --parse --json            # Generate both Markdown and JSON
-  ` + string(constants.CLIExtensionPrefix) + ` logs --format markdown         # Generate cross-run security audit report in Markdown
-  ` + string(constants.CLIExtensionPrefix) + ` logs --format pretty           # Generate cross-run security audit report in console format
+  ` + string(constants.CLIExtensionPrefix) + ` logs -v                        # Verbose compact output (extra columns + sections)
+  ` + string(constants.CLIExtensionPrefix) + ` logs --json                    # JSON format (compact by default, use -v for full)
+  ` + string(constants.CLIExtensionPrefix) + ` logs --json -v                 # Full JSON with audit metadata
+  ` + string(constants.CLIExtensionPrefix) + ` logs --format tsv              # Tab-separated (minimal, raw data)
+  ` + string(constants.CLIExtensionPrefix) + ` logs --format console          # Decorated console tables (human-friendly)
+  ` + string(constants.CLIExtensionPrefix) + ` logs --format markdown         # Cross-run security audit report (Markdown)
+  ` + string(constants.CLIExtensionPrefix) + ` logs --format pretty           # Cross-run security audit report (console)
   ` + string(constants.CLIExtensionPrefix) + ` logs weekly-research --format markdown --last 10  # Cross-run report for last 10 runs
   ` + string(constants.CLIExtensionPrefix) + ` logs --train                   # Train log pattern weights from last 10 runs
   ` + string(constants.CLIExtensionPrefix) + ` logs my-workflow --train -c 50 # Train log pattern weights from up to 50 runs of a specific workflow
@@ -100,10 +114,10 @@ Examples:
   ` + string(constants.CLIExtensionPrefix) + ` logs weekly-research --repo owner/repo  # Download logs from specific repository
 
   # Cache maintenance
-  ` + string(constants.CLIExtensionPrefix) + ` logs --after -1w                # Evict local cache older than 1 week before downloading runs
-  ` + string(constants.CLIExtensionPrefix) + ` logs --after -30d               # Evict local cache older than 30 days before downloading runs
-  ` + string(constants.CLIExtensionPrefix) + ` logs --after -1mo               # Evict local cache older than 1 month before downloading runs
-  ` + string(constants.CLIExtensionPrefix) + ` logs --after 2024-01-01         # Evict local cache older than 2024-01-01 before downloading runs`,
+  ` + string(constants.CLIExtensionPrefix) + ` logs --cache-before -1w          # Evict local cache older than 1 week before downloading runs
+  ` + string(constants.CLIExtensionPrefix) + ` logs --cache-before -30d         # Evict local cache older than 30 days before downloading runs
+  ` + string(constants.CLIExtensionPrefix) + ` logs --cache-before -1mo         # Evict local cache older than 1 month before downloading runs
+  ` + string(constants.CLIExtensionPrefix) + ` logs --cache-before 2024-01-01   # Evict local cache older than 2024-01-01 before downloading runs`,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			logsCommandLog.Printf("Starting logs command: args=%d", len(args))
 
@@ -139,6 +153,7 @@ Examples:
 				filteredIntegrity, _ := cmd.Flags().GetBool("filtered-integrity")
 				train, _ := cmd.Flags().GetBool("train")
 				format, _ := cmd.Flags().GetString("format")
+				reportFile, _ := cmd.Flags().GetString("report-file")
 				artifacts, _ := cmd.Flags().GetStringSlice("artifacts")
 
 				if engine != "" {
@@ -150,35 +165,87 @@ Examples:
 					}
 				}
 
-				return DownloadWorkflowLogsFromStdin(cmd.Context(), runURLs, outputDir, engine, repoOverride, verbose, toolGraph, noStaged, firewallOnly, noFirewall, parse, jsonOutput, timeout, summaryFile, safeOutputType, filteredIntegrity, train, format, artifacts)
+				if err := validateReportFileFlags(reportFile, format, jsonOutput); err != nil {
+					return err
+				}
+
+				return DownloadWorkflowLogsFromStdin(cmd.Context(), StdinLogsOptions{
+					RunURLs:           runURLs,
+					OutputDir:         outputDir,
+					Engine:            engine,
+					RepoOverride:      repoOverride,
+					Verbose:           verbose,
+					ToolGraph:         toolGraph,
+					NoStaged:          noStaged,
+					FirewallOnly:      firewallOnly,
+					NoFirewall:        noFirewall,
+					Parse:             parse,
+					JSONOutput:        jsonOutput,
+					Timeout:           timeout,
+					SummaryFile:       summaryFile,
+					SafeOutputType:    safeOutputType,
+					FilteredIntegrity: filteredIntegrity,
+					Train:             train,
+					Format:            format,
+					ReportFile:        reportFile,
+					ArtifactSets:      artifacts,
+				})
 			}
 
 			var workflowName string
 			if len(args) > 0 && args[0] != "" {
 				logsCommandLog.Printf("Resolving workflow name from argument: %s", args[0])
 
-				// Use flexible workflow name matching (workflow ID or display name)
-				resolvedName, err := workflow.FindWorkflowName(args[0])
-				if err != nil {
-					// Workflow not found - provide suggestions
-					suggestions := []string{
-						fmt.Sprintf("Run '%s status' to see all available workflows", string(constants.CLIExtensionPrefix)),
-						"Check for typos in the workflow name",
-						"Use the workflow ID (e.g., 'test-claude') or GitHub Actions workflow name (e.g., 'Test Claude')",
+				repoOverrideEarly, _ := cmd.Flags().GetString("repo")
+				if repoOverrideEarly != "" {
+					// When --repo is specified, only use local lock-file resolution when
+					// the target repo is the current repository. Local lock files are
+					// authoritative for the current repo and allow us to map the workflow
+					// ID (e.g. "audit-workflows") to its GitHub Actions display name
+					// (e.g. "Agentic Workflow Audit Agent"), which gh run list requires.
+					//
+					// For cross-repo queries, skip local resolution to avoid mapping a
+					// local display name onto a different repository's workflow topology.
+					//
+					// Note: the argument must be a workflow ID (e.g. "test-claude"),
+					// not a display name (e.g. "Test Claude"). Display-name lookup
+					// requires local lock files, which are unavailable for remote repos.
+					if repoIsLocal(repoOverrideEarly) {
+						if resolved, resolveErr := workflow.FindWorkflowName(args[0]); resolveErr == nil {
+							workflowName = resolved
+							logsCommandLog.Printf("Resolved workflow name via local lock files: %s -> %s", args[0], workflowName)
+						} else {
+							workflowName = normalizeWorkflowID(args[0])
+							logsCommandLog.Printf("Local resolution failed, using normalized workflow name: %s", workflowName)
+						}
+					} else {
+						workflowName = normalizeWorkflowID(args[0])
+						logsCommandLog.Printf("Using normalized workflow name for remote repo: %s", workflowName)
 					}
+				} else {
+					// Use flexible workflow name matching (workflow ID or display name)
+					resolvedName, err := workflow.FindWorkflowName(args[0])
+					if err != nil {
+						// Workflow not found - provide suggestions
+						suggestions := []string{
+							fmt.Sprintf("Run '%s status' to see all available workflows", string(constants.CLIExtensionPrefix)),
+							"Check for typos in the workflow name",
+							"Use the workflow ID (e.g., 'test-claude') or GitHub Actions workflow name (e.g., 'Test Claude')",
+						}
 
-					// Add fuzzy match suggestions
-					similarNames := suggestWorkflowNames(args[0])
-					if len(similarNames) > 0 {
-						suggestions = append([]string{fmt.Sprintf("Did you mean: %s?", strings.Join(similarNames, ", "))}, suggestions...)
+						// Add fuzzy match suggestions
+						similarNames := suggestWorkflowNames(args[0])
+						if len(similarNames) > 0 {
+							suggestions = append([]string{fmt.Sprintf("Did you mean: %s?", strings.Join(similarNames, ", "))}, suggestions...)
+						}
+
+						return errors.New(console.FormatErrorWithSuggestions(
+							fmt.Sprintf("workflow '%s' not found", args[0]),
+							suggestions,
+						))
 					}
-
-					return errors.New(console.FormatErrorWithSuggestions(
-						fmt.Sprintf("workflow '%s' not found", args[0]),
-						suggestions,
-					))
+					workflowName = resolvedName
 				}
-				workflowName = resolvedName
 			}
 
 			count, _ := cmd.Flags().GetInt("count")
@@ -207,8 +274,14 @@ Examples:
 			filteredIntegrity, _ := cmd.Flags().GetBool("filtered-integrity")
 			train, _ := cmd.Flags().GetBool("train")
 			format, _ := cmd.Flags().GetString("format")
+			reportFile, _ := cmd.Flags().GetString("report-file")
 			artifacts, _ := cmd.Flags().GetStringSlice("artifacts")
-			after, _ := cmd.Flags().GetString("after")
+			cacheBefore, _ := cmd.Flags().GetString("cache-before")
+			if !cmd.Flags().Changed("cache-before") {
+				if cmd.Flags().Changed("after") {
+					cacheBefore, _ = cmd.Flags().GetString("after")
+				}
+			}
 
 			// Resolve relative dates to absolute dates for GitHub CLI
 			now := time.Now()
@@ -241,7 +314,11 @@ Examples:
 				}
 			}
 
-			logsCommandLog.Printf("Executing logs download: workflow=%s, count=%d, engine=%s, train=%v, after=%s", workflowName, count, engine, train, after)
+			if err := validateReportFileFlags(reportFile, format, jsonOutput); err != nil {
+				return err
+			}
+
+			logsCommandLog.Printf("Executing logs download: workflow=%s, count=%d, engine=%s, train=%v, cache_before=%s", workflowName, count, engine, train, cacheBefore)
 
 			return DownloadWorkflowLogs(cmd.Context(), LogsDownloadOptions{
 				WorkflowName:      workflowName,
@@ -267,8 +344,9 @@ Examples:
 				FilteredIntegrity: filteredIntegrity,
 				Train:             train,
 				Format:            format,
+				ReportFile:        reportFile,
 				ArtifactSets:      artifacts,
-				After:             after,
+				After:             cacheBefore,
 			})
 		},
 	}
@@ -294,10 +372,14 @@ Examples:
 	logsCmd.Flags().Int("timeout", 0, "Download timeout in minutes (0 = no timeout)")
 	logsCmd.Flags().String("summary-file", "summary.json", "Path to write the summary JSON file relative to output directory (use empty string to disable)")
 	logsCmd.Flags().Bool("train", false, "Analyze log patterns across downloaded runs and save pattern weights to drain3_weights.json in the output directory")
-	logsCmd.Flags().String("format", "", "Output format for cross-run audit report: pretty, markdown (generates security audit report instead of default metrics table)")
+	logsCmd.Flags().String("format", "", "Output format: console (decorated tables), tsv (tab-separated), pretty (cross-run report), markdown (cross-run Markdown). Default: compact agent-optimized output")
+	logsCmd.Flags().String("report-file", "", "Write --format markdown output directly to this file path instead of stdout (creates parent directories as needed)")
 	logsCmd.Flags().Int("last", 0, "Alias for --count: number of recent runs to download")
-	logsCmd.Flags().StringSlice("artifacts", nil, "Artifact sets to download (default: all). Valid sets: "+strings.Join(ValidArtifactSetNames(), ", "))
-	logsCmd.Flags().String("after", "", "(Cache eviction) Evict locally cached run folders for runs before this date, prior to downloading. Accepts deltas like -1d, -1w, -1mo (or explicit day counts like -30d), or an absolute date YYYY-MM-DD. Unlike --start-date, this only clears local cache and does not filter which runs are fetched.")
+	logsCmd.Flags().StringSlice("artifacts", []string{"usage"}, "Artifact sets to download (default: usage). Use 'all' for everything, or comma-separate sets. Valid sets: "+validArtifactSets)
+	logsCmd.Flags().String("cache-before", "", "(Cache eviction) Evict locally cached run folders for runs before this date, prior to downloading. Accepts deltas like -1d, -1w, -1mo (or explicit day counts like -30d), or an absolute date YYYY-MM-DD. Unlike --start-date, this only clears local cache and does not filter which runs are fetched.")
+	logsCmd.Flags().String("after", "", "Alias for --cache-before")
+	_ = logsCmd.Flags().MarkHidden("after")
+	_ = logsCmd.Flags().MarkDeprecated("after", "use --cache-before")
 	logsCmd.Flags().Bool("stdin", false, "Read workflow run IDs or URLs from stdin (one per line) instead of discovering runs via the GitHub API")
 	logsCmd.MarkFlagsMutuallyExclusive("firewall", "no-firewall")
 
@@ -354,3 +436,46 @@ Examples:
 // parseAgentLog runs the JavaScript log parser on agent logs and writes markdown to log.md
 
 // parseFirewallLogs runs the JavaScript firewall log parser and writes markdown to firewall.md
+
+// repoIsLocal reports whether the given --repo flag value refers to the current local
+// repository. It extracts the owner/repo portion (stripping an optional HOST/ prefix),
+// then compares against the GITHUB_REPOSITORY environment variable (set by the MCP
+// server container) and, if that is absent, against the repository detected from the
+// local git checkout via GetCurrentRepoSlug.
+//
+// This is used by the logs command to decide whether local lock files are authoritative
+// for resolving a workflow display name: they are authoritative only when --repo points
+// to the same repository that is checked out locally.
+func repoIsLocal(repo string) bool {
+	// Strip optional HOST/ prefix (e.g. "github.com/owner/repo" → "owner/repo")
+	ownerRepo, _ := normalizeRepoForAPI(repo)
+
+	// Fast path: GITHUB_REPOSITORY is always the current repo in MCP server containers.
+	if envRepo := os.Getenv("GITHUB_REPOSITORY"); envRepo != "" {
+		return strings.EqualFold(ownerRepo, envRepo)
+	}
+
+	// Fallback: detect from git remote / gh CLI (result is cached on first call).
+	currentRepo, err := GetCurrentRepoSlug()
+	if err != nil {
+		logsCommandLog.Printf("Could not determine current repo slug for comparison: %v", err)
+		return false
+	}
+	return strings.EqualFold(ownerRepo, currentRepo)
+}
+
+// validateReportFileFlags returns an error if --report-file is combined with an
+// incompatible flag. --report-file only takes effect for --format markdown output
+// and is bypassed when --json is set.
+func validateReportFileFlags(reportFile, format string, jsonOutput bool) error {
+	if reportFile == "" {
+		return nil
+	}
+	if format != "markdown" {
+		return errors.New("--report-file requires --format markdown")
+	}
+	if jsonOutput {
+		return errors.New("--report-file cannot be used with --json")
+	}
+	return nil
+}

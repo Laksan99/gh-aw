@@ -1,4 +1,6 @@
 ---
+private: true
+emoji: "🔧"
 name: Refactoring Cadence
 description: Tracks repository code health over time using file length, cyclomatic complexity, file growth, and TODO/FIXME/HACK churn metrics — optimized for Go and JavaScript codebases. Automatically opens a refactoring issue when the health score drops below a configurable threshold.
 on:
@@ -8,6 +10,7 @@ permissions:
   contents: read
   issues: read
   actions: read
+  copilot-requests: write
 tracker-id: refactoring-cadence
 engine: copilot
 imports:
@@ -19,7 +22,7 @@ imports:
       title-prefix: "[refactoring-cadence] "
       expires: "14d"
       labels: [refactoring, ai-generated]
-  - shared/observability-otlp.md
+  - shared/otlp.md
 tools:
   cli-proxy: true
   github:
@@ -29,7 +32,7 @@ tools:
   cache-memory: true
 safe-outputs:
   messages:
-    footer: "> 🔧 *Code health check by [{workflow_name}]({run_url})*{effective_tokens_suffix}{history_link}"
+    footer: "> 🔧 *Code health check by [{workflow_name}]({run_url})*{ai_credits_suffix}{history_link}"
     run-started: "🔧 Refactoring Cadence online! [{workflow_name}]({run_url}) is measuring code health..."
     run-success: "✅ Code health check complete! [{workflow_name}]({run_url}) has finished its analysis."
     run-failure: "🔧 Code health check failed! [{workflow_name}]({run_url}) {status}. Code health status unknown..."
@@ -38,10 +41,8 @@ network:
     - defaults
     - go
 timeout-minutes: 20
-features:
-  copilot-requests: true
-
 ---
+
 # Refactoring Cadence
 
 You are the **Refactoring Cadence** agent — a continuous code health monitor that prevents technical debt accumulation by tracking key metrics over time and alerting when code quality degrades.

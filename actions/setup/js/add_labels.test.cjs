@@ -38,6 +38,12 @@ describe("add_labels", () => {
       rest: {
         issues: {
           addLabels: async () => ({}),
+          get: async () => ({
+            data: {
+              title: "Test issue title",
+              labels: [],
+            },
+          }),
         },
       },
     };
@@ -107,6 +113,127 @@ describe("add_labels", () => {
       expect(addLabelsCalls[0].labels).toEqual(["bug", "enhancement"]);
     });
 
+    it("should accept structured label entries and add normalized label names", async () => {
+      const handler = await main({ max: 10 });
+      const addLabelsCalls = [];
+
+      mockGithub.rest.issues.addLabels = async params => {
+        addLabelsCalls.push(params);
+        return {};
+      };
+
+      const result = await handler(
+        {
+          item_number: 456,
+          labels: [{ name: "bug", rationale: "Known crash path", confidence: "high", suggest: true }],
+        },
+        {}
+      );
+
+      expect(result.success).toBe(true);
+      expect(result.number).toBe(456);
+      expect(addLabelsCalls).toHaveLength(1);
+      expect(addLabelsCalls[0].labels).toEqual(["bug"]);
+    });
+
+    it("should send structured label metadata when issue_intents runtime feature is enabled", async () => {
+      const previousFeatures = process.env.GH_AW_RUNTIME_FEATURES;
+      process.env.GH_AW_RUNTIME_FEATURES = "issue_intents";
+      try {
+        const handler = await main({ max: 10 });
+        const addLabelsCalls = [];
+
+        mockGithub.rest.issues.addLabels = async params => {
+          addLabelsCalls.push(params);
+          return {};
+        };
+
+        const result = await handler(
+          {
+            item_number: 456,
+            labels: [{ name: "bug", rationale: "Application crashes on file uploads >5MB", confidence: "HIGH" }],
+          },
+          {}
+        );
+
+        expect(result.success).toBe(true);
+        expect(addLabelsCalls).toHaveLength(1);
+        expect(addLabelsCalls[0].labels).toEqual([{ name: "bug", rationale: "Application crashes on file uploads >5MB", confidence: "HIGH" }]);
+      } finally {
+        if (previousFeatures === undefined) {
+          delete process.env.GH_AW_RUNTIME_FEATURES;
+        } else {
+          process.env.GH_AW_RUNTIME_FEATURES = previousFeatures;
+        }
+      }
+    });
+
+    it("should accept issue_number as an alias for item_number", async () => {
+      const handler = await main({ max: 10 });
+      const addLabelsCalls = [];
+
+      mockGithub.rest.issues.addLabels = async params => {
+        addLabelsCalls.push(params);
+        return {};
+      };
+
+      const result = await handler(
+        {
+          issue_number: 456,
+          labels: ["bug"],
+        },
+        {}
+      );
+
+      expect(result.success).toBe(true);
+      expect(result.number).toBe(456);
+      expect(addLabelsCalls[0].issue_number).toBe(456);
+    });
+
+    it("should accept pr_number as an alias for item_number", async () => {
+      const handler = await main({ max: 10 });
+      const addLabelsCalls = [];
+
+      mockGithub.rest.issues.addLabels = async params => {
+        addLabelsCalls.push(params);
+        return {};
+      };
+
+      const result = await handler(
+        {
+          pr_number: 789,
+          labels: ["enhancement"],
+        },
+        {}
+      );
+
+      expect(result.success).toBe(true);
+      expect(result.number).toBe(789);
+      expect(addLabelsCalls[0].issue_number).toBe(789);
+    });
+
+    it("should accept pull_number as an alias for item_number", async () => {
+      const handler = await main({ max: 10 });
+      const addLabelsCalls = [];
+
+      mockGithub.rest.issues.addLabels = async params => {
+        addLabelsCalls.push(params);
+        return {};
+      };
+
+      const result = await handler(
+        {
+          pull_number: 101,
+          labels: ["needs-review"],
+        },
+        {}
+      );
+
+      expect(result.success).toBe(true);
+      expect(result.number).toBe(101);
+      expect(addLabelsCalls[0].issue_number).toBe(101);
+    });
+
     it("should add labels to an issue from context when item_number not provided", async () => {
       const handler = await main({ max: 10 });
       const addLabelsCalls = [];
@@ -127,6 +254,40 @@ describe("add_labels", () => {
       expect(result.number).toBe(123);
       expect(result.labelsAdded).toEqual(["documentation"]);
       expect(result.contextType).toBe("issue");
+    });
+
+    it("should add labels from workflow_dispatch aw_context when issue payload is absent", async () => {
+      mockContext.eventName = "workflow_dispatch";
+      mockContext.payload = {
+        inputs: {
+          aw_context: JSON.stringify({
+            event_type: "issue_comment",
+            item_type: "issue",
+            item_number: 456,
+            repo: "test-owner/test-repo",
+          }),
+        },
+      };
+
+      const handler = await main({ max: 10 });
+      const addLabelsCalls = [];
+
+      mockGithub.rest.issues.addLabels = async params => {
+        addLabelsCalls.push(params);
+        return {};
+      };
+
+      const result = await handler(
+        {
+          labels: ["documentation"],
+        },
+        {}
+      );
+
+      expect(result.success).toBe(true);
+      expect(result.number).toBe(456);
+      expect(result.contextType).toBe("issue");
+      expect(addLabelsCalls[0].issue_number).toBe(456);
     });
 
     it("should add labels to a pull request from context", async () => {
@@ -745,6 +906,157 @@ describe("add_labels", () => {
 
       expect(result.success).toBe(true);
       expect(result.labelsAdded[0].length).toBe(64);
+    });
+
+    it("should handle numeric string from context payload correctly", async () => {
+      const handler = await main({ max: 10 });
+      const addLabelsCalls = [];
+
+      mockContext.payload = {
+        issue: {
+          number: "123", // String number from payload
+        },
+      };
+
+      mockGithub.rest.issues.addLabels = async params => {
+        addLabelsCalls.push(params);
+        return {};
+      };
+
+      const result = await handler(
+        {
+          labels: ["bug"],
+        },
+        {}
+      );
+
+      expect(result.success).toBe(true);
+      expect(addLabelsCalls).toHaveLength(1);
+    });
+
+    it("should reject invalid non-numeric value from context", async () => {
+      const handler = await main({ max: 10 });
+
+      mockContext.payload = {
+        issue: {
+          number: "not-a-number",
+        },
+      };
+
+      const result = await handler(
+        {
+          labels: ["bug"],
+        },
+        {}
+      );
+
+      expect(result.success).toBe(false);
+      expect(result.error).toContain("No issue/PR number available");
+    });
+
+    it("should skip when item does not have all required_labels", async () => {
+      const handler = await main({ max: 10, required_labels: ["needs-triage"] });
+
+      mockGithub.rest.issues.get = async () => ({
+        data: { title: "Some issue", labels: [{ name: "bug" }] },
+      });
+
+      const result = await handler({ item_number: 100, labels: ["enhancement"] }, {});
+
+      expect(result.success).toBe(false);
+      expect(result.skipped).toBe(true);
+      expect(result.error).toContain("required-labels");
+    });
+
+    it("should add labels when item has all required_labels", async () => {
+      const handler = await main({ max: 10, required_labels: ["needs-triage"] });
+      const addLabelsCalls = [];
+
+      mockGithub.rest.issues.get = async () => ({
+        data: { title: "Some issue", labels: [{ name: "needs-triage" }, { name: "bug" }] },
+      });
+      mockGithub.rest.issues.addLabels = async params => {
+        addLabelsCalls.push(params);
+        return {};
+      };
+
+      const result = await handler({ item_number: 100, labels: ["enhancement"] }, {});
+
+      expect(result.success).toBe(true);
+      expect(addLabelsCalls.length).toBe(1);
+    });
+
+    it("should skip when item title does not start with required_title_prefix", async () => {
+      const handler = await main({ max: 10, required_title_prefix: "[Bot]" });
+
+      mockGithub.rest.issues.get = async () => ({
+        data: { title: "Regular issue title", labels: [] },
+      });
+
+      const result = await handler({ item_number: 100, labels: ["bug"] }, {});
+
+      expect(result.success).toBe(false);
+      expect(result.skipped).toBe(true);
+      expect(result.error).toContain("required prefix");
+    });
+
+    it("should add labels when item title starts with required_title_prefix", async () => {
+      const handler = await main({ max: 10, required_title_prefix: "[Bot]" });
+      const addLabelsCalls = [];
+
+      mockGithub.rest.issues.get = async () => ({
+        data: { title: "[Bot] Automated issue", labels: [] },
+      });
+      mockGithub.rest.issues.addLabels = async params => {
+        addLabelsCalls.push(params);
+        return {};
+      };
+
+      const result = await handler({ item_number: 100, labels: ["automation"] }, {});
+
+      expect(result.success).toBe(true);
+      expect(addLabelsCalls.length).toBe(1);
+    });
+
+    it("should check both required_labels and required_title_prefix together", async () => {
+      const handler = await main({
+        max: 10,
+        required_labels: ["approved"],
+        required_title_prefix: "[Ready]",
+      });
+
+      // Passes required_labels but fails required_title_prefix
+      mockGithub.rest.issues.get = async () => ({
+        data: { title: "Not ready issue", labels: [{ name: "approved" }] },
+      });
+
+      const result = await handler({ item_number: 100, labels: ["bug"] }, {});
+
+      expect(result.success).toBe(false);
+      expect(result.skipped).toBe(true);
+      expect(result.error).toContain("required prefix");
+    });
+
+    it("should add labels when both required_labels and required_title_prefix match", async () => {
+      const handler = await main({
+        max: 10,
+        required_labels: ["approved"],
+        required_title_prefix: "[Ready]",
+      });
+      const addLabelsCalls = [];
+
+      mockGithub.rest.issues.get = async () => ({
+        data: { title: "[Ready] Ship it", labels: [{ name: "approved" }, { name: "bug" }] },
+      });
+      mockGithub.rest.issues.addLabels = async params => {
+        addLabelsCalls.push(params);
+        return {};
+      };
+
+      const result = await handler({ item_number: 100, labels: ["enhancement"] }, {});
+
+      expect(result.success).toBe(true);
+      expect(addLabelsCalls.length).toBe(1);
     });
   });
 });

@@ -3,6 +3,7 @@ package workflow
 import (
 	"fmt"
 	"maps"
+	"sort"
 	"strings"
 
 	"github.com/github/gh-aw/pkg/constants"
@@ -161,9 +162,25 @@ func (c *Compiler) buildSafeJobs(data *WorkflowData, threatDetectionEnabled bool
 
 	safeJobsLog.Printf("Building %d safe-jobs, threatDetectionEnabled=%v", len(data.SafeOutputs.Jobs), threatDetectionEnabled)
 	var safeJobNames []string
-	for jobName, jobConfig := range data.SafeOutputs.Jobs {
-		// Normalize job name to use underscores for consistency
-		normalizedJobName := stringutil.NormalizeSafeOutputIdentifier(jobName)
+
+	// Collect normalized names and a config lookup map, then sort by normalized name.
+	// Sorting on the normalized form (rather than the raw key) guarantees that the
+	// returned safeJobNames slice and the conclusion job's needs: list are ordered
+	// consistently with the names that appear in the compiled YAML, even when raw
+	// names contain characters (e.g. '.', '-') that normalize differently from '_'.
+	type safeJobEntry struct {
+		normalizedName string
+		config         *SafeJobConfig
+	}
+	entries := make([]safeJobEntry, 0, len(data.SafeOutputs.Jobs))
+	for rawName, cfg := range data.SafeOutputs.Jobs {
+		entries = append(entries, safeJobEntry{stringutil.NormalizeSafeOutputIdentifier(rawName), cfg})
+	}
+	sort.Slice(entries, func(i, j int) bool { return entries[i].normalizedName < entries[j].normalizedName })
+
+	for _, entry := range entries {
+		jobConfig := entry.config
+		normalizedJobName := entry.normalizedName
 
 		job := &Job{
 			Name:        normalizedJobName,
@@ -241,48 +258,31 @@ func (c *Compiler) buildSafeJobs(data *WorkflowData, threatDetectionEnabled bool
 		agentArtifactPrefix := artifactPrefixExprForAgentDownstreamJob(data)
 		downloadSteps := buildArtifactDownloadSteps(ArtifactDownloadConfig{
 			ArtifactName: agentArtifactPrefix + constants.AgentArtifactName,
-			DownloadPath: "${{ runner.temp }}/gh-aw/safe-jobs/",
+			DownloadPath: SafeJobsDownloadDirExpr,
 			SetupEnvStep: false, // We'll handle env vars separately to add job-specific ones
 			StepName:     "Download agent output artifact",
 		}, c.getActionPin)
 		steps = append(steps, downloadSteps...)
 
 		// the download artifacts always creates a folder, then unpacks in that folder
-		agentOutputArtifactFilename := "${RUNNER_TEMP}/gh-aw/safe-jobs/" + constants.AgentOutputFilename
 
-		// Add environment variables step with GH_AW_AGENT_OUTPUT and job-specific env vars
-		steps = append(steps, "      - name: Configure Safe Outputs Job Environment Variables\n")
-		steps = append(steps, "        id: setup-safe-job-env\n")
-		steps = append(steps, "        run: |\n")
-		steps = append(steps, "          find \"${RUNNER_TEMP}/gh-aw/safe-jobs/\" -type f -print\n")
-		// Configure GH_AW_AGENT_OUTPUT to point to downloaded artifact file
-		steps = append(steps, fmt.Sprintf("          echo \"GH_AW_AGENT_OUTPUT=%s\" >> \"$GITHUB_OUTPUT\"\n", agentOutputArtifactFilename))
-
-		// Add job-specific environment variables
-		if jobConfig.Env != nil {
-			for key, value := range jobConfig.Env {
-				steps = append(steps, fmt.Sprintf("          echo \"%s=%s\" >> \"$GITHUB_OUTPUT\"\n", key, value))
-			}
-		}
-
-		// Add custom steps from the job configuration, injecting env vars from the
-		// setup-safe-job-env step outputs so user steps can access them.
+		// Add custom steps from the job configuration, injecting env vars directly so
+		// user steps can access GH_AW_AGENT_OUTPUT and all job-specific env vars.
 		if len(jobConfig.Steps) > 0 {
-			// Build the env vars that were set in the setup-safe-job-env step so we can inject them.
+			// GH_AW_AGENT_OUTPUT uses the runner.temp Actions expression so the path is
+			// resolved by the runner without requiring a $GITHUB_OUTPUT write.
 			setupEnvVars := map[string]string{
-				"GH_AW_AGENT_OUTPUT": "${{ steps.setup-safe-job-env.outputs.GH_AW_AGENT_OUTPUT }}",
+				"GH_AW_AGENT_OUTPUT": SafeJobsDownloadDirExpr + constants.AgentOutputFilename,
 			}
-			if jobConfig.Env != nil {
-				for key := range jobConfig.Env {
-					setupEnvVars[key] = fmt.Sprintf("${{ steps.setup-safe-job-env.outputs.%s }}", key)
-				}
-			}
+			// All job-specific env vars (literal or expression-based) are injected with
+			// their original values. Nothing goes through $GITHUB_OUTPUT.
+			maps.Copy(setupEnvVars, jobConfig.Env)
 			for _, step := range jobConfig.Steps {
 				if stepMap, ok := step.(map[string]any); ok {
 					// Convert to typed step for action pinning
 					typedStep, err := MapToStep(stepMap)
 					if err != nil {
-						return nil, fmt.Errorf("failed to convert step to typed step for safe job %s: %w", jobName, err)
+						return nil, fmt.Errorf("failed to convert step to typed step for safe job %s: %w", normalizedJobName, err)
 					}
 
 					// Inject setup env vars so user steps can access GH_AW_AGENT_OUTPUT
@@ -297,12 +297,15 @@ func (c *Compiler) buildSafeJobs(data *WorkflowData, threatDetectionEnabled bool
 					}
 
 					// Apply action pinning using type-safe version
-					pinnedStep := applyActionPinToTypedStep(typedStep, data)
+					pinnedStep, err := applyActionPinToTypedStep(typedStep, data)
+					if err != nil {
+						return nil, fmt.Errorf("failed to pin action for step in safe job %s: %w", normalizedJobName, err)
+					}
 
 					// Convert back to map for YAML generation
 					stepYAML, err := ConvertStepToYAML(pinnedStep.ToMap())
 					if err != nil {
-						return nil, fmt.Errorf("failed to convert step to YAML for safe job %s: %w", jobName, err)
+						return nil, fmt.Errorf("failed to convert step to YAML for safe job %s: %w", normalizedJobName, err)
 					}
 					steps = append(steps, stepYAML)
 				}
@@ -324,7 +327,7 @@ func (c *Compiler) buildSafeJobs(data *WorkflowData, threatDetectionEnabled bool
 		// Add the job to the job manager
 		if err := c.jobManager.AddJob(job); err != nil {
 			safeJobsLog.Printf("Failed to add safe-job %s: %v", normalizedJobName, err)
-			return nil, fmt.Errorf("failed to add safe job %s: %w", jobName, err)
+			return nil, fmt.Errorf("failed to add safe job %s: %w", normalizedJobName, err)
 		}
 		safeJobsLog.Printf("Created safe-job: %s with %d dependencies and %d steps", normalizedJobName, len(job.Needs), len(job.Steps))
 		safeJobNames = append(safeJobNames, normalizedJobName)
@@ -342,7 +345,7 @@ func extractSafeJobsFromFrontmatter(frontmatter map[string]any) map[string]*Safe
 		if safeOutputsMap, ok := safeOutputs.(map[string]any); ok {
 			if jobs, exists := safeOutputsMap["jobs"]; exists {
 				if jobsMap, ok := jobs.(map[string]any); ok {
-					c := &Compiler{} // Create a temporary compiler instance for parsing
+					c := NewCompiler() // Create a temporary compiler instance for parsing
 					return c.parseSafeJobsConfig(jobsMap)
 				}
 			}

@@ -23,10 +23,16 @@ import (
 	"strings"
 	"time"
 
+	"github.com/github/gh-aw/pkg/console"
 	"github.com/github/gh-aw/pkg/logger"
+	"github.com/github/gh-aw/pkg/stringutil"
 )
 
 var errorHelpersLog = logger.New("workflow:error_helpers")
+
+// FieldLocation represents a source file location for a validation error.
+// File and Line are optional; zero values mean "location unknown".
+type FieldLocation = console.ErrorPosition
 
 // WorkflowValidationError represents an error that occurred during input validation
 type WorkflowValidationError struct {
@@ -34,22 +40,31 @@ type WorkflowValidationError struct {
 	Value      string
 	Reason     string
 	Suggestion string
+	Severity   ErrorSeverity
+	Category   string
 	Timestamp  time.Time
+	// Location context (optional — zero values mean location unknown)
+	File   string
+	Line   int
+	Column int
 }
 
 // Error implements the error interface
 func (e *WorkflowValidationError) Error() string {
 	var b strings.Builder
 
-	fmt.Fprintf(&b, "[%s] Validation failed for field '%s'",
-		e.Timestamp.Format(time.RFC3339), e.Field)
+	if e.Line > 0 {
+		// When a source location is known, omit the timestamp so the compiler's
+		// file:line:col: prefix is not cluttered with a redundant timestamp.
+		fmt.Fprintf(&b, "Validation failed for field '%s'", e.Field)
+	} else {
+		fmt.Fprintf(&b, "[%s] Validation failed for field '%s'",
+			e.Timestamp.Format(time.RFC3339), e.Field)
+	}
 
 	if e.Value != "" {
 		// Truncate long values
-		truncatedValue := e.Value
-		if len(truncatedValue) > 100 {
-			truncatedValue = truncatedValue[:97] + "..."
-		}
+		truncatedValue := stringutil.Truncate(e.Value, 100)
 		fmt.Fprintf(&b, "\n\nValue: %s", truncatedValue)
 	}
 
@@ -67,11 +82,14 @@ func NewValidationError(field, value, reason, suggestion string) *WorkflowValida
 	if errorHelpersLog.Enabled() {
 		errorHelpersLog.Printf("Creating validation error: field=%s, reason=%s", field, reason)
 	}
+	severity, category := classifyValidationSeverity(field, reason)
 	return &WorkflowValidationError{
 		Field:      field,
 		Value:      value,
 		Reason:     reason,
 		Suggestion: suggestion,
+		Severity:   severity,
+		Category:   category,
 		Timestamp:  time.Now(),
 	}
 }
@@ -150,10 +168,7 @@ func (e *ConfigurationError) Error() string {
 
 	if e.Value != "" {
 		// Truncate long values
-		truncatedValue := e.Value
-		if len(truncatedValue) > 100 {
-			truncatedValue = truncatedValue[:97] + "..."
-		}
+		truncatedValue := stringutil.Truncate(e.Value, 100)
 		fmt.Fprintf(&b, "\n\nValue: %s", truncatedValue)
 	}
 

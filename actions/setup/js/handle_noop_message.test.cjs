@@ -20,6 +20,12 @@ describe("handle_noop_message", () => {
     // Create temp directory for test files
     tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "handle-noop-test-"));
 
+    // getPromptPath() throws unless GH_AW_PROMPTS_DIR or RUNNER_TEMP is set.
+    // On CI RUNNER_TEMP is ambient, but it is not set in local dev, so set the
+    // prompts dir explicitly to make the suite environment-independent. The
+    // actual path is irrelevant because fs.readFileSync is mocked below.
+    process.env.GH_AW_PROMPTS_DIR = tempDir;
+
     // Mock fs.readFileSync to return template content
     originalReadFileSync = fs.readFileSync;
     fs.readFileSync = vi.fn((filePath, encoding) => {
@@ -76,7 +82,7 @@ This issue helps you:
 
 {message}
 
-> Generated from [{workflow_name}]({run_url}){effective_tokens_suffix}`;
+> Generated from [{workflow_name}]({run_url}){aic_suffix}{ambient_context_suffix}{history_link}`;
       }
       return originalReadFileSync.call(fs, filePath, encoding);
     });
@@ -670,7 +676,7 @@ This issue helps you:
     expect(commentCall.body).not.toContain("<script>");
   });
 
-  it("should include effective token count in footer when GH_AW_EFFECTIVE_TOKENS is set", async () => {
+  it("should not include effective token count in footer when GH_AW_EFFECTIVE_TOKENS is set", async () => {
     process.env.GH_AW_WORKFLOW_NAME = "Token Test Workflow";
     process.env.GH_AW_RUN_URL = "https://github.com/test/test/actions/runs/123";
     process.env.GH_AW_AGENT_CONCLUSION = "success";
@@ -696,7 +702,7 @@ This issue helps you:
     await main();
 
     const commentCall = mockGithub.rest.issues.createComment.mock.calls[0][0];
-    expect(commentCall.body).toContain("· ● 12.5K");
+    expect(commentCall.body).not.toContain("12.5K");
   });
 
   it("should not include effective token count in footer when GH_AW_EFFECTIVE_TOKENS is not set", async () => {
@@ -727,5 +733,141 @@ This issue helps you:
     const commentCall = mockGithub.rest.issues.createComment.mock.calls[0][0];
     expect(commentCall.body).not.toContain("●");
     expect(commentCall.body).toContain("> Generated from [No Token Workflow](https://github.com/test/test/actions/runs/456)");
+  });
+
+  it("should include AIC suffix in comment footer when GH_AW_AIC is set", async () => {
+    process.env.GH_AW_WORKFLOW_NAME = "AIC Test Workflow";
+    process.env.GH_AW_RUN_URL = "https://github.com/test/test/actions/runs/123";
+    process.env.GH_AW_AGENT_CONCLUSION = "success";
+    process.env.GH_AW_AIC = "0.025";
+
+    const outputFile = path.join(tempDir, "agent_output.json");
+    fs.writeFileSync(outputFile, JSON.stringify({ items: [{ type: "noop", message: "No action needed" }] }));
+    process.env.GH_AW_AGENT_OUTPUT = outputFile;
+
+    mockGithub.rest.search.issuesAndPullRequests.mockResolvedValue({
+      data: { total_count: 1, items: [{ number: 1, node_id: "ID", html_url: "url" }] },
+    });
+    mockGithub.rest.issues.createComment.mockResolvedValue({ data: {} });
+
+    const { main } = await import("./handle_noop_message.cjs?t=" + Date.now());
+    await main();
+
+    const commentCall = mockGithub.rest.issues.createComment.mock.calls[0][0];
+    expect(commentCall.body).toContain("AIC");
+  });
+
+  it("should include detection AIC in the footer total when GH_AW_THREAT_DETECTION_AIC is set", async () => {
+    process.env.GH_AW_WORKFLOW_NAME = "Detection AIC Workflow";
+    process.env.GH_AW_RUN_URL = "https://github.com/test/test/actions/runs/123";
+    process.env.GH_AW_AGENT_CONCLUSION = "success";
+    process.env.GH_AW_AIC = "0.100";
+    process.env.GH_AW_THREAT_DETECTION_AIC = "0.025";
+
+    const outputFile = path.join(tempDir, "agent_output.json");
+    fs.writeFileSync(outputFile, JSON.stringify({ items: [{ type: "noop", message: "No action needed" }] }));
+    process.env.GH_AW_AGENT_OUTPUT = outputFile;
+
+    mockGithub.rest.search.issuesAndPullRequests.mockResolvedValue({
+      data: { total_count: 1, items: [{ number: 1, node_id: "ID", html_url: "url" }] },
+    });
+    mockGithub.rest.issues.createComment.mockResolvedValue({ data: {} });
+
+    const { main } = await import("./handle_noop_message.cjs?t=" + Date.now());
+    await main();
+
+    const commentCall = mockGithub.rest.issues.createComment.mock.calls[0][0];
+    expect(commentCall.body).toContain("0.125 AIC");
+  });
+
+  it("should not include AIC suffix in comment footer when GH_AW_AIC is not set", async () => {
+    process.env.GH_AW_WORKFLOW_NAME = "No Credits Workflow";
+    process.env.GH_AW_RUN_URL = "https://github.com/test/test/actions/runs/123";
+    process.env.GH_AW_AGENT_CONCLUSION = "success";
+    delete process.env.GH_AW_AIC;
+    delete process.env.GH_AW_THREAT_DETECTION_AIC;
+
+    const outputFile = path.join(tempDir, "agent_output.json");
+    fs.writeFileSync(outputFile, JSON.stringify({ items: [{ type: "noop", message: "No action needed" }] }));
+    process.env.GH_AW_AGENT_OUTPUT = outputFile;
+
+    mockGithub.rest.search.issuesAndPullRequests.mockResolvedValue({
+      data: { total_count: 1, items: [{ number: 1, node_id: "ID", html_url: "url" }] },
+    });
+    mockGithub.rest.issues.createComment.mockResolvedValue({ data: {} });
+
+    const { main } = await import("./handle_noop_message.cjs?t=" + Date.now());
+    await main();
+
+    const commentCall = mockGithub.rest.issues.createComment.mock.calls[0][0];
+    expect(commentCall.body).not.toContain(" AIC");
+  });
+
+  it("should include ambient context suffix in comment footer when GH_AW_AMBIENT_CONTEXT is set", async () => {
+    process.env.GH_AW_WORKFLOW_NAME = "Ambient Context Workflow";
+    process.env.GH_AW_RUN_URL = "https://github.com/test/test/actions/runs/123";
+    process.env.GH_AW_AGENT_CONCLUSION = "success";
+    process.env.GH_AW_AMBIENT_CONTEXT = "1200";
+
+    const outputFile = path.join(tempDir, "agent_output.json");
+    fs.writeFileSync(outputFile, JSON.stringify({ items: [{ type: "noop", message: "No action needed" }] }));
+    process.env.GH_AW_AGENT_OUTPUT = outputFile;
+
+    mockGithub.rest.search.issuesAndPullRequests.mockResolvedValue({
+      data: { total_count: 1, items: [{ number: 1, node_id: "ID", html_url: "url" }] },
+    });
+    mockGithub.rest.issues.createComment.mockResolvedValue({ data: {} });
+
+    const { main } = await import("./handle_noop_message.cjs?t=" + Date.now());
+    await main();
+
+    const commentCall = mockGithub.rest.issues.createComment.mock.calls[0][0];
+    expect(commentCall.body).toContain("⊞");
+    expect(commentCall.body).toContain("1.2K");
+  });
+
+  it("should include history link in comment footer when GH_AW_WORKFLOW_ID is set", async () => {
+    process.env.GH_AW_WORKFLOW_NAME = "History Link Workflow";
+    process.env.GH_AW_RUN_URL = "https://github.com/test/test/actions/runs/123";
+    process.env.GH_AW_AGENT_CONCLUSION = "success";
+    process.env.GH_AW_WORKFLOW_ID = "history-link-workflow";
+
+    const outputFile = path.join(tempDir, "agent_output.json");
+    fs.writeFileSync(outputFile, JSON.stringify({ items: [{ type: "noop", message: "No action needed" }] }));
+    process.env.GH_AW_AGENT_OUTPUT = outputFile;
+
+    mockGithub.rest.search.issuesAndPullRequests.mockResolvedValue({
+      data: { total_count: 1, items: [{ number: 1, node_id: "ID", html_url: "url" }] },
+    });
+    mockGithub.rest.issues.createComment.mockResolvedValue({ data: {} });
+
+    const { main } = await import("./handle_noop_message.cjs?t=" + Date.now());
+    await main();
+
+    const commentCall = mockGithub.rest.issues.createComment.mock.calls[0][0];
+    expect(commentCall.body).toContain("◷");
+    expect(commentCall.body).toContain("history-link-workflow");
+  });
+
+  it("should not include history link when GH_AW_WORKFLOW_ID is not set", async () => {
+    process.env.GH_AW_WORKFLOW_NAME = "No History Workflow";
+    process.env.GH_AW_RUN_URL = "https://github.com/test/test/actions/runs/123";
+    process.env.GH_AW_AGENT_CONCLUSION = "success";
+    delete process.env.GH_AW_WORKFLOW_ID;
+
+    const outputFile = path.join(tempDir, "agent_output.json");
+    fs.writeFileSync(outputFile, JSON.stringify({ items: [{ type: "noop", message: "No action needed" }] }));
+    process.env.GH_AW_AGENT_OUTPUT = outputFile;
+
+    mockGithub.rest.search.issuesAndPullRequests.mockResolvedValue({
+      data: { total_count: 1, items: [{ number: 1, node_id: "ID", html_url: "url" }] },
+    });
+    mockGithub.rest.issues.createComment.mockResolvedValue({ data: {} });
+
+    const { main } = await import("./handle_noop_message.cjs?t=" + Date.now());
+    await main();
+
+    const commentCall = mockGithub.rest.issues.createComment.mock.calls[0][0];
+    expect(commentCall.body).not.toContain("◷");
   });
 });

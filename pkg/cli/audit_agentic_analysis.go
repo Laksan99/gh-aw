@@ -52,6 +52,10 @@ func buildToolUsageInfo(metrics LogMetrics) []ToolUsageInfo {
 			}
 			if toolCall.MaxOutputSize > existing.MaxOutputSize {
 				existing.MaxOutputSize = toolCall.MaxOutputSize
+				// Keep the sample from the call with the largest output.
+				if toolCall.OutputSample != "" {
+					existing.OutputSample = toolCall.OutputSample
+				}
 			}
 			if toolCall.MaxDuration > 0 {
 				maxDuration := timeutil.FormatDuration(toolCall.MaxDuration)
@@ -67,6 +71,7 @@ func buildToolUsageInfo(metrics LogMetrics) []ToolUsageInfo {
 			CallCount:     toolCall.CallCount,
 			MaxInputSize:  toolCall.MaxInputSize,
 			MaxOutputSize: toolCall.MaxOutputSize,
+			OutputSample:  toolCall.OutputSample,
 		}
 		if toolCall.MaxDuration > 0 {
 			info.MaxDuration = timeutil.FormatDuration(toolCall.MaxDuration)
@@ -188,7 +193,6 @@ func deriveRunAgenticAnalysis(processedRun ProcessedRun, metrics LogMetrics) (*A
 	createdItems := extractCreatedItemsFromManifest(processedRun.Run.LogsPath)
 	metricsData := MetricsData{
 		TokenUsage:    processedRun.Run.TokenUsage,
-		EstimatedCost: processedRun.Run.EstimatedCost,
 		ActionMinutes: processedRun.Run.ActionMinutes,
 		Turns:         processedRun.Run.Turns,
 		ErrorCount:    processedRun.Run.ErrorCount,
@@ -366,7 +370,7 @@ func buildAgenticAssessments(processedRun ProcessedRun, metrics MetricsData, too
 			Severity:       severity,
 			Summary:        fmt.Sprintf("About %d%% of this run's turns appear to be data-gathering that could move to deterministic steps.", deterministicPct),
 			Evidence:       fmt.Sprintf("agentic_fraction=%.2f turns=%d", fingerprint.AgenticFraction, metrics.Turns),
-			Recommendation: "Move data-fetching work to frontmatter steps: (pre-agent) writing to /tmp/gh-aw/agent/ or post-steps: (post-agent) to reduce inference cost. See the Deterministic & Agentic Patterns guide.",
+			Recommendation: "Move data-fetching work to frontmatter steps: (pre-agent) writing to /tmp/gh-aw/agent/ or post-steps: (post-agent) to reduce inference cost. See the DeterministicOps guide.",
 		})
 	}
 

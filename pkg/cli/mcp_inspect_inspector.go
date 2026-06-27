@@ -17,6 +17,13 @@ import (
 
 var mcpInspectorLog = logger.New("cli:mcp_inspect_inspector")
 
+const (
+	// mcpStdioServerStartupDelay gives stdio MCP servers time to start accepting connections.
+	mcpStdioServerStartupDelay = 2 * time.Second
+	// mcpProcessCleanupDelay spaces cleanup signals so each MCP process can exit cleanly.
+	mcpProcessCleanupDelay = 100 * time.Millisecond
+)
+
 // spawnMCPInspector launches the official @modelcontextprotocol/inspector tool
 // and spawns any stdio MCP servers beforehand
 func spawnMCPInspector(workflowFile string, serverFilter string, verbose bool) error {
@@ -138,6 +145,11 @@ func spawnMCPInspector(workflowFile string, serverFilter string, verbose bool) e
 					wg.Add(1)
 					go func(serverCmd *exec.Cmd, serverName string) {
 						defer wg.Done()
+						defer func() {
+							if r := recover(); r != nil {
+								mcpInspectorLog.Printf("Panic in MCP server monitor for %s (recovered): %v", serverName, r)
+							}
+						}()
 						if err := serverCmd.Wait(); err != nil && verbose {
 							fmt.Fprintln(os.Stderr, console.FormatWarningMessage(fmt.Sprintf("Server %s exited with error: %v", serverName, err)))
 						}
@@ -149,7 +161,7 @@ func spawnMCPInspector(workflowFile string, serverFilter string, verbose bool) e
 				}
 
 				// Give servers a moment to start up
-				time.Sleep(2 * time.Second)
+				time.Sleep(mcpStdioServerStartupDelay)
 				fmt.Fprintln(os.Stderr, console.FormatSuccessMessage("All stdio servers started successfully"))
 			}
 
@@ -193,12 +205,17 @@ func spawnMCPInspector(workflowFile string, serverFilter string, verbose bool) e
 				}
 				// Give each process a chance to clean up
 				if i < len(serverProcesses)-1 {
-					time.Sleep(100 * time.Millisecond)
+					time.Sleep(mcpProcessCleanupDelay)
 				}
 			}
 			// Wait for all background goroutines to finish (with timeout)
 			done := make(chan struct{})
 			go func() {
+				defer func() {
+					if r := recover(); r != nil {
+						mcpInspectorLog.Printf("Panic in MCP server cleanup wait (recovered): %v", r)
+					}
+				}()
 				wg.Wait()
 				close(done)
 			}()

@@ -1,4 +1,5 @@
 ---
+emoji: "🔒"
 description: Daily analysis of secret usage patterns across all compiled lock.yml workflow files
 on:
   schedule: daily
@@ -8,7 +9,10 @@ permissions:
   issues: read
   pull-requests: read
   discussions: read
-engine: copilot
+  copilot-requests: write
+engine:
+  id: copilot
+  copilot-sdk: true
 strict: true
 tracker-id: daily-secrets-analysis
 tools:
@@ -22,11 +26,9 @@ imports:
   - uses: shared/daily-audit-base.md
     with:
       title-prefix: "[daily secrets] "
-  - shared/observability-otlp.md
-features:
-  copilot-requests: true
-
+  - shared/otlp.md
 ---
+
 {{#runtime-import? .github/shared-instructions.md}}
 
 # Daily Secrets Analysis Agent
@@ -78,9 +80,9 @@ echo "Total github.token references: $TOKEN_REFS"
 # Extract unique secret names
 grep -roh 'secrets\.[A-Z_]*' .github/workflows/*.lock.yml 2>/dev/null | \
   awk -F'.' '{print $2}' | \
-  sort -u > /tmp/gh-aw/secret-names.txt
+  sort -u > /tmp/gh-aw/agent/secret-names.txt
 
-SECRET_TYPES=$(wc -l < /tmp/gh-aw/secret-names.txt)
+SECRET_TYPES=$(wc -l < /tmp/gh-aw/agent/secret-names.txt)
 echo "Unique secret types: $SECRET_TYPES"
 ```
 
@@ -90,14 +92,14 @@ Count usage of each secret type:
 
 ```bash
 # Create usage report
-cat /tmp/gh-aw/secret-names.txt | while read secret_name; do
+cat /tmp/gh-aw/agent/secret-names.txt | while read secret_name; do
   count=$(grep -rh "secrets\.${secret_name}" .github/workflows/*.lock.yml 2>/dev/null | wc -l)
   echo "${count}|${secret_name}"
-done | sort -rn > /tmp/gh-aw/secret-usage.txt
+done | sort -rn > /tmp/gh-aw/agent/secret-usage.txt
 
 # Show top 10 secrets
 echo "=== Top 10 Secrets by Usage ==="
-head -10 /tmp/gh-aw/secret-usage.txt | while IFS='|' read count name; do
+head -10 /tmp/gh-aw/agent/secret-usage.txt | while IFS='|' read count name; do
   echo "  $name: $count occurrences"
 done
 ```
@@ -175,7 +177,7 @@ If available, compare with historical data (this will work after first run):
 
 ```bash
 # Save current stats for next run
-cat > /tmp/gh-aw/secrets-stats.json << EOF
+cat > /tmp/gh-aw/agent/secrets-stats.json << EOF
 {
   "date": "$(date -I)",
   "total_workflows": $TOTAL_WORKFLOWS,

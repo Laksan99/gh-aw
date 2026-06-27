@@ -23,7 +23,9 @@ import (
 	"regexp"
 	"strings"
 
+	"github.com/github/gh-aw/pkg/constants"
 	"github.com/github/gh-aw/pkg/parser"
+	"github.com/github/gh-aw/pkg/setutil"
 )
 
 // runtimeImportMacroRe matches {{#runtime-import filepath}} or {{#runtime-import? filepath}}.
@@ -41,7 +43,8 @@ func extractRuntimeImportPaths(markdownContent string) []string {
 	}
 
 	var paths []string
-	seen := make(map[string]bool)
+	seen := make(map[string]struct {
+	})
 
 	matches := runtimeImportMacroRe.FindAllStringSubmatch(markdownContent, -1)
 
@@ -71,9 +74,10 @@ func extractRuntimeImportPaths(markdownContent string) []string {
 			}
 
 			// Add to list if not already seen
-			if !seen[importPath] {
+			if !setutil.Contains(seen, importPath) {
 				paths = append(paths, importPath)
-				seen[importPath] = true
+				seen[importPath] = struct {
+				}{}
 			}
 		}
 	}
@@ -104,8 +108,8 @@ func validateRuntimeImportFiles(markdownContent string, workspaceDir string) ([]
 	for _, filePath := range paths {
 		// Normalize the path to be relative to .github folder
 		normalizedPath := filePath
-		if strings.HasPrefix(normalizedPath, ".github/") {
-			normalizedPath = normalizedPath[8:] // Remove ".github/"
+		if strings.HasPrefix(normalizedPath, constants.GithubDir) {
+			normalizedPath = normalizedPath[len(constants.GithubDir):] // Remove ".github/"
 		} else if strings.HasPrefix(normalizedPath, ".github\\") {
 			normalizedPath = normalizedPath[8:] // Remove ".github\" (Windows)
 		}
@@ -153,6 +157,9 @@ func validateRuntimeImportFiles(markdownContent string, workspaceDir string) ([]
 		// runtime-imported file. Unknown fields are collected and returned to the
 		// caller so it can emit them through the normal warning counter.
 		for _, w := range parser.ValidateInlineSubAgentsFrontmatter(string(content)) {
+			subAgentWarnings = append(subAgentWarnings, fmt.Sprintf("runtime-import %q: %s", filePath, w))
+		}
+		for _, w := range parser.ValidateInlineSkillsFrontmatter(string(content)) {
 			subAgentWarnings = append(subAgentWarnings, fmt.Sprintf("runtime-import %q: %s", filePath, w))
 		}
 	}

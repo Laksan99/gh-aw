@@ -1,4 +1,5 @@
 ---
+emoji: "🏥"
 description: Investigates failed CI workflows to identify root causes and patterns, creating issues with diagnostic information; also reviews PR check failures when the ci-doctor label is applied
 on:
   label_command:
@@ -6,6 +7,7 @@ on:
     events: [pull_request]
     strategy: decentralized
 
+max-daily-ai-credits: 10000
 permissions:
   actions: read         # To query workflow runs, jobs, and logs
   contents: read        # To read repository files
@@ -29,13 +31,13 @@ safe-outputs:
   update-issue:
   noop:
   messages:
-    footer: "> 🩺 *Diagnosis provided by [{workflow_name}]({run_url})*{effective_tokens_suffix}{history_link}"
+    footer: "> 🩺 *Diagnosis provided by [{workflow_name}]({run_url})*{ai_credits_suffix}{history_link}"
     run-started: "🏥 CI Doctor reporting for duty! [{workflow_name}]({run_url}) is examining the patient on this {event_type}..."
     run-success: "🩺 Examination complete! [{workflow_name}]({run_url}) has delivered the diagnosis. Prescription issued! 💊"
     run-failure: "🏥 Medical emergency! [{workflow_name}]({run_url}) {status}. Doctor needs assistance..."
 
 imports:
-  - shared/observability-otlp.md
+  - shared/otlp.md
 tools:
   cli-proxy: true
   cache-memory: true
@@ -56,9 +58,9 @@ steps:
       REPO: ${{ github.repository }}
     run: |
       set -e
-      LOG_DIR="/tmp/ci-doctor/logs"
-      ARTIFACT_DIR="/tmp/ci-doctor/artifacts"
-      FILTERED_DIR="/tmp/ci-doctor/filtered"
+      LOG_DIR="/tmp/gh-aw/agent/ci-doctor/logs"
+      ARTIFACT_DIR="/tmp/gh-aw/agent/ci-doctor/artifacts"
+      FILTERED_DIR="/tmp/gh-aw/agent/ci-doctor/filtered"
       mkdir -p "$LOG_DIR" "$ARTIFACT_DIR" "$FILTERED_DIR"
 
       echo "=== CI Doctor: Pre-downloading logs and artifacts for run $RUN_ID ==="
@@ -121,7 +123,7 @@ steps:
       done
 
       # Write summary for the agent
-      SUMMARY_FILE="/tmp/ci-doctor/summary.txt"
+      SUMMARY_FILE="/tmp/gh-aw/agent/ci-doctor/summary.txt"
       {
         echo "=== CI Doctor Pre-Analysis ==="
         echo "Run ID: $RUN_ID"
@@ -161,7 +163,7 @@ steps:
       REPO: ${{ github.repository }}
     run: |
       set -e
-      PR_DIR="/tmp/ci-doctor/pr"
+      PR_DIR="/tmp/gh-aw/agent/ci-doctor/pr"
       mkdir -p "$PR_DIR"
 
       echo "=== CI Doctor: Fetching check runs for PR #$PR_NUMBER (SHA: $HEAD_SHA) ==="
@@ -201,9 +203,11 @@ steps:
       echo ""
       echo "✅ PR pre-analysis complete. Agent should start with $SUMMARY_FILE"
 
-source: githubnext/agentics/workflows/ci-doctor.md@ea350161ad5dcc9624cf510f134c6a9e39a6f94d
-
+source: githubnext/agentics/workflows/ci-doctor.md@e15e57b40918dbca11b350c55d02ab61934afa75
+features:
+  gh-aw-detection: true
 ---
+
 # CI Failure Doctor
 
 You are the CI Failure Doctor, an expert investigative agent that analyzes failed GitHub Actions checks to identify root causes and patterns. You operate in one of two modes depending on the trigger:
@@ -230,15 +234,15 @@ You were invoked via the `ci-doctor` label on pull request #${{ github.event.pul
 
 Check run data was fetched before this session:
 
-- **Summary**: `/tmp/ci-doctor/pr/summary.txt` — all check runs and their status
-- **All checks**: `/tmp/ci-doctor/pr/check-runs.json` — full check run details
-- **Failed checks**: `/tmp/ci-doctor/pr/failed-checks.json` — checks with failure/cancelled/timed_out conclusions
+- **Summary**: `/tmp/gh-aw/agent/ci-doctor/pr/summary.txt` — all check runs and their status
+- **All checks**: `/tmp/gh-aw/agent/ci-doctor/pr/check-runs.json` — full check run details
+- **Failed checks**: `/tmp/gh-aw/agent/ci-doctor/pr/failed-checks.json` — checks with failure/cancelled/timed_out conclusions
 
 ### PR CI Doctor Protocol
 
 > **Available GitHub tools**: `list_workflow_jobs`, `get_check_runs`, `get_job_logs`, and other actions tools are provided via the configured GitHub toolsets (`default` + `actions`).
 
-1. **Read** `/tmp/ci-doctor/pr/summary.txt` to understand the current check status.
+1. **Read** `/tmp/gh-aw/agent/ci-doctor/pr/summary.txt` to understand the current check status.
 2. **If no checks are failing**: call `noop` with the message "All PR checks are passing — no action needed." and stop.
 3. **For each failing check**:
    a. Use `list_workflow_jobs` (or `get_check_runs`) to get the associated workflow run and job IDs.
@@ -304,19 +308,20 @@ Check run data was fetched before this session:
 
 Logs and artifacts have been pre-downloaded before this session started:
 
-- **Summary**: `/tmp/ci-doctor/summary.txt` — failed jobs, failed steps, all file locations, and pre-located error hints
-- **Job metadata**: `/tmp/ci-doctor/logs/failed-jobs.json` — structured list of failed jobs and their failed steps
-- **Log files**: `/tmp/ci-doctor/logs/job-<job-id>.log` — full job logs downloaded from GitHub Actions
-- **Artifact files**: `/tmp/ci-doctor/artifacts/` — all workflow run artifacts, unpacked by artifact name
-- **Hint files**: `/tmp/ci-doctor/filtered/*-hints.txt` — pre-located error lines (from logs and artifacts) via generic grep heuristics
+- **Summary**: `/tmp/gh-aw/agent/ci-doctor/summary.txt` — failed jobs, failed steps, all file locations, and pre-located error hints
+- **Job metadata**: `/tmp/gh-aw/agent/ci-doctor/logs/failed-jobs.json` — structured list of failed jobs and their failed steps
+- **Log files**: `/tmp/gh-aw/agent/ci-doctor/logs/job-<job-id>.log` — full job logs downloaded from GitHub Actions
+- **Artifact files**: `/tmp/gh-aw/agent/ci-doctor/artifacts/` — all workflow run artifacts, unpacked by artifact name
+- **Hint files**: `/tmp/gh-aw/agent/ci-doctor/filtered/*-hints.txt` — pre-located error lines (from logs and artifacts) via generic grep heuristics
 
-**Start here**: Read `/tmp/ci-doctor/summary.txt` first — it lists every file location and the first few hint matches. Then examine the relevant hint files to jump directly to error locations (read ±10 lines around each hinted line number before loading the full log or artifact).
+**Start here**: Read `/tmp/gh-aw/agent/ci-doctor/summary.txt` first — it lists every file location and the first few hint matches. Then examine the relevant hint files to jump directly to error locations (read ±10 lines around each hinted line number before loading the full log or artifact).
 
 ## Investigation Protocol
 
 **ONLY proceed if the workflow conclusion is 'failure' or 'cancelled'**. If the workflow was successful, **call the `noop` tool** immediately and exit.
 
 ### Phase 1: Initial Triage
+
 1. **Verify Failure**: Check that `${{ github.event.workflow_run.conclusion }}` is `failure` or `cancelled`
    - **If the workflow was successful**: Call the `noop` tool with message "CI workflow completed successfully - no investigation needed" and **stop immediately**. Do not proceed with any further analysis.
    - **If the workflow failed or was cancelled**: Proceed with the investigation steps below.
@@ -325,10 +330,10 @@ Logs and artifacts have been pre-downloaded before this session started:
 4. **Quick Assessment**: Determine if this is a new type of failure or a recurring pattern
 
 ### Phase 2: Deep Log Analysis
-1. **Use Pre-Downloaded Logs and Artifacts**: Use the files in `/tmp/ci-doctor/`:
+1. **Use Pre-Downloaded Logs and Artifacts**: Use the files in `/tmp/gh-aw/agent/ci-doctor/`:
    - Read the summary and hint files first (minimal context load)
    - Read ±10 lines around each hinted line number in the full log or artifact file
-   - Check `/tmp/ci-doctor/artifacts/` for any structured output (test reports, coverage, etc.)
+   - Check `/tmp/gh-aw/agent/ci-doctor/artifacts/` for any structured output (test reports, coverage, etc.)
    - Only load the full log content if the hints are insufficient
 2. **Fallback Log Retrieval**: If pre-downloaded files are unavailable, use `get_job_logs` with `failed_only=true`, `return_content=true`, and `tail_lines=100` to get the most relevant portion of logs directly (avoids downloading large blob files). Do NOT use `web-fetch` on blob storage log URLs.
 3. **Pattern Recognition**: Analyze logs for:
@@ -346,8 +351,9 @@ Logs and artifacts have been pre-downloaded before this session started:
    - Timing patterns
 
 ### Phase 3: Historical Context Analysis
+
 1. **Search Investigation History**: Use file-based storage to search for similar failures:
-   - Read from cached investigation files in `/tmp/memory/investigations/`
+   - Read from cached investigation files in `/tmp/gh-aw/agent/memory/investigations/`
    - Parse previous failure patterns and solutions
    - Look for recurring error signatures
 2. **Issue History**: Search existing issues for related problems
@@ -355,6 +361,7 @@ Logs and artifacts have been pre-downloaded before this session started:
 4. **PR Context**: If triggered by a PR, analyze the changed files
 
 ### Phase 4: Root Cause Investigation
+
 1. **Categorize Failure Type**:
    - **Code Issues**: Syntax errors, logic bugs, test failures
    - **Infrastructure**: Runner issues, network problems, resource constraints
@@ -370,11 +377,12 @@ Logs and artifacts have been pre-downloaded before this session started:
    - For timeout issues: Identify slow operations and bottlenecks
 
 ### Phase 5: Pattern Storage and Knowledge Building
+
 1. **Store Investigation**: Save structured investigation data to files:
-   - Write investigation report to `/tmp/memory/investigations/<timestamp>-<run-id>.json`
+   - Write investigation report to `/tmp/gh-aw/agent/memory/investigations/<timestamp>-<run-id>.json`
      - **Important**: Use filesystem-safe timestamp format `YYYY-MM-DD-HH-MM-SS-sss` (e.g., `2026-02-12-11-20-45-458`)
      - **Do NOT use** ISO 8601 format with colons (e.g., `2026-02-12T11:20:45.458Z`) - colons are not allowed in artifact filenames
-   - Store error patterns in `/tmp/memory/patterns/`
+   - Store error patterns in `/tmp/gh-aw/agent/memory/patterns/`
    - Maintain an index file of all investigations for fast searching
 2. **Update Pattern Database**: Enhance knowledge with new findings by updating pattern files
 3. **Save Artifacts**: Store detailed logs and analysis in the cached directories
@@ -500,8 +508,8 @@ You **MUST** always end by calling exactly one of these safe output tools before
 
 ## Cache Usage Strategy
 
-- Store investigation database and knowledge patterns in `/tmp/memory/investigations/` and `/tmp/memory/patterns/`
-- Cache detailed log analysis and artifacts in `/tmp/investigation/logs/` and `/tmp/investigation/reports/`
+- Store investigation database and knowledge patterns in `/tmp/gh-aw/agent/memory/investigations/` and `/tmp/gh-aw/agent/memory/patterns/`
+- Cache detailed log analysis and artifacts in `/tmp/gh-aw/agent/investigation/logs/` and `/tmp/gh-aw/agent/investigation/reports/`
 - Persist findings across workflow runs using GitHub Actions cache
 - Build cumulative knowledge about failure patterns and solutions using structured JSON files
 - Use file-based indexing for fast pattern matching and similarity detection

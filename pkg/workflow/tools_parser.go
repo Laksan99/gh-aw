@@ -52,12 +52,11 @@ package workflow
 import (
 	"fmt"
 	"maps"
-	"os"
 	"strconv"
 	"strings"
 
-	"github.com/github/gh-aw/pkg/console"
 	"github.com/github/gh-aw/pkg/logger"
+	"github.com/github/gh-aw/pkg/setutil"
 )
 
 var toolsParserLog = logger.New("workflow:tools_parser")
@@ -156,26 +155,27 @@ func NewTools(toolsMap map[string]any) *Tools {
 	}
 
 	// Extract custom MCP tools (anything not in the known list)
-	knownTools := map[string]bool{
-		"github":            true,
-		"bash":              true,
-		"web-fetch":         true,
-		"web-search":        true,
-		"edit":              true,
-		"playwright":        true,
-		"agentic-workflows": true,
-		"cache-memory":      true,
-		"comment-memory":    true,
-		"repo-memory":       true,
-		"safety-prompt":     true,
-		"timeout":           true,
-		"startup-timeout":   true,
-		"cli-proxy":         true,
+	knownTools := map[string]struct {
+	}{
+		"github":            {},
+		"bash":              {},
+		"web-fetch":         {},
+		"web-search":        {},
+		"edit":              {},
+		"playwright":        {},
+		"agentic-workflows": {},
+		"cache-memory":      {},
+		"comment-memory":    {},
+		"repo-memory":       {},
+		"safety-prompt":     {},
+		"timeout":           {},
+		"startup-timeout":   {},
+		"cli-proxy":         {},
 	}
 
 	customCount := 0
 	for name, config := range toolsMap {
-		if !knownTools[name] {
+		if !setutil.Contains(knownTools, name) {
 			tools.Custom[name] = parseMCPServerConfig(config)
 			customCount++
 		}
@@ -209,17 +209,17 @@ func parseGitHubTool(val any) *GitHubToolConfig {
 			ReadOnly: true, // default to read-only for security
 		}
 
-		if allowed, ok := configMap["allowed"].([]any); ok {
-			config.Allowed = make(GitHubAllowedTools, 0, len(allowed))
-			for _, item := range allowed {
-				if str, ok := item.(string); ok {
-					config.Allowed = append(config.Allowed, GitHubToolName(str))
-				}
+		if allowedSetting, ok := configMap["allowed"]; ok {
+			// Tool call limits are enforced by MCP guard policies; parser keeps only tool names.
+			allowedTools, _ := parseGitHubAllowedToolsAndLimits(allowedSetting)
+			config.Allowed = make(GitHubAllowedTools, 0, len(allowedTools))
+			for _, toolName := range allowedTools {
+				config.Allowed = append(config.Allowed, GitHubToolName(toolName))
 			}
 		}
 
 		if mode, ok := configMap["mode"].(string); ok {
-			config.Mode = mode
+			config.Mode = GitHubMCPMode(mode)
 		}
 		if mcpType, ok := configMap["type"].(string); ok {
 			config.Type = mcpType
@@ -292,8 +292,9 @@ func parseGitHubTool(val any) *GitHubToolConfig {
 		if allowedRepos, ok := configMap["allowed-repos"]; ok {
 			config.AllowedRepos = allowedRepos // Store as-is, validation will happen later
 		} else if repos, ok := configMap["repos"]; ok {
-			// Deprecated: use 'allowed-repos' instead of 'repos'
-			fmt.Fprintln(os.Stderr, console.FormatWarningMessage("'tools.github.repos' is deprecated. Use 'tools.github.allowed-repos' instead. Run 'gh aw fix' to automatically migrate."))
+			// Deprecated: use 'allowed-repos' instead of 'repos'.
+			// The deprecation warning is emitted by the generic schema-driven walker in
+			// warnDeprecatedFrontmatterFields; no extra hard-coded warning is needed here.
 			config.AllowedRepos = repos // Populate canonical field for validation
 		}
 		if integrity, ok := configMap["min-integrity"].(string); ok {
@@ -497,6 +498,9 @@ func parseWebSearchTool(val any) *WebSearchToolConfig {
 
 // parseEditTool converts raw edit tool configuration
 func parseEditTool(val any) *EditToolConfig {
+	if boolVal, ok := val.(bool); ok && !boolVal {
+		return nil
+	}
 	// edit is either nil or an empty object
 	return &EditToolConfig{}
 }
@@ -696,24 +700,25 @@ func parseMCPServerConfig(val any) MCPServerConfig {
 	}
 
 	// Store any unknown fields in CustomFields
-	knownFields := map[string]bool{
-		"command":        true,
-		"args":           true,
-		"env":            true,
-		"mode":           true,
-		"type":           true,
-		"version":        true,
-		"toolsets":       true,
-		"url":            true,
-		"headers":        true,
-		"container":      true,
-		"entrypoint":     true,
-		"entrypointArgs": true,
-		"mounts":         true,
+	knownFields := map[string]struct {
+	}{
+		"command":        {},
+		"args":           {},
+		"env":            {},
+		"mode":           {},
+		"type":           {},
+		"version":        {},
+		"toolsets":       {},
+		"url":            {},
+		"headers":        {},
+		"container":      {},
+		"entrypoint":     {},
+		"entrypointArgs": {},
+		"mounts":         {},
 	}
 
 	for key, value := range configMap {
-		if !knownFields[key] {
+		if !setutil.Contains(knownFields, key) {
 			config.CustomFields[key] = value
 		}
 	}

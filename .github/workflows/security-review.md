@@ -1,4 +1,6 @@
 ---
+private: true
+emoji: "🔒"
 description: Security-focused AI agent that reviews pull requests to identify changes that could weaken security posture or extend AWF boundaries
 on:
   slash_command:
@@ -12,6 +14,7 @@ permissions:
   discussions: read
   issues: read
   security-events: read
+  copilot-requests: write
 tools:
   github:
     toolsets: [all]
@@ -21,7 +24,7 @@ tools:
   web-fetch:
 safe-outputs:
   messages:
-    footer: "> 🔒 *Security review by [{workflow_name}]({run_url})*{effective_tokens_suffix}{history_link}"
+    footer: "> 🔒 *Security review by [{workflow_name}]({run_url})*{ai_credits_suffix}{history_link}"
     run-started: "🔍 [{workflow_name}]({run_url}) is analyzing this {event_type} for security implications..."
     run-success: "🔒 [{workflow_name}]({run_url}) completed the security review."
     run-failure: "⚠️ [{workflow_name}]({run_url}) {status} during security review."
@@ -30,7 +33,7 @@ imports:
   - uses: shared/pr-review-base.md
   - shared/security-analysis-base.md
 
-  - shared/observability-otlp.md
+  - shared/otlp.md
 ---
 
 # Security Review Agent 🔒

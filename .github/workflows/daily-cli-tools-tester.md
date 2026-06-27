@@ -1,13 +1,20 @@
 ---
+private: true
+emoji: "🧪"
 description: Daily exploratory testing of audit, logs, and compile tools in gh-aw CLI
 on:
   schedule: daily
   workflow_dispatch:
+max-ai-credits: 1500
+max-daily-ai-credits: 10000
 permissions:
   contents: read
   issues: read
   pull-requests: read
   actions: read
+sandbox:
+  agent:
+    sudo: false
 tools:
   cli-proxy: true
   agentic-workflows:
@@ -28,9 +35,9 @@ imports:
       title-prefix: "[cli-tools-test] "
       expires: 3d
 
-  - shared/observability-otlp.md
-firewall:
-  effective-token-steering: true
+  - shared/otlp.md
+features:
+  gh-aw-detection: true
 ---
 
 # Daily CLI Tools Exploratory Tester
@@ -56,6 +63,12 @@ When problems are detected, create detailed GitHub issues with reproduction step
 - **`compile` calls**: Use targeted compilation of 3 representative workflows instead of bulk compilation when the goal is validation.
 - **Parallel batching**: Combine independent tool calls into a single turn whenever possible (e.g. run 2–3 targeted compiles in parallel rather than sequentially).
 - **Skip redundant variants**: If a test variant (e.g. a second date-range filter) would produce essentially the same signal as one already run, skip it and document the skip reason.
+
+## Command Guardrails (Required)
+
+- Do **NOT** repeatedly retry variations of the same blocked command.
+- If a command fails due to permission/policy, stop that approach immediately and use `report_incomplete` with the blocked command and error.
+- If you hit repeated permission-denied errors for the same action, short-circuit instead of continuing retries.
 
 ## Available Tools
 
@@ -429,14 +442,14 @@ Test whether compilation correctly detects changes:
 
 ```bash
 # Record current state
-ls -la .github/workflows/*.lock.yml > /tmp/before.txt
+ls -la .github/workflows/*.lock.yml > /tmp/gh-aw/agent/before.txt
 
 # Compile again without changes
 # Use the "compile" tool to recompile all workflows
 
 # Check if lock files changed
-ls -la .github/workflows/*.lock.yml > /tmp/after.txt
-diff /tmp/before.txt /tmp/after.txt
+ls -la .github/workflows/*.lock.yml > /tmp/gh-aw/agent/after.txt
+diff /tmp/gh-aw/agent/before.txt /tmp/gh-aw/agent/after.txt
 ```
 
 **Expected**: Lock files should not change if markdown source hasn't changed
@@ -539,7 +552,7 @@ Monitor resource consumption during testing:
 
 ```bash
 # Check disk usage
-df -h /tmp/gh-aw/
+df -h /tmp/gh-aw/agent/
 
 # Count log files downloaded
 find /tmp/gh-aw/aw-mcp/logs/ -type f | wc -l

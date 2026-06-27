@@ -1,7 +1,7 @@
 # Security Architecture Specification Validation
 
 **Document**: Validation of `security-architecture-spec.md` against compiled `.lock.yml` files  
-**Date**: January 29, 2026  
+**Date**: May 15, 2026  
 **Validator**: GitHub Copilot Agent  
 **Scope**: Cross-reference specification requirements with actual implementation
 
@@ -9,7 +9,7 @@
 
 ## Executive Summary
 
-✅ **VALIDATION RESULT**: The specification accurately reflects the implementation in compiled `.lock.yml` files and JavaScript implementation.
+✅ **VALIDATION RESULT**: The specification accurately reflects the implementation in compiled `.lock.yml` files and JavaScript implementation (revalidated on 2026-05-15).
 
 All major security architecture claims in the specification have been verified against actual workflow implementations:
 - ✅ Job architecture (activation, agent, safe_outputs)
@@ -472,6 +472,19 @@ concurrency:
 
 ---
 
+## Revalidation Cadence
+
+Whenever any of the following occur, re-run this validation:
+
+1. `specs/security-architecture-spec.md` changes any MUST/SHALL-level requirement, compliance-test mapping, or security guarantee wording.
+2. Compiler or runtime changes alter compiled job structure, permission separation, threat-detection placement, timestamp validation, or other `.lock.yml` security behaviors described in this report.
+3. Companion security specifications (`scratchpad/guard-policies-specification.md`, `scratchpad/github-mcp-access-control-specification.md`) add or revise GitHub guard-policy or runtime-access-control behaviors that the top-level security architecture depends on.
+4. Validation evidence files, example workflows, or implementation locations cited in the Detailed Validation table move or change substantially.
+
+For each revalidation pass, reviewers SHOULD rerun the Detailed Validation procedure above, refresh the evidence-location table, update the Minor Discrepancies section, and revise the validation grade if any claim is no longer fully verified.
+
+---
+
 ## Recommendations for Specification Enhancement
 
 ### 1. Add Concrete Job Dependency Diagram
@@ -536,7 +549,7 @@ All major security claims are verifiable:
 - Action pinning to immutable SHAs
 - Runtime timestamp validation
 
-The specification provides an accurate and comprehensive formalization of the security architecture that can be confidently used for:
+The specification provides an accurate formalization of the security architecture that can be used for:
 - Security audits and reviews
 - Implementation in other CI/CD platforms
 - Compliance certification

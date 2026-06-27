@@ -1,22 +1,30 @@
 ---
+private: true
+emoji: "📊"
 description: Tracks and visualizes daily code metrics and trends to monitor repository health and development patterns
 on:
   schedule: daily
   workflow_dispatch:
+max-daily-ai-credits: 10000
 permissions:
   contents: read
   issues: read
   pull-requests: read
 tracker-id: daily-code-metrics
 engine: claude
+sandbox:
+  agent:
+    sudo: false
 tools:
   cli-proxy: true
+  github:
+    mode: gh-proxy
   repo-memory:
     branch-prefix: daily
     description: "Historical code quality and health metrics"
     file-glob: ["*.json", "*.jsonl", "*.csv", "*.md"]
     max-file-size: 102400  # 100KB
-    max-patch-size: 51200  # 50KB - increased from default 10KB to handle history.jsonl growth
+    max-patch-size: 131072  # 128KB - increased from 50KB to prevent history.jsonl truncation failures
   bash: true
 timeout-minutes: 30
 strict: true
@@ -28,9 +36,25 @@ imports:
   - shared/trends.md
 
 
-  - shared/observability-otlp.md
-firewall:
-  effective-token-steering: true
+  - shared/otlp.md
+experiments:
+  output_format:
+    variants: [full_detail, executive_summary]
+    description: "Tests whether a concise executive summary report drives higher reader engagement than the current full-detail 6-chart report."
+    hypothesis: "H0: no change in discussion engagement rate. H1: executive_summary variant increases discussion reactions+comments by ≥20% due to improved readability."
+    metric: discussion_engagement_score
+    secondary_metrics: [output_token_count, run_duration_seconds, chart_count]
+    guardrail_metrics:
+      - name: report_empty_rate
+        threshold: "<=0"
+      - name: quality_score_present
+        threshold: ">=1"
+    min_samples: 20
+    weight: [50, 50]
+    start_date: "2026-05-16"
+    issue: 1
+features:
+  gh-aw-detection: true
 ---
 {{#runtime-import? .github/shared-instructions.md}}
 
@@ -55,9 +79,9 @@ All metrics use standardized names from scratchpad/metrics-glossary.md:
 **Tests**: Test files/LOC (`test_lines_of_code`), test-to-source ratio (`test_to_source_ratio`)
 
 **Churn (7d)**: Files modified, commits, lines added/deleted, most active files (requires `git fetch --unshallow`)
-  - **IMPORTANT**: Exclude generated `*.lock.yml` files from churn calculations to avoid noise
-  - Calculate separate churn metrics: source code churn vs workflow lock file churn
-  - Use source code churn (excluding `*.lock.yml`) for quality score calculation
+  - **IMPORTANT**: Exclude generated files (`*.lock.yml`, `actions-lock.json`) from churn calculations to avoid noise
+  - Calculate separate churn metrics: source code churn vs generated file churn
+  - Use source code churn (excluding `*.lock.yml` and `actions-lock.json`) for quality score calculation
 
 **Workflows**: Total `.md` files (`total_workflows`), `.lock.yml` files, avg workflow size in `.github/workflows`
 
@@ -95,73 +119,37 @@ Store as JSON Lines in `/tmp/gh-aw/repo-memory/default/history.jsonl`:
 }
 ```
 
-**Note**: Churn metrics are split into `source` (excludes `*.lock.yml`) and `lock_files` (only `*.lock.yml`) for separate tracking.
+**Note**: Churn metrics are split into `source` (excludes `*.lock.yml` and `actions-lock.json`) and `generated_files` (only `*.lock.yml` and `actions-lock.json`) for separate tracking.
 
 ## Data Visualization with Python
 
+{{#if experiments.output_format == 'full_detail' }}
 Generate **6 high-quality charts** to visualize code metrics and trends using Python, matplotlib, and seaborn. All charts must be uploaded as assets and embedded in the discussion report.
 
 ### Required Charts
 
-#### 1. LOC by Language (`loc_by_language.png`)
-**Type**: Horizontal bar chart
-**Content**: Distribution of lines of code by programming language
-- Sort by LOC descending
-- Include percentage labels on bars
-- Use color-coding by language type (e.g., compiled vs interpreted)
-- Show total LOC in title
-- Save to: `/tmp/gh-aw/python/charts/loc_by_language.png`
+| # | Filename | Description |
+|---|----------|-------------|
+| 1 | `loc_by_language.png` | Horizontal bar chart of LOC by language (sorted descending, percentage labels, language-type colors, total LOC in title). |
+| 2 | `top_directories.png` | Horizontal bar chart of top 10 directories by LOC (full paths, LOC and percent, highlight `cmd`/`pkg`/`docs`/`workflows`, distinct directory-type colors). |
+| 3 | `quality_score_breakdown.png` | Stacked bar or pie breakdown: Test Coverage 30%, Code Organization 25%, Documentation 20%, Churn Stability 15%, Comment Density 10%; show current vs target with red→green gradient. |
+| 4 | `test_coverage.png` | Grouped comparison of test vs source LOC by language, ratio visualization, optional trend indicator, recommended ratio marker (0.5–1.0). |
+| 5 | `code_churn.png` | Diverging bars for top 10 most changed source files (7d); **exclude** `*.lock.yml` and `actions-lock.json`; show added/deleted/net, color by file type. |
+| 6 | `historical_trends.png` | Multi-line 30-day trends for total LOC, test coverage %, and quality score with optional multi-axis scales, 7-day moving averages, and >10% annotations. |
 
-#### 2. Top Directories (`top_directories.png`)
-**Type**: Horizontal bar chart
-**Content**: Top 10 directories by lines of code
-- Show full directory paths
-- Display LOC count and percentage of total codebase
-- Highlight key directories (cmd, pkg, docs, workflows)
-- Use distinct colors for different directory types
-- Save to: `/tmp/gh-aw/python/charts/top_directories.png`
+All charts save to `/tmp/gh-aw/python/charts/<filename>`.
+{{#else}}
+Generate **2 high-quality charts** focusing on the most actionable signals:
 
-#### 3. Quality Score Breakdown (`quality_score_breakdown.png`)
-**Type**: Stacked bar or pie chart with breakdown
-**Content**: Quality score component breakdown
-- Test Coverage: 30%
-- Code Organization: 25%
-- Documentation: 20%
-- Churn Stability: 15%
-- Comment Density: 10%
-- Show current score vs target (100%) for each component
-- Use color gradient from red (poor) to green (excellent)
-- Save to: `/tmp/gh-aw/python/charts/quality_score_breakdown.png`
+### Required Charts
 
-#### 4. Test Coverage (`test_coverage.png`)
-**Type**: Grouped bar chart or side-by-side comparison
-**Content**: Test vs source code comparison
-- Test LOC vs Source LOC by language
-- Test-to-source ratio visualization
-- Include trend indicator if historical data available
-- Highlight recommended ratio (e.g., 0.5-1.0)
-- Save to: `/tmp/gh-aw/python/charts/test_coverage.png`
+| # | Filename | Description |
+|---|----------|-------------|
+| 1 | `quality_score_breakdown.png` | Stacked bar or pie breakdown: Test Coverage 30%, Code Organization 25%, Documentation 20%, Churn Stability 15%, Comment Density 10%; show current vs target with red→green gradient. |
+| 2 | `historical_trends.png` | Multi-line 30-day trends for total LOC, test coverage %, and quality score with optional multi-axis scales, 7-day moving averages, and >10% annotations. |
 
-#### 5. Code Churn (`code_churn.png`)
-**Type**: Diverging bar chart
-**Content**: Top 10 most changed source files in last 7 days
-- **EXCLUDE** `*.lock.yml` files (generated workflow files)
-- Show lines added (positive) and deleted (negative)
-- Net change highlighting
-- Color-code by file type
-- Include file paths truncated if needed
-- Save to: `/tmp/gh-aw/python/charts/code_churn.png`
-
-#### 6. Historical Trends (`historical_trends.png`)
-**Type**: Multi-line time series chart
-**Content**: Track key metrics over 30 days
-- Total LOC trend line
-- Test coverage percentage trend line
-- Quality score trend line
-- Use multiple y-axes if scales differ significantly
-- Show 7-day moving averages
-- Annotate significant changes (>10%)
-- Save to: `/tmp/gh-aw/python/charts/historical_trends.png`
+All charts save to `/tmp/gh-aw/python/charts/<filename>`.
+{{/if}}
 
 ### Chart Quality Standards
 
@@ -169,21 +157,21 @@ All charts must meet these quality standards:
 
 - **DPI**: 300 minimum for publication quality
 - **Figure Size**: 12x7 inches (consistent with daily-issues-report)
-- **Styling**: Use seaborn styling (`sns.set_style("whitegrid")`)
-- **Color Palette**: Professional colors (`sns.set_palette("husl")` or custom)
 - **Labels**: Clear titles, axis labels, and legends
 - **Grid Lines**: Enable for readability (`ax.grid(True, alpha=0.3)`)
 - **Save Format**: PNG with `bbox_inches='tight'` for proper cropping
 
 ### Python Script Structure
 
-Create a Python script to collect data, analyze metrics, and generate all 6 charts:
+Create a Python script to collect data, analyze metrics, and generate the charts required for the selected output format variant:
+
+Read the selected variant from environment variable `GH_AW_EXPERIMENTS_OUTPUT_FORMAT` and branch chart generation logic accordingly.
 
 ```python
 #!/usr/bin/env python3
 """
 Daily Code Metrics Analysis and Visualization
-Generates 6 charts for code metrics tracking
+Generates code metrics charts for the selected output format variant
 """
 import pandas as pd
 import numpy as np
@@ -193,9 +181,7 @@ from datetime import datetime, timedelta
 import json
 from pathlib import Path
 
-# Set style
-sns.set_style("whitegrid")
-sns.set_palette("husl")
+# Apply canonical chart setup (see python-dataviz.md Chart Generation Best Practices)
 
 # Load historical data from repo-memory
 history_file = Path('/tmp/gh-aw/repo-memory/default/history.jsonl')
@@ -209,23 +195,11 @@ if history_file.exists():
 # (Collect metrics using bash commands and save to JSON first)
 current_metrics = json.load(open('/tmp/gh-aw/python/data/current_metrics.json'))
 
-# Generate each chart
-# Chart 1: LOC by Language
+# Generate required charts for selected variant
+# Chart: Quality Score Breakdown
 # ... implementation ...
 
-# Chart 2: Top Directories  
-# ... implementation ...
-
-# Chart 3: Quality Score Breakdown
-# ... implementation ...
-
-# Chart 4: Test Coverage
-# ... implementation ...
-
-# Chart 5: Code Churn
-# ... implementation ...
-
-# Chart 6: Historical Trends
+# Chart: Historical Trends
 # ... implementation ...
 
 print("All charts generated successfully")
@@ -272,41 +246,50 @@ Use detailed template with embedded visualization charts:
 
 ### Discussion Structure
 
-**Title**: `Daily Code Metrics Report - YYYY-MM-DD`
-
-**Body**:
+- **Title**: `Daily Code Metrics Report - YYYY-MM-DD`
+- **Body template**:
 
 ```markdown
+{{#if experiments.output_format == 'executive_summary' }}
+**Key metrics today**: LOC: X,XXX | Quality score: XX/100 | Test ratio: X.XX | Active files (7d): XXX
+
+### 📊 Key Visualizations
+
+![Quality Score](URL_FROM_UPLOAD_ASSET)
+
+![Historical Trends](URL_FROM_UPLOAD_ASSET)
+
+### 💡 Top Recommendations
+- [Recommendation 1]
+- [Recommendation 2]
+- [Recommendation 3]
+
+*For full metric tables, switch to `full_detail` variant.*
+{{else}}
 Brief 2-3 paragraph executive summary highlighting key findings, quality score, notable trends, and any concerns requiring attention.
 
 ### 📊 Visualizations
 
-#### LOC Distribution by Language
 ![LOC by Language](URL_FROM_UPLOAD_ASSET)
 
 [Analysis of language distribution and changes]
 
-#### Top Directories by LOC
 ![Top Directories](URL_FROM_UPLOAD_ASSET)
 
 [Analysis of directory sizes and organization]
 
-#### Quality Score Breakdown
 ![Quality Score](URL_FROM_UPLOAD_ASSET)
 
 [Current quality score and component analysis]
 
-#### Test Coverage Analysis
 ![Test Coverage](URL_FROM_UPLOAD_ASSET)
 
 [Test coverage metrics and recommendations]
 
-#### Code Churn (Last 7 Days)
 ![Code Churn](URL_FROM_UPLOAD_ASSET)
 
-[Most changed source files and activity patterns - excludes generated *.lock.yml files]
+[Most changed source files and activity patterns - excludes generated *.lock.yml and actions-lock.json files]
 
-#### Historical Trends (30 Days)
 ![Historical Trends](URL_FROM_UPLOAD_ASSET)
 
 [Trend analysis and significant changes]
@@ -315,15 +298,12 @@ Brief 2-3 paragraph executive summary highlighting key findings, quality score, 
 <summary>📈 Detailed Metrics</summary>
 
 ### Size Metrics
-
-#### Lines of Code by Language
 | Language | LOC | % of Total | Change (7d) |
 |----------|-----|------------|-------------|
 | Go | X,XXX | XX% | ⬆️ +X% |
 | JavaScript | X,XXX | XX% | ➡️ 0% |
 | ... | ... | ... | ... |
 
-#### Lines of Code by Directory
 | Directory | LOC | % of Total | Files |
 |-----------|-----|------------|-------|
 | pkg/ | X,XXX | XX% | XXX |
@@ -349,27 +329,22 @@ Brief 2-3 paragraph executive summary highlighting key findings, quality score, 
 
 ### Code Churn (Last 7 Days)
 
-#### Source Code Churn (Excludes *.lock.yml)
-
 - **Files Modified**: XXX files
 - **Commits**: XXX commits
 - **Lines Added**: +X,XXX lines
 - **Lines Deleted**: -X,XXX lines
 - **Net Change**: +/-X,XXX lines
 
-#### Most Active Source Files
-1. path/to/file.go: +XXX/-XXX lines
-2. path/to/file.js: +XXX/-XXX lines
-...
+**Most Active Source Files**: path/to/file.go (+XXX/-XXX), path/to/file.js (+XXX/-XXX), ...
 
-#### Workflow Lock File Churn (*.lock.yml only)
+### Generated File Churn (*.lock.yml and actions-lock.json)
 
-- **Lock Files Modified**: XXX files
+- **Generated Files Modified**: XXX files
 - **Lines Added**: +X,XXX lines
 - **Lines Deleted**: -X,XXX lines
 - **Net Change**: +/-X,XXX lines
 
-**Note**: Lock file churn is reported separately and excluded from quality score calculations to avoid noise from generated files.
+**Note**: Generated file churn (`.lock.yml` and `actions-lock.json`) is reported separately and excluded from quality score calculations to avoid noise from code-generated files.
 
 ### Workflow Metrics
 
@@ -386,8 +361,6 @@ Brief 2-3 paragraph executive summary highlighting key findings, quality score, 
 - **Documentation Coverage**: XX%
 
 ### Quality Score: XX/100
-
-#### Component Breakdown
 - **Test Coverage (30%)**: XX/30 points
 - **Code Organization (25%)**: XX/25 points
 - **Documentation (20%)**: XX/20 points
@@ -406,15 +379,16 @@ Brief 2-3 paragraph executive summary highlighting key findings, quality score, 
 ---
 *Report generated by Daily Code Metrics workflow*
 *Historical data: 30 days | Last updated: YYYY-MM-DD HH:MM UTC*
+{{/if}}
 ```
 
 ### Report Guidelines
 
 - **Report Formatting**: Use h3 (###) or lower for all headers in your report to maintain proper document hierarchy. Wrap long sections in `<details><summary>Section Name</summary>` tags to improve readability and reduce scrolling.
-- Include all 6 visualization charts as embedded images
+- Include variant-appropriate visualization charts as embedded images (6 for `full_detail`, 2 for `executive_summary`)
 - Upload charts using `upload asset` tool for permanent URLs
 - Provide brief analysis for each chart
-- Use collapsible details section for detailed metrics tables
+- Use collapsible details section for detailed metrics tables in `full_detail` mode
 - Highlight trends with emoji indicators (⬆️/➡️/⬇️)
 - Calculate and display quality score prominently
 - Provide 3-5 actionable recommendations
@@ -426,13 +400,13 @@ Weighted average: Test coverage (30%), Code organization (25%), Documentation (2
 
 ### Churn Stability Component (15% of Quality Score)
 
-**CRITICAL**: Use **source code churn only** (exclude `*.lock.yml` files) when calculating churn stability for the quality score.
+**CRITICAL**: Use **source code churn only** (exclude `*.lock.yml` and `actions-lock.json` files) when calculating churn stability for the quality score.
 
 **Calculation**:
-1. Calculate source code churn: `git log --since="7 days ago" --numstat --pretty=format: -- . ':!*.lock.yml'`
+1. Calculate source code churn: `git log --since="7 days ago" --numstat --pretty=format: -- . ':!*.lock.yml' ':!**/actions-lock.json'`
 2. Compute churn score based on files modified and net change (lower churn = higher stability)
 3. Normalize to 0-15 points scale
-4. Track workflow lock file churn separately for informational purposes only
+4. Track generated file churn separately for informational purposes only
 
 This ensures the quality score reflects actionable source code volatility, not noise from generated files.
 
@@ -443,7 +417,7 @@ This ensures the quality score reflects actionable source code volatility, not n
 - Use repo memory for persistent history (90-day retention)
 - Handle missing data gracefully
 - Visual indicators for quick scanning
-- Generate all 6 required visualization charts
+- Generate variant-appropriate required visualization charts (6 for `full_detail`, 2 for `executive_summary`)
 - Upload charts as assets for permanent URLs
 - Embed charts in discussion report with analysis
 - Store metrics to repo memory, create discussion report with visualizations

@@ -24,10 +24,10 @@ In our [previous posts](/gh-aw/blog/2026-01-13-meet-the-workflows-continuous-sim
 
 ## Continuous Improvement Workflows
 
-- **[Go Module Usage Expert (aka Go Fan)](https://github.com/github/gh-aw/blob/v0.45.5/.github/workflows/go-fan.md?plain=1)** - Daily Go module usage reviewer  
-- **[Typist](https://github.com/github/gh-aw/blob/v0.45.5/.github/workflows/typist.md?plain=1)** - Analyzes type usage patterns for improved safety  
+- **[Go Module Usage Expert (aka Go Fan)](https://github.com/github/gh-aw/blob/main/.github/workflows/go-fan.md?plain=1)** - Daily Go module usage reviewer  
+- **[Typist](https://github.com/github/gh-aw/blob/main/.github/workflows/typist.md?plain=1)** - Analyzes type usage patterns for improved safety  
 - **[Functional Pragmatist](https://github.com/github/gh-aw/blob/main/.github/workflows/functional-programming-enhancer.md?plain=1)** - Applies functional techniques pragmatically  
-- **[Repository Quality Improver](https://github.com/github/gh-aw/blob/v0.45.5/.github/workflows/repository-quality-improver.md?plain=1)** - Holistic code quality analysis  
+- **[Repository Quality Improver](https://github.com/githubnext/agentics/blob/main/workflows/repository-quality-improver.md?plain=1)** - Holistic code quality analysis  
 
 ### Go Module Usage Expert: The Dependency Enthusiast 🐹
 
@@ -41,7 +41,7 @@ This ensures recently updated modules get reviewed first since new features migh
 
 For each module, Go Module Usage Expert researches the repository (releases, docs, best practices), analyzes actual usage patterns using Serena, and generates actionable recommendations. It saves summaries under `scratchpad/mods/` and opens GitHub Discussions.
 
-The output of Go Module Usage Expert is a discussion, which is then often "task mined" for actionable tasks using the [TaskOps](https://github.github.com/gh-aw/patterns/task-ops/) design pattern.
+The output of Go Module Usage Expert is a discussion, which is then often "task mined" for actionable tasks using the [ResearchPlanAssignOps](https://github.github.com/gh-aw/patterns/research-plan-assign-ops/) design pattern.
 
 Let's take a look at an example of how this works:
 
@@ -60,7 +60,7 @@ Typist looks for untyped usages: `interface{}` or `any` where specific types wou
 
 Using grep patterns and Serena's semantic analysis, it discovers type definitions, identifies semantic duplicates, analyzes untyped usage patterns, and generates refactoring recommendations.
 
-Typist also uses the [TaskOps](https://github.github.com/gh-aw/patterns/task-ops/) pattern. This means the job of Typist is not to fix code, but to analyze code and recommend possible improvements.
+Typist also uses the [ResearchPlanAssignOps](https://github.github.com/gh-aw/patterns/research-plan-assign-ops/) pattern. This means the job of Typist is not to fix code, but to analyze code and recommend possible improvements.
 
 Let's take a look at an example of this in practice:
 
@@ -119,13 +119,13 @@ You can add these workflows to your own repository and remix them. Get going wit
 **Go Module Usage Expert:**
 
 ```bash
-gh aw add-wizard https://github.com/github/gh-aw/blob/v0.45.5/.github/workflows/go-fan.md
+gh aw add-wizard https://github.com/github/gh-aw/blob/main/.github/workflows/go-fan.md
 ```
 
 **Typist:**
 
 ```bash
-gh aw add-wizard https://github.com/github/gh-aw/blob/v0.45.5/.github/workflows/typist.md
+gh aw add-wizard https://github.com/github/gh-aw/blob/main/.github/workflows/typist.md
 ```
 
 **Functional Pragmatist:**
@@ -137,7 +137,7 @@ gh aw add-wizard https://github.com/github/gh-aw/blob/main/.github/workflows/fun
 **Repository Quality Improver:**
 
 ```bash
-gh aw add-wizard https://github.com/github/gh-aw/blob/v0.45.5/.github/workflows/repository-quality-improver.md
+gh aw add-wizard https://github.com/githubnext/agentics/blob/main/workflows/repository-quality-improver.md
 ```
 
 Then edit and remix the workflow specifications to meet your needs, regenerate the lock file using `gh aw compile`, and push to your repository. See our [Quick Start](https://github.github.com/gh-aw/setup/quick-start/) for further installation and setup instructions.

@@ -13,6 +13,7 @@ import (
 	"strings"
 
 	"github.com/github/gh-aw/pkg/console"
+	"github.com/github/gh-aw/pkg/constants"
 	"github.com/github/gh-aw/pkg/parser"
 )
 
@@ -167,24 +168,22 @@ func (c *Compiler) validateStrictFirewall(engineID string, networkPermissions *N
 		}
 
 		if len(ecosystemDomainsNotAsIdentifiers) > 0 {
-			strictModeValidationLog.Printf("Engine '%s' has ecosystem domains not specified as identifiers in strict mode, emitting warning", engineID)
+			strictModeValidationLog.Printf("Engine '%s' has ecosystem domains not specified as identifiers in strict mode, emitting informational guidance", engineID)
 
-			// Build warning message with ecosystem suggestions
+			// Build informational message with ecosystem suggestions
 			var suggestions []string
 			for _, ds := range ecosystemDomainsNotAsIdentifiers {
 				suggestions = append(suggestions, fmt.Sprintf("'%s' → '%s'", ds.domain, ds.ecosystem))
 			}
 
-			warningMsg := "strict mode: recommend using ecosystem identifiers instead of individual domain names for better maintainability: " + strings.Join(suggestions, ", ")
+			infoMsg := "recommend using ecosystem identifiers instead of individual domain names for better maintainability: " + strings.Join(suggestions, ", ")
 
-			// Print warning message and increment warning count
-			fmt.Fprintln(os.Stderr, console.FormatWarningMessage(warningMsg))
-			c.IncrementWarningCount()
+			fmt.Fprintln(os.Stderr, console.FormatInfoMessage(infoMsg))
 		}
 	}
 
 	// Only apply firewall validation to copilot and codex engines
-	if engineID != "copilot" && engineID != "codex" {
+	if engineID != string(constants.CopilotEngine) && engineID != string(constants.CodexEngine) {
 		strictModeValidationLog.Printf("Engine '%s' does not support firewall, skipping firewall validation", engineID)
 		return nil
 	}

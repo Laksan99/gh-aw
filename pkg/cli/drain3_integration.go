@@ -7,6 +7,7 @@ import (
 
 	"github.com/github/gh-aw/pkg/agentdrain"
 	"github.com/github/gh-aw/pkg/logger"
+	"github.com/github/gh-aw/pkg/setutil"
 )
 
 var drain3Log = logger.New("cli:drain3_integration")
@@ -91,11 +92,10 @@ func buildDrain3InsightsMultiRun(processedRuns []ProcessedRun) []ObservabilityIn
 
 	for _, pr := range processedRuns {
 		events := buildAgentEventsFromProcessedRun(pr, MetricsData{
-			Turns:         pr.Run.Turns,
-			TokenUsage:    pr.Run.TokenUsage,
-			EstimatedCost: pr.Run.EstimatedCost,
-			ErrorCount:    pr.Run.ErrorCount,
-			WarningCount:  pr.Run.WarningCount,
+			Turns:        pr.Run.Turns,
+			TokenUsage:   pr.Run.TokenUsage,
+			ErrorCount:   pr.Run.ErrorCount,
+			WarningCount: pr.Run.WarningCount,
 		}, nil)
 		totalEvents += len(events)
 
@@ -356,12 +356,14 @@ func buildAnomalyReasons(anomalies []struct {
 	report *agentdrain.AnomalyReport
 }) string {
 	reasons := make([]string, 0, len(anomalies))
-	seen := make(map[string]bool)
+	seen := make(map[string]struct {
+	})
 	for _, a := range anomalies {
 		r := fmt.Sprintf("stage=%s score=%.2f: %s", a.evt.Stage, a.report.AnomalyScore, a.report.Reason)
-		if !seen[r] {
+		if !setutil.Contains(seen, r) {
 			reasons = append(reasons, r)
-			seen[r] = true
+			seen[r] = struct {
+			}{}
 		}
 		if len(reasons) >= 5 {
 			break

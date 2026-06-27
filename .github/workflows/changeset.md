@@ -1,4 +1,5 @@
 ---
+emoji: "📋"
 name: Changeset Generator
 description: Automatically creates changeset files when PRs are labeled with 'changeset' or 'smoke' to document changes for release notes
 on:
@@ -7,6 +8,7 @@ on:
     names: ["changeset", "smoke"]
   workflow_dispatch:
   reaction: "rocket"
+max-daily-ai-credits: 10000
 if: github.event.pull_request.base.ref == github.event.repository.default_branch
 permissions:
   contents: read
@@ -14,7 +16,7 @@ permissions:
   issues: read
 engine:
   id: codex
-  model: gpt-5.4-mini
+  model: gpt-5.4
 strict: true
 safe-outputs:
   push-to-pull-request-branch:
@@ -29,9 +31,10 @@ safe-outputs:
   update-pull-request:
     title: false
     operation: append
-  threat-detection:
-    engine: false
+  threat-detection: {}
 timeout-minutes: 20
+features:
+  gh-aw-detection: true
 network:
   allowed:
     - defaults
@@ -48,7 +51,10 @@ imports:
   - ../skills/jqschema/SKILL.md
 
 
-  - shared/observability-otlp.md
+  - shared/otlp.md
+sandbox:
+  agent:
+    sudo: false
 ---
 
 # Changeset Generator

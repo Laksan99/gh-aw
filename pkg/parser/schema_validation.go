@@ -8,6 +8,7 @@ import (
 
 	"github.com/github/gh-aw/pkg/constants"
 	"github.com/github/gh-aw/pkg/logger"
+	"github.com/github/gh-aw/pkg/setutil"
 )
 
 var schemaValidationLog = logger.New("parser:schema_validation")
@@ -34,10 +35,13 @@ var sharedWorkflowAllowedOnFields = map[string]struct{}{
 }
 
 // buildForbiddenFieldsMap converts the SharedWorkflowForbiddenFields slice to a map for efficient lookup
-func buildForbiddenFieldsMap() map[string]bool {
-	forbiddenMap := make(map[string]bool)
+func buildForbiddenFieldsMap() map[string]struct {
+} {
+	forbiddenMap := make(map[string]struct {
+	})
 	for _, field := range constants.SharedWorkflowForbiddenFields {
-		forbiddenMap[field] = true
+		forbiddenMap[field] = struct {
+		}{}
 	}
 	return forbiddenMap
 }
@@ -54,7 +58,7 @@ func validateSharedWorkflowFields(frontmatter map[string]any) error {
 			}
 			continue
 		}
-		if sharedWorkflowForbiddenFields[key] {
+		if setutil.Contains(sharedWorkflowForbiddenFields, key) {
 			forbiddenFound = append(forbiddenFound, key)
 		}
 	}
@@ -84,6 +88,8 @@ func validateSharedWorkflowOnField(onValue any) error {
 			disallowed = append(disallowed, key)
 		}
 	}
+
+	schemaValidationLog.Printf("Validating shared workflow 'on' field: %d key(s), %d disallowed", len(onMap), len(disallowed))
 
 	if len(disallowed) > 0 {
 		return fmt.Errorf(
@@ -128,6 +134,14 @@ func ValidateMainWorkflowFrontmatterWithSchemaAndLocation(frontmatter map[string
 // ValidateIncludedFileFrontmatterWithSchemaAndLocation validates included file frontmatter with file location info
 func ValidateIncludedFileFrontmatterWithSchemaAndLocation(frontmatter map[string]any, filePath string) error {
 	schemaValidationLog.Printf("Validating included file frontmatter: file=%s, fields=%d", filePath, len(frontmatter))
+
+	// Custom agent files (.github/agents/*.md) follow the Copilot agent format,
+	// which differs from the gh-aw workflow schema. Skip schema validation for them.
+	if isCustomAgentFile(filePath) {
+		schemaValidationLog.Printf("Skipping schema validation for custom agent file: %s", filePath)
+		return nil
+	}
+
 	// Filter out ignored fields before validation
 	filtered := filterIgnoredFields(frontmatter)
 
@@ -159,4 +173,10 @@ func ValidateIncludedFileFrontmatterWithSchemaAndLocation(frontmatter map[string
 func ValidateMCPConfigWithSchema(mcpConfig map[string]any) error {
 	schemaValidationLog.Printf("Validating MCP configuration against JSON schema: %d fields", len(mcpConfig))
 	return validateWithSchema(mcpConfig, mcpConfigSchema, "MCP configuration")
+}
+
+// ValidateRepositoryPackageManifestWithSchemaAndLocation validates an aw.yml repository package manifest.
+func ValidateRepositoryPackageManifestWithSchemaAndLocation(manifest map[string]any, filePath string) error {
+	schemaValidationLog.Printf("Validating repository package manifest: file=%s, fields=%d", filePath, len(manifest))
+	return validateWithSchemaAndLocation(manifest, awManifestSchema, "Agentic Workflow manifest", filePath)
 }

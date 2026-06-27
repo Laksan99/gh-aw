@@ -1,57 +1,75 @@
 ---
-description: Deep research analyzing Copilot CLI current state, available features, and missed optimization opportunities
+private: true
 on:
   schedule:
-    - cron: daily
+  - cron: daily
+max-daily-ai-credits: 10000
 permissions:
+  actions: read
   contents: read
+  discussions: read
   issues: read
   pull-requests: read
-  actions: read
-  discussions: read
-
-engine: copilot
-
+  copilot-requests: write
 network:
   allowed:
-    - defaults
-    - github
-
+  - defaults
+  - github
+imports:
+- shared/reporting.md
+- shared/otlp.md
+safe-outputs:
+  create-discussion:
+    category: research
+    close-older-discussions: true
+    expires: 1d
+    max: 1
+    title-prefix: "[copilot-cli-research] "
+description: Deep research analyzing Copilot CLI current state, available features, and missed optimization opportunities
+emoji: 🔬
+engine:
+  id: copilot
+  copilot-sdk: true
+strict: true
+timeout-minutes: 20
+sandbox:
+  agent:
+    sudo: false
 tools:
+  bash:
+  - "*"
+  - find .github -name "*.md"
+  - find .github -type f -exec cat {} +
+  - find pkg -name "copilot*.go"
+  - cat pkg/workflow/copilot*.go
+  - grep -r *
+  - git log --oneline
+  - git diff
+  - grep
+  - sort
+  - wc
+  - xargs
+  - basename
+  - echo
+  - cat
+  - ls
+  - head
+  - tail
   cli-proxy: true
   github:
     mode: gh-proxy
-    toolsets: [default, actions]
+    toolsets:
+    - default
+    - actions
   repo-memory:
     branch-name: memory/copilot-cli-research
-    description: "Copilot CLI research notes and analysis history"
-    file-glob: ["*.json", "*.md"]
-    max-file-size: 204800  # 200KB
-  bash:
-    - "find .github -name '*.md'"
-    - "find .github -type f -exec cat {} +"
-    - "find pkg -name 'copilot*.go'"
-    - "cat pkg/workflow/copilot*.go"
-    - "grep -r *"
-    - "git log --oneline"
-    - "git diff"
-
-safe-outputs:
-  create-discussion:
-    expires: 1d
-    title-prefix: "[copilot-cli-research] "
-    category: "research"
-    max: 1
-    close-older-discussions: true
-
-timeout-minutes: 20
-strict: true
-imports:
-  - shared/reporting.md
-  - shared/observability-otlp.md
+    description: Copilot CLI research notes and analysis history
+    file-glob:
+    - "*.json"
+    - "*.md"
+    max-file-size: 204800
 features:
-  copilot-requests: true
-
+  gh-aw-detection: true
 ---
 
 # Copilot CLI Deep Research Agent
@@ -69,6 +87,12 @@ You are a research agent tasked with performing a comprehensive analysis of GitH
 Conduct a thorough investigation comparing the **current state of Copilot CLI** (as documented and implemented) with **how it's actually being used** in this repository's agentic workflows.
 
 ## Research Phases
+
+### Tool Guardrails (Required)
+
+- Do **not** use inline Python shell one-liners (for example `shell(python3 -c "...")`) to read or parse repository files.
+- Prefer structured workflow tools for repository inspection (`glob`, `grep`, `view`) before falling back to shell commands.
+- Keep shell usage focused on simple allowed commands; avoid ad-hoc scripting patterns that trigger tool-denial guardrails.
 
 ### Phase 1: Inventory Current Copilot CLI Capabilities
 

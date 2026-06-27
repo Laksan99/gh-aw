@@ -2,12 +2,15 @@ package workflow
 
 import (
 	"fmt"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
 
 	"github.com/github/gh-aw/pkg/constants"
 	"github.com/github/gh-aw/pkg/logger"
+	"github.com/github/gh-aw/pkg/setutil"
+	"github.com/github/gh-aw/pkg/sliceutil"
 )
 
 var agenticEngineLog = logger.New("workflow:agentic_engine")
@@ -189,6 +192,12 @@ type LogParser interface {
 	// GetLogFileForParsing returns the log file path to use for JavaScript parsing in the workflow
 	// This may be different from the stdout/stderr log file if the engine produces separate detailed logs
 	GetLogFileForParsing() string
+
+	// GetErrorDetectionScriptId returns the name of the JavaScript script used to detect engine
+	// errors from the agent stdio log after execution. The script runs on the host runner (outside
+	// the AWF sandbox container) so it can write to GITHUB_OUTPUT. Returns empty string if the
+	// engine does not provide a post-execution error detection step.
+	GetErrorDetectionScriptId() string
 }
 
 // SecurityProvider handles security-related configuration
@@ -202,6 +211,13 @@ type SecurityProvider interface {
 	// This includes engine-specific auth tokens and the MCP gateway API key when MCP servers are present
 	// Returns: slice of secret names (e.g., ["COPILOT_GITHUB_TOKEN", "MCP_GATEWAY_API_KEY"])
 	GetRequiredSecretNames(workflowData *WorkflowData) []string
+
+	// GetSupportedEnvVarKeys returns the list of engine.env variable names that this engine
+	// explicitly supports as documented in the AWF specification. These keys are allowed to carry
+	// secrets in engine.env without triggering the strict-mode secret-leakage check.
+	// Unlike GetRequiredSecretNames, this list is static and contains only the env var keys
+	// that are purposefully exposed to the engine container via engine.env.
+	GetSupportedEnvVarKeys() []string
 }
 
 // ModelEnvVarProvider is implemented by engines whose CLIs natively read a specific
@@ -209,9 +225,19 @@ type SecurityProvider interface {
 // The default implementation in BaseEngine returns "" (no native env var).
 type ModelEnvVarProvider interface {
 	// GetModelEnvVarName returns the name of the native environment variable the CLI
-	// uses for model selection (e.g., "COPILOT_MODEL", "ANTHROPIC_MODEL", "GEMINI_MODEL").
+	// uses for model selection (e.g., "COPILOT_MODEL", "ANTHROPIC_MODEL", "ANTIGRAVITY_MODEL").
 	// Returns an empty string if the engine does not support a native model env var.
 	GetModelEnvVarName() string
+}
+
+// LLMProviderResolver is implemented by engines that support selecting
+// different inference providers at runtime (for example engine.model-provider).
+// This interface is intentionally separate from CodingAgentEngine so provider
+// concerns remain decoupled from core engine execution capabilities.
+type LLMProviderResolver interface {
+	// ResolveLLMProvider returns the effective provider for the workflow
+	// (for example "github", "anthropic", or "openai").
+	ResolveLLMProvider(workflowData *WorkflowData) string
 }
 
 // AgentFileProvider is an optional interface implemented by engines that have
@@ -338,12 +364,19 @@ func (e *BaseEngine) GetModelEnvVarName() string {
 // Engines can override this to use engine-specific log files
 func (e *BaseEngine) GetLogFileForParsing() string {
 	// Default to agent-stdio.log which contains stdout/stderr
-	return "/tmp/gh-aw/agent-stdio.log"
+	return constants.AgentStdioLogPath
 }
 
 // GetRequiredSecretNames returns an empty list by default
 // Engines must override this to specify their required secrets
 func (e *BaseEngine) GetRequiredSecretNames(workflowData *WorkflowData) []string {
+	return []string{}
+}
+
+// GetSupportedEnvVarKeys returns an empty list by default.
+// Engines should override this to enumerate the engine.env keys they support,
+// as defined in the AWF specification (engine_constants.go).
+func (e *BaseEngine) GetSupportedEnvVarKeys() []string {
 	return []string{}
 }
 
@@ -387,6 +420,13 @@ func (e *BaseEngine) GetLogParserScriptId() string {
 	return ""
 }
 
+// GetErrorDetectionScriptId returns empty string by default (no post-execution error detection)
+// Engines can override this to provide a host-runner script that detects errors in the agent
+// stdio log and writes them as GITHUB_OUTPUT values after the AWF container exits.
+func (e *BaseEngine) GetErrorDetectionScriptId() string {
+	return ""
+}
+
 // RenderMCPConfig provides a default no-op implementation for MCP configuration
 // Engines can override this to provide custom MCP server configuration
 func (e *BaseEngine) RenderMCPConfig(yaml *strings.Builder, tools map[string]any, mcpTools []string, workflowData *WorkflowData) error {
@@ -427,7 +467,8 @@ var (
 	registryInitOnce sync.Once
 )
 
-// NewEngineRegistry creates a new engine registry with built-in engines
+// NewEngineRegistry creates a new engine registry with built-in engines.
+// Panics on invalid built-in engine registration.
 func NewEngineRegistry() *EngineRegistry {
 	agenticEngineLog.Print("Creating new engine registry")
 
@@ -441,13 +482,14 @@ func NewEngineRegistry() *EngineRegistry {
 		NewCodexEngine(),
 		NewCopilotEngine(),
 		NewGeminiEngine(),
+		NewAntigravityEngine(),
 		NewOpenCodeEngine(),
 		NewCrushEngine(),
 		NewPiEngine(),
 	}
 	for _, engine := range builtins {
 		if err := registry.Register(engine); err != nil {
-			panic(fmt.Sprintf("failed to register built-in engine: %v", err))
+			panic(fmt.Sprintf("BUG: failed to register built-in engine: %v", err))
 		}
 	}
 
@@ -499,11 +541,7 @@ func (r *EngineRegistry) GetEngine(id string) (CodingAgentEngine, error) {
 // GetSupportedEngines returns a list of all supported engine IDs
 func (r *EngineRegistry) GetSupportedEngines() []string {
 	agenticEngineLog.Print("Getting list of supported engines")
-	var engines []string
-	for id := range r.engines {
-		engines = append(engines, id)
-	}
-	sort.Strings(engines)
+	engines := sliceutil.SortedKeys(r.engines)
 	return engines
 }
 
@@ -536,7 +574,8 @@ func (r *EngineRegistry) GetAllAgentManifestFolders() []string {
 // computeAllAgentManifestFolders computes the manifest folders list from the registered engines.
 // Called once during NewEngineRegistry to populate cachedManifestFolders.
 func (r *EngineRegistry) computeAllAgentManifestFolders() []string {
-	seen := map[string]bool{}
+	seen := map[string]struct {
+	}{}
 	var result []string
 	for _, engine := range r.engines {
 		provider, ok := engine.(AgentFileProvider)
@@ -545,15 +584,16 @@ func (r *EngineRegistry) computeAllAgentManifestFolders() []string {
 		}
 		for _, prefix := range provider.GetAgentManifestPathPrefixes() {
 			folder := strings.TrimSuffix(prefix, "/")
-			if folder != "" && !seen[folder] {
-				seen[folder] = true
+			if folder != "" && !setutil.Contains(seen, folder) {
+				seen[folder] = struct {
+				}{}
 				result = append(result, folder)
 			}
 		}
 	}
 	// Always include .agents — the gh-aw platform agent directory.
 	// It is not owned by any specific engine but must always be snapshotted.
-	if !seen[".agents"] {
+	if !setutil.Contains(seen, ".agents") {
 		result = append(result, ".agents")
 	}
 	sort.Strings(result)
@@ -577,7 +617,8 @@ func (r *EngineRegistry) GetAllAgentManifestFiles() []string {
 // computeAllAgentManifestFiles computes the manifest files list from the registered engines.
 // Called once during NewEngineRegistry to populate cachedManifestFiles.
 func (r *EngineRegistry) computeAllAgentManifestFiles() []string {
-	seen := map[string]bool{}
+	seen := map[string]struct {
+	}{}
 	var result []string
 	for _, engine := range r.engines {
 		provider, ok := engine.(AgentFileProvider)
@@ -585,8 +626,9 @@ func (r *EngineRegistry) computeAllAgentManifestFiles() []string {
 			continue
 		}
 		for _, file := range provider.GetAgentManifestFiles() {
-			if !seen[file] {
-				seen[file] = true
+			if !setutil.Contains(seen, file) {
+				seen[file] = struct {
+				}{}
 				result = append(result, file)
 			}
 		}
@@ -613,7 +655,16 @@ func (r *EngineRegistry) GetEngineByPrefix(prefix string) (CodingAgentEngine, er
 		agenticEngineLog.Printf("No engine found matching prefix: %s", prefix)
 		return nil, fmt.Errorf("no engine found matching prefix: %s", prefix)
 	}
-	sort.Slice(candidates, func(i, j int) bool { return candidates[i].id < candidates[j].id })
+	slices.SortFunc(candidates, func(a, b engineCandidate) int {
+		switch {
+		case a.id < b.id:
+			return -1
+		case a.id > b.id:
+			return 1
+		default:
+			return 0
+		}
+	})
 	agenticEngineLog.Printf("Found %d engine candidate(s) for prefix %s, using: %s", len(candidates), prefix, candidates[0].id)
 	return candidates[0].engine, nil
 }

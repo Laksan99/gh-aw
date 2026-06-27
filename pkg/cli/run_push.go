@@ -10,7 +10,7 @@ import (
 	"sort"
 	"strings"
 
-	"github.com/github/gh-aw/pkg/gitutil"
+	"github.com/github/gh-aw/pkg/setutil"
 	"github.com/github/gh-aw/pkg/stringutil"
 
 	"github.com/github/gh-aw/pkg/console"
@@ -30,8 +30,10 @@ var runPushLog = logger.New("cli:run_push")
 func collectWorkflowFiles(ctx context.Context, workflowPath string, verbose bool, approve bool) ([]string, error) {
 	runPushLog.Printf("Collecting files for workflow: %s", workflowPath)
 
-	files := make(map[string]bool) // Use map to avoid duplicates
-	visited := make(map[string]bool)
+	files := make(map[string]struct { // Use map to avoid duplicates
+	})
+	visited := make(map[string]struct {
+	})
 
 	// Get absolute path for the workflow
 	absWorkflowPath, err := filepath.Abs(workflowPath)
@@ -49,7 +51,8 @@ func collectWorkflowFiles(ctx context.Context, workflowPath string, verbose bool
 	}
 
 	// Add the workflow .md file
-	files[absWorkflowPath] = true
+	files[absWorkflowPath] = struct {
+	}{}
 	runPushLog.Printf("Added workflow file: %s", absWorkflowPath)
 
 	// Check lock file and log hash status for observability
@@ -57,7 +60,7 @@ func collectWorkflowFiles(ctx context.Context, workflowPath string, verbose bool
 	runPushLog.Printf("Checking lock file: %s", lockFilePath)
 
 	// Always recompile, but check and log hash status for observability
-	if _, err := os.Stat(lockFilePath); err == nil {
+	if fileutil.FileExists(lockFilePath) {
 		runPushLog.Printf("Lock file exists: %s", lockFilePath)
 		// Check frontmatter hash for observability
 		runPushLog.Print("Checking frontmatter hash for observability")
@@ -100,8 +103,9 @@ func collectWorkflowFiles(ctx context.Context, workflowPath string, verbose bool
 	runPushLog.Printf("Recompilation completed successfully")
 
 	// Add the corresponding .lock.yml file
-	if _, err := os.Stat(lockFilePath); err == nil {
-		files[lockFilePath] = true
+	if fileutil.FileExists(lockFilePath) {
+		files[lockFilePath] = struct {
+		}{}
 		runPushLog.Printf("Added lock file: %s", lockFilePath)
 	} else if verbose {
 		runPushLog.Printf("Lock file not found after compilation: %s", lockFilePath)
@@ -226,13 +230,16 @@ func checkLockFileStatus(workflowPath string) (*LockFileStatus, error) {
 }
 
 // collectImports recursively collects all imported files (transitive closure)
-func collectImports(workflowPath string, files map[string]bool, visited map[string]bool, verbose bool) error {
+func collectImports(workflowPath string, files map[string]struct {
+}, visited map[string]struct {
+}, verbose bool) error {
 	// Avoid processing the same file multiple times
-	if visited[workflowPath] {
+	if setutil.Contains(visited, workflowPath) {
 		runPushLog.Printf("Skipping already visited file: %s", workflowPath)
 		return nil
 	}
-	visited[workflowPath] = true
+	visited[workflowPath] = struct {
+	}{}
 
 	runPushLog.Printf("Processing imports for: %s", workflowPath)
 
@@ -324,7 +331,7 @@ func collectImports(workflowPath string, files map[string]bool, visited map[stri
 		runPushLog.Printf("Processing import %d/%d: %s", i+1, len(imports), importPath)
 
 		// Resolve the import path
-		resolvedPath := resolveImportPathLocal(importPath, workflowDir)
+		resolvedPath := resolveImportPath(importPath, workflowDir, importPathRunPushOpts)
 		if resolvedPath == "" {
 			runPushLog.Printf("Could not resolve import path: %s", importPath)
 			if verbose {
@@ -355,7 +362,8 @@ func collectImports(workflowPath string, files map[string]bool, visited map[stri
 		runPushLog.Printf("Import file exists: %s", absImportPath)
 
 		// Add the import file
-		files[absImportPath] = true
+		files[absImportPath] = struct {
+		}{}
 		runPushLog.Printf("Added import file: %s", absImportPath)
 
 		// Recursively collect imports from this file
@@ -370,46 +378,11 @@ func collectImports(workflowPath string, files map[string]bool, visited map[stri
 	return nil
 }
 
-// resolveImportPathLocal is a local version of resolveImportPath for push functionality
-// This is needed to avoid circular dependencies with imports.go
-func resolveImportPathLocal(importPath, baseDir string) string {
-	runPushLog.Printf("Resolving import path: %s (baseDir: %s)", importPath, baseDir)
-
-	// Handle section references (file.md#Section) - strip the section part
-	if strings.Contains(importPath, "#") {
-		parts := strings.SplitN(importPath, "#", 2)
-		runPushLog.Printf("Stripping section reference: %s -> %s", importPath, parts[0])
-		importPath = parts[0]
-	}
-
-	// Skip workflowspec format imports (owner/repo/path@sha)
-	if isWorkflowSpecFormat(importPath) {
-		runPushLog.Printf("Skipping workflowspec format import: %s", importPath)
-		return ""
-	}
-
-	// If the import path is absolute (starts with /), use it relative to repo root
-	if strings.HasPrefix(importPath, "/") {
-		runPushLog.Printf("Import path is absolute (starts with /): %s", importPath)
-		// Find git root
-		gitRoot, err := gitutil.FindGitRoot()
-		if err != nil {
-			runPushLog.Printf("Failed to find git root: %v", err)
-			return ""
-		}
-		resolved := filepath.Join(gitRoot, strings.TrimPrefix(importPath, "/"))
-		runPushLog.Printf("Resolved absolute import: %s (git root: %s)", resolved, gitRoot)
-		return resolved
-	}
-
-	// Otherwise, resolve relative to the workflow file's directory
-	resolved := filepath.Join(baseDir, importPath)
-	runPushLog.Printf("Resolved relative import: %s", resolved)
-	return resolved
-}
-
 // pushWorkflowFiles commits and pushes the workflow files to the repository
-func pushWorkflowFiles(workflowName string, files []string, refOverride string, verbose bool) error {
+func pushWorkflowFiles(ctx context.Context, workflowName string, files []string, refOverride string, verbose bool) error {
+	if ctx == nil {
+		return errors.New("context is required")
+	}
 	runPushLog.Printf("Pushing %d files for workflow: %s", len(files), workflowName)
 	runPushLog.Printf("Files to push: %v", files)
 
@@ -423,7 +396,7 @@ func pushWorkflowFiles(workflowName string, files []string, refOverride string, 
 	// Stage all files
 	gitArgs := append([]string{"add"}, files...)
 	runPushLog.Printf("Executing git command: git %v", gitArgs)
-	cmd := exec.Command("git", gitArgs...)
+	cmd := exec.CommandContext(ctx, "git", gitArgs...)
 	if output, err := cmd.CombinedOutput(); err != nil {
 		runPushLog.Printf("Failed to stage files: %v, output: %s", err, string(output))
 		return fmt.Errorf("failed to stage files: %w\nOutput: %s", err, string(output))
@@ -436,7 +409,7 @@ func pushWorkflowFiles(workflowName string, files []string, refOverride string, 
 
 	// Check if there are any staged files in git (after we've staged our files)
 	runPushLog.Printf("Checking staged files with git diff --cached --name-only")
-	statusCmd := exec.Command("git", "diff", "--cached", "--name-only")
+	statusCmd := exec.CommandContext(ctx, "git", "diff", "--cached", "--name-only")
 	statusOutput, err := statusCmd.CombinedOutput()
 	if err != nil {
 		runPushLog.Printf("Failed to check git status: %v, output: %s", err, string(statusOutput))
@@ -445,7 +418,7 @@ func pushWorkflowFiles(workflowName string, files []string, refOverride string, 
 	runPushLog.Printf("Git status output: %s", string(statusOutput))
 
 	// Check if there are no staged changes (nothing to commit)
-	if len(strings.TrimSpace(string(statusOutput))) == 0 {
+	if strings.TrimSpace(string(statusOutput)) == "" {
 		runPushLog.Printf("No staged changes detected")
 		if verbose {
 			fmt.Fprintln(os.Stderr, console.FormatInfoMessage("No changes to commit"))
@@ -483,7 +456,8 @@ func pushWorkflowFiles(workflowName string, files []string, refOverride string, 
 	// Check if there are staged files beyond what we just staged
 	// Convert our files list to a map for quick lookup
 	runPushLog.Printf("Building map of our files for comparison")
-	ourFiles := make(map[string]bool)
+	ourFiles := make(map[string]struct {
+	})
 	for _, file := range files {
 		// Normalize the path
 		absPath, err := filepath.Abs(file)
@@ -491,7 +465,8 @@ func pushWorkflowFiles(workflowName string, files []string, refOverride string, 
 			// Validate the absolute path
 			validPath, validErr := fileutil.ValidateAbsolutePath(absPath)
 			if validErr == nil {
-				ourFiles[validPath] = true
+				ourFiles[validPath] = struct {
+				}{}
 				runPushLog.Printf("Added to our files map: %s (absolute: %s)", file, validPath)
 			} else {
 				runPushLog.Printf("Failed to validate path for %s: %v", absPath, validErr)
@@ -499,7 +474,8 @@ func pushWorkflowFiles(workflowName string, files []string, refOverride string, 
 		} else {
 			runPushLog.Printf("Failed to get absolute path for %s: %v", file, err)
 		}
-		ourFiles[file] = true
+		ourFiles[file] = struct {
+		}{}
 		runPushLog.Printf("Added to our files map: %s", file)
 	}
 
@@ -513,12 +489,12 @@ func pushWorkflowFiles(workflowName string, files []string, refOverride string, 
 		if err == nil {
 			// Validate the staged path
 			validPath, validErr := fileutil.ValidateAbsolutePath(absStagedPath)
-			if validErr == nil && ourFiles[validPath] {
+			if validErr == nil && setutil.Contains(ourFiles, validPath) {
 				runPushLog.Printf("Staged file %s matches our file %s (absolute)", stagedFile, validPath)
 				continue
 			}
 		}
-		if ourFiles[stagedFile] {
+		if setutil.Contains(ourFiles, stagedFile) {
 			runPushLog.Printf("Staged file %s matches our file (relative)", stagedFile)
 			continue
 		}
@@ -579,7 +555,7 @@ func pushWorkflowFiles(workflowName string, files []string, refOverride string, 
 
 	// Commit the changes
 	runPushLog.Printf("Executing git commit with message: %s", commitMessage)
-	cmd = exec.Command("git", "commit", "-m", commitMessage)
+	cmd = exec.CommandContext(ctx, "git", "commit", "-m", commitMessage)
 	if output, err := cmd.CombinedOutput(); err != nil {
 		runPushLog.Printf("Failed to commit: %v, output: %s", err, string(output))
 		return fmt.Errorf("failed to commit changes: %w\nOutput: %s", err, string(output))
@@ -593,7 +569,7 @@ func pushWorkflowFiles(workflowName string, files []string, refOverride string, 
 	// Push the changes
 	runPushLog.Print("Pushing changes to remote")
 	runPushLog.Printf("Executing git push")
-	cmd = exec.Command("git", "push")
+	cmd = exec.CommandContext(ctx, "git", "push")
 	if output, err := cmd.CombinedOutput(); err != nil {
 		runPushLog.Printf("Failed to push: %v, output: %s", err, string(output))
 		return fmt.Errorf("failed to push changes: %w\nOutput: %s", err, string(output))

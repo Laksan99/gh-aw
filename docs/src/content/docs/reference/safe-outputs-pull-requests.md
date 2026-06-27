@@ -10,6 +10,7 @@ This page is the primary reference for pull-request-focused safe outputs:
 - [`create-pull-request`](#pull-request-creation-create-pull-request)
 - [`update-pull-request`](#pull-request-updates-update-pull-request)
 - [`close-pull-request`](#close-pull-request-close-pull-request)
+- [`merge-pull-request`](#merge-pull-request-merge-pull-request) (experimental)
 - [`create-pull-request-review-comment`](#pr-review-comments-create-pull-request-review-comment)
 - [`submit-pull-request-review`](#submit-pr-review-submit-pull-request-review)
 - [`reply-to-pull-request-review-comment`](#reply-to-pr-review-comment-reply-to-pull-request-review-comment)
@@ -23,9 +24,7 @@ For all other safe-output types see [Safe Outputs](/gh-aw/reference/safe-outputs
 
 ## Pull Request Creation (`create-pull-request:`)
 
-Creates PRs with code changes. By default, falls back to creating an issue if PR creation fails (e.g., org settings block it). Set `fallback-as-issue: false` to disable this fallback and avoid requiring `issues: write` permission. `expires` field (same-repo only) auto-closes after period: integers (days) or `2h`, `7d`, `2w`, `1m`, `1y` (hours < 24 treated as 1 day).
-
-Multiple PRs per run are supported by setting `max` higher than 1. Each PR is created from its own branch with an independent patch, so concurrent calls do not conflict.
+Creates a PR with the agent's code changes. Falls back to opening an issue if PR creation is blocked (e.g. org settings) — set `fallback-as-issue: false` to disable. Set `max` above `1` to allow multiple independent PRs per run.
 
 ```yaml wrap
 safe-outputs:
@@ -34,87 +33,76 @@ safe-outputs:
     labels: [automation]          # labels to attach
     reviewers: [user1, copilot]   # reviewers (use 'copilot' for bot)
     team-reviewers: [platform-reviewers] # team slugs to request as reviewers
-    assignees: [user1]            # assignees for fallback issues (including protected-files and PR creation failure fallbacks)
+    assignees: [user1]            # assignees for fallback issues
     draft: true                   # create as draft — enforced as policy (default: true)
     max: 3                        # max PRs per run (default: 1)
-    expires: 14                   # auto-close after 14 days (same-repo only)
+    expires: 14                   # auto-close after N days (same-repo only; also accepts 2h, 7d, 2w, 1m, 1y)
     if-no-changes: "warn"         # "warn" (default), "error", or "ignore"
-    target-repo: "owner/repo"     # cross-repository
+    target-repo: "owner/repo"     # cross-repository target
     allowed-repos: ["org/repo1", "org/repo2"]  # additional allowed repositories
-    base-branch: "vnext"          # target branch for PR (default: github.base_ref || github.ref_name)
+    base-branch: "vnext"          # PR target branch (default: github.base_ref || github.ref_name)
     allowed-base-branches:        # allow agent to override base branch at runtime (glob patterns)
       - main
       - release/*
+    allowed-branches:             # restrict agent-selected source branch names (glob patterns)
+      - feature/*
+      - release/*
     fallback-as-issue: false      # disable issue fallback (default: true)
     auto-close-issue: false       # don't auto-add "Fixes #N" to PR description (default: true)
+    normalize-closing-keywords: true # strip backticks around recognized issue-closing keywords in PR body text
     preserve-branch-name: true    # omit random salt suffix from branch name (default: false)
-    recreate-ref: true      # force-delete and recreate the remote branch when it already exists (requires preserve-branch-name; default: false)
-    excluded-files:               # files to omit from the patch entirely
+    recreate-ref: true            # force-recreate remote branch when it already exists (requires preserve-branch-name; default: false)
+    excluded-files:               # strip these files from the patch entirely
       - "**/*.lock"
       - "dist/**"
+    max-patch-files: 300          # max unique files in the patch (default: 100)
+    max-patch-size: 2048          # max patch size in KB (default: 4096)
     github-token: ${{ secrets.SOME_CUSTOM_TOKEN }} # optional custom token for permissions
     github-token-for-extra-empty-commit: ${{ secrets.CI_TOKEN }} # optional token to push empty commit triggering CI
+    signed-commits: true          # signed commits via GraphQL API (default: true); set false to use git push directly
     protected-files: fallback-to-issue  # push branch, create review issue if protected files modified
 ```
 
-The `base-branch` field specifies which branch the pull request should target. This is particularly useful for cross-repository PRs where you need to target non-default branches (e.g., `vnext`, `release/v1.0`, `staging`). When not specified, defaults to `github.base_ref` (the PR's target branch) with a fallback to `github.ref_name` (the workflow's branch) for push events.
+See [Cross-Repository Operations](/gh-aw/reference/cross-repository/) for `target-repo`, `allowed-repos`, and authentication configuration.
 
-The `allowed-base-branches` field enables per-run base branch overrides by the agent at runtime. When configured, the agent may supply a `base` field in the `create_pull_request` tool call to target a branch other than the compiled `base-branch`. The override is accepted only when it matches one of the configured glob patterns (e.g., `main`, `release/*`). Without `allowed-base-branches`, only the compiled `base-branch` is used regardless of what the agent requests. This is useful when agent-computed data (such as a version string or user request) determines the target branch at runtime:
+### Branch targeting
 
-```yaml wrap
-safe-outputs:
-  create-pull-request:
-    base-branch: main
-    allowed-base-branches:
-      - main
-      - release/*
-```
+`base-branch` sets the PR's target branch. Defaults to `github.base_ref` (PR event) or `github.ref_name` (push event). Use `allowed-base-branches` to let the agent pick the target branch at runtime — the agent supplies a `base` value in the tool call and it is accepted only if it matches one of the configured glob patterns.
 
-**Example use case:** A workflow in `org/engineering` that creates PRs in `org/docs` targeting the `vnext` branch for feature documentation:
+`allowed-branches` restricts which _source_ branch names the agent may use. The effective branch (agent-provided, or the checkout branch as fallback) must match a configured glob.
 
-```yaml wrap
-safe-outputs:
-  create-pull-request:
-    target-repo: "org/docs"
-    base-branch: "vnext"
-    draft: true
-    github-token: ${{ secrets.SOME_CUSTOM_TOKEN }} # optional custom token for permissions
-```
+### Branch naming
 
-The `excluded-files` field accepts a list of glob patterns. Each matching file is stripped from the patch using `git format-patch`'s `:(exclude)` magic pathspec at generation time, so the file never appears in the commit. Excluded files are also exempt from `allowed-files` and `protected-files` checks. This is useful for suppressing auto-generated or lock files that the agent must not commit (e.g. `**/*.lock`, `dist/**`). Supports `*` (any characters except `/`) and `**` (any characters including `/`).
+By default a random hex suffix is appended to the agent-provided branch name to avoid collisions. Set `preserve-branch-name: true` to omit the suffix (useful for repositories that enforce naming conventions such as Jira keys). If `preserve-branch-name: true` and the branch already exists on the remote, use `recreate-ref: true` to force-delete and recreate it (force-push semantics, intended for long-lived branches whose previous PR was already merged).
 
-The `preserve-branch-name` field, when set to `true`, omits the random hex salt suffix that is normally appended to the agent-specified branch name. This is useful when the target repository enforces branch naming conventions such as Jira keys in uppercase (e.g., `bugfix/BR-329-red` instead of `bugfix/br-329-red-cde2a954`). Invalid characters are always replaced for security, and casing is always preserved regardless of this setting. Defaults to `false`.
+### Patch limits
 
-When `preserve-branch-name: true` and the agent-supplied branch name already exists on the remote, the default behavior is to fall back (e.g. open an issue when `fallback-as-issue: true`) rather than rename the branch or overwrite the remote ref. To enable reuse of the existing remote branch, set `recreate-ref: true`: the handler will force-delete the stale remote ref and recreate it from the agent's local HEAD (force-push semantics). This is the intended behavior for long-lived reusable branches whose previous PR was merged. `recreate-ref` requires `preserve-branch-name: true` to take effect; the handler does not silently rename the branch in this case.
+`excluded-files` strips matching files from the patch before the commit is created — they are also exempt from `allowed-files` and `protected-files` checks. `max-patch-files` (default `100`) and `max-patch-size` (default `4096 KB`) guard against unexpectedly large commits; raise them when the workflow intentionally produces many or large generated files.
 
-The `draft` field is a **configuration policy**, not a default. Whatever value is set in the workflow frontmatter is always used — the agent cannot override it at runtime.
+### Other notes
 
-By default, when a workflow is triggered from an issue, the `create-pull-request` handler automatically appends `- Fixes #N` to the PR description if no closing keyword is already present. This causes GitHub to auto-close the triggering issue when the PR is merged. Set `auto-close-issue: false` to opt out of this behavior — useful for partial-work PRs, multi-PR workflows, or any case where the PR should reference but not close the issue.
+- `draft` is a **policy**, not a default — the agent cannot override it at runtime.
+- `auto-close-issue` (default `true`) appends `Fixes #N` to the PR description when the workflow is triggered from an issue. Set to `false` for partial-work or multi-PR flows.
+- `normalize-closing-keywords` strips wrapping backticks from recognized issue-closing keywords in the PR body (for example, `` `Closes #123` `` → `Closes #123`).
+- When `create-pull-request` is configured, git commands (`checkout`, `branch`, `switch`, `add`, `rm`, `commit`, `merge`) are automatically enabled.
+- PRs do not trigger CI by default. See [Triggering CI](/gh-aw/reference/triggering-ci/).
+- `create-pull-request` can be disabled at runtime without recompiling by setting the `GH_AW_POLICY_ALLOW_CREATE_PULL_REQUEST` GitHub Actions variable to `"false"` at repository, organization, or enterprise scope. See [Governance](/gh-aw/guides/governance/#disabling-create-pull-request-org-wide).
 
-PR creation may fail if "Allow GitHub Actions to create and approve pull requests" is disabled in Organization Settings. By default (`fallback-as-issue: true`), fallback creates an issue with branch link. Set `fallback-as-issue: false` to disable fallback.
+### How it works
 
-When `create-pull-request` is configured, git commands (`checkout`, `branch`, `switch`, `add`, `rm`, `commit`, `merge`) are automatically enabled.
+The agent's commits are packaged as a **git bundle** and uploaded as an Actions artifact. A separate, permission-controlled `safe_outputs` job then:
 
-By default, PRs created with GitHub Agentic Workflows do not trigger CI. See [Triggering CI](/gh-aw/reference/triggering-ci/) for how to configure CI triggers.
+1. Checks out the target repository at the base branch (shallow, depth 1). Any additional `fetch:` refs declared in `checkout:` frontmatter for the target repository are fetched so their commits are locally available.
+2. Applies the bundle via `git fetch <bundle-file>`. If prerequisite commits are missing (because the base branch advanced while the agent was running), they are fetched from origin by SHA and the bundle fetch retried automatically.
+3. Pushes the branch using the GitHub GraphQL API (signed commits) and creates the pull request.
 
-### How PR creation works
+If the base branch advances between agent start and `safe_outputs` apply, the PR is created slightly behind the current base — normal behavior the author can address with a rebase. If a non-fast-forward race occurs during the push itself, the job creates a fallback PR from a temporary branch so no changes are lost.
 
-When the coding agent finishes its task, it records the requested changes in a structured output file. A separate, permission-controlled job then reads that output and applies the changes:
+An older **patch transport** (`git format-patch` / `git am --3way`) is used when bundle data is unavailable. `--3way` resolves cleanly against an updated base when there are no conflicts; if it cannot, the patch is applied at the agent's original base commit and the PR UI shows the conflicts for manual resolution.
 
-1. The agent's commits are exported as a `git format-patch` file covering everything since the original checkout commit.
-2. The safe-output job checks out the target repository and fetches the latest state of the base branch.
-3. The patch is applied to a new branch using `git am --3way`. The `--3way` flag allows the patch to succeed even when the agent's source repository differs from the target (for example, in cross-repository workflows).
-4. The branch is pushed and the GitHub API creates the pull request.
-
-### If the target branch has changed
-
-If commits have been pushed to the base branch after the agent started, two outcomes are possible:
-
-- **No conflicts** — `git am --3way` resolves the patch cleanly against the updated base. The PR is created normally and targets the current head of the base branch.
-- **Conflicts** — if `--3way` cannot resolve the conflicts automatically, the safe-output job falls back to applying the patch at the commit the agent originally branched from. The PR is created with the branch based on that earlier commit, and GitHub's pull request UI shows the conflicts for manual resolution.
-
-> [!NOTE]
-> The fallback to the original base commit requires that commit to be present in the target repository. In cross-repository scenarios where the agent repository's history is unrelated, only the `--3way` attempt is made and a hard failure is returned if that also fails.
+:::note[Cross-repo targets]
+The `safe_outputs` job always mirrors the agent job's checkout layout. When a `checkout:` entry places a repository in a subdirectory (a `path:` is set), `safe_outputs` checks out **every** repository to the same location the agent used — the workflow repository at the workspace root plus each cross-repo checkout at its `path:` — regardless of whether `target-repo` names a specific repository or the wildcard `"*"`. This lets a specific `target-repo` (and the two-or-more cross-repo case) operate against an identical layout. When the target repository is checked out at the workspace root (no `path:`), it is checked out there in both jobs.
+:::
 
 ## Pull Request Updates (`update-pull-request:`)
 
@@ -130,12 +118,16 @@ safe-outputs:
     max: 1                    # max updates (default: 1)
     target: "*"               # "triggering" (default), "*", or number
     target-repo: "owner/repo" # cross-repository
+    required-labels: [automated]     # only update if PR has ALL these labels
+    required-title-prefix: "[bot] "  # only update if PR title starts with this prefix
     github-token: ${{ secrets.SOME_CUSTOM_TOKEN }} # optional custom token for permissions
 ```
 
 **Target**: `"triggering"` (requires PR event), `"*"` (any PR), or number (specific PR).
 
 When `update-branch: true` is set, the handler calls the GitHub REST `pulls.updateBranch` API to merge the latest base branch changes into the PR branch before applying title or body updates. This requires `contents: write` permission; without it only `contents: read` is needed. The field can also be used alone (with `title: false` and `body: false`) to update the branch without changing the PR description.
+
+If GitHub reports `There are no new commits on the base branch.` or `merge conflict between base and head`, the branch update is treated as best-effort: the workflow logs a warning and continues processing the safe output.
 
 When using `target: "*"`, the agent must provide `pull_request_number` in the output to identify which pull request to update.
 
@@ -156,6 +148,38 @@ safe-outputs:
     github-token: ${{ secrets.SOME_CUSTOM_TOKEN }} # optional custom token for permissions
 ```
 
+## Merge Pull Request (`merge-pull-request:`)
+
+:::caution[Experimental]
+`merge-pull-request` is an experimental safe output. `gh aw compile` emits an experimental feature warning when a workflow uses it. The merge is blocked unless every configured policy gate passes; merges to the repository default branch are always refused.
+:::
+
+Merges a pull request only after configured policy gates pass — status checks, review decision, unresolved review threads, label and branch constraints, and GitHub mergeability.
+
+```yaml wrap
+safe-outputs:
+  merge-pull-request:
+    max: 1                            # max merges per run (default: 1, range: 1-10)
+    required-labels: [ready-to-merge] # ALL listed labels must be present on the PR
+    required-title-prefix: "[bot] "   # only merge PRs whose title starts with this prefix
+    allowed-branches: ["feature/*"]   # glob patterns for the PR's source branch
+    target: "triggering"              # "triggering" (default, current PR) or "*" (any PR with pull_request_number)
+    target-repo: "owner/repo"         # cross-repository target
+    allowed-repos: ["org/other-repo"] # additional repositories the agent can merge into
+    staged: false                     # if true, evaluate gates and emit preview results without performing the merge
+    github-token: ${{ secrets.SOME_CUSTOM_TOKEN }} # optional custom token for permissions
+```
+
+**Target**: `"triggering"` (requires a PR event) or `"*"` (the agent supplies `pull_request_number` in the tool call). When `target: "*"` is used with cross-repository configuration, the agent may also supply `repo` (in `owner/repo` format); the value must match `target-repo` or appear in `allowed-repos`.
+
+**Merge method**: The agent selects `merge`, `squash`, or `rebase` per tool call. The base branch is taken from the pull request; merges to the repository default branch are refused by this safe output type.
+
+**Gate semantics**: The handler validates mergeability (not draft, no conflicts), required status checks, the GitHub review decision, unresolved review thread gating, `required-labels`, `required-title-prefix`, and `allowed-branches`. If any gate fails, the merge is skipped and the reason is reported. Idempotent: already-merged PRs return success.
+
+**Staged mode**: Setting `staged: true` runs all gate checks and emits a preview result without calling the GitHub merge API. Use this to validate policy in dry-run scenarios.
+
+See [Cross-Repository Operations](/gh-aw/reference/cross-repository/) for `target-repo`, `allowed-repos`, and authentication configuration. See the [Safe Outputs Specification](/gh-aw/specs/safe-outputs-specification/#type-merge_pull_request) for the complete schema and operational semantics.
+
 ## PR Review Comments (`create-pull-request-review-comment:`)
 
 Creates review comments on specific code lines in PRs. Supports single-line and multi-line comments.
@@ -169,6 +193,8 @@ safe-outputs:
     target-repo: "owner/repo" # cross-repository
     allowed-repos: ["org/repo1", "org/repo2"]  # additional allowed repositories
     footer: "if-body"         # footer control: "always", "none", or "if-body"
+    required-labels: [automated]     # only comment if PR has ALL these labels
+    required-title-prefix: "[bot] "  # only comment if PR title starts with this prefix
     github-token: ${{ secrets.SOME_CUSTOM_TOKEN }} # optional custom token for permissions
 ```
 
@@ -188,11 +214,15 @@ safe-outputs:
     target-repo: "owner/repo"      # cross-repository
     allowed-repos: ["org/repo1"]   # additional allowed repositories
     footer: "always"               # "always", "none", or "if-body"
+    required-labels: [automated]   # only submit review if PR has ALL these labels
+    required-title-prefix: "[bot] " # only submit review if PR title starts with this prefix
 ```
 
 Use `allowed-events` to control review decisions (`APPROVE`, `COMMENT`, `REQUEST_CHANGES`). Prefer `allowed-events: [COMMENT]` by default so bot reviews remain informative and non-blocking.
 
 When you intentionally allow `REQUEST_CHANGES`, set `supersede-older-reviews: true` to dismiss older blocking reviews from the same workflow after posting a replacement review. This behavior is best-effort.
+
+When `target: "*"` is configured, the agent must supply `pull_request_number` in each `submit_pull_request_review` tool call to identify which PR to review — omitting it will cause the review to fail. For cross-repository scenarios, the agent can also supply `repo` (in `owner/repo` format) to route the review to a PR in a different repository; the value must match `target-repo` or appear in `allowed-repos`.
 
 ## Reply to PR Review Comment (`reply-to-pull-request-review-comment:`)
 
@@ -206,6 +236,8 @@ safe-outputs:
     target-repo: "owner/repo"            # cross-repository
     allowed-repos: ["org/other-repo"]    # additional allowed repositories
     footer: true                         # add AI-generated footer (default: true)
+    required-labels: [automated]         # only reply if PR has ALL these labels
+    required-title-prefix: "[bot] "      # only reply if PR title starts with this prefix
     github-token: ${{ secrets.SOME_CUSTOM_TOKEN }} # optional custom token for permissions
 ```
 
@@ -230,8 +262,17 @@ safe-outputs:
     target: "triggering"                 # "triggering" (default), "*", or number
     target-repo: "owner/repo"            # cross-repository
     allowed-repos: ["org/repo1", "org/repo2"]  # additional allowed repositories
+    required-labels: [automated]         # only resolve if PR has ALL these labels
+    required-title-prefix: "[bot] "      # only resolve if PR title starts with this prefix
     github-token: ${{ secrets.SOME_CUSTOM_TOKEN }} # optional custom token for permissions
 ```
+
+:::note[Integration-token limitation]
+GitHub can return `Resource not accessible by integration` for `resolveReviewThread` even with `pull-requests: write` on `GITHUB_TOKEN` (for example, bot-authored threads in non-interactive runs).  
+When this happens, gh-aw soft-skips the message with a warning and continues processing other safe outputs.
+
+To make resolution reliable, configure `safe-outputs.resolve-pull-request-review-thread.github-token` with a token that can resolve review threads in your repository.
+:::
 
 See [Cross-Repository Operations](/gh-aw/reference/cross-repository/) for documentation on `target-repo`, `allowed-repos`, and cross-repository authentication.
 
@@ -243,7 +284,7 @@ See [Cross-Repository Operations](/gh-aw/reference/cross-repository/) for docume
 
 ## Push to PR Branch (`push-to-pull-request-branch:`)
 
-Pushes changes to a PR's branch. Validates via `title-prefix` and `labels` to ensure only approved PRs receive changes. Multiple pushes per run are supported by setting `max` higher than 1.
+Pushes changes to a PR's branch. Validates via `required-title-prefix` and `required-labels` to ensure only approved PRs receive changes. Multiple pushes per run are supported by setting `max` higher than 1.
 
 :::caution[Fork PRs Not Supported]
 This safe output **cannot push to PRs from forks**. Fork PRs will fail early with a clear error message. This is a security restriction—the workflow does not have write access to fork repositories.
@@ -253,8 +294,8 @@ This safe output **cannot push to PRs from forks**. Fork PRs will fail early wit
 safe-outputs:
   push-to-pull-request-branch:
     target: "*"                 # "triggering" (default), "*", or number
-    title-prefix: "[bot] "      # require title prefix
-    labels: [automated]         # require all labels
+    required-title-prefix: "[bot] "      # require title prefix
+    required-labels: [automated]         # require all labels
     max: 3                      # max pushes per run (default: 1)
     if-no-changes: "warn"       # "warn" (default), "error", or "ignore"
     excluded-files:               # files to omit from the patch entirely
@@ -262,6 +303,7 @@ safe-outputs:
     github-token: ${{ secrets.SOME_CUSTOM_TOKEN }} # optional custom token for permissions
     github-token-for-extra-empty-commit: ${{ secrets.CI_TOKEN }} # optional token to push empty commit triggering CI
     fallback-as-pull-request: true        # on non-fast-forward failure, create fallback PR to original PR branch (default: true)
+    signed-commits: true                  # signed commits are required (default); set false to use git push directly
     ignore-missing-branch-failure: false  # treat deleted/missing branch errors as skipped instead of failed (default: false)
     check-branch-protection: true         # set to false to skip the branch protection pre-flight check (default: true)
     protected-files: fallback-to-issue  # create review issue if protected files modified
@@ -271,9 +313,25 @@ safe-outputs:
 
 When `push-to-pull-request-branch` is configured, git commands (`checkout`, `branch`, `switch`, `add`, `rm`, `commit`, `merge`) are automatically enabled.
 
+### Destination branch
+
+The agent **does not specify the destination branch**. Both the source and
+destination branches are derived from the triggering pull request:
+
+- The **source branch** is the branch currently checked out in the agent's
+  workspace. The agent must commit its changes onto the PR's head ref before
+  calling the tool.
+- The **destination branch** is always the triggering pull request's head ref,
+  resolved by the apply-time push job via `pulls.get(pull_number).head.ref`.
+
+This eliminates a class of failures where the agent passed a wrong or synthetic
+branch name (see [issue #37835](https://github.com/github/gh-aw/issues/37835)).
+
+By default, pushes are replayed through GitHub's signed commit API because `signed-commits: true` means signed commits are required. Set `signed-commits: false` only for repositories that do not require signed commits; this uses direct `git push` and can preserve merge commits that the signed commit API cannot represent. This field is supported by both `create-pull-request` and `push-to-pull-request-branch`.
+
 ### Cross-repo usage
 
-`push-to-pull-request-branch` supports pushing to pull requests in a different repository via `target-repo` (and optionally `allowed-repos`). When `target-repo` is set, **the target repository must be checked out into the workflow workspace** using the `checkout:` frontmatter field with a `path:` specified.
+`push-to-pull-request-branch` supports pushing to pull requests in a different repository via `target-repo` (and optionally `allowed-repos`). When `target-repo` is set, **the target repository must be checked out into the workflow workspace** using the `checkout:` frontmatter field with a `path:` specified. Use `target-repo: "*"` to let the agent choose the target repository at runtime (the safe_outputs job will check out all `checkout:` repositories into subdirectories automatically).
 
 ```yaml wrap
 checkout:
@@ -287,7 +345,7 @@ safe-outputs:
   github-token: ${{ secrets.CROSS_REPO_PAT }}
   push-to-pull-request-branch:
     target-repo: "org/target-repo"
-    title-prefix: "[bot] "
+    required-title-prefix: "[bot] "
 ```
 
 The `path:` field is required so the agent knows where the target repository is mounted in the workspace. Without a `path`, the checkout action writes to the root of the workspace and overwrites the source repository, which will cause the workflow to fail.
@@ -296,31 +354,49 @@ See [Cross-Repository Operations](/gh-aw/reference/cross-repository/) for a comp
 
 Like `create-pull-request`, pushes with GitHub Agentic Workflows do not trigger CI. See [Triggering CI](/gh-aw/reference/triggering-ci/) for how to enable automatic CI triggers.
 
+### Checkout token for git operations
+
+`create-pull-request` and `push-to-pull-request-branch` run their git operations (fetch/push) against a repository that the `safe_outputs` job checks out with credentials persisted in `.git/config`. A **single** token is persisted into that checkout, resolved with this precedence:
+
+1. `create-pull-request.github-token`
+2. `push-to-pull-request-branch.github-token`
+3. The `safe-outputs.github-app` minted token (when a GitHub App is configured)
+4. `safe-outputs.github-token`
+5. The default `${{ secrets.GH_AW_GITHUB_TOKEN || secrets.GITHUB_TOKEN }}`
+
+Because only one token can govern the shared checkout, **if you configure both `create-pull-request` and `push-to-pull-request-branch` for the same repository, give them the same token.** If they specify different `github-token` values, the higher-precedence one wins for the checkout, so the other output's git operations run with a token you did not intend. Set the token once at `safe-outputs.github-token` (or `safe-outputs.github-app`) and let both outputs inherit it, or set identical `github-token` values on each.
+
+:::note
+This applies to the git checkout used by the handlers' `fetch`/`push`. The GitHub API calls each handler makes still honor that handler's own `github-token` precedence.
+:::
+
 ## Add Reviewer (`add-reviewer:`)
 
-Adds reviewers to pull requests. Specify `reviewers` to restrict to specific GitHub usernames and `team-reviewers` to restrict to specific team slugs.
+Adds reviewers to pull requests. Specify `allowed-reviewers` to restrict to specific GitHub usernames and `allowed-team-reviewers` to restrict to specific team slugs.
 
 ```yaml wrap
 safe-outputs:
   add-reviewer:
-    reviewers: [user1, copilot]  # restrict to specific user/bot reviewers
-    team-reviewers: [platform-reviewers] # restrict to specific team reviewers
+    allowed-reviewers: [user1, copilot]  # restrict to specific user/bot reviewers
+    allowed-team-reviewers: [platform-reviewers] # restrict to specific team reviewers
     max: 3                       # max reviewers (default: 3)
     target: "*"                  # "triggering" (default), "*", or number
     target-repo: "owner/repo"    # cross-repository
+    required-labels: [automated]     # only add reviewer if PR has ALL these labels
+    required-title-prefix: "[bot] "  # only add reviewer if PR title starts with this prefix
     github-token: ${{ secrets.SOME_CUSTOM_TOKEN }} # optional custom token for permissions
 ```
 
 **Target**: `"triggering"` (requires PR event), `"*"` (any PR), or number (specific PR).
 
-Use `reviewers: [copilot]` to assign the Copilot PR reviewer bot. See [Assign to Agent](/gh-aw/reference/assign-to-copilot/).
+Use `allowed-reviewers: [copilot]` to assign the Copilot PR reviewer bot. See [Copilot Cloud Agent](/gh-aw/reference/copilot-cloud-agent/).
 
 ## Compile-Time Warnings for `target: "*"`
 
 When `target: "*"` is used, `gh aw compile` emits warnings for two common misconfigurations:
 
 - **Missing wildcard fetch** — no `checkout` block with a wildcard `fetch` pattern (e.g., `fetch: ["*"]`). Without this, the agent cannot access arbitrary PR branches at runtime and will fail with permission-like errors.
-- **No constraints** — neither `title-prefix` nor `labels` is set, which allows pushing to any PR in the repository with no additional gating.
+- **No constraints** — neither `required-title-prefix` nor `required-labels` is set, which allows pushing to any PR in the repository with no additional gating.
 
 Both warnings are suppressed when the recommended configuration is in place:
 
@@ -328,7 +404,8 @@ Both warnings are suppressed when the recommended configuration is in place:
 safe-outputs:
   push-to-pull-request-branch:
     target: "*"
-    title-prefix: "[bot] "
+    required-title-prefix: "[bot] "
+    required-labels: [automated]
 checkout:
   fetch: ["*"]
   fetch-depth: 0
@@ -369,7 +446,8 @@ The `protected-files` field accepts either a string policy value or an object wi
 
 | Value | Behavior |
 |-------|-----------|
-| `blocked` (default) | Hard-block: the safe output fails with an error |
+| `request_review` (default) | Create the pull request and submit a `REQUEST_CHANGES` review listing the protected files. The agent's work is preserved, and a human reviewer must approve before merge. |
+| `blocked` | Hard-block: the safe output fails with an error |
 | `fallback-to-issue` | Create a review issue with instructions for the human to apply or reject the changes manually |
 | `allowed` | No restriction — all protected file changes are permitted. **Use only when the workflow is explicitly designed to manage these files.** |
 
@@ -379,7 +457,7 @@ The `protected-files` field accepts either a string policy value or an object wi
 safe-outputs:
   create-pull-request:
     protected-files:
-      policy: fallback-to-issue   # same values as string form (default: blocked)
+      policy: fallback-to-issue   # same values as string form (default: request_review)
       exclude:
         - AGENTS.md               # allow the agent to update its own instruction file
         - CHANGELOG.md            # allow the agent to update the changelog
@@ -402,14 +480,14 @@ safe-outputs:
 ```
 :::
 
-**`create-pull-request` with `fallback-to-issue`**: the branch is pushed normally, then a review issue is created with a PR creation intent link, a `[!WARNING]` banner explaining why the fallback was triggered, and instructions to review carefully before creating the PR.
+**`create-pull-request` with `fallback-to-issue`**: when protected files are detected, gh-aw skips pushing and creates a review issue with a PR creation intent link, a `[!WARNING]` banner explaining why the fallback was triggered, and instructions to review carefully before creating the PR.
 
 **`push-to-pull-request-branch` with `fallback-to-issue`**: instead of pushing to the PR branch, a review issue is created with the target PR link, patch download/apply instructions, and a review warning.
 
 ```yaml wrap
 safe-outputs:
   create-pull-request:
-    protected-files: fallback-to-issue  # push branch, require human review before PR
+    protected-files: fallback-to-issue  # skip push and require human review before PR
 
   push-to-pull-request-branch:
     protected-files: fallback-to-issue  # create issue instead of pushing when protected files change
@@ -429,7 +507,7 @@ on:
         type: string
         default: fallback-to-issue
         description: >
-          Protected-file policy: 'blocked', 'fallback-to-issue', or 'allowed'.
+          Protected-file policy: 'request_review', 'blocked', 'fallback-to-issue', or 'allowed'.
       patch-format:
         type: string
         default: bundle
@@ -498,9 +576,6 @@ Patterns support `*` (any characters except `/`) and `**` (any characters includ
 
 > [!NOTE]
 > When `allowed-files` is not set, only the `protected-files` policy applies and all non-protected files are permitted.
-
-> [!WARNING]
-> `allowed-files` should enumerate exactly the files the workflow legitimately manages. Overly broad patterns (e.g., `**`) disable all protection.
 
 ### Allowing Workflow File Changes with `allow-workflows`
 

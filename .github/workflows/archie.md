@@ -1,4 +1,6 @@
 ---
+private: true
+emoji: "🏛️"
 name: Archie
 description: Generates Mermaid diagrams to visualize issue and pull request relationships when invoked with the /archie command
 on:
@@ -8,18 +10,20 @@ on:
     events: [issues, issue_comment, pull_request, pull_request_comment]
   reaction: eyes
   status-comment: true
+max-daily-ai-credits: 10000
 permissions:
   contents: read
   issues: read
   pull-requests: read
   actions: read
+  copilot-requests: write
 engine:
   id: copilot
   agent: adr-writer
 strict: true
 imports:
   - shared/mcp/serena-go.md
-  - shared/observability-otlp.md
+  - shared/otlp.md
 tools:
   cli-proxy: true
   github:
@@ -32,7 +36,7 @@ safe-outputs:
   add-comment:
     max: 1
   messages:
-    footer: "> 📊 *Diagram rendered by [{workflow_name}]({run_url})*{effective_tokens_suffix}{history_link}"
+    footer: "> 📊 *Diagram rendered by [{workflow_name}]({run_url})*{ai_credits_suffix}{history_link}"
     footer-workflow-recompile: "> 🔧 *Workflow sync report by [{workflow_name}]({run_url}) for {repository}*"
     footer-workflow-recompile-comment: "> 🔄 *Update from [{workflow_name}]({run_url}) for {repository}*"
     run-started: "📐 [{workflow_name}]({run_url}) is analyzing the architecture for this {event_type}..."
@@ -40,10 +44,10 @@ safe-outputs:
     run-failure: "📐 [{workflow_name}]({run_url}) encountered an issue and could not complete the architecture diagram. Check the [run logs]({run_url}) for details."
 timeout-minutes: 10
 features:
-  copilot-requests: true
-firewall:
-  effective-token-steering: true
-
+  gh-aw-detection: true
+sandbox:
+  agent:
+    sudo: false
 ---
 
 # Archie - Mermaid Diagram Generator
@@ -102,6 +106,7 @@ Use Serena to generate 1-3 simple Mermaid diagrams:
    - `journey` - for user or development journeys
    - `gantt` - for timelines and schedules
    - `pie` - for proportional data
+5. **Descriptive Node IDs**: Always use descriptive node IDs that reflect the node's meaning (e.g., `ValidateInput`, `SendNotification`). Never use single-letter IDs (e.g., `A`, `B`, `C`). Descriptive IDs survive edits and remain traceable.
 
 ### Number of Diagrams
 
@@ -119,10 +124,10 @@ Choose the number based on complexity:
 **Flowchart Example:**
 ```mermaid
 graph TD
-    A[Start] --> B[Process]
-    B --> C{Decision}
-    C -->|Yes| D[Action 1]
-    C -->|No| E[Action 2]
+    Start[Start] --> Process[Process]
+    Process --> Decision{Decision}
+    Decision -->|Yes| ActionYes[Action 1]
+    Decision -->|No| ActionNo[Action 2]
 ```
 
 **Sequence Diagram Example:**
@@ -149,6 +154,7 @@ Before posting, ensure your diagrams:
 - [ ] Syntax follows Mermaid specification
 - [ ] No advanced styling or custom themes
 - [ ] Node labels are clear and concise
+- [ ] Node IDs are descriptive (not single letters like `A`, `B`, `C`)
 - [ ] Relationships are properly defined
 - [ ] Total diagrams: between 1 and 3
 
@@ -230,6 +236,7 @@ If generating multiple diagrams, wrap diagrams 2 and 3 in `<details><summary>Vie
 A successful Archie run:
 - ✅ Analyzes the trigger context and any linked references
 - ✅ Generates between 1 and 3 valid Mermaid diagrams
+- ✅ Uses descriptive node IDs (never single-letter IDs like `A`, `B`, `C`)
 - ✅ Ensures diagrams are GitHub Markdown-compatible
 - ✅ Posts diagrams as a well-formatted comment
 - ✅ Uses Serena for diagram generation consistency

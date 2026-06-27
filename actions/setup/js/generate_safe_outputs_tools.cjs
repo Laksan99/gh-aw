@@ -1,6 +1,7 @@
 // @ts-check
 /// <reference types="@actions/github-script" />
 "use strict";
+// @safe-outputs-exempt SEC-004 — schema generator; does not process user body content. The substring "body:" appears only in the comment referencing the "allow-body" config option.
 
 /**
  * generate_safe_outputs_tools.cjs
@@ -29,6 +30,45 @@
 const fs = require("fs");
 const path = require("path");
 const { ERR_CONFIG } = require("./error_codes.cjs");
+
+const ADD_COMMENT_DEFAULT_DISCUSSIONS_NOTE =
+  "NOTE: By default, this tool does not require discussions:write permission. Set 'discussions: true' in the workflow's safe-outputs.add-comment configuration to enable discussion comments and request this permission.";
+const ADD_COMMENT_DISCUSSIONS_ENABLED_NOTE = "NOTE: Discussion comments are enabled for this workflow because discussions:write permission is available.";
+const ADD_COMMENT_DISCUSSIONS_DISABLED_NOTE =
+  "NOTE: Discussion comments are disabled for this workflow because discussions:write permission is not available. Set 'discussions: true' in the workflow's safe-outputs.add-comment configuration to enable discussion comments and request this permission.";
+const ADD_COMMENT_REPLY_SUPPORT_SENTENCE = "Supports reply_to_id for discussion threading.";
+const ADD_COMMENT_REPLY_SUPPORT_REGEX = /\s*Supports reply_to_id for discussion threading\./g;
+
+/**
+ * Update add_comment description to match runtime-safe-output permissions.
+ * @param {string} description
+ * @param {unknown} addCommentConfig
+ * @returns {string}
+ */
+function updateAddCommentDescription(description, addCommentConfig) {
+  const discussionCommentsEnabled = typeof addCommentConfig === "object" && addCommentConfig !== null && "discussions" in addCommentConfig && addCommentConfig.discussions === true;
+
+  let updated = description || "";
+  const note = discussionCommentsEnabled ? ADD_COMMENT_DISCUSSIONS_ENABLED_NOTE : ADD_COMMENT_DISCUSSIONS_DISABLED_NOTE;
+  if (updated.includes(ADD_COMMENT_DEFAULT_DISCUSSIONS_NOTE)) {
+    updated = updated.replace(ADD_COMMENT_DEFAULT_DISCUSSIONS_NOTE, note);
+  } else if (!updated.includes(ADD_COMMENT_DISCUSSIONS_ENABLED_NOTE) && !updated.includes(ADD_COMMENT_DISCUSSIONS_DISABLED_NOTE)) {
+    updated = `${updated} ${note}`.trim();
+  }
+
+  if (discussionCommentsEnabled) {
+    if (!updated.includes(ADD_COMMENT_REPLY_SUPPORT_SENTENCE)) {
+      updated = `${updated} ${ADD_COMMENT_REPLY_SUPPORT_SENTENCE}`.trim();
+    }
+  } else {
+    updated = updated
+      .replace(ADD_COMMENT_REPLY_SUPPORT_REGEX, "")
+      .replace(/\s{2,}/g, " ")
+      .trim();
+  }
+
+  return updated;
+}
 
 async function main() {
   const toolsSourcePath = process.env.GH_AW_SAFE_OUTPUTS_TOOLS_SOURCE_PATH || `${process.env.RUNNER_TEMP}/gh-aw/actions/safe_outputs_tools.json`;
@@ -64,7 +104,7 @@ async function main() {
   const config = JSON.parse(fs.readFileSync(configPath, "utf8"));
 
   // Load tools meta (description suffixes, repo params, dynamic tools)
-  /** @type {{description_suffixes?: Record<string, string>, repo_params?: Record<string, {type: string, description: string}>, dynamic_tools?: Array<unknown>}} */
+  /** @type {{description_suffixes?: Record<string, string>, repo_params?: Record<string, {type: string, description: string}>, dynamic_tools?: Array<unknown>, required_field_removals?: Record<string, string[]>, required_field_additions?: Record<string, string[]>}} */
   let toolsMeta = { description_suffixes: {}, repo_params: {}, dynamic_tools: [] };
   if (fs.existsSync(toolsMetaPath)) {
     toolsMeta = JSON.parse(fs.readFileSync(toolsMetaPath, "utf8"));
@@ -91,6 +131,10 @@ async function main() {
         enhancedTool.description = (enhancedTool.description || "") + descSuffix;
       }
 
+      if (tool.name === "add_comment") {
+        enhancedTool.description = updateAddCommentDescription(enhancedTool.description, config.add_comment);
+      }
+
       // Add repo parameter to inputSchema if configured
       const repoParam = toolsMeta.repo_params?.[tool.name];
       if (repoParam) {
@@ -101,6 +145,22 @@ async function main() {
           enhancedTool.inputSchema.properties = {};
         }
         enhancedTool.inputSchema.properties.repo = repoParam;
+      }
+
+      // Remove fields from inputSchema.required when configured (e.g. allow-body: false)
+      const requiredRemovals = toolsMeta.required_field_removals?.[tool.name];
+      if (requiredRemovals && Array.isArray(enhancedTool.inputSchema?.required)) {
+        enhancedTool.inputSchema.required = enhancedTool.inputSchema.required.filter(/** @param {string} f */ f => !requiredRemovals.includes(f));
+        if (enhancedTool.inputSchema.required.length === 0) {
+          delete enhancedTool.inputSchema.required;
+        }
+      }
+
+      // Add fields to inputSchema.required when configured (e.g. require-temporary-id: true)
+      const requiredAdditions = toolsMeta.required_field_additions?.[tool.name];
+      if (requiredAdditions && requiredAdditions.length > 0) {
+        const existingRequired = Array.isArray(enhancedTool.inputSchema?.required) ? enhancedTool.inputSchema.required : [];
+        enhancedTool.inputSchema.required = Array.from(new Set([...existingRequired, ...requiredAdditions]));
       }
 
       return enhancedTool;

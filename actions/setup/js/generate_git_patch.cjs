@@ -10,9 +10,9 @@ const fs = require("fs");
 const path = require("path");
 
 const { getErrorMessage } = require("./error_helpers.cjs");
-const { execGitSync, getGitAuthEnv } = require("./git_helpers.cjs");
+const { ensureOriginRemoteTrackingRef, execGitSync } = require("./git_helpers.cjs");
 const { ERR_SYSTEM } = require("./error_codes.cjs");
-const { sanitizeForFilename, sanitizeBranchNameForPatch, sanitizeRepoSlugForPatch, getPatchPath, getPatchPathForRepo, buildExcludePathspecs, computeIncrementalDiffSize } = require("./git_patch_utils.cjs");
+const { sanitizeForFilename, sanitizeBranchNameForPatch, sanitizeRepoSlugForPatch, getPatchPathForBranch, getPatchPathForBranchInRepo, buildExcludePathspecs, computeIncrementalDiffSize } = require("./git_patch_utils.cjs");
 
 // sanitizeForFilename is re-exported below for backward compatibility with
 // existing callers that imported it from this module.
@@ -40,6 +40,8 @@ function debugLog(message) {
  *     In incremental mode, origin/branchName is fetched explicitly and merge-base fallback is disabled.
  * @param {string} [options.cwd] - Working directory for git commands. Defaults to GITHUB_WORKSPACE or process.cwd().
  *   Use this for multi-repo scenarios where repos are checked out to subdirectories.
+ * @param {string} [options.workspacePath] - Path relative to GITHUB_WORKSPACE used as git working directory.
+ *   When set, this takes precedence over options.cwd and must resolve to a directory under GITHUB_WORKSPACE.
  * @param {string} [options.repoSlug] - Repository slug (owner/repo) to include in patch filename for disambiguation.
  *   Required for multi-repo scenarios to prevent patch file collisions.
  * @param {string} [options.token] - GitHub token for git authentication. Falls back to GITHUB_TOKEN env var.
@@ -47,12 +49,15 @@ function debugLog(message) {
  * @param {string[]} [options.excludedFiles] - Glob patterns for files to exclude from the patch.
  *   Each pattern is passed to `git format-patch` as a `:(exclude)<pattern>` magic pathspec so
  *   matching files are never included in the generated patch.
+ * @param {string} [options.pinnedSha] - SECURITY: When set, use this SHA as the branch tip instead
+ *   of resolving refs/heads/<branchName>. Prevents TOCTOU races where the agent flips the branch
+ *   ref between patch and bundle generation.
  * @returns {Promise<Object>} Object with patch info or error
  */
 async function generateGitPatch(branchName, baseBranch, options = {}) {
   const mode = options.mode || "full";
-  // Support custom cwd for multi-repo scenarios
-  const cwd = options.cwd || process.env.GITHUB_WORKSPACE || process.cwd();
+  const workspaceRoot = process.env.GITHUB_WORKSPACE || process.cwd();
+  let cwd = options.cwd || workspaceRoot;
   // Include repo slug in patch path for multi-repo disambiguation
 
   // Build :(exclude) pathspec arguments from the excludedFiles option.
@@ -68,7 +73,36 @@ async function generateGitPatch(branchName, baseBranch, options = {}) {
   function excludeArgs() {
     return excludeArgsArr;
   }
-  const patchPath = options.repoSlug ? getPatchPathForRepo(branchName, options.repoSlug) : getPatchPath(branchName);
+  const patchPath = options.repoSlug ? getPatchPathForBranchInRepo(branchName, options.repoSlug) : getPatchPathForBranch(branchName);
+
+  if (options.workspacePath !== undefined && options.workspacePath !== null && String(options.workspacePath).trim() !== "") {
+    const root = path.resolve(workspaceRoot);
+    const candidate = path.resolve(root, String(options.workspacePath));
+    const relative = path.relative(root, candidate);
+    if (relative.startsWith("..") || path.isAbsolute(relative)) {
+      const errorMessage = `Invalid workspacePath '${String(options.workspacePath)}': path must stay under GITHUB_WORKSPACE`;
+      return {
+        success: false,
+        error: errorMessage,
+        patchPath,
+      };
+    }
+    if (!fs.existsSync(candidate)) {
+      return {
+        success: false,
+        error: `Invalid workspacePath '${String(options.workspacePath)}': directory does not exist`,
+        patchPath,
+      };
+    }
+    if (!fs.statSync(candidate).isDirectory()) {
+      return {
+        success: false,
+        error: `Invalid workspacePath '${String(options.workspacePath)}': path is not a directory`,
+        patchPath,
+      };
+    }
+    cwd = candidate;
+  }
 
   // Validate baseBranch early to avoid confusing git errors (e.g., origin/undefined)
   if (typeof baseBranch !== "string" || baseBranch.trim() === "") {
@@ -99,15 +133,25 @@ async function generateGitPatch(branchName, baseBranch, options = {}) {
   // can use it directly. The From <sha> header in format-patch output contains the
   // *new* commit SHA which won't exist in the target checkout.
   let baseCommitSha = null;
+  let resolvedTipRef = null;
 
   try {
     // Strategy 1: If we have a branch name, check if that branch exists and get its diff
     if (branchName) {
-      debugLog(`Strategy 1: Checking if branch '${branchName}' exists locally`);
-      // Check if the branch exists locally
+      resolvedTipRef = options.pinnedSha || branchName;
+      // SECURITY: When pinnedSha is provided, use it directly as the tip commit instead
+      // of dereferencing refs/heads/<branchName>. This prevents TOCTOU races where the
+      // agent can flip the branch ref between patch and bundle generation.
+      const tipRef = resolvedTipRef;
       try {
-        execGitSync(["show-ref", "--verify", "--quiet", `refs/heads/${branchName}`], { cwd });
-        debugLog(`Strategy 1: Branch '${branchName}' exists locally`);
+        if (options.pinnedSha) {
+          debugLog(`Strategy 1: Using pinned SHA ${options.pinnedSha} (branch: ${branchName})`);
+        } else {
+          debugLog(`Strategy 1: Checking if branch '${branchName}' exists locally`);
+          // Check if the branch exists locally
+          execGitSync(["show-ref", "--verify", "--quiet", `refs/heads/${branchName}`], { cwd });
+          debugLog(`Strategy 1: Branch '${branchName}' exists locally`);
+        }
 
         // Determine base ref for patch generation
         let baseRef;
@@ -115,50 +159,31 @@ async function generateGitPatch(branchName, baseBranch, options = {}) {
         if (mode === "incremental") {
           // INCREMENTAL MODE (for push_to_pull_request_branch):
           // Only include commits that are new since origin/branchName.
-          // This prevents including commits that already exist on the PR branch.
-          // Prefer a fresh fetch of origin/branchName; fall back to the existing
-          // remote tracking ref (set up by the initial shallow checkout) when the
-          // fetch fails (e.g. due to shallow clone limitations or missing credentials).
+          // Tries a local-only check first, then a single network fetch attempt.
+          // The fetch will succeed for public repos (no credentials needed) and
+          // fail fast for private repos without credentials (execGitSync runs
+          // git with GIT_TERMINAL_PROMPT=0 and a 60s timeout).
 
-          debugLog(`Strategy 1 (incremental): Fetching origin/${branchName}`);
-          // Configure git authentication via GIT_CONFIG_* environment variables.
-          // This ensures the fetch works when .git/config credentials are unavailable
-          // (e.g. after clean_git_credentials.sh) and on GitHub Enterprise Server (GHES).
-          // Use options.token when provided (cross-repo PAT), falling back to GITHUB_TOKEN.
-          // SECURITY: The auth header is passed via env vars so it is never written to
-          // .git/config on disk, preventing file-monitoring attacks.
-          const fetchEnv = { ...process.env, ...getGitAuthEnv(options.token) };
-
-          try {
-            // Explicitly fetch origin/branchName to ensure we have the latest
-            // Use "--" to prevent branch names starting with "-" from being interpreted as options
-            execGitSync(["fetch", "origin", "--", `${branchName}:refs/remotes/origin/${branchName}`], { cwd, env: fetchEnv });
+          debugLog(`Strategy 1 (incremental): Resolving origin/${branchName}`);
+          const incrementalRefResult = ensureOriginRemoteTrackingRef(branchName, { cwd, token: options.token, suppressLogs: true });
+          if (incrementalRefResult.exists) {
             baseRef = `origin/${branchName}`;
-            debugLog(`Strategy 1 (incremental): Successfully fetched, baseRef=${baseRef}`);
-          } catch (fetchError) {
-            // Fetch failed. Check if origin/branchName already exists from the initial shallow checkout.
-            // This handles cases where git fetch fails due to shallow clone limitations or when
-            // GITHUB_TOKEN is unavailable in the MCP server process (e.g. after clean_git_credentials.sh).
-            // Using the existing remote tracking ref as a fallback is safe: it represents the state
-            // of the branch at checkout time, so the incremental patch will include all commits
-            // made by the agent since then.
-            debugLog(`Strategy 1 (incremental): Fetch failed - ${getErrorMessage(fetchError)}, checking for existing remote tracking ref`);
-            try {
-              execGitSync(["show-ref", "--verify", "--quiet", `refs/remotes/origin/${branchName}`], { cwd });
-              // Remote tracking ref exists from initial shallow checkout — use it as base
-              baseRef = `origin/${branchName}`;
-              debugLog(`Strategy 1 (incremental): Using existing remote tracking ref as fallback, baseRef=${baseRef}`);
-            } catch (refCheckError) {
-              // No remote tracking ref at all — cannot safely generate an incremental patch.
-              // Report both errors: the original fetch failure and the missing ref.
-              debugLog(`Strategy 1 (incremental): No existing remote tracking ref found (${getErrorMessage(refCheckError)}), failing`);
-              errorMessage = `Cannot generate incremental patch: failed to fetch origin/${branchName} and no existing remote tracking ref found. This typically happens when the remote branch doesn't exist yet or was force-pushed. Fetch error: ${getErrorMessage(fetchError)}`;
-              return {
-                success: false,
-                error: errorMessage,
-                patchPath: patchPath,
-              };
+            if (incrementalRefResult.fetched) {
+              debugLog(`Strategy 1 (incremental): Fetched origin/${branchName} from remote, baseRef=${baseRef}`);
+            } else {
+              debugLog(`Strategy 1 (incremental): Using existing remote tracking ref, baseRef=${baseRef}`);
             }
+          } else {
+            debugLog(`Strategy 1 (incremental): origin/${branchName} not present locally and remote fetch failed (${incrementalRefResult.fetchError ? getErrorMessage(incrementalRefResult.fetchError) : "no error"}), failing`);
+            errorMessage =
+              `Cannot generate incremental patch: refs/remotes/origin/${branchName} is not present in checkout '${cwd}' and could not be fetched ` +
+              `(the safe-outputs MCP server has no credentials for private repositories). ` +
+              `Add ${JSON.stringify(branchName)} to the workflow's checkout.fetch list so the branch is fetched during setup.`;
+            return {
+              success: false,
+              error: errorMessage,
+              patchPath: patchPath,
+            };
           }
         } else {
           // FULL MODE (for create_pull_request):
@@ -175,37 +200,40 @@ async function generateGitPatch(branchName, baseBranch, options = {}) {
           // never made. Always compute the merge-base with the default branch so the patch
           // contains exactly the agent's changes.
           debugLog(`Strategy 1 (full): Computing merge-base with ${defaultBranch} (ignoring any stale origin/${branchName})`);
-          // Check if origin/<defaultBranch> already exists locally (e.g., from checkout with fetch-depth: 0)
-          // This is important for cross-repo checkouts where persist-credentials: false prevents fetching
-          let hasLocalDefaultBranch = false;
-          try {
-            execGitSync(["show-ref", "--verify", "--quiet", `refs/remotes/origin/${defaultBranch}`], { cwd });
-            hasLocalDefaultBranch = true;
-            debugLog(`Strategy 1 (full): origin/${defaultBranch} exists locally`);
-          } catch {
-            // origin/<defaultBranch> doesn't exist locally, try to fetch it
-            debugLog(`Strategy 1 (full): origin/${defaultBranch} not found locally, attempting fetch`);
+          // Check if origin/<defaultBranch> already exists locally (e.g., from checkout with fetch-depth: 0).
+          // When missing, try a single network fetch — succeeds for public repos and
+          // fails fast for private repos without credentials.
+          const defaultBranchRefResult = ensureOriginRemoteTrackingRef(defaultBranch, { cwd, token: options.token, suppressLogs: true });
+          const hasLocalDefaultBranch = defaultBranchRefResult.exists;
+          if (hasLocalDefaultBranch) {
+            if (defaultBranchRefResult.fetched) {
+              debugLog(`Strategy 1 (full): fetched origin/${defaultBranch} from remote`);
+            } else {
+              debugLog(`Strategy 1 (full): origin/${defaultBranch} exists locally`);
+            }
+          } else {
+            debugLog(
+              `Strategy 1 (full): origin/${defaultBranch} not present locally and remote fetch failed (likely private repo without credentials in MCP server). Add ${JSON.stringify(defaultBranch)} to checkout.fetch to enable this strategy.`
+            );
+          }
+
+          // If origin/<defaultBranch> is unavailable (e.g. credentials were cleaned),
+          // fall back to the local base branch ref when it exists.
+          let defaultBranchRef = null;
+          if (hasLocalDefaultBranch) {
+            defaultBranchRef = `origin/${defaultBranch}`;
+          } else {
             try {
-              // Configure git authentication via GIT_CONFIG_* environment variables.
-              // This ensures the fetch works when .git/config credentials are unavailable
-              // (e.g. after clean_git_credentials.sh) and on GitHub Enterprise Server (GHES).
-              // Use options.token when provided (cross-repo PAT), falling back to GITHUB_TOKEN.
-              // SECURITY: The auth header is passed via env vars so it is never written to
-              // .git/config on disk, preventing file-monitoring attacks.
-              const fullFetchEnv = { ...process.env, ...getGitAuthEnv(options.token) };
-              // Use "--" to prevent branch names starting with "-" from being interpreted as options
-              execGitSync(["fetch", "origin", "--", defaultBranch], { cwd, env: fullFetchEnv });
-              hasLocalDefaultBranch = true;
-              debugLog(`Strategy 1 (full): Successfully fetched origin/${defaultBranch}`);
-            } catch (fetchErr) {
-              // Fetch failed (likely due to persist-credentials: false in cross-repo checkout)
-              // We'll try other strategies below
-              debugLog(`Strategy 1 (full): Fetch failed - ${getErrorMessage(fetchErr)} (will try other strategies)`);
+              execGitSync(["show-ref", "--verify", "--quiet", `refs/heads/${defaultBranch}`], { cwd });
+              defaultBranchRef = defaultBranch;
+              debugLog(`Strategy 1 (full): Using local branch ${defaultBranch} as fallback base ref`);
+            } catch {
+              // No local branch fallback either
             }
           }
 
-          if (hasLocalDefaultBranch) {
-            baseRef = execGitSync(["merge-base", "--", `origin/${defaultBranch}`, branchName], { cwd }).trim();
+          if (defaultBranchRef) {
+            baseRef = execGitSync(["merge-base", "--", defaultBranchRef, tipRef], { cwd }).trim();
             debugLog(`Strategy 1 (full): Computed merge-base: ${baseRef}`);
           } else {
             // No remote refs available - fall through to Strategy 2
@@ -219,12 +247,12 @@ async function generateGitPatch(branchName, baseBranch, options = {}) {
         debugLog(`Strategy 1: Resolved baseRef ${baseRef} to SHA ${baseCommitSha}`);
 
         // Count commits to be included
-        const commitCount = parseInt(execGitSync(["rev-list", "--count", `${baseRef}..${branchName}`], { cwd }).trim(), 10);
-        debugLog(`Strategy 1: Found ${commitCount} commits between ${baseRef} and ${branchName}`);
+        const commitCount = parseInt(execGitSync(["rev-list", "--count", `${baseRef}..${tipRef}`], { cwd }).trim(), 10);
+        debugLog(`Strategy 1: Found ${commitCount} commits between ${baseRef} and ${tipRef}`);
 
         if (commitCount > 0) {
           // Generate patch from the determined base to the branch
-          const patchContent = execGitSync(["format-patch", `${baseRef}..${branchName}`, "--stdout", ...excludeArgs()], { cwd });
+          const patchContent = execGitSync(["format-patch", `${baseRef}..${tipRef}`, "--stdout", ...excludeArgs()], { cwd });
 
           if (patchContent && patchContent.trim()) {
             fs.writeFileSync(patchPath, patchContent, "utf8");
@@ -253,20 +281,33 @@ async function generateGitPatch(branchName, baseBranch, options = {}) {
         // error preserves the "incremental" contract that the patch reflects only
         // the new commits.
         if (!patchGenerated && mode === "incremental") {
-          debugLog(`Strategy 1 (incremental): format-patch produced no output for ${baseRef}..${branchName} despite ${commitCount} incremental commit(s), refusing to fall through to checkout-base strategies`);
+          debugLog(`Strategy 1 (incremental): format-patch produced no output for ${baseRef}..${tipRef} despite ${commitCount} incremental commit(s), refusing to fall through to checkout-base strategies`);
           return {
             success: false,
-            error: `Cannot generate incremental patch: git format-patch produced no output for ${baseRef}..${branchName} despite ${commitCount} incremental commit(s).`,
+            error: `Cannot generate incremental patch: git format-patch produced no output for ${baseRef}..${tipRef} despite ${commitCount} incremental commit(s).`,
             patchPath: patchPath,
           };
         }
       } catch (branchError) {
-        // Branch does not exist locally
+        // Branch does not exist locally (or pinnedSha failed)
         debugLog(`Strategy 1: Branch '${branchName}' does not exist locally - ${getErrorMessage(branchError)}`);
+        if (options.pinnedSha) {
+          // SECURITY: When pinnedSha is set, fail closed — do not fall through to
+          // other strategies that would resolve a different commit.
+          return {
+            success: false,
+            error: `Pinned SHA ${options.pinnedSha} failed to generate patch: ${getErrorMessage(branchError)}`,
+            patchPath: patchPath,
+          };
+        }
         if (mode === "incremental") {
           return {
             success: false,
-            error: `Branch ${branchName} does not exist locally. Cannot generate incremental patch.`,
+            error:
+              `Branch ${branchName} does not exist locally in checkout '${cwd}'. ` +
+              "Cannot generate incremental patch. Possible causes: " +
+              `(1) you have not checked out '${branchName}' yet (for example: git checkout -b ${branchName} --track origin/${branchName}); ` +
+              "(2) the tool is running in the wrong repository checkout. Ensure GITHUB_WORKSPACE points to the repository that contains this pull request branch.",
             patchPath: patchPath,
           };
         }
@@ -357,24 +398,46 @@ async function generateGitPatch(branchName, baseBranch, options = {}) {
             debugLog(`Strategy 3: Found ${commitCount} commits not reachable from any remote ref`);
 
             if (commitCount > 0) {
-              // Get the merge-base with the first remote ref (typically origin/HEAD or origin/main)
-              // to determine the starting point for the patch
-              let baseCommit;
+              // Choose the closest merge-base across all remote refs.
+              // for-each-ref output is lexicographic, so "first ref" is arbitrary and can
+              // point to stale branches that produce oversized patches.
+              let bestBaseCommit = null;
+              let bestBaseRef = null;
+              let bestCommitCount = Number.POSITIVE_INFINITY;
               for (const ref of remoteRefs) {
                 try {
-                  baseCommit = execGitSync(["merge-base", ref, branchName], { cwd }).trim();
-                  if (baseCommit) {
-                    debugLog(`Strategy 3: Found merge-base ${baseCommit} with ref ${ref}`);
-                    break;
+                  const candidateBase = execGitSync(["merge-base", ref, "--", branchName], { cwd }).trim();
+                  if (!candidateBase) {
+                    continue;
+                  }
+
+                  const candidateCommitCount = parseInt(execGitSync(["rev-list", "--count", `${candidateBase}..${branchName}`], { cwd }).trim(), 10);
+                  if (Number.isNaN(candidateCommitCount)) {
+                    debugLog(`Strategy 3: Ignoring merge-base ${candidateBase} from ref ${ref} due to invalid commit count`);
+                    continue;
+                  }
+                  if (candidateCommitCount <= 0) {
+                    debugLog(`Strategy 3: Skipping ref ${ref} — merge-base not behind branch (count=${candidateCommitCount})`);
+                    continue;
+                  }
+
+                  if (candidateCommitCount < bestCommitCount) {
+                    bestBaseCommit = candidateBase;
+                    bestBaseRef = ref;
+                    bestCommitCount = candidateCommitCount;
+                    if (bestCommitCount === 1) {
+                      break;
+                    }
                   }
                 } catch {
                   // Try next ref
                 }
               }
 
-              if (baseCommit) {
-                baseCommitSha = baseCommit;
-                const patchContent = execGitSync(["format-patch", `${baseCommit}..${branchName}`, "--stdout", ...excludeArgs()], { cwd });
+              if (bestBaseCommit) {
+                baseCommitSha = bestBaseCommit;
+                debugLog(`Strategy 3: Selected merge-base ${bestBaseCommit} with ref ${bestBaseRef} (commitCount=${bestCommitCount})`);
+                const patchContent = execGitSync(["format-patch", `${bestBaseCommit}..${branchName}`, "--stdout", ...excludeArgs()], { cwd });
 
                 if (patchContent && patchContent.trim()) {
                   fs.writeFileSync(patchPath, patchContent, "utf8");
@@ -427,16 +490,77 @@ async function generateGitPatch(branchName, baseBranch, options = {}) {
     // The measurement itself (stream to temp file via `git diff --output`, stat,
     // cleanup) is extracted into git_patch_utils.computeIncrementalDiffSize so
     // it is O(1) memory and independently unit-testable against a real repo.
+    //
+    // When the agent has merged the default branch into the PR branch (to resolve
+    // conflicts or sync a stale branch), the naive diff base of `origin/<branch>`
+    // (the PR's old head) inflates diffSize to include all of the default branch's
+    // new commits — even though those commits are already on origin/<defaultBranch>
+    // and represent no new content in the PR. Fix: when the merge-base between
+    // origin/<defaultBranch> and the local branch is NOT an ancestor of the PR's
+    // current head (baseCommitSha), the agent merged default-branch commits ahead
+    // of the PR head. Use the merge-base as the effective diff base to exclude those
+    // merged upstream commits from the size measurement.
+    let diffBaseForSize = baseCommitSha;
+    if (mode === "incremental" && baseCommitSha && resolvedTipRef && defaultBranch) {
+      try {
+        let baseBranchRemoteRef = null;
+        try {
+          execGitSync(["show-ref", "--verify", "--quiet", `refs/remotes/origin/${defaultBranch}`], { cwd });
+          baseBranchRemoteRef = `refs/remotes/origin/${defaultBranch}`;
+        } catch {
+          // origin/<defaultBranch> not available locally; skip the adjustment
+        }
+        if (baseBranchRemoteRef) {
+          // Only adjust the diff base when baseCommitSha is an ancestor of the local
+          // branch tip.  If it is NOT an ancestor the branch was rewritten (rebase /
+          // force-push); in that case the merge-base adjustment could undercount by
+          // ignoring commits that changed relative to the remote, so keep the original
+          // baseCommitSha as the diff base.
+          let baseIsAncestorOfBranch = false;
+          try {
+            execGitSync(["merge-base", "--is-ancestor", "--", baseCommitSha, resolvedTipRef], { cwd });
+            baseIsAncestorOfBranch = true;
+          } catch {
+            // baseCommitSha is not an ancestor of tipRef (rebase / force-push)
+            debugLog(`Strategy 1 (incremental): baseCommitSha ${baseCommitSha} is not an ancestor of ${resolvedTipRef} (rebase/force-push?); skipping merge-base adjustment`);
+          }
+
+          if (baseIsAncestorOfBranch) {
+            const mb = execGitSync(["merge-base", "--", baseBranchRemoteRef, resolvedTipRef], { cwd }).trim();
+            // Check if mb is already an ancestor of baseCommitSha.
+            // If it is, baseCommitSha is "later" and the agent did NOT merge the default
+            // branch ahead of the PR head — keep baseCommitSha as the diff base.
+            // If mb is NOT an ancestor of baseCommitSha, the agent merged default-branch
+            // commits that are beyond the PR head. Use mb to exclude those commits from
+            // the incremental diff size measurement.
+            let mbIsAncestorOfBase = false;
+            try {
+              execGitSync(["merge-base", "--is-ancestor", "--", mb, baseCommitSha], { cwd });
+              mbIsAncestorOfBase = true;
+            } catch {
+              // mb is not an ancestor of baseCommitSha
+            }
+            if (!mbIsAncestorOfBase) {
+              debugLog(`Strategy 1 (incremental): agent merged ${defaultBranch} ahead of PR head; using merge-base ${mb} as diff base instead of PR head ${baseCommitSha}`);
+              diffBaseForSize = mb;
+            }
+          }
+        }
+      } catch (adjustErr) {
+        debugLog(`Strategy 1 (incremental): diff-base adjustment failed (${getErrorMessage(adjustErr)}); using original base`);
+      }
+    }
+
     let diffSize = null;
-    if (mode === "incremental" && baseCommitSha && branchName) {
+    if (mode === "incremental" && diffBaseForSize && resolvedTipRef) {
       diffSize = computeIncrementalDiffSize({
-        baseRef: baseCommitSha,
-        headRef: branchName,
+        baseRef: diffBaseForSize,
+        headRef: resolvedTipRef,
         cwd,
         tmpPath: `${patchPath}.diff.tmp`,
         excludedFiles: options.excludedFiles,
       });
-      debugLog(`Final: diffSize=${diffSize ?? "(n/a)"} bytes (baseRef=${baseCommitSha}..${branchName})`);
+      debugLog(`Final: diffSize=${diffSize ?? "(n/a)"} bytes (baseRef=${diffBaseForSize}..${resolvedTipRef})`);
     }
 
     debugLog(`Final: SUCCESS - patchSize=${patchSize} bytes, patchLines=${patchLines}, diffSize=${diffSize ?? "(n/a)"} bytes, baseCommit=${baseCommitSha || "(unknown)"}`);
@@ -461,8 +585,8 @@ async function generateGitPatch(branchName, baseBranch, options = {}) {
 
 module.exports = {
   generateGitPatch,
-  getPatchPath,
-  getPatchPathForRepo,
+  getPatchPathForBranch,
+  getPatchPathForBranchInRepo,
   sanitizeBranchNameForPatch,
   sanitizeRepoSlugForPatch,
 };

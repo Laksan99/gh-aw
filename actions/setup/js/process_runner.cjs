@@ -44,12 +44,18 @@ function sleep(ms) {
  * Run a command with the given arguments, transparently forwarding stdin/stdout/stderr.
  * Also collects combined stdout+stderr output for error pattern detection.
  *
+ * The child process is spawned with `cwd` set to `process.env.GH_AW_ENGINE_CWD` when
+ * available, falling back to `process.env.GITHUB_WORKSPACE`, so that engines and their
+ * skill-discovery paths resolve relative to the configured or repository checkout root
+ * rather than the harness working directory.
+ *
  * @param {{
  *   command: string,
  *   args: string[],
  *   attempt: number,
  *   log: (message: string) => void,
- *   logArgs?: string[]
+ *   logArgs?: string[],
+ *   env?: NodeJS.ProcessEnv
  * }} options
  *   - command   - The executable to run
  *   - args      - Arguments to pass to the command
@@ -59,7 +65,7 @@ function sleep(ms) {
  *                 Pass a redacted copy to avoid leaking sensitive values.
  * @returns {Promise<{exitCode: number, output: string, hasOutput: boolean, durationMs: number}>}
  */
-function runProcess({ command, args, attempt, log, logArgs }) {
+function runProcess({ command, args, attempt, log, logArgs, env }) {
   return new Promise(resolve => {
     const startTime = Date.now();
     // Guard against the promise being settled more than once.  On some systems Node
@@ -78,7 +84,8 @@ function runProcess({ command, args, attempt, log, logArgs }) {
 
     const child = spawn(command, args, {
       stdio: ["inherit", "pipe", "pipe"],
-      env: process.env,
+      env: env ?? process.env,
+      cwd: process.env.GH_AW_ENGINE_CWD || process.env.GITHUB_WORKSPACE || undefined,
     });
 
     log(`attempt ${attempt + 1}: process started (pid=${child.pid ?? "unknown"})`);
@@ -137,6 +144,54 @@ function runProcess({ command, args, attempt, log, logArgs }) {
   });
 }
 
+/**
+ * @param {NodeJS.ProcessEnv} [env]
+ * @returns {boolean}
+ */
+function isCopilotSDKEnabled(env) {
+  const sourceEnv = env ?? process.env;
+  return Boolean(sourceEnv.COPILOT_SDK_URI);
+}
+
+/**
+ * Returns the Copilot SDK environment additions to inject into child processes
+ * when SDK mode is active.
+ *
+ * When COPILOT_SDK_URI is set in process.env, returns an object with
+ * { COPILOT_SDK_URI } so callers can merge it into their child-process env.
+ * Returns an empty object when SDK mode is not active, making it safe to call
+ * unconditionally.
+ *
+ * Intended to be shared by all engine harnesses (copilot_harness, claude_harness, …)
+ * so that COPILOT_SDK_URI is forwarded consistently without duplicating the logic.
+ *
+ * @param {NodeJS.ProcessEnv} [env] - Source environment (defaults to process.env)
+ * @returns {NodeJS.ProcessEnv}
+ */
+function buildCopilotSDKEnv(env) {
+  const sourceEnv = env ?? process.env;
+  if (!isCopilotSDKEnabled(sourceEnv)) return {};
+  const uri = sourceEnv.COPILOT_SDK_URI;
+  if (!uri) return {};
+  /** @type {NodeJS.ProcessEnv} */
+  const sdkEnv = { COPILOT_SDK_URI: uri };
+  sdkEnv.COPILOT_SDK_LOG_LEVEL = sourceEnv.COPILOT_SDK_LOG_LEVEL || "all";
+  if (sourceEnv.COPILOT_SDK_SEND_TIMEOUT_MS) {
+    sdkEnv.COPILOT_SDK_SEND_TIMEOUT_MS = sourceEnv.COPILOT_SDK_SEND_TIMEOUT_MS;
+    return sdkEnv;
+  }
+
+  const timeoutMinutes = Number(sourceEnv.GH_AW_TIMEOUT_MINUTES);
+  if (!Number.isFinite(timeoutMinutes) || timeoutMinutes <= 0) {
+    return sdkEnv;
+  }
+
+  // Keep SDK sendAndWait timeout below the job step timeout by 30 seconds.
+  const timeoutMs = Math.max(Math.floor(timeoutMinutes * 60 * 1000) - 30 * 1000, 1000);
+  sdkEnv.COPILOT_SDK_SEND_TIMEOUT_MS = String(timeoutMs);
+  return sdkEnv;
+}
+
 if (typeof module !== "undefined" && module.exports) {
-  module.exports = { runProcess, formatDuration, sleep };
+  module.exports = { runProcess, formatDuration, sleep, isCopilotSDKEnabled, buildCopilotSDKEnv };
 }

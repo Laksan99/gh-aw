@@ -8,9 +8,10 @@ import (
 	"path/filepath"
 	"regexp"
 	"slices"
-	"sort"
 	"strings"
 
+	"github.com/github/gh-aw/pkg/constants"
+	"github.com/github/gh-aw/pkg/fileutil"
 	"github.com/github/gh-aw/pkg/logger"
 )
 
@@ -99,8 +100,14 @@ func loadPolicyManifest(manifestPath string) (*PolicyManifest, error) {
 	}
 
 	// Sort rules by order for deterministic matching
-	sort.Slice(manifest.Rules, func(i, j int) bool {
-		return manifest.Rules[i].Order < manifest.Rules[j].Order
+	slices.SortFunc(manifest.Rules, func(a, b PolicyRule) int {
+		if a.Order < b.Order {
+			return -1
+		}
+		if a.Order > b.Order {
+			return 1
+		}
+		return 0
 	})
 
 	firewallPolicyLog.Printf("Loaded policy manifest: version=%d, rules=%d, ssl_bump=%v, dlp=%v",
@@ -311,7 +318,8 @@ func enrichWithPolicyRules(entries []AuditLogEntry, manifest *PolicyManifest) *P
 
 	ruleHitMap := make(map[string]int)
 	var deniedRequests []EnrichedRequest
-	uniqueDomains := make(map[string]bool)
+	uniqueDomains := make(map[string]struct {
+	})
 	allowedCount := 0
 	deniedCount := 0
 
@@ -331,7 +339,8 @@ func enrichWithPolicyRules(entries []AuditLogEntry, manifest *PolicyManifest) *P
 		if idx := strings.LastIndex(host, ":"); idx != -1 {
 			domain = host[:idx]
 		}
-		uniqueDomains[strings.ToLower(domain)] = true
+		uniqueDomains[strings.ToLower(domain)] = struct {
+		}{}
 
 		rule := findMatchingRule(entry, manifest.Rules)
 
@@ -422,14 +431,14 @@ func detectFirewallAuditArtifacts(runDir string) (manifestPath, auditJSONLPath s
 	checkDir := func(dir, label string) bool {
 		if manifestPath == "" {
 			candidate := filepath.Join(dir, "policy-manifest.json")
-			if _, err := os.Stat(candidate); err == nil {
+			if fileutil.FileExists(candidate) {
 				manifestPath = candidate
 				firewallPolicyLog.Printf("Found policy manifest in %s: %s", label, manifestPath)
 			}
 		}
 		if auditJSONLPath == "" {
 			candidate := filepath.Join(dir, "audit.jsonl")
-			if _, err := os.Stat(candidate); err == nil {
+			if fileutil.FileExists(candidate) {
 				auditJSONLPath = candidate
 				firewallPolicyLog.Printf("Found audit JSONL in %s: %s", label, auditJSONLPath)
 			}
@@ -456,7 +465,7 @@ func detectFirewallAuditArtifacts(runDir string) (manifestPath, auditJSONLPath s
 			if !checkDir(filepath.Join(agentDir, "sandbox", "firewall", "audit"), agentBase+"/sandbox/firewall/audit") {
 				// Old artifact structure (/tmp/gh-aw/ prefix preserved inside the artifact):
 				//   <agentDir>/tmp/gh-aw/sandbox/firewall/audit/
-				checkDir(filepath.Join(agentDir, "tmp", "gh-aw", "sandbox", "firewall", "audit"), agentBase+"/tmp/gh-aw/sandbox/firewall/audit")
+				checkDir(filepath.Join(agentDir, "tmp", "gh-aw", "sandbox", "firewall", "audit"), agentBase+constants.AWFAuditDir)
 			}
 			if manifestPath != "" && auditJSONLPath != "" {
 				return manifestPath, auditJSONLPath, nil

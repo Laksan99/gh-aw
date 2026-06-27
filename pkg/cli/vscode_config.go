@@ -7,7 +7,9 @@ import (
 	"os"
 	"path/filepath"
 
+	"github.com/github/gh-aw/pkg/console"
 	"github.com/github/gh-aw/pkg/constants"
+	"github.com/github/gh-aw/pkg/fileutil"
 
 	"github.com/github/gh-aw/pkg/logger"
 )
@@ -68,18 +70,17 @@ func ensureVSCodeSettings(verbose bool) error {
 
 	// Create .vscode directory if it doesn't exist
 	vscodeDir := ".vscode"
-	if err := os.MkdirAll(vscodeDir, constants.DirPermPublic); err != nil {
+	settingsPath := filepath.Join(vscodeDir, "settings.json")
+	if err := fileutil.EnsureParentDir(settingsPath, constants.DirPermPublic); err != nil {
 		return fmt.Errorf("failed to create .vscode directory: %w", err)
 	}
 	vscodeConfigLog.Printf("Ensured directory exists: %s", vscodeDir)
 
-	settingsPath := filepath.Join(vscodeDir, "settings.json")
-
 	// Check if settings.json already exists
-	if _, err := os.Stat(settingsPath); err == nil {
+	if fileutil.FileExists(settingsPath) {
 		vscodeConfigLog.Print("Settings file already exists, skipping creation")
 		if verbose {
-			fmt.Fprintf(os.Stderr, "Settings file already exists at %s\n", settingsPath)
+			fmt.Fprintln(os.Stderr, console.FormatInfoMessageStderr("Settings file already exists at "+settingsPath))
 		}
 		return nil
 	}

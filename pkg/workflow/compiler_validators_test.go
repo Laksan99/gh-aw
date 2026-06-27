@@ -3,7 +3,12 @@
 package workflow
 
 import (
+	"bytes"
+	"errors"
+	"io"
+	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/github/gh-aw/pkg/testutil"
@@ -67,38 +72,33 @@ func TestValidateFeatureConfig(t *testing.T) {
 	tests := []struct {
 		name          string
 		features      map[string]any
-		inlineDisable bool
 		shouldError   bool
 		errorContains string
 	}{
 		{
-			name:          "no features",
-			features:      nil,
-			inlineDisable: false,
-			shouldError:   false,
+			name:        "no features",
+			features:    nil,
+			shouldError: false,
 		},
 		{
 			name: "valid action-mode dev",
 			features: map[string]any{
 				"action-mode": "dev",
 			},
-			inlineDisable: false,
-			shouldError:   false,
+			shouldError: false,
 		},
 		{
 			name: "valid action-mode release",
 			features: map[string]any{
 				"action-mode": "release",
 			},
-			inlineDisable: false,
-			shouldError:   false,
+			shouldError: false,
 		},
 		{
 			name: "invalid action-mode",
 			features: map[string]any{
 				"action-mode": "invalid-mode",
 			},
-			inlineDisable: false,
 			shouldError:   true,
 			errorContains: "invalid action-mode feature flag",
 		},
@@ -107,15 +107,7 @@ func TestValidateFeatureConfig(t *testing.T) {
 			features: map[string]any{
 				"action-mode": "",
 			},
-			inlineDisable: false,
-			shouldError:   false,
-		},
-		{
-			name:          "inline-sub-agents false is rejected",
-			features:      nil,
-			inlineDisable: true,
-			shouldError:   true,
-			errorContains: "inline-sub-agents: false is not supported",
+			shouldError: false,
 		},
 	}
 
@@ -126,11 +118,10 @@ func TestValidateFeatureConfig(t *testing.T) {
 
 			compiler := NewCompiler()
 			workflowData := &WorkflowData{
-				Name:                    "Test",
-				MarkdownContent:         "# Test",
-				AI:                      "copilot",
-				Features:                tt.features,
-				InlineSubAgentsDisabled: tt.inlineDisable,
+				Name:            "Test",
+				MarkdownContent: "# Test",
+				AI:              "copilot",
+				Features:        tt.features,
 			}
 
 			err := compiler.validateFeatureConfig(workflowData, markdownPath)
@@ -141,6 +132,72 @@ func TestValidateFeatureConfig(t *testing.T) {
 				}
 			} else {
 				assert.NoError(t, err, "validateFeatureConfig should not return an error")
+			}
+		})
+	}
+}
+
+func TestEmitExperimentalFeatureWarningsGHAWDetection(t *testing.T) {
+	t.Setenv("GH_AW_FEATURES", "")
+	tests := []struct {
+		name          string
+		features      map[string]any
+		expectWarning bool
+	}{
+		{
+			name: "gh-aw-detection enabled produces experimental warning",
+			features: map[string]any{
+				"gh-aw-detection": true,
+			},
+			expectWarning: true,
+		},
+		{
+			name: "gh-aw-detection disabled does not produce experimental warning",
+			features: map[string]any{
+				"gh-aw-detection": false,
+			},
+			expectWarning: false,
+		},
+		{
+			name:          "no gh-aw-detection does not produce experimental warning",
+			features:      nil,
+			expectWarning: false,
+		},
+	}
+
+	expectedMessage := "Using experimental feature: gh-aw-detection"
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			compiler := NewCompiler()
+			workflowData := &WorkflowData{
+				Features: tt.features,
+			}
+
+			oldStderr := os.Stderr
+			r, w, err := os.Pipe()
+			require.NoError(t, err)
+			os.Stderr = w
+			t.Cleanup(func() {
+				os.Stderr = oldStderr
+				_ = w.Close()
+				_ = r.Close()
+			})
+
+			compiler.emitExperimentalFeatureWarnings(workflowData)
+
+			require.NoError(t, w.Close())
+			os.Stderr = oldStderr
+			var buf bytes.Buffer
+			_, err = io.Copy(&buf, r)
+			require.NoError(t, err)
+			stderrOutput := buf.String()
+
+			if tt.expectWarning {
+				assert.Contains(t, stderrOutput, expectedMessage)
+				assert.Positive(t, compiler.GetWarningCount())
+			} else {
+				assert.NotContains(t, stderrOutput, expectedMessage)
+				assert.Zero(t, compiler.GetWarningCount())
 			}
 		})
 	}
@@ -207,6 +264,64 @@ func TestValidatePermissions(t *testing.T) {
 					ID: "copilot",
 					Auth: &EngineAuthConfig{
 						Type: "github-oidc",
+					},
+				},
+			},
+			shouldError:     false,
+			wantPermissions: true,
+		},
+		{
+			name: "observability otlp github-app requires id-token write",
+			workflowData: &WorkflowData{
+				Name:            "Test",
+				MarkdownContent: "# Test",
+				AI:              "copilot",
+				Permissions:     "permissions:\n  contents: read\n",
+				RawFrontmatter: map[string]any{
+					"observability": map[string]any{
+						"otlp": map[string]any{
+							"github-app": map[string]any{},
+						},
+					},
+				},
+			},
+			shouldError:     true,
+			errorContains:   "observability.otlp.github-app requires permissions.id-token: write",
+			wantPermissions: false,
+		},
+		{
+			name: "observability otlp github-app with id-token write succeeds",
+			workflowData: &WorkflowData{
+				Name:            "Test",
+				MarkdownContent: "# Test",
+				AI:              "copilot",
+				Permissions:     "permissions:\n  contents: read\n  id-token: write\n",
+				RawFrontmatter: map[string]any{
+					"observability": map[string]any{
+						"otlp": map[string]any{
+							"github-app": map[string]any{},
+						},
+					},
+				},
+			},
+			shouldError:     false,
+			wantPermissions: true,
+		},
+		{
+			name: "observability otlp GitHub App credentials do not require id-token write",
+			workflowData: &WorkflowData{
+				Name:            "Test",
+				MarkdownContent: "# Test",
+				AI:              "copilot",
+				Permissions:     "permissions:\n  contents: read\n",
+				RawFrontmatter: map[string]any{
+					"observability": map[string]any{
+						"otlp": map[string]any{
+							"github-app": map[string]any{
+								"app-id":      "${{ vars.APP_ID }}",
+								"private-key": "${{ secrets.APP_PRIVATE_KEY }}",
+							},
+						},
 					},
 				},
 			},
@@ -305,6 +420,216 @@ func TestValidateToolConfiguration(t *testing.T) {
 				}
 			} else {
 				assert.NoError(t, err, "validateToolConfiguration should not return an error")
+			}
+		})
+	}
+}
+
+func TestValidatePermissions_UsesCachedPermissionScopeValidation(t *testing.T) {
+	tmpDir := testutil.TempDir(t, "perms-cache-test")
+	markdownPath := filepath.Join(tmpDir, "test.md")
+
+	cachedErr := errors.New("cached permission scope validation failure")
+	workflowData := &WorkflowData{
+		Name:                          "Test",
+		MarkdownContent:               "# Test",
+		AI:                            "copilot",
+		Permissions:                   "permissions:\n  contents: read\n",
+		CachedPermissionScopeNamesSet: true,
+		CachedPermissionScopeNamesErr: cachedErr,
+	}
+
+	compiler := NewCompiler()
+	_, err := compiler.validatePermissions(workflowData, markdownPath)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), cachedErr.Error())
+}
+
+func TestValidatePermissions_EmitsCopilotRequestsTipOncePerMarkdownPath(t *testing.T) {
+	tmpDir := testutil.TempDir(t, "perms-tip-once-test")
+	markdownPath := filepath.Join(tmpDir, "test.md")
+
+	workflowData := &WorkflowData{
+		Name:        "Test",
+		AI:          "copilot",
+		Permissions: "permissions:\n  contents: read\n",
+		EngineConfig: &EngineConfig{
+			ID: "copilot",
+		},
+	}
+
+	compiler := NewCompiler()
+
+	stderr := testutil.CaptureStderr(t, func() {
+		_, err := compiler.validatePermissions(workflowData, markdownPath)
+		require.NoError(t, err)
+		_, err = compiler.validatePermissions(workflowData, markdownPath)
+		require.NoError(t, err)
+	})
+
+	const tipText = "Tip: set permissions.copilot-requests: write to use GitHub Actions token-based inference"
+	assert.Equal(t, 1, strings.Count(stderr, tipText), "copilot-requests tip should be emitted only once per markdown path")
+}
+
+func TestValidateToolConfiguration_EmitsSandboxWarningBeforeThreatDetectionError(t *testing.T) {
+	tmpDir := testutil.TempDir(t, "tool-warning-test")
+	markdownPath := filepath.Join(tmpDir, "test.md")
+
+	compiler := NewCompiler()
+	compiler.SetStrictMode(false)
+
+	workflowData := &WorkflowData{
+		Name: "Test",
+		Features: map[string]any{
+			"dangerously-disable-sandbox-agent": "controlled environment with no internet access",
+		},
+		SandboxConfig: &SandboxConfig{
+			Agent: &AgentSandboxConfig{Disabled: true},
+		},
+		SafeOutputs: &SafeOutputsConfig{
+			ThreatDetection: &ThreatDetectionConfig{},
+		},
+	}
+
+	initialWarnings := compiler.GetWarningCount()
+	var validateErr error
+	stderr := testutil.CaptureStderr(t, func() {
+		validateErr = compiler.validateToolConfiguration(workflowData, markdownPath, &Permissions{})
+	})
+
+	require.Error(t, validateErr)
+	assert.Contains(t, validateErr.Error(), "threat detection requires sandbox.agent")
+	assert.Contains(t, stderr, "Agent sandbox disabled (sandbox.agent: false)")
+	assert.Equal(t, initialWarnings+1, compiler.GetWarningCount())
+}
+
+// TestWarnPromptTmpPaths tests the /tmp path heuristic used by the compiler.
+func TestWarnPromptTmpPaths(t *testing.T) {
+	tests := []struct {
+		name          string
+		content       string
+		expectWarning bool
+	}{
+		{
+			name:          "no tmp reference",
+			content:       "# Workflow\n\nDo some work.",
+			expectWarning: false,
+		},
+		{
+			name:          "correct path /tmp/gh-aw/agent/ only",
+			content:       "Store output in /tmp/gh-aw/agent/result.txt",
+			expectWarning: false,
+		},
+		{
+			name:          "correct path /tmp/gh-aw/agent/ subdirectory",
+			content:       "Write to /tmp/gh-aw/agent/logs/output.log for later inspection.",
+			expectWarning: false,
+		},
+		{
+			name:          "bare /tmp/ reference",
+			content:       "Save the file to /tmp/myfile.txt",
+			expectWarning: true,
+		},
+		{
+			name:          "/tmp/gh-aw/ subpath is safe",
+			content:       "Write your output to /tmp/gh-aw/result.json",
+			expectWarning: false,
+		},
+		{
+			name:          "/tmp/ root only",
+			content:       "Use /tmp/ for temporary storage.",
+			expectWarning: true,
+		},
+		{
+			name:          "mix of correct and raw /tmp/ reference",
+			content:       "Prefer /tmp/gh-aw/agent/ but avoid plain /tmp/foo paths.",
+			expectWarning: true,
+		},
+		{
+			name:          "cache-memory path is safe",
+			content:       "Read state from /tmp/gh-aw/cache-memory/my-workflow/state.json",
+			expectWarning: false,
+		},
+		{
+			name:          "named cache-memory path is safe",
+			content:       "Use /tmp/gh-aw/cache-memory-focus-areas/ for storage.",
+			expectWarning: false,
+		},
+		{
+			name:          "repo-memory path is safe",
+			content:       "Access shared memory at /tmp/gh-aw/repo-memory/default/metrics.json",
+			expectWarning: false,
+		},
+		{
+			name:          "comment-memory path is safe",
+			content:       "Append haiku to /tmp/gh-aw/comment-memory/notes.md",
+			expectWarning: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			msg := warnPromptTmpPaths(tt.content)
+			if tt.expectWarning {
+				assert.NotEmpty(t, msg, "expected a warning message")
+				assert.Contains(t, msg, "/tmp/gh-aw/agent/", "warning should suggest /tmp/gh-aw/agent/")
+			} else {
+				assert.Empty(t, msg, "expected no warning message")
+			}
+		})
+	}
+}
+
+// TestValidatePromptTmpPaths tests that validatePromptTmpPaths increments the
+// warning counter and emits a message when the markdown body has problematic /tmp paths.
+func TestValidatePromptTmpPaths(t *testing.T) {
+	tests := []struct {
+		name       string
+		markdown   string
+		expectWarn bool
+	}{
+		{
+			name:       "no tmp reference — no warning",
+			markdown:   "# Hello\n\nDo some work.",
+			expectWarn: false,
+		},
+		{
+			name:       "correct /tmp/gh-aw/agent/ — no warning",
+			markdown:   "Store results in /tmp/gh-aw/agent/output.txt",
+			expectWarn: false,
+		},
+		{
+			name:       "bare /tmp/ reference — warning",
+			markdown:   "Save artifacts to /tmp/data.json",
+			expectWarn: true,
+		},
+		{
+			name:       "/tmp/gh-aw/ subpath — no warning",
+			markdown:   "Write summary to /tmp/gh-aw/summary.txt",
+			expectWarn: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			tmpDir := testutil.TempDir(t, "tmp-path-test")
+			markdownPath := filepath.Join(tmpDir, "workflow.md")
+
+			compiler := NewCompiler()
+			workflowData := &WorkflowData{
+				Name:            "Test",
+				MarkdownContent: tt.markdown,
+				AI:              "copilot",
+			}
+
+			before := compiler.GetWarningCount()
+			compiler.validatePromptTmpPaths(workflowData, markdownPath)
+			after := compiler.GetWarningCount()
+
+			if tt.expectWarn {
+				assert.Greater(t, after, before, "warning count should have increased")
+			} else {
+				assert.Equal(t, before, after, "warning count should not have changed")
 			}
 		})
 	}

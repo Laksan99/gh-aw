@@ -1,6 +1,12 @@
 ---
+private: true
+emoji: "🧪"
 description: Smoke test workflow that validates Pi engine functionality
 on:
+  slash_command:
+    name: smoke-pi
+    strategy: centralized
+    events: [issues, issue_comment, pull_request, pull_request_comment]
   workflow_dispatch:
   pull_request:
     types: [labeled]
@@ -14,12 +20,22 @@ permissions:
 name: Smoke Pi
 engine:
   id: pi
-  model: copilot/claude-sonnet-4-20250514
+  model: copilot/gpt-5.4
 strict: true
+sandbox:
+  agent:
+    sudo: false
+    config:
+      filesystem:
+        allowWrite:
+          - ${{ github.workspace }}
+          - /tmp/gh-aw/agent
+runtimes:
+  node: {}
 imports:
   - shared/gh.md
   - shared/reporting-otlp.md
-  - shared/observability-otlp.md
+  - shared/otlp.md
 network:
   allowed:
     - defaults
@@ -47,12 +63,13 @@ safe-outputs:
     add-labels:
       allowed: [smoke-pi]
     messages:
-      footer: "> 🥧 *[{workflow_name}]({run_url}) — Powered by Pi*{effective_tokens_suffix}{history_link}"
+      footer: "> 🥧 *[{workflow_name}]({run_url}) — Powered by Pi*{ai_credits_suffix}{history_link}"
       run-started: "🥧 Pi initializing... [{workflow_name}]({run_url}) begins on this {event_type}..."
       run-success: "🚀 [{workflow_name}]({run_url}) **MISSION COMPLETE!** Pi delivered. 🥧"
       run-failure: "⚠️ [{workflow_name}]({run_url}) {status}. Pi encountered unexpected challenges..."
 timeout-minutes: 10
-
+features:
+  gh-aw-detection: false
 ---
 
 # Smoke Test: Pi Engine Validation
@@ -64,11 +81,13 @@ timeout-minutes: 10
 
 ## Test Requirements
 
-1. **GitHub MCP Testing**: Use GitHub MCP tools to fetch details of exactly 2 merged pull requests from ${{ github.repository }} (title and number only)
+Execute the following tests sequentially in a single turn:
+
+1. **GitHub CLI Testing**: Use `gh` CLI commands to fetch details of exactly 2 merged pull requests from ${{ github.repository }} (title and number only)
 2. **Web Fetch Testing**: Use the web-fetch MCP tool to fetch https://github.com and verify the response contains "GitHub" (do NOT use bash or playwright for this test - use the web-fetch MCP tool directly)
 3. **File Writing Testing**: Create a test file `/tmp/gh-aw/agent/smoke-test-pi-${{ github.run_id }}.txt` with content "Smoke test passed for Pi at $(date)" (create the directory if it doesn't exist)
 4. **Bash Tool Testing**: Execute bash commands to verify file creation was successful (use `cat` to read the file back)
-5. **Build gh-aw**: Run `GOCACHE=/tmp/go-cache GOMODCACHE=/tmp/go-mod make build` to verify the agent can successfully build the gh-aw project. If the command fails, mark this test as ❌ and report the failure.
+5. **Build gh-aw**: Run `GOCACHE=/tmp/gh-aw/agent/go-cache GOMODCACHE=/tmp/gh-aw/agent/go-mod make build` to verify the agent can successfully build the gh-aw project. If the command fails, mark this test as ❌ and report the failure.
 
 ## Output
 
@@ -86,4 +105,8 @@ timeout-minutes: 10
 
 If all tests pass and this workflow was triggered by a pull_request event, use the `add_labels` safe-output tool to add the label `smoke-pi` to the pull request (omit the `item_number` parameter to auto-target the triggering PR).
 
-{{#runtime-import shared/noop-reminder.md}}
+**Important**: If no action is needed after completing your analysis, you **MUST** call the `noop` safe-output tool with a brief explanation. Pass arguments directly to the tool. Do **NOT** wrap them under a `noop` key. Failing to call any safe-output tool is the most common cause of safe-output workflow failures.
+
+```json
+{"message": "No action needed: [brief explanation of what was analyzed and why]"}
+```

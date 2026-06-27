@@ -12,19 +12,20 @@ import (
 // TestParseOnSection tests command, reaction, and stop-after parsing from frontmatter
 func TestParseOnSection(t *testing.T) {
 	tests := []struct {
-		name                       string
-		frontmatter                map[string]any
-		workflowData               *WorkflowData
-		markdownPath               string
-		expectedError              bool
-		expectedCommand            []string
-		expectedReaction           string
-		expectedLockAgent          bool
-		expectedOn                 string
-		expectedCentralized        bool
-		expectedLabelDecentralized bool
-		checkCommandEvents         bool
-		expectedOtherEvents        map[string]any
+		name                        string
+		frontmatter                 map[string]any
+		workflowData                *WorkflowData
+		markdownPath                string
+		expectedError               bool
+		expectedCommand             []string
+		expectedReaction            string
+		expectedLockAgent           bool
+		expectedOn                  string
+		expectedCentralized         bool
+		expectedLabelDecentralized  bool
+		checkCommandEvents          bool
+		expectedOtherEvents         map[string]any
+		expectedConcurrencyContains string
 	}{
 		{
 			name: "slash_command trigger with default command from filename",
@@ -321,11 +322,13 @@ func TestParseOnSection(t *testing.T) {
 				assert.Equal(t, tt.expectedCentralized, tt.workflowData.CommandCentralized, "CommandCentralized mismatch")
 				assert.Equal(t, tt.expectedLabelDecentralized, tt.workflowData.LabelCommandDecentralized, "LabelCommandDecentralized mismatch")
 				assert.Equal(t, tt.expectedLockAgent, tt.workflowData.LockForAgent, "LockForAgent mismatch")
+				if tt.expectedConcurrencyContains != "" {
+					assert.Contains(t, tt.workflowData.Concurrency, tt.expectedConcurrencyContains)
+				}
 				if tt.checkCommandEvents {
 					assert.NotNil(t, tt.workflowData.CommandOtherEvents, "CommandOtherEvents should be set")
 					if tt.expectedOtherEvents != nil {
-						// Basic check that other events were extracted
-						assert.NotEmpty(t, tt.workflowData.CommandOtherEvents, "CommandOtherEvents should not be empty")
+						assert.Equal(t, tt.expectedOtherEvents, tt.workflowData.CommandOtherEvents, "CommandOtherEvents mismatch")
 					}
 				}
 			}
@@ -414,7 +417,7 @@ func TestCompilerMergeSafeJobsFromIncludedConfigs(t *testing.T) {
 
 func TestExtractCommandConfig_CentralizedStrategy(t *testing.T) {
 	c := &Compiler{}
-	names, events, centralized := c.extractCommandConfig(map[string]any{
+	names, events, centralized, placeholder := c.extractCommandConfig(map[string]any{
 		"on": map[string]any{
 			"slash_command": map[string]any{
 				"name":     "deploy",
@@ -427,6 +430,24 @@ func TestExtractCommandConfig_CentralizedStrategy(t *testing.T) {
 	assert.Equal(t, []string{"deploy"}, names)
 	assert.Equal(t, []string{"issue_comment"}, events)
 	assert.True(t, centralized)
+	assert.Empty(t, placeholder)
+}
+
+func TestExtractCommandConfig_Placeholder(t *testing.T) {
+	c := &Compiler{}
+	names, events, centralized, placeholder := c.extractCommandConfig(map[string]any{
+		"on": map[string]any{
+			"slash_command": map[string]any{
+				"name":        "review-bot",
+				"placeholder": "to review this PR",
+			},
+		},
+	})
+
+	assert.Equal(t, []string{"review-bot"}, names)
+	assert.Nil(t, events)
+	assert.False(t, centralized)
+	assert.Equal(t, "to review this PR", placeholder)
 }
 
 // TestApplyDefaultTools tests default tool application logic

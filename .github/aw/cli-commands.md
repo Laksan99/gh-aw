@@ -36,7 +36,7 @@ Initialize a repository for agentic workflows.
 gh aw init
 ```
 
-Creates `.github/agents/agentic-workflows.agent.md` and supporting files.
+Creates `.github/skills/agentic-workflows/SKILL.md` and supporting files.
 
 **MCP equivalent**: Not available — run from a local terminal or use the `upgrade` tool for updates.
 
@@ -58,10 +58,6 @@ gh aw compile --approve           # Approve new secrets / action changes
 
 **MCP equivalent**: `compile` tool
 
-```
-Use the compile tool with workflow_name: "my-workflow"
-```
-
 ---
 
 ### `gh aw run`
@@ -77,19 +73,10 @@ gh aw run <workflow-name>           # Run by short name
 gh aw run <workflow-name>.md        # Alternative: explicit .md extension
 gh aw run <workflow-name> --ref main              # Run on a specific branch/tag/SHA
 gh aw run <workflow-name> --repeat 3              # Run 4 times total (1 + 3 repeats)
-gh aw run <workflow-name> --input key=value       # Pass a specific input
+gh aw run <workflow-name> -F key=value            # Pass a specific input (alias: --raw-field)
 ```
 
-**MCP equivalent**: Not available in the agentic-workflows MCP tool. If you cannot access the CLI, use the GitHub MCP server to dispatch the workflow:
-
-```
-Use the github MCP server tool "create_workflow_dispatch" with:
-  - owner: <org>
-  - repo: <repo>
-  - workflow_id: <workflow-name>.lock.yml
-  - ref: main
-  - inputs: { ... }
-```
+**MCP equivalent**: Not available. Fallback: use the GitHub MCP server's `create_workflow_dispatch` with `workflow_id: <workflow-name>.lock.yml`.
 
 ---
 
@@ -106,13 +93,10 @@ gh aw logs -c 10                    # Last 10 runs
 gh aw logs --start-date -1w         # Last week's runs
 gh aw logs --start-date 2024-01-01 --end-date 2024-01-31
 gh aw logs -o ./workflow-logs       # Save to directory
+gh aw logs --repo owner/repo        # Query logs in another repository
 ```
 
 **MCP equivalent**: `logs` tool
-
-```
-Use the logs tool with workflow_name: "my-workflow"
-```
 
 ---
 
@@ -129,10 +113,6 @@ gh aw audit <id1> <id2> <id3> --json  # Multi-run diff
 
 **MCP equivalent**: `audit` tool (single run) / `audit-diff` tool (multi-run comparison)
 
-```
-Use the audit tool with run_id: 20135841934
-```
-
 ---
 
 ### `gh aw status`
@@ -141,6 +121,7 @@ Show the status of all agentic workflows in the repository.
 
 ```bash
 gh aw status
+gh aw status --repo owner/repo    # Query status in another repository
 ```
 
 **MCP equivalent**: `status` tool
@@ -180,6 +161,10 @@ Upgrade the repository's agentic workflows configuration to the latest gh-aw ver
 gh aw upgrade               # Upgrade agent files + codemods + compile
 gh aw upgrade -v            # Verbose output
 gh aw upgrade --no-fix      # Skip codemods and compilation
+gh aw upgrade --create-pull-request         # Open a PR with the upgrade changes (alias: --pr)
+gh aw upgrade --org my-org                  # Preview upgrade PRs across an organization
+gh aw upgrade --org my-org --repos '*-service'  # Limit org mode to matching repos
+gh aw upgrade --org my-org --create-issue   # Open issues in org repos with agentic workflows (requires --org)
 ```
 
 **MCP equivalent**: `upgrade` tool
@@ -203,10 +188,59 @@ gh aw add <workflow-url>
 Update imported shared workflow components.
 
 ```bash
-gh aw update
+gh aw update                                # Update all workflows from source
+gh aw update <workflow-name>                # Update a specific workflow
+gh aw update --major                        # Allow major version updates
+gh aw update --create-pull-request          # Update and open a PR (alias: --pr)
+gh aw update --repo owner/repo              # Update workflows in another repository (isolated shallow checkout)
+gh aw update --cool-down 3d                 # Custom cooldown before applying pending releases
 ```
 
 **MCP equivalent**: `update` tool
+
+---
+
+### `gh aw deploy`
+
+Deploy workflows to a target repository (chains update, add, compile --purge, opens a PR). `--repo` is required.
+
+```bash
+gh aw deploy <workflow>... --repo owner/repo            # Deploy listed workflows
+gh aw deploy githubnext/agentics/ci-doctor --repo o/r   # Deploy a shared workflow
+gh aw deploy ./local-workflow.md --repo owner/repo      # Deploy a local workflow
+gh aw deploy <workflow> --repo owner/repo --force       # Overwrite without confirmation
+```
+
+**MCP equivalent**: Not available — run from a local terminal or invoke the CLI inside a workflow step with `github/gh-aw/actions/setup-cli`.
+
+---
+
+### `gh aw env`
+
+Manage compiler default variables (`GH_AW_DEFAULT_*`) as repo/org/enterprise GitHub Actions variables. YAML file uses lowercase `default_*` keys. `null` deletes the variable; any non-null string sets it (`""` = set-to-empty, not delete).
+
+```bash
+gh aw env get [file]                          # Download defaults to file.yml (default name)
+gh aw env get --scope org --org myorg         # Org-scope export
+gh aw env update file.yml --scope repo        # Apply with interactive confirmation
+gh aw env update file.yml --scope ent --enterprise myent --yes  # Skip confirmation
+gh aw env update file.yml --scope repo --dry-run  # Preview without applying
+```
+
+Example file:
+
+```yaml
+default_max_ai_credits: "1000"
+default_max_turn_cache_misses: "5"
+default_detection_max_ai_credits: "400"
+default_max_turns: "12"
+default_model_copilot: "gpt-5-mini"
+default_model_codex: null   # delete this variable
+```
+
+Recognized keys include `default_max_ai_credits`, `default_max_turn_cache_misses`, `default_detection_max_ai_credits`, `default_max_daily_ai_credits`, `default_timeout_minutes`, `default_max_turns`, `default_detection_model`, `default_utc`, `default_model_copilot`, `default_model_claude`, `default_model_codex`. The compiler resolves model selection as `GH_AW_MODEL_*` → `GH_AW_DEFAULT_MODEL_*` → built-in engine fallback.
+
+**MCP equivalent**: Not available — run from a local terminal.
 
 ---
 
@@ -240,4 +274,6 @@ gh aw mcp list                                   # List workflows with MCP serve
 | `gh aw update` | `update` |
 | `gh aw fix` | `fix` |
 | `gh aw upgrade` | `upgrade` |
+| `gh aw deploy` | *(local only)* |
+| `gh aw env` | *(local only)* |
 | `gh aw init` | *(local only)* |

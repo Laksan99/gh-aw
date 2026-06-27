@@ -4,13 +4,13 @@ description: Style guide for workflow status messages (all safe-outputs.messages
 
 # Workflow Status Messages
 
-Apply this guide when writing `safe-outputs.messages` in any workflow. Messages appear in GitHub issues, PR comments, and discussions.
+For writing `safe-outputs.messages`. Messages appear in GitHub issues, PR comments, and discussions.
 
 ## Rules
 
-**Tone:** Plain and professional. Describe what the workflow does or what happened. No casual phrases ("Mission accomplished!", "Knowledge acquired!"), no dramatic language ("interrupted!", "crashed!"), no excitement punctuation (`!!`).
+**Tone:** Plain and professional. No casual phrases ("Mission accomplished!"), no dramatic language ("interrupted!"), no excitement punctuation (`!!`).
 
-**Emoji:** One per message, at the start. Use the same emoji across `run-started`, `run-success`, `run-failure`, and `footer` for consistency. Do not append trailing emojis (`🏆`, `✅`, `📋`, etc.).
+**Emoji:** One per message, at the start. Use the same emoji across `run-started`, `run-success`, `run-failure`, and `footer`. No trailing emojis.
 
 Emoji by domain: 🔍 search · 📐 architecture · 🔬 analysis/security · 📦 dependencies · 📝 docs · 🧪 testing · 🚀 release · 👀 review
 
@@ -29,7 +29,7 @@ Emoji by domain: 🔍 search · 📐 architecture · 🔬 analysis/security · �
 
 | Key | Variables | Default |
 |-----|-----------|---------|
-| `footer` | `{workflow_name}`, `{run_url}`, `{triggering_number}`, `{workflow_source}`, `{workflow_source_url}` | *(system default)* |
+| `footer` | `{workflow_name}`, `{run_url}`, `{triggering_number}`, `{triggering_type}`, `{workflow_source}`, `{workflow_source_url}` | *(system default)* |
 | `footer-install` | `{workflow_source}`, `{workflow_source_url}` | *(system default)* |
 | `footer-workflow-recompile` | `{workflow_name}`, `{run_url}`, `{repository}` | `> Workflow sync report by [{workflow_name}]({run_url}) for {repository}` |
 | `footer-workflow-recompile-comment` | `{workflow_name}`, `{run_url}`, `{repository}` | `> Update from [{workflow_name}]({run_url}) for {repository}` |

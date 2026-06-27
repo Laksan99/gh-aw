@@ -11,10 +11,11 @@ const { generateFooterWithMessages, getDetectionCautionAlert } = require("./mess
 const { sanitizeContent } = require("./sanitize_content.cjs");
 const { getPRNumber } = require("./update_context_helpers.cjs");
 const { logStagedPreviewInfo } = require("./staged_preview.cjs");
-const { isStagedMode } = require("./safe_output_helpers.cjs");
+const { isStagedMode, checkRequiredFilter } = require("./safe_output_helpers.cjs");
 const { parseBoolTemplatable } = require("./templatable.cjs");
 const { createAuthenticatedGitHubClient } = require("./handler_auth.cjs");
 const { buildWorkflowRunUrl } = require("./workflow_metadata_helpers.cjs");
+const { resolveAllowedMentionsFromPayload } = require("./resolve_mentions_from_payload.cjs");
 
 /**
  * Type constant for handler identification
@@ -38,6 +39,17 @@ async function main(config = {}) {
   const isStaged = isStagedMode(config);
   const { defaultTargetRepo, allowedRepos } = resolveTargetRepoConfig(config);
   const githubClient = await createAuthenticatedGitHubClient(config);
+
+  const requiredLabels = Array.isArray(config.required_labels) ? config.required_labels : [];
+  const requiredTitlePrefix = config.required_title_prefix || "";
+  if (requiredLabels.length > 0) core.info(`Required labels (all): ${requiredLabels.join(", ")}`);
+  if (requiredTitlePrefix) core.info(`Required title prefix: ${requiredTitlePrefix}`);
+  let allowedMentionAliases = [];
+  if (Array.isArray(config.allowedMentionAliases)) {
+    allowedMentionAliases = config.allowedMentionAliases;
+  } else if (config.mentions != null) {
+    allowedMentionAliases = await resolveAllowedMentionsFromPayload(context, githubClient, core, config.mentions);
+  }
 
   // Determine the triggering PR number from context
   const triggeringPRNumber = getPRNumber(context.payload);
@@ -147,6 +159,11 @@ async function main(config = {}) {
         }
       }
 
+      // Apply required-labels/required-title-prefix filter before counting
+      const repoParts = { owner, repo };
+      const filterResult = await checkRequiredFilter(githubClient, repoParts, targetPRNumber, requiredLabels, requiredTitlePrefix, "reply_to_pr_review_comment");
+      if (filterResult) return filterResult;
+
       // Validation passed — count this message against the max quota
       processedCount++;
 
@@ -157,7 +174,7 @@ async function main(config = {}) {
       }
 
       // Inject CAUTION at top of body unconditionally if threat detection warning was raised
-      let finalBody = sanitizeContent(body);
+      let finalBody = sanitizeContent(body, { allowedAliases: allowedMentionAliases });
       const detectionCaution = getDetectionCautionAlert(workflowName, runUrl);
       if (detectionCaution) {
         finalBody = detectionCaution + "\n\n" + finalBody;

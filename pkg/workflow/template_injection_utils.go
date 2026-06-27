@@ -4,8 +4,10 @@ import (
 	"errors"
 	"fmt"
 	"regexp"
-	"sort"
+	"slices"
 	"strings"
+
+	"github.com/github/gh-aw/pkg/stringutil"
 )
 
 // extractRunBlocks walks the YAML tree and extracts all run: field values
@@ -79,6 +81,71 @@ func removeHeredocContent(content string) string {
 	return result
 }
 
+// stripShellLineComments removes bash-style # line comments while preserving text
+// inside single/double quotes and escaped # characters.
+func stripShellLineComments(content string) string {
+	var out strings.Builder
+	out.Grow(len(content))
+
+	inSingleQuote := false
+	inDoubleQuote := false
+	escaped := false
+
+	for i := 0; i < len(content); i++ {
+		ch := content[i]
+
+		// Preserve newlines and reset escape state across lines.
+		if ch == '\n' {
+			out.WriteByte(ch)
+			escaped = false
+			continue
+		}
+
+		if escaped {
+			out.WriteByte(ch)
+			escaped = false
+			continue
+		}
+
+		if ch == '\\' && !inSingleQuote {
+			out.WriteByte(ch)
+			escaped = true
+			continue
+		}
+
+		if ch == '\'' && !inDoubleQuote {
+			inSingleQuote = !inSingleQuote
+			out.WriteByte(ch)
+			continue
+		}
+
+		if ch == '"' && !inSingleQuote {
+			inDoubleQuote = !inDoubleQuote
+			out.WriteByte(ch)
+			continue
+		}
+
+		if ch == '#' && !inSingleQuote && !inDoubleQuote && isShellCommentStart(content, i) {
+			for i+1 < len(content) && content[i+1] != '\n' {
+				i++
+			}
+			continue
+		}
+
+		out.WriteByte(ch)
+	}
+
+	return out.String()
+}
+
+func isShellCommentStart(content string, index int) bool {
+	if index == 0 {
+		return true
+	}
+	prev := content[index-1]
+	return prev == ' ' || prev == '\t' || prev == '\n' || prev == '\r' || prev == ';'
+}
+
 // replaceOutsideQuotedHeredocs replaces all occurrences of old with new in s,
 // skipping content inside quoted heredoc blocks (e.g. << 'EOF' ... EOF).
 //
@@ -107,14 +174,21 @@ func replaceOutsideQuotedHeredocs(s, old, new string) string {
 	}
 
 	if len(quotedRegions) == 0 {
-		return strings.ReplaceAll(s, old, new)
+		return replaceOutsideShellLineComments(s, old, new)
 	}
 
 	templateInjectionValidationLog.Printf("Replacing outside %d quoted heredoc region(s): replacing %q with %q", len(quotedRegions), old, new)
 
 	// Sort regions by start position so we can walk left-to-right.
-	sort.Slice(quotedRegions, func(i, j int) bool {
-		return quotedRegions[i].start < quotedRegions[j].start
+	slices.SortFunc(quotedRegions, func(a, b region) int {
+		switch {
+		case a.start < b.start:
+			return -1
+		case a.start > b.start:
+			return 1
+		default:
+			return 0
+		}
 	})
 
 	var result strings.Builder
@@ -122,7 +196,7 @@ func replaceOutsideQuotedHeredocs(s, old, new string) string {
 	for _, r := range quotedRegions {
 		// Replace in the non-heredoc segment before this region.
 		if pos < r.start {
-			result.WriteString(strings.ReplaceAll(s[pos:r.start], old, new))
+			result.WriteString(replaceOutsideShellLineComments(s[pos:r.start], old, new))
 		}
 		// Write the quoted-heredoc region verbatim.
 		result.WriteString(s[r.start:r.end])
@@ -130,8 +204,78 @@ func replaceOutsideQuotedHeredocs(s, old, new string) string {
 	}
 	// Replace in the trailing non-heredoc segment.
 	if pos < len(s) {
-		result.WriteString(strings.ReplaceAll(s[pos:], old, new))
+		result.WriteString(replaceOutsideShellLineComments(s[pos:], old, new))
 	}
+	return result.String()
+}
+
+// replaceOutsideShellLineComments replaces old with new in shell script content
+// while preserving text inside bash-style # line comments.
+func replaceOutsideShellLineComments(content, old, new string) string {
+	var result strings.Builder
+	result.Grow(len(content))
+
+	inSingleQuote := false
+	inDoubleQuote := false
+	escaped := false
+	segmentStart := 0
+
+	for i := 0; i < len(content); {
+		ch := content[i]
+
+		if ch == '\n' {
+			escaped = false
+			i++
+			continue
+		}
+
+		if escaped {
+			escaped = false
+			i++
+			continue
+		}
+
+		if ch == '\\' && !inSingleQuote {
+			escaped = true
+			i++
+			continue
+		}
+
+		if ch == '\'' && !inDoubleQuote {
+			inSingleQuote = !inSingleQuote
+			i++
+			continue
+		}
+
+		if ch == '"' && !inSingleQuote {
+			inDoubleQuote = !inDoubleQuote
+			i++
+			continue
+		}
+
+		if ch == '#' && !inSingleQuote && !inDoubleQuote && isShellCommentStart(content, i) {
+			result.WriteString(strings.ReplaceAll(content[segmentStart:i], old, new))
+
+			commentEnd := i
+			for commentEnd < len(content) && content[commentEnd] != '\n' {
+				commentEnd++
+			}
+			result.WriteString(content[i:commentEnd])
+			if commentEnd < len(content) {
+				result.WriteByte('\n')
+				commentEnd++
+			}
+
+			escaped = false
+			segmentStart = commentEnd
+			i = commentEnd
+			continue
+		}
+
+		i++
+	}
+
+	result.WriteString(strings.ReplaceAll(content[segmentStart:], old, new))
 	return result.String()
 }
 
@@ -151,10 +295,7 @@ func extractRunSnippet(runContent string, expression string) string {
 			// Return the trimmed line containing the expression
 			trimmed := strings.TrimSpace(line)
 			// Limit snippet length to avoid overwhelming error messages
-			if len(trimmed) > 100 {
-				return trimmed[:97] + "..."
-			}
-			return trimmed
+			return stringutil.Truncate(trimmed, 100)
 		}
 	}
 
@@ -241,7 +382,7 @@ func formatRunScriptExpressionGuardrailError(violations []TemplateInjectionViola
 	builder.WriteString("Examples found:\n")
 
 	maxExamples := min(5, len(violations))
-	for i := 0; i < maxExamples; i++ {
+	for i := range maxExamples {
 		fmt.Fprintf(&builder, "  - %s\n", violations[i].Expression)
 		fmt.Fprintf(&builder, "    in: %s\n", violations[i].Snippet)
 	}

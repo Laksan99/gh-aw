@@ -24,10 +24,46 @@ func TestCompileScheduleSeedHelpUsesConsistentQuotes(t *testing.T) {
 	require.NotNil(t, scheduleSeedFlag, "compile command should define --schedule-seed")
 	assert.Contains(t, scheduleSeedFlag.Usage, "\"github/gh-aw\"", "--schedule-seed example should use double quotes")
 	assert.Contains(t, scheduleSeedFlag.Usage, "\"origin\"", "--schedule-seed remote example should use double quotes")
+	assert.Contains(t, scheduleSeedFlag.Usage, "(e.g.,", "--schedule-seed example should use standard e.g., punctuation")
 }
 
 func TestCompileStagedFlagHelpText(t *testing.T) {
 	stagedFlag := compileCmd.Flags().Lookup("staged")
 	require.NotNil(t, stagedFlag, "compile command should define --staged")
 	assert.Equal(t, "Force all safe-outputs into staged mode", stagedFlag.Usage)
+}
+
+func TestCompileShowAllFlagHelpText(t *testing.T) {
+	showAllFlag := compileCmd.Flags().Lookup("show-all")
+	require.NotNil(t, showAllFlag, "compile command should define --show-all")
+	assert.Equal(t, "Display all prioritized compilation errors instead of the default top five", showAllFlag.Usage)
+}
+
+func TestCompileGhAwRefMutuallyExclusiveFlags(t *testing.T) {
+	tests := []struct {
+		name string
+		args []string
+	}{
+		{
+			name: "gh-aw-ref with action-tag",
+			args: []string{"compile", "--gh-aw-ref", "main", "--action-tag", "v1.2.3"},
+		},
+		{
+			name: "gh-aw-ref with action-mode",
+			args: []string{"compile", "--gh-aw-ref", "main", "--action-mode", "dev"},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			rootCmd.SetArgs(tt.args)
+			t.Cleanup(func() {
+				rootCmd.SetArgs([]string{})
+			})
+
+			err := rootCmd.Execute()
+			require.Error(t, err)
+			assert.Contains(t, err.Error(), "if any flags in the group", "expected mutually exclusive flag-group error")
+		})
+	}
 }

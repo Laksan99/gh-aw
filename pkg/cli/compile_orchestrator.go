@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 
 	"github.com/github/gh-aw/pkg/console"
+	"github.com/github/gh-aw/pkg/constants"
 	"github.com/github/gh-aw/pkg/logger"
 	"github.com/github/gh-aw/pkg/workflow"
 )
@@ -24,6 +25,15 @@ func CompileWorkflows(ctx context.Context, config CompileConfig) ([]*workflow.Wo
 		fmt.Fprintln(os.Stderr, console.FormatWarningMessage("Operation cancelled"))
 		return nil, ctx.Err()
 	default:
+	}
+
+	if os.Getenv("GH_HOST") == "" {
+		if detectedHost := getHostFromOriginRemote(); detectedHost != "github.com" && detectedHost != "" {
+			compileOrchestratorLog.Printf("Auto-detected GHES host from git remote: %s", detectedHost)
+			workflow.SetDefaultGHHost(detectedHost)
+		} else if detectedHost == "github.com" {
+			workflow.SetDefaultGHHost("")
+		}
 	}
 
 	// Validate configuration
@@ -50,7 +60,7 @@ func CompileWorkflows(ctx context.Context, config CompileConfig) ([]*workflow.Wo
 	// Set up workflow directory (using default if not specified)
 	workflowDir := config.WorkflowDir
 	if workflowDir == "" {
-		workflowDir = ".github/workflows"
+		workflowDir = constants.GetWorkflowDir()
 		compileOrchestratorLog.Printf("Using default workflow directory: %s", workflowDir)
 	} else {
 		workflowDir = filepath.Clean(workflowDir)
@@ -68,6 +78,16 @@ func CompileWorkflows(ctx context.Context, config CompileConfig) ([]*workflow.Wo
 
 	// Create and configure compiler
 	compiler := createAndConfigureCompiler(config)
+	compiler.SetContext(ctx)
+
+	if err := validateRepositoryManifestForCompilation(config, stats, &validationResults); err != nil {
+		if config.JSONOutput {
+			if outputErr := outputResults(stats, &validationResults, config); outputErr != nil {
+				return nil, outputErr
+			}
+		}
+		return nil, err
+	}
 
 	// Handle watch mode (early return)
 	if config.Watch {
@@ -86,15 +106,15 @@ func CompileWorkflows(ctx context.Context, config CompileConfig) ([]*workflow.Wo
 			}
 			markdownFile = resolvedFile
 		}
-		return nil, watchAndCompileWorkflows(markdownFile, compiler, config.Verbose)
+		return nil, watchAndCompileWorkflows(ctx, markdownFile, compiler, config.Verbose)
 	}
 
 	// Compile specific files or all files in directory
 	if len(config.MarkdownFiles) > 0 {
 		// Compile specific workflow files
-		return compileSpecificFiles(compiler, config, stats, &validationResults)
+		return compileSpecificFiles(ctx, compiler, config, stats, &validationResults)
 	}
 
 	// Compile all workflow files in directory
-	return compileAllFilesInDirectory(compiler, config, workflowDir, stats, &validationResults)
+	return compileAllFilesInDirectory(ctx, compiler, config, workflowDir, stats, &validationResults)
 }

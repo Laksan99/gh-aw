@@ -1,5 +1,7 @@
 # stringutil Package
 
+> Utility functions for string manipulation, sanitization, identifier normalization, ANSI stripping, URL parsing, and GitHub PAT validation.
+
 ## Overview
 
 The `stringutil` package provides utility functions for working with strings. It is organized into focused sub-files covering ANSI stripping, identifier normalization, sanitization, URL utilities, and PAT (Personal Access Token) validation.
@@ -16,6 +18,23 @@ The `stringutil` package is organized into focused sub-files:
 | `sanitize.go` | Security-sensitive string sanitization |
 | `urls.go` | URL normalization and domain extraction |
 | `pat_validation.go` | GitHub PAT classification and validation |
+| `fuzzy_match.go` | Fuzzy string matching for "Did you mean?" suggestions |
+
+### Exported Types
+
+| Type | Kind | Description |
+|------|------|-------------|
+| `SanitizeOptions` | struct | Options for `SanitizeName` (preserved characters, hyphen trimming, and default value) |
+| `PATType` | string alias | Type of GitHub Personal Access Token (fine-grained, classic, oauth, unknown) with methods: `String()`, `IsFineGrained()`, `IsValid()` |
+
+### Constants
+
+| Constant | Type | Value | Description |
+|----------|------|-------|-------------|
+| `PATTypeFineGrained` | `PATType` | `"fine-grained"` | Fine-grained PAT (prefix `github_pat_`) |
+| `PATTypeClassic` | `PATType` | `"classic"` | Classic PAT (prefix `ghp_`) |
+| `PATTypeOAuth` | `PATType` | `"oauth"` | OAuth token (prefix `gho_`) |
+| `PATTypeUnknown` | `PATType` | `"unknown"` | Unrecognized token format |
 
 ## General Utilities (`stringutil.go`)
 
@@ -32,6 +51,10 @@ stringutil.Truncate("hi", 8)          // "hi"
 
 Normalizes trailing whitespace in multi-line content. Trims trailing spaces and tabs from every line, then ensures the content ends with exactly one newline (or is empty). This reduces spurious diffs caused by trailing-whitespace differences.
 
+### `NormalizeLeadingWhitespace(content string) string`
+
+Removes shared leading indentation from non-empty lines in a multi-line string. This is useful for normalizing heredoc-like blocks while preserving relative indentation.
+
 ### `ParseVersionValue(version any) string`
 
 Converts a `any`-typed version value (typically from YAML parsing, which may produce `int`, `float64`, or `string`) into a string. Returns an empty string for nil.
@@ -40,6 +63,14 @@ Converts a `any`-typed version value (typically from YAML parsing, which may pro
 stringutil.ParseVersionValue("20")    // "20"
 stringutil.ParseVersionValue(20)      // "20"
 stringutil.ParseVersionValue(20.0)    // "20"
+```
+
+### `FormatList(items []string) string`
+
+Formats a slice of strings as a natural-language list with an Oxford comma.
+
+```go
+stringutil.FormatList([]string{"a", "b", "c"}) // "a, b, and c"
 ```
 
 ### `IsPositiveInteger(s string) bool`
@@ -99,6 +130,10 @@ stringutil.LockFileToMarkdown(".github/workflows/test.lock.yml")
 ## Sanitization (`sanitize.go`)
 
 These functions remove sensitive information to prevent accidental leakage in logs or error messages.
+
+### `SanitizeName(name string, opts *SanitizeOptions) string`
+
+Sanitizes a name for identifiers and filenames using configurable behavior (preserved special characters, optional hyphen trimming, and fallback default value).
 
 ### `SanitizeErrorMessage(message string) string`
 
@@ -181,6 +216,24 @@ if err := stringutil.ValidateCopilotPAT(token); err != nil {
 
 Returns a human-readable description of the token type (e.g. `"fine-grained personal access token"`).
 
+## Fuzzy Matching (`fuzzy_match.go`)
+
+### `FindClosestMatches(target string, candidates []string, maxResults int) []string`
+
+Finds the closest matching strings using Levenshtein distance. Returns up to `maxResults` matches that have a distance of 3 or less. Results are sorted by distance (closest first), then alphabetically for ties. Case-insensitive matching. Exact matches are excluded.
+
+This function is useful for "Did you mean?" suggestions when a user provides an unrecognized value (e.g., a typo in an engine name or event type).
+
+```go
+engines := []string{"copilot", "claude", "codex", "custom"}
+matches := stringutil.FindClosestMatches("copiliot", engines, 3)
+// → ["copilot"]
+```
+
+### `LevenshteinDistance(a, b string) int`
+
+Computes the Levenshtein distance between two strings — the minimum number of single-character edits (insertions, deletions, or substitutions) required to change one string into the other. Uses dynamic programming with space optimization (only the previous row is stored).
+
 ## Usage Examples
 
 ```go
@@ -211,6 +264,15 @@ stringutil.NormalizeGitHubHostURL("github.example.com") // "https://github.examp
 if err := stringutil.ValidateCopilotPAT(token); err != nil {
     fmt.Fprintln(os.Stderr, console.FormatErrorMessage(err.Error()))
 }
+
+// Find closest matches for "Did you mean?" suggestions
+engines := []string{"copilot", "claude", "codex", "custom"}
+matches := stringutil.FindClosestMatches("copiliot", engines, 3)
+// → ["copilot"]
+
+// Compute Levenshtein distance
+distance := stringutil.LevenshteinDistance("copiliot", "copilot")
+// → 1
 ```
 
 ## Dependencies
@@ -218,11 +280,15 @@ if err := stringutil.ValidateCopilotPAT(token); err != nil {
 **Internal**:
 - `github.com/github/gh-aw/pkg/logger` — debug logging
 
-## Design Notes
+## Design Decisions
 
 - All debug output uses namespace-prefixed loggers (`stringutil:identifiers`, `stringutil:sanitize`, `stringutil:urls`, `stringutil:pat_validation`) and is only emitted when `DEBUG=stringutil:*`.
 - `SanitizeErrorMessage` is intentionally conservative: it excludes common GitHub Actions keywords to avoid over-redacting legitimate error messages.
 - `StripANSI` handles both CSI sequences (`ESC[`) and other ESC-prefixed sequences to cover the full range of ANSI escape codes found in terminal output.
+
+## Thread Safety
+
+All functions in this package are stateless pure functions operating on immutable string inputs. They are safe to call concurrently from multiple goroutines without synchronization.
 
 ---
 

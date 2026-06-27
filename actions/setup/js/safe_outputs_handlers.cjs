@@ -10,9 +10,10 @@ const { estimateTokens } = require("./estimate_tokens.cjs");
 const { writeLargeContentToFile } = require("./write_large_content_to_file.cjs");
 const { getCurrentBranch } = require("./get_current_branch.cjs");
 const { getBaseBranch } = require("./get_base_branch.cjs");
+const { lookupCheckout } = require("./checkout_manifest.cjs");
 const { generateGitPatch } = require("./generate_git_patch.cjs");
 const { generateGitBundle } = require("./generate_git_bundle.cjs");
-const { hasMergeCommitsInRange } = require("./git_helpers.cjs");
+const { hasMergeCommitsInRange, execGitSync } = require("./git_helpers.cjs");
 const { enforceCommentLimits } = require("./comment_limit_helpers.cjs");
 const { getErrorMessage } = require("./error_helpers.cjs");
 const { ERR_CONFIG, ERR_SYSTEM, ERR_VALIDATION } = require("./error_codes.cjs");
@@ -20,6 +21,178 @@ const { findRepoCheckout } = require("./find_repo_checkout.cjs");
 const { resolveTargetRepoConfig, resolveAndValidateRepo } = require("./repo_helpers.cjs");
 const { getOrGenerateTemporaryId } = require("./temporary_id.cjs");
 const { parseAllowedExtensionsEnv } = require("./allowed_extensions_helpers.cjs");
+const { sanitizeTitle, applyTitlePrefix } = require("./sanitize_title.cjs");
+const { parseDeduplicateByTitle, normalizeTitleForDedup, findDuplicateByTitle } = require("./issue_title_dedup.cjs");
+const { validateCreatePullRequestIntent, validatePushToPullRequestBranchIntent, validateCreateIssueIntent, validateAddCommentIntent } = require("./intent_probe.cjs");
+const { globPatternToRegex } = require("./glob_pattern_helpers.cjs");
+const { resolveInvocationContext } = require("./invocation_context_helpers.cjs");
+const { lstatGuard } = require("./symlink_guard.cjs");
+
+/** PR event names used for target:triggering context validation across all safe-output handlers. */
+const PR_EVENT_NAMES = new Set(["pull_request", "pull_request_target", "pull_request_review", "pull_request_review_comment"]);
+
+/**
+ * Resolve effective event name and payload from an invocation context,
+ * falling back to the raw GitHub Actions context.
+ * @param {ReturnType<typeof resolveInvocationContext> | null | undefined} invocationContext
+ * @param {any} rawContext
+ */
+function resolveEffectiveContext(invocationContext, rawContext) {
+  return {
+    effectiveEventName: invocationContext?.eventName || rawContext.eventName,
+    effectivePayload: invocationContext?.eventPayload || rawContext.payload,
+  };
+}
+
+/**
+ * Read and parse a JSON file.
+ * @param {string} filePath
+ * @returns {any}
+ */
+function readJSONFile(filePath) {
+  return JSON.parse(fs.readFileSync(filePath, "utf8"));
+}
+
+const safeOutputsTools = readJSONFile(path.join(__dirname, "safe_outputs_tools.json"));
+
+const safeOutputsToolMap = new Map(safeOutputsTools.map(tool => [tool.name, tool]));
+
+/**
+ * @param {string} error
+ * @returns {{content: Array<{type: "text", text: string}>, isError: true}}
+ */
+function buildIntentErrorResponse(error) {
+  return {
+    content: [
+      {
+        type: "text",
+        text: JSON.stringify({
+          result: "error",
+          error,
+        }),
+      },
+    ],
+    isError: true,
+  };
+}
+
+/**
+ * Build an actionable missing temporary_id error for configured tools.
+ * @param {string} toolName
+ * @param {string} configKey
+ * @returns {string}
+ */
+function buildMissingTemporaryIdError(toolName, configKey) {
+  const temporaryIdExamples = {
+    create_pull_request: "aw_pr1",
+    create_issue: "aw_issue1",
+  };
+  const example = temporaryIdExamples[toolName] || "aw_item1";
+  return `${toolName} requires 'temporary_id' when safe-outputs.${configKey}.require-temporary-id is enabled. Set temporary_id (for example "${example}") and retry.`;
+}
+
+/**
+ * @param {Record<string, any>} safeOutputsConfig
+ * @param {string} toolName
+ * @returns {Record<string, any>}
+ */
+function getSafeOutputsToolConfig(safeOutputsConfig, toolName) {
+  return safeOutputsConfig?.[toolName] || safeOutputsConfig?.[toolName.replace(/_/g, "-")] || {};
+}
+
+/**
+ * @param {Record<string, any>} entry
+ * @param {string[]} fieldNames
+ * @returns {boolean}
+ */
+function hasExplicitTargetParameter(entry, fieldNames) {
+  return fieldNames.some(field => entry[field] !== undefined && entry[field] !== null && String(entry[field]).trim() !== "");
+}
+
+/**
+ * @param {string} toolName
+ * @returns {{primary?: string, anyOf?: string[]} | null}
+ */
+function getWildcardTargetRequirement(toolName) {
+  return safeOutputsToolMap.get(toolName)?.["x-safe-outputs-target-requirements"]?.["*"] || null;
+}
+
+/**
+ * Returns true if `args` contains at least one meaningful field for update_pull_request:
+ * a string `title`, a string `body`, or `update_branch === true`.
+ * Mirrors the downstream requiresOneOf:title,body,update_branch validation in
+ * safe_output_type_validator.cjs (which also excludes field === false from the count).
+ * @param {Record<string, any> | null | undefined} args
+ * @returns {boolean}
+ */
+function hasUpdatePullRequestFields(args) {
+  const safeArgs = args || {};
+  return typeof safeArgs.title === "string" || typeof safeArgs.body === "string" || safeArgs.update_branch === true;
+}
+
+/**
+ * Parse branch pattern configuration from array or comma-separated string.
+ * @param {string[]|string|undefined} value
+ * @returns {string[]}
+ */
+function parseAllowedBranchPatterns(value) {
+  if (Array.isArray(value)) {
+    return value.map(item => String(item).trim()).filter(Boolean);
+  }
+  if (typeof value === "string") {
+    return value
+      .split(",")
+      .map(item => item.trim())
+      .filter(Boolean);
+  }
+  return [];
+}
+
+/**
+ * @param {string} branch
+ * @param {string[]} allowedPatterns
+ * @returns {boolean}
+ */
+function isAllowedBranch(branch, allowedPatterns) {
+  for (const pattern of allowedPatterns) {
+    if (branch === pattern) {
+      return true;
+    }
+    if (pattern === "*") {
+      // Add this fast-path
+      return true;
+    }
+    if (pattern.includes("*") && globPatternToRegex(pattern, { pathMode: true, caseSensitive: true }).test(branch)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+/**
+ * Resolve and validate a workspace-relative patch path.
+ * @param {string|undefined} workspacePath
+ * @returns {{success: true, absolutePath: string} | {success: false, error: string}}
+ */
+function resolvePatchWorkspacePath(workspacePath) {
+  const candidatePath = typeof workspacePath === "string" ? workspacePath.trim() : "";
+  if (!candidatePath) {
+    return { success: false, error: "patch_workspace_path is empty" };
+  }
+  const workspaceRoot = path.resolve(process.env.GITHUB_WORKSPACE || process.cwd());
+  const resolved = path.resolve(workspaceRoot, candidatePath);
+  const relative = path.relative(workspaceRoot, resolved);
+  if (relative.startsWith("..") || path.isAbsolute(relative)) {
+    return { success: false, error: `Invalid patch_workspace_path '${candidatePath}': path must stay under GITHUB_WORKSPACE` };
+  }
+  if (!fs.existsSync(resolved)) {
+    return { success: false, error: `Invalid patch_workspace_path '${candidatePath}': directory does not exist` };
+  }
+  if (!fs.statSync(resolved).isDirectory()) {
+    return { success: false, error: `Invalid patch_workspace_path '${candidatePath}': path is not a directory` };
+  }
+  return { success: true, absolutePath: resolved };
+}
 
 /**
  * Create handlers for safe output tools
@@ -29,18 +202,118 @@ const { parseAllowedExtensionsEnv } = require("./allowed_extensions_helpers.cjs"
  * @returns {Object} An object containing all handler functions
  */
 function createHandlers(server, appendSafeOutput, config = {}) {
-  /**
-   * Default handler for safe output tools
-   * @param {string} type - The tool type
-   * @returns {Function} Handler function
-   */
-  const defaultHandler = type => args => {
-    const entry = { ...(args || {}), type };
+  const TOKEN_THRESHOLD = 16000;
 
-    // Check if any field in the entry has content exceeding 16000 tokens
+  /**
+   * Session-scoped per-type operation counters.
+   * Incremented on every successful appendSafeOutput call (MCE4 dual enforcement).
+   * @type {Map<string, number>}
+   */
+  const operationCounts = new Map();
+
+  /**
+   * Return the explicitly user-configured max for a safe-output type, or null if not set / unlimited.
+   * Uses getSafeOutputsToolConfig for consistent key-normalisation (hyphens → underscores).
+   * Does NOT fall back to validation-config defaults: MCP-time enforcement is only
+   * applied when the user has explicitly set a limit; downstream enforcement covers defaults.
+   * Per Safe Outputs Specification MCE5: the same config source as the processor.
+   * @param {string} type - normalised safe-output type name (e.g. "add_comment")
+   * @returns {number | null}
+   */
+  function getExplicitMax(type) {
+    const toolConfig = getSafeOutputsToolConfig(config, type);
+    if (!toolConfig || typeof toolConfig !== "object") return null;
+    if (!("max" in toolConfig)) return null;
+    const maxVal = toolConfig.max;
+    if (maxVal === -1) return null; // -1 means unlimited
+    if (typeof maxVal === "number" && Number.isInteger(maxVal) && maxVal > 0) {
+      return maxVal;
+    }
+    return null;
+  }
+
+  /**
+   * Enforce the per-type operation count limit at invocation time.
+   * Throws a JSON-RPC -32602 error when the configured max has already been reached.
+   * Per Safe Outputs Specification MCE4: Dual Enforcement — constraints MUST be
+   * enforced at both invocation time (MCP server) and processing time (safe output
+   * processor) to provide defence-in-depth.
+   * @param {string} type - normalised safe-output type name
+   */
+  function enforcePerTypeMax(type) {
+    const maxAllowed = getExplicitMax(type);
+    if (maxAllowed === null) return; // no explicit limit configured
+    const current = operationCounts.get(type) || 0;
+    if (current >= maxAllowed) {
+      throw {
+        code: -32602,
+        message: `E002: ${type} limit reached — ${current} of ${maxAllowed} already used this run`,
+        data: {
+          constraint: "max",
+          type,
+          limit: maxAllowed,
+          guidance:
+            `You have used all ${maxAllowed} ${type} operations for this run. ` +
+            `Further ${type} calls will be ignored. Prioritize the most important items ` +
+            `(e.g. consolidate multiple updates into one), or call noop. ` +
+            `Note: other safe-output types have independent budgets, so applying one type ` +
+            `without its companion type can leave inconsistent state.`,
+        },
+      };
+    }
+  }
+
+  /**
+   * Append a safe-output entry after enforcing the per-type max count.
+   * Increments the session counter only after a successful write, mirroring the
+   * approach used by inlineReviewCommentCount so that write errors do not advance
+   * the counter.
+   * Per Safe Outputs Specification MCE4: invocation-time half of dual enforcement.
+   * @param {Record<string, any>} entry
+   */
+  const appendSafeOutputCounted = entry => {
+    const type = entry?.type;
+    if (type) enforcePerTypeMax(type);
+    appendSafeOutput(entry);
+    if (type) operationCounts.set(type, (operationCounts.get(type) || 0) + 1);
+  };
+
+  /**
+   * Validate schema-declared explicit target parameters for wildcard-target tools.
+   * @param {Record<string, any>} entry
+   * @returns {{content: Array<{type: "text", text: string}>, isError: true} | null}
+   */
+  const validateWildcardTargetRequirement = entry => {
+    const toolName = entry?.type;
+    const requirement = getWildcardTargetRequirement(toolName);
+    if (!requirement) {
+      return null;
+    }
+
+    const toolConfig = getSafeOutputsToolConfig(config, toolName);
+    if (toolConfig.target !== "*") {
+      return null;
+    }
+
+    const anyOf = Array.isArray(requirement.anyOf) ? requirement.anyOf : [];
+    if (anyOf.length === 0 || hasExplicitTargetParameter(entry, anyOf)) {
+      return null;
+    }
+
+    const configKey = toolName.replace(/_/g, "-");
+    const primary = requirement.primary || anyOf[0];
+    const guidance = anyOf.length === 1 ? primary : `one of: ${anyOf.join(", ")}`;
+    return buildIntentErrorResponse(`${toolName} requires ${primary} when safe-outputs.${configKey}.target is '*'. Provide ${guidance} and retry.`);
+  };
+
+  /**
+   * Detect and offload large string fields to files.
+   * @param {Record<string, any>} entry
+   * @returns {Object | null} MCP response if large content was handled, else null
+   */
+  const maybeHandleLargeContent = entry => {
     let largeContent = null;
     let largeFieldName = null;
-    const TOKEN_THRESHOLD = 16000;
 
     for (const [key, value] of Object.entries(entry)) {
       if (typeof value === "string") {
@@ -54,29 +327,41 @@ function createHandlers(server, appendSafeOutput, config = {}) {
       }
     }
 
-    if (largeContent && largeFieldName) {
-      // Write large content to file
-      const fileInfo = writeLargeContentToFile(largeContent);
-
-      // Replace large field with file reference
-      entry[largeFieldName] = `[Content too large, saved to file: ${fileInfo.filename}]`;
-
-      // Append modified entry to safe outputs
-      appendSafeOutput(entry);
-
-      // Return file info to the agent
-      return {
-        content: [
-          {
-            type: "text",
-            text: JSON.stringify(fileInfo),
-          },
-        ],
-      };
+    if (!largeContent || !largeFieldName) {
+      return null;
     }
 
+    const fileInfo = writeLargeContentToFile(largeContent);
+    entry[largeFieldName] = `[Content too large, saved to file: ${fileInfo.filename}]`;
+    appendSafeOutputCounted(entry);
+
+    return {
+      content: [
+        {
+          type: "text",
+          text: JSON.stringify(fileInfo),
+        },
+      ],
+    };
+  };
+
+  /**
+   * Default handler for safe output tools
+   * Spec cross-reference: Safe Output Outcome Evaluation §2/§4/§5/§6/§7/§8/§9/§10/§11/§12/§13/§14/§15/§16/§18/§19/§20/§21/§22/§23/§24/§25/§26/§27/§28/§29.
+   * @param {string} type - The tool type
+   * @returns {Function} Handler function
+   */
+  const defaultHandler = type => args => {
+    const entry = { ...(args || {}), type };
+    const wildcardTargetValidationError = validateWildcardTargetRequirement(entry);
+    if (wildcardTargetValidationError) {
+      return wildcardTargetValidationError;
+    }
+    const largeContentResponse = maybeHandleLargeContent(entry);
+    if (largeContentResponse) return largeContentResponse;
+
     // Normal case - no large content
-    appendSafeOutput(entry);
+    appendSafeOutputCounted(entry);
     return {
       content: [
         {
@@ -87,8 +372,20 @@ function createHandlers(server, appendSafeOutput, config = {}) {
     };
   };
 
+  const createIssueConfig = config.create_issue || {};
+  let deduplicateByTitle = { enabled: false, maxDistance: 0 };
+  try {
+    deduplicateByTitle = parseDeduplicateByTitle(createIssueConfig.deduplicate_by_title);
+  } catch (error) {
+    throw new Error(`${ERR_VALIDATION}: ${getErrorMessage(error)}`);
+  }
+  const createIssueTitlePrefix = createIssueConfig.title_prefix ?? "";
+  /** @type {Map<string, Array<{title: string, normalizedTitle: string}>>} */
+  const seenIssueTitlesByRepo = new Map();
+
   /**
    * Handler for upload_asset tool
+   * Spec cross-reference: not part of the numbered outcome types in Safe Output Outcome Evaluation v1.0.0.
    */
   const uploadAssetHandler = args => {
     const branchName = process.env.GH_AW_ASSETS_BRANCH;
@@ -146,7 +443,9 @@ function createHandlers(server, appendSafeOutput, config = {}) {
     }
 
     // Create assets directory
-    const assetsDir = "/tmp/gh-aw/safeoutputs/assets";
+    // Use RUNNER_TEMP so the staged files land on the host filesystem (shared with
+    // the artifact-upload step), matching the same pattern used by upload_artifact.
+    const assetsDir = path.join(process.env.RUNNER_TEMP || "/tmp", "gh-aw", "safeoutputs", "assets");
     if (!fs.existsSync(assetsDir)) {
       fs.mkdirSync(assetsDir, { recursive: true });
     }
@@ -192,7 +491,7 @@ function createHandlers(server, appendSafeOutput, config = {}) {
       targetFileName: targetFileName,
     };
 
-    appendSafeOutput(entry);
+    appendSafeOutputCounted(entry);
 
     return {
       content: [
@@ -206,12 +505,17 @@ function createHandlers(server, appendSafeOutput, config = {}) {
 
   /**
    * Handler for create_pull_request tool
+   * Spec cross-reference: Safe Output Outcome Evaluation §1 (`create_pull_request`).
    * Resolves the current branch if branch is not provided or is the base branch
+   * Validates exploratory probe payloads against the resolved effective branch
    * Generates git patch for the changes (unless allow-empty is true)
    * Supports multi-repo scenarios via the optional 'repo' parameter
    */
   const createPullRequestHandler = async args => {
     const entry = { ...args, type: "create_pull_request" };
+    if (config.create_pull_request?.require_temporary_id === true && !entry.temporary_id) {
+      return buildIntentErrorResponse(buildMissingTemporaryIdError("create_pull_request", "create-pull-request"));
+    }
 
     // Resolve target repo configuration and validate the target repo early
     // This is needed before getBaseBranch to ensure we resolve the base branch
@@ -242,23 +546,36 @@ function createHandlers(server, appendSafeOutput, config = {}) {
     }
     const { repoParts } = repoResult;
 
-    // Get base branch for the resolved target repository.
-    // Prefer explicit safe-output config value when provided, otherwise fall back
-    // to dynamic resolution from trigger context/default branch.
-    const baseBranch = prConfig.base_branch || (await getBaseBranch(repoParts));
-
-    // Store the resolved base branch in the entry so the apply-time checkout step
-    // can use it directly instead of inferring from event context.
-    // This makes the safe output "self-describing" and fixes checkout for events
-    // like issue_comment on PRs targeting non-default branches.
-    entry.base_branch = baseBranch;
-
     // Determine the working directory for git operations
-    // If repo is specified, find where it's checked out
+    // If repo is specified or configured, find where it's checked out
     let repoCwd = null;
     let repoSlug = null;
+    const patchWorkspacePath = typeof prConfig.patch_workspace_path === "string" ? prConfig.patch_workspace_path.trim() : "";
+    const currentCheckoutRepo = typeof prConfig.current_checkout_repo === "string" ? prConfig.current_checkout_repo.trim() : "";
+    const patchWorkspaceMatchesTargetRepo = patchWorkspacePath && (!currentCheckoutRepo || currentCheckoutRepo === repoResult.repo);
 
-    if (entry.repo && entry.repo.trim()) {
+    if (patchWorkspaceMatchesTargetRepo) {
+      const patchWorkspaceResult = resolvePatchWorkspacePath(patchWorkspacePath);
+      if (!patchWorkspaceResult.success) {
+        return {
+          content: [
+            {
+              type: "text",
+              text: JSON.stringify({
+                result: "error",
+                error: patchWorkspaceResult.error,
+              }),
+            },
+          ],
+          isError: true,
+        };
+      }
+      repoCwd = patchWorkspaceResult.absolutePath;
+      repoSlug = repoResult.repo;
+      server.debug(`Using configured patch_workspace_path for create_pull_request: ${patchWorkspacePath} -> ${repoCwd}`);
+    }
+
+    if (((entry.repo && entry.repo.trim()) || prConfig["target-repo"]) && !repoCwd) {
       // Use the validated/qualified repo slug from repoResult to avoid divergence
       // between the raw user input and the normalized/qualified repo name
       repoSlug = repoResult.repo;
@@ -289,6 +606,34 @@ function createHandlers(server, appendSafeOutput, config = {}) {
       server.debug(`Found repo checkout at: ${repoCwd}`);
     }
 
+    // Get base branch for the resolved target repository.
+    // Priority:
+    //   1. Explicit `base-branch` from the workflow config (no I/O, no fetch).
+    //   2. Checkout manifest written by the workflow's setup phase (no network).
+    //   3. Local origin/HEAD metadata + payload/API fallbacks via getBaseBranch.
+    let baseBranch;
+    const configuredBaseBranch = typeof prConfig.base_branch === "string" ? prConfig.base_branch.trim() : "";
+    if (configuredBaseBranch) {
+      baseBranch = configuredBaseBranch;
+    } else {
+      const manifestEntry = lookupCheckout(repoResult.repo);
+      if (manifestEntry && manifestEntry.default_branch) {
+        baseBranch = manifestEntry.default_branch;
+        server.debug(`Using checkout-manifest default_branch for ${repoResult.repo}: ${baseBranch}`);
+      } else {
+        baseBranch = await getBaseBranch(repoParts, {
+          preferLocalDefaultBranchMetadata: Boolean(repoCwd),
+          cwd: repoCwd || undefined,
+        });
+      }
+    }
+
+    // Store the resolved base branch in the entry so the apply-time checkout step
+    // can use it directly instead of inferring from event context.
+    // This makes the safe output "self-describing" and fixes checkout for events
+    // like issue_comment on PRs targeting non-default branches.
+    entry.base_branch = baseBranch;
+
     // If branch is not provided, is empty, or equals the base branch, use the current branch from git
     // This handles cases where the agent incorrectly passes the base branch instead of the working branch
     if (!entry.branch || entry.branch.trim() === "" || entry.branch === baseBranch) {
@@ -303,13 +648,54 @@ function createHandlers(server, appendSafeOutput, config = {}) {
       entry.branch = detectedBranch;
     }
 
+    // Reject if branch still equals base_branch after detection.
+    // This means the base branch was incorrectly resolved (e.g., resolved to the
+    // feature branch itself due to a confused event context). Writing a safe output
+    // in this state would cause a cryptic git exit-1 in the safe_outputs job when
+    // it tries to fetch a non-existent remote ref.
+    if (entry.branch === entry.base_branch) {
+      return {
+        content: [
+          {
+            type: "text",
+            text: JSON.stringify({
+              result: "error",
+              error: `Branch '${entry.branch}' equals base_branch '${entry.base_branch}'. Cannot create a pull request from a branch into itself. Ensure 'branch' is your feature branch and that the base branch resolves to the target (e.g., 'main' or 'master').`,
+            }),
+          },
+        ],
+        isError: true,
+      };
+    }
+
+    const allowedBranches = parseAllowedBranchPatterns(prConfig.allowed_branches);
+    if (allowedBranches.length > 0 && !isAllowedBranch(entry.branch, allowedBranches)) {
+      return {
+        content: [
+          {
+            type: "text",
+            text: JSON.stringify({
+              result: "error",
+              error: `Branch '${entry.branch}' does not match allowed-branches. Allowed patterns: ${allowedBranches.join(", ")}`,
+            }),
+          },
+        ],
+        isError: true,
+      };
+    }
+
+    const intentValidationError = validateCreatePullRequestIntent(entry);
+    if (intentValidationError) {
+      return buildIntentErrorResponse(intentValidationError);
+    }
+
     // Check if allow-empty is enabled in configuration
     const allowEmpty = config.create_pull_request?.allow_empty === true;
 
     if (allowEmpty) {
       server.debug(`allow-empty is enabled for create_pull_request - skipping patch generation`);
       // Append the safe output entry without generating a patch
-      appendSafeOutput(entry);
+      appendSafeOutputCounted(entry);
       return {
         content: [
           {
@@ -362,14 +748,51 @@ function createHandlers(server, appendSafeOutput, config = {}) {
       transportOptions.token = prConfig["github-token"];
     }
 
+    // SECURITY: Pin the branch ref to a SHA before generating any transport artifacts.
+    // This prevents TOCTOU races where the agent flips the ref between patch and bundle
+    // generation, causing the two to represent different commit sets.
+    const gitCwd = repoCwd || process.env.GITHUB_WORKSPACE || process.cwd();
+    let pinnedSha;
+    try {
+      pinnedSha = execGitSync(["rev-parse", "--verify", `refs/heads/${entry.branch}^{commit}`], { cwd: gitCwd })
+        .toString()
+        .trim();
+      server.debug(`Pinned branch '${entry.branch}' to SHA ${pinnedSha}`);
+    } catch (pinError) {
+      server.debug(`Failed to pin branch '${entry.branch}': ${getErrorMessage(pinError)}`);
+      if (useBundle) {
+        return {
+          content: [
+            {
+              type: "text",
+              text: JSON.stringify({
+                result: "error",
+                error: `Failed to pin branch '${entry.branch}' before bundle generation: ${getErrorMessage(pinError)}`,
+                details: `Bundle transport requires branch pinning to prevent patch/bundle desynchronization. Retry after ensuring the branch exists locally (for example: git branch --list '${entry.branch}').`,
+              }),
+            },
+          ],
+          isError: true,
+        };
+      }
+      pinnedSha = null;
+    }
+
     // Always generate a patch for policy enforcement (allowed-files/protected-files/excluded-files),
     // even when bundle transport is selected for apply-time commit transport.
     server.debug(`Generating patch for create_pull_request with branch: ${entry.branch}${repoCwd ? ` in ${repoCwd} baseBranch: ${baseBranch}` : ""}`);
     /** @type {Record<string, any>} */
     const patchOptions = { ...transportOptions };
+    if (patchWorkspaceMatchesTargetRepo) {
+      patchOptions.workspacePath = patchWorkspacePath;
+    }
     // Pass excluded_files so git excludes them via :(exclude) pathspecs at generation time.
     if (Array.isArray(prConfig.excluded_files) && prConfig.excluded_files.length > 0) {
       patchOptions.excludedFiles = prConfig.excluded_files;
+    }
+    // Pass pinnedSha so patch generation uses the pinned commit, not a potentially-flipped ref
+    if (pinnedSha) {
+      patchOptions.pinnedSha = pinnedSha;
     }
     const patchResult = await generateGitPatch(entry.branch, baseBranch, patchOptions);
 
@@ -398,8 +821,9 @@ function createHandlers(server, appendSafeOutput, config = {}) {
     // prettier-ignore
     server.debug(`Patch generated successfully: ${patchResult.patchPath} (${patchResult.patchSize} bytes, ${patchResult.patchLines} lines)`);
 
-    // Store the patch path in the entry so consumers know which file to use
-    entry.patch_path = patchResult.patchPath;
+    // Patch/bundle paths are not transmitted via the safe-output entry: the
+    // privileged safe_outputs job re-derives them from the (validated) branch name
+    // using resolve_transport_paths.
 
     // Store the base commit SHA so the create_pull_request handler can use it
     // directly in the fallback path (the From <sha> header in format-patch output
@@ -433,8 +857,50 @@ function createHandlers(server, appendSafeOutput, config = {}) {
 
       server.debug(`Bundle generated successfully: ${bundleResult.bundlePath} (${bundleResult.bundleSize} bytes)`);
 
-      // Store the bundle path in the entry so consumers know which file to use
-      entry.bundle_path = bundleResult.bundlePath;
+      // SECURITY: Verify the branch ref hasn't been flipped between patch and bundle
+      // generation (TOCTOU check). If the SHA changed, the bundle may contain different
+      // commits than the patch used for file-protection policy enforcement.
+      if (pinnedSha) {
+        try {
+          const currentSha = execGitSync(["rev-parse", "--verify", `refs/heads/${entry.branch}^{commit}`], { cwd: gitCwd })
+            .toString()
+            .trim();
+          if (currentSha !== pinnedSha) {
+            server.debug(`SECURITY: Branch '${entry.branch}' SHA changed during transport generation (was ${pinnedSha}, now ${currentSha}). Aborting.`);
+            return {
+              content: [
+                {
+                  type: "text",
+                  text: JSON.stringify({
+                    result: "error",
+                    error: "Branch ref changed during transport artifact generation. This may indicate a concurrent modification. Please retry.",
+                    details: `Branch '${entry.branch}' pointed to ${pinnedSha} at start but ${currentSha} after bundle generation.`,
+                  }),
+                },
+              ],
+              isError: true,
+            };
+          }
+        } catch (verifyError) {
+          server.debug(`SECURITY: Failed to verify branch SHA after bundle generation: ${getErrorMessage(verifyError)}`);
+          return {
+            content: [
+              {
+                type: "text",
+                text: JSON.stringify({
+                  result: "error",
+                  error: `Failed to verify branch integrity after bundle generation: ${getErrorMessage(verifyError)}`,
+                }),
+              },
+            ],
+            isError: true,
+          };
+        }
+      }
+
+      // Bundle path is not transmitted via the safe-output entry: the privileged
+      // safe_outputs job re-derives it from the (validated) branch name using
+      // resolve_transport_paths.
 
       // Prefer the base_commit captured from format-patch generation (used by
       // patch-based fallback/apply paths). Only fall back to bundle base commit
@@ -443,7 +909,7 @@ function createHandlers(server, appendSafeOutput, config = {}) {
         entry.base_commit = bundleResult.baseCommit;
       }
 
-      appendSafeOutput(entry);
+      appendSafeOutputCounted(entry);
       return {
         content: [
           {
@@ -465,7 +931,7 @@ function createHandlers(server, appendSafeOutput, config = {}) {
       };
     }
 
-    appendSafeOutput(entry);
+    appendSafeOutputCounted(entry);
     return {
       content: [
         {
@@ -485,14 +951,24 @@ function createHandlers(server, appendSafeOutput, config = {}) {
 
   /**
    * Handler for push_to_pull_request_branch tool
-   * Resolves the current branch if branch is not provided or is the base branch
-   * Generates git patch for the changes
+   * Spec cross-reference: Safe Output Outcome Evaluation §17 (`push_to_pull_request_branch`).
+   * The agent SHOULD supply a `branch` argument identifying the local branch it
+   * committed onto. This is required for batch workflows that loop over multiple PRs
+   * and checkout different branches; without it, the source branch would be inferred
+   * from the current git HEAD which may not match the PR being processed. When
+   * `branch` is omitted, it is derived from the current checkout as a fallback.
+   * The destination branch is independently derived by the apply-time push handler
+   * from pulls.get(pull_number).head.ref.
    *
    * Note: Fork PR detection is handled by push_to_pull_request_branch.cjs handler
    * which fetches the PR and calls detectForkPR() with full PR data.
    */
   const pushToPullRequestBranchHandler = async args => {
-    const entry = { ...args, type: "push_to_pull_request_branch" };
+    const entry = { ...(args || {}), type: "push_to_pull_request_branch" };
+    const wildcardTargetValidationError = validateWildcardTargetRequirement(entry);
+    if (wildcardTargetValidationError) {
+      return wildcardTargetValidationError;
+    }
 
     // Resolve target repo configuration and validate the target repo early
     // This is needed before getBaseBranch to ensure we resolve the base branch
@@ -518,22 +994,38 @@ function createHandlers(server, appendSafeOutput, config = {}) {
     }
     const { repoParts } = repoResult;
 
-    // Get base branch for the resolved target repository
-    const baseBranch = await getBaseBranch(repoParts);
-
-    // Store the resolved base branch in the entry so the apply-time checkout step
-    // can use it directly instead of inferring from event context.
-    // This makes the safe output "self-describing" and fixes checkout for events
-    // like issue_comment on PRs targeting non-default branches.
-    entry.base_branch = baseBranch;
-
     // Determine the working directory for git operations.
     // Look up the checkout path when the target repo is explicitly provided by the agent
     // or explicitly configured via target-repo in the workflow config — this ensures patch
     // generation runs from the correct directory when the target repo is checked out in a subdirectory.
     let repoCwd = null;
     const itemRepo = repoResult.repo;
-    if ((entry.repo && entry.repo.trim()) || pushConfig["target-repo"]) {
+    const pushPatchWorkspacePath = typeof pushConfig.patch_workspace_path === "string" ? pushConfig.patch_workspace_path.trim() : "";
+    const pushCurrentCheckoutRepo = typeof pushConfig.current_checkout_repo === "string" ? pushConfig.current_checkout_repo.trim() : "";
+    const pushPatchWorkspaceMatchesTargetRepo = pushPatchWorkspacePath && (!pushCurrentCheckoutRepo || pushCurrentCheckoutRepo === itemRepo);
+
+    if (pushPatchWorkspaceMatchesTargetRepo) {
+      const patchWorkspaceResult = resolvePatchWorkspacePath(pushPatchWorkspacePath);
+      if (!patchWorkspaceResult.success) {
+        return {
+          content: [
+            {
+              type: "text",
+              text: JSON.stringify({
+                result: "error",
+                error: patchWorkspaceResult.error,
+              }),
+            },
+          ],
+          isError: true,
+        };
+      }
+      repoCwd = patchWorkspaceResult.absolutePath;
+      entry.repo_cwd = repoCwd;
+      server.debug(`Using configured patch_workspace_path for push_to_pull_request_branch: ${pushPatchWorkspacePath} -> ${repoCwd}`);
+    }
+
+    if (((entry.repo && entry.repo.trim()) || pushConfig["target-repo"]) && !repoCwd) {
       server.debug(`Looking for checkout of target repo: ${itemRepo}`);
       const checkoutResult = findRepoCheckout(itemRepo);
       if (!checkoutResult.success) {
@@ -555,18 +1047,93 @@ function createHandlers(server, appendSafeOutput, config = {}) {
       server.debug(`Selected checkout folder for ${itemRepo}: ${repoCwd}`);
     }
 
-    // If branch is not provided, is empty, or equals the base branch, use the current branch from git
-    // This handles cases where the agent incorrectly passes the base branch instead of the working branch
-    if (!entry.branch || entry.branch.trim() === "" || entry.branch === baseBranch) {
-      const detectedBranch = getCurrentBranch(repoCwd);
-
-      if (entry.branch === baseBranch) {
-        server.debug(`Branch equals base branch (${baseBranch}), detecting actual working branch: ${detectedBranch}`);
+    // Get base branch for the resolved target repository.
+    // Priority:
+    //   1. Explicit `base-branch` from the workflow config (no I/O, no fetch).
+    //   2. Checkout manifest written by the workflow's setup phase (no network).
+    //   3. Local origin/HEAD metadata in the side-repo checkout (when available).
+    //   4. Payload / GitHub API fallbacks via getBaseBranch.
+    let baseBranch;
+    const configuredBaseBranch = typeof pushConfig.base_branch === "string" ? pushConfig.base_branch.trim() : "";
+    if (configuredBaseBranch) {
+      baseBranch = configuredBaseBranch;
+      server.debug(`Using configured base_branch for push_to_pull_request_branch: ${baseBranch}`);
+    } else {
+      const manifestEntry = lookupCheckout(itemRepo);
+      if (manifestEntry && manifestEntry.default_branch) {
+        baseBranch = manifestEntry.default_branch;
+        server.debug(`Using checkout-manifest default_branch for ${itemRepo}: ${baseBranch}`);
       } else {
-        server.debug(`Using current branch for push_to_pull_request_branch: ${detectedBranch}`);
+        baseBranch = await getBaseBranch(repoParts, {
+          preferLocalDefaultBranchMetadata: Boolean(repoCwd),
+          cwd: repoCwd || undefined,
+        });
       }
+    }
 
-      entry.branch = detectedBranch;
+    // Store the resolved base branch in the entry so the apply-time checkout step
+    // can use it directly instead of inferring from event context.
+    // This makes the safe output "self-describing" and fixes checkout for events
+    // like issue_comment on PRs targeting non-default branches.
+    entry.base_branch = baseBranch;
+
+    // Use the agent-supplied branch if provided; fall back to the current checkout.
+    // The agent-supplied value is authoritative: in multi-PR batch workflows the
+    // working tree may be checked out to a different PR's branch by the time the
+    // MCP handler runs, so relying solely on HEAD can produce a wrong source ref
+    // and cause the apply step to fail with "couldn't find remote ref".
+    // The apply-time push job re-derives the destination from pulls.get(pull_number)
+    // independently, so this branch name is used only as the source ref for the
+    // incremental diff against origin/<branch>.
+    if (entry.branch && typeof entry.branch === "string" && entry.branch.trim()) {
+      entry.branch = entry.branch.trim();
+      server.debug(`Using agent-supplied branch for push_to_pull_request_branch: ${entry.branch}`);
+    } else {
+      // Fallback: derive from the current checkout (backward compat for single-PR workflows
+      // where the working tree is reliably on the PR head ref at call time).
+      try {
+        const detectedBranch = getCurrentBranch(repoCwd);
+        server.debug(`Using current branch for push_to_pull_request_branch: ${detectedBranch}`);
+        entry.branch = detectedBranch;
+      } catch (branchErr) {
+        return {
+          content: [
+            {
+              type: "text",
+              text: JSON.stringify({
+                result: "error",
+                error: `Failed to determine source branch for push_to_pull_request_branch: ${getErrorMessage(branchErr)}. Either supply a 'branch' argument explicitly or ensure the working tree is checked out to the pull request's head ref before calling this tool.`,
+              }),
+            },
+          ],
+          isError: true,
+        };
+      }
+    }
+
+    // Reject if the detected branch equals base_branch. This means the workspace
+    // is checked out on the PR's base (e.g. main) rather than the PR's head ref,
+    // so there is nothing to push. Writing a safe output in this state would
+    // cause a cryptic git exit-1 in the safe_outputs job when it tries to fetch
+    // a non-existent remote ref.
+    if (entry.branch === entry.base_branch) {
+      return {
+        content: [
+          {
+            type: "text",
+            text: JSON.stringify({
+              result: "error",
+              error: `Detected branch '${entry.branch}' equals base_branch '${entry.base_branch}'. The workspace is checked out on the base branch, not the pull request's head branch — there is nothing to push. Check out the PR's head ref and commit your changes there before calling push_to_pull_request_branch.`,
+            }),
+          },
+        ],
+        isError: true,
+      };
+    }
+
+    const intentValidationError = validatePushToPullRequestBranchIntent(entry);
+    if (intentValidationError) {
+      return buildIntentErrorResponse(intentValidationError);
     }
 
     // Determine transport format: "bundle" (default) uses git bundle (preserves merge topology),
@@ -625,14 +1192,51 @@ function createHandlers(server, appendSafeOutput, config = {}) {
       pushTransportOptions.token = pushConfig["github-token"];
     }
 
+    // SECURITY: Pin the branch ref to a SHA before generating any transport artifacts.
+    // This prevents TOCTOU races where the agent flips the ref between patch and bundle
+    // generation, causing the two to represent different commit sets.
+    const pushGitCwd = repoCwd || process.env.GITHUB_WORKSPACE || process.cwd();
+    let pushPinnedSha;
+    try {
+      pushPinnedSha = execGitSync(["rev-parse", "--verify", `refs/heads/${entry.branch}^{commit}`], { cwd: pushGitCwd })
+        .toString()
+        .trim();
+      server.debug(`Pinned branch '${entry.branch}' to SHA ${pushPinnedSha}`);
+    } catch (pinError) {
+      server.debug(`Failed to pin branch '${entry.branch}': ${getErrorMessage(pinError)}`);
+      if (useBundle) {
+        return {
+          content: [
+            {
+              type: "text",
+              text: JSON.stringify({
+                result: "error",
+                error: `Failed to pin branch '${entry.branch}' before bundle generation: ${getErrorMessage(pinError)}`,
+                details: `Bundle transport requires branch pinning to prevent patch/bundle desynchronization. Retry after ensuring the branch exists locally (for example: git branch --list '${entry.branch}').`,
+              }),
+            },
+          ],
+          isError: true,
+        };
+      }
+      pushPinnedSha = null;
+    }
+
     // Always generate an incremental patch for policy enforcement (allowed-files/protected-files/excluded-files),
     // even when bundle transport is selected for apply-time commit transport.
     server.debug(`Generating incremental patch for push_to_pull_request_branch with branch: ${entry.branch}, baseBranch: ${baseBranch}`);
     /** @type {Record<string, any>} */
     const pushPatchOptions = { ...pushTransportOptions };
+    if (pushPatchWorkspaceMatchesTargetRepo) {
+      pushPatchOptions.workspacePath = pushPatchWorkspacePath;
+    }
     // Pass excluded_files so git excludes them via :(exclude) pathspecs at generation time.
     if (Array.isArray(pushConfig.excluded_files) && pushConfig.excluded_files.length > 0) {
       pushPatchOptions.excludedFiles = pushConfig.excluded_files;
+    }
+    // Pass pinnedSha so patch generation uses the pinned commit, not a potentially-flipped ref
+    if (pushPinnedSha) {
+      pushPatchOptions.pinnedSha = pushPinnedSha;
     }
     const patchResult = await generateGitPatch(entry.branch, baseBranch, pushPatchOptions);
 
@@ -661,8 +1265,9 @@ function createHandlers(server, appendSafeOutput, config = {}) {
     // prettier-ignore
     server.debug(`Patch generated successfully: ${patchResult.patchPath} (${patchResult.patchSize} bytes, ${patchResult.patchLines} lines, diffSize=${patchResult.diffSize ?? "(n/a)"} bytes)`);
 
-    // Store the patch path in the entry so consumers know which file to use
-    entry.patch_path = patchResult.patchPath;
+    // Patch/bundle paths are not transmitted via the safe-output entry: the
+    // privileged safe_outputs job re-derives them from the (validated) branch name
+    // using resolve_transport_paths.
 
     // Store the base commit SHA so the push handler can use it directly
     if (patchResult.baseCommit) {
@@ -704,8 +1309,49 @@ function createHandlers(server, appendSafeOutput, config = {}) {
 
       server.debug(`Bundle generated successfully: ${bundleResult.bundlePath} (${bundleResult.bundleSize} bytes)`);
 
-      // Store the bundle path in the entry so consumers know which file to use
-      entry.bundle_path = bundleResult.bundlePath;
+      // SECURITY: Verify the branch ref hasn't been flipped between patch and bundle
+      // generation (TOCTOU check).
+      if (pushPinnedSha) {
+        try {
+          const currentSha = execGitSync(["rev-parse", "--verify", `refs/heads/${entry.branch}^{commit}`], { cwd: pushGitCwd })
+            .toString()
+            .trim();
+          if (currentSha !== pushPinnedSha) {
+            server.debug(`SECURITY: Branch '${entry.branch}' SHA changed during transport generation (was ${pushPinnedSha}, now ${currentSha}). Aborting.`);
+            return {
+              content: [
+                {
+                  type: "text",
+                  text: JSON.stringify({
+                    result: "error",
+                    error: "Branch ref changed during transport artifact generation. This may indicate a concurrent modification. Please retry.",
+                    details: `Branch '${entry.branch}' pointed to ${pushPinnedSha} at start but ${currentSha} after bundle generation.`,
+                  }),
+                },
+              ],
+              isError: true,
+            };
+          }
+        } catch (verifyError) {
+          server.debug(`SECURITY: Failed to verify branch SHA after bundle generation: ${getErrorMessage(verifyError)}`);
+          return {
+            content: [
+              {
+                type: "text",
+                text: JSON.stringify({
+                  result: "error",
+                  error: `Failed to verify branch integrity after bundle generation: ${getErrorMessage(verifyError)}`,
+                }),
+              },
+            ],
+            isError: true,
+          };
+        }
+      }
+
+      // Bundle path is not transmitted via the safe-output entry: the privileged
+      // safe_outputs job re-derives it from the (validated) branch name using
+      // resolve_transport_paths.
 
       // Prefer the base_commit captured from format-patch generation (used by
       // patch-based fallback/apply paths). Only fall back to bundle base commit
@@ -714,7 +1360,7 @@ function createHandlers(server, appendSafeOutput, config = {}) {
         entry.base_commit = bundleResult.baseCommit;
       }
 
-      appendSafeOutput(entry);
+      appendSafeOutputCounted(entry);
       return {
         content: [
           {
@@ -736,7 +1382,7 @@ function createHandlers(server, appendSafeOutput, config = {}) {
       };
     }
 
-    appendSafeOutput(entry);
+    appendSafeOutputCounted(entry);
     return {
       content: [
         {
@@ -756,6 +1402,7 @@ function createHandlers(server, appendSafeOutput, config = {}) {
 
   /**
    * Handler for push_repo_memory tool
+   * Spec cross-reference: not part of the numbered outcome types in Safe Output Outcome Evaluation v1.0.0.
    * Validates that memory files in the configured memory directory are within size limits.
    * Returns an error if any file or the total size exceeds the configured limits,
    * with guidance to reduce memory size before the workflow completes.
@@ -936,7 +1583,92 @@ function createHandlers(server, appendSafeOutput, config = {}) {
   };
 
   /**
+   * Handler for create_issue tool
+   * Applies title-based within-run deduplication for immediate feedback.
+   */
+  const createIssueHandler = args => {
+    const entry = { ...(args || {}), type: "create_issue" };
+    if (createIssueConfig.require_temporary_id === true && !entry.temporary_id) {
+      return buildIntentErrorResponse(buildMissingTemporaryIdError("create_issue", "create-issue"));
+    }
+    const intentValidationError = validateCreateIssueIntent(entry);
+    if (intentValidationError) {
+      return buildIntentErrorResponse(intentValidationError);
+    }
+
+    const { defaultTargetRepo, allowedRepos } = resolveTargetRepoConfig(createIssueConfig);
+    const repoResult = resolveAndValidateRepo(entry, defaultTargetRepo, allowedRepos, "issue");
+    if (!repoResult.success) {
+      return {
+        content: [
+          {
+            type: "text",
+            text: JSON.stringify({
+              result: "error",
+              error: repoResult.error,
+            }),
+          },
+        ],
+        isError: true,
+      };
+    }
+    const resolvedRepo = repoResult.repo;
+
+    let resolvedTitle = entry.title?.trim() || "";
+    if (!resolvedTitle) {
+      resolvedTitle = entry.body?.trim() || "Agent Output";
+    }
+    resolvedTitle = applyTitlePrefix(sanitizeTitle(resolvedTitle, createIssueTitlePrefix), createIssueTitlePrefix);
+
+    if (deduplicateByTitle.enabled) {
+      const normalizedTitle = normalizeTitleForDedup(resolvedTitle);
+      const seenTitles = seenIssueTitlesByRepo.get(resolvedRepo) || [];
+      const duplicate = findDuplicateByTitle(normalizedTitle, seenTitles, deduplicateByTitle.maxDistance);
+      if (duplicate) {
+        const droppedEntry = {
+          ...entry,
+          _dropped_duplicate_by_title: true,
+          _dedup_source: "mcp-within-run",
+          _duplicate_title: duplicate.title,
+          _duplicate_distance: duplicate.distance,
+        };
+        const largeContentResponse = maybeHandleLargeContent(droppedEntry);
+        if (!largeContentResponse) {
+          appendSafeOutputCounted(droppedEntry);
+        }
+        return {
+          content: [
+            {
+              type: "text",
+              text: JSON.stringify({
+                result: "duplicate_dropped",
+                reason: `Duplicate create_issue title matched "${duplicate.title}" (distance=${duplicate.distance})`,
+              }),
+            },
+          ],
+        };
+      }
+      seenTitles.push({ title: resolvedTitle, normalizedTitle });
+      seenIssueTitlesByRepo.set(resolvedRepo, seenTitles);
+    }
+
+    const largeContentResponse = maybeHandleLargeContent(entry);
+    if (largeContentResponse) return largeContentResponse;
+
+    appendSafeOutputCounted(entry);
+    return {
+      content: [
+        {
+          type: "text",
+          text: JSON.stringify({ result: "success" }),
+        },
+      ],
+    };
+  };
+
+  /**
    * Handler for create_project tool
+   * Spec cross-reference: not part of the numbered outcome types in Safe Output Outcome Evaluation v1.0.0.
    * Auto-generates a temporary ID if not provided and returns it to the agent
    */
   const createProjectHandler = args => {
@@ -954,7 +1686,7 @@ function createHandlers(server, appendSafeOutput, config = {}) {
     server.debug(`temporary_id for create_project: ${entry.temporary_id}`);
 
     // Append to safe outputs
-    appendSafeOutput(entry);
+    appendSafeOutputCounted(entry);
 
     // Return the temporary_id to the agent so it can reference this project
     return {
@@ -973,6 +1705,7 @@ function createHandlers(server, appendSafeOutput, config = {}) {
 
   /**
    * Handler for add_comment tool
+   * Spec cross-reference: Safe Output Outcome Evaluation §3 (`add_comment`).
    * Per Safe Outputs Specification MCE1: Enforces constraints during tool invocation
    * to provide immediate feedback to the LLM before recording to NDJSON
    * Also auto-generates a temporary_id if not provided and returns it to the agent
@@ -993,8 +1726,64 @@ function createHandlers(server, appendSafeOutput, config = {}) {
       };
     }
 
+    // Refuse discussion-specific requests when discussions are not enabled in config.
+    // reply_to_id is a discussion-only field; its presence unambiguously means the
+    // agent is targeting a GitHub Discussion.  Guard here (MCP phase) so the agent
+    // gets immediate, actionable feedback rather than a late failure at execution time.
+    const addCommentConfig = getSafeOutputsToolConfig(config, "add_comment");
+    const discussionsEnabled = addCommentConfig.discussions === true;
+    const hasReplyToId = args?.reply_to_id != null && String(args.reply_to_id).trim() !== "";
+    if (hasReplyToId && !discussionsEnabled) {
+      return buildIntentErrorResponse(
+        "add_comment with reply_to_id targets a GitHub Discussion, but discussion comments are not enabled for this workflow. " +
+          "Set 'discussions: true' in the workflow's safe-outputs.add-comment configuration to enable discussion comments and request discussions:write permission."
+      );
+    }
+
+    // Reject target:triggering early when no explicit item number and no issue/PR/discussion context.
+    // Per Safe Outputs Specification MCE1: provides actionable feedback before writing to NDJSON.
+    // Mirrors update_issue validation; explicit item_number bypasses this check because the
+    // downstream handler resolves explicit numbers before falling back to triggering context.
+    const effectiveAddCommentTarget = addCommentConfig.target || "triggering";
+    const hasExplicitItemNumber = args?.item_number != null || args?.issue_number != null || args?.["pr-number"] != null;
+    if (effectiveAddCommentTarget === "triggering" && !hasExplicitItemNumber) {
+      let invocationContext = null;
+      try {
+        invocationContext = resolveInvocationContext(context);
+      } catch (err) {
+        // A validation error (e.g. disallowed target_repo / SEC-005) is a real failure — surface it.
+        if (err?.message?.startsWith(ERR_VALIDATION)) {
+          return buildIntentErrorResponse(err.message);
+        }
+        // Unexpected structural error: skip validation and let downstream handle gracefully.
+      }
+      if (invocationContext != null) {
+        const { effectiveEventName, effectivePayload } = resolveEffectiveContext(invocationContext, context);
+        const isIssueCommentOnPR = effectiveEventName === "issue_comment" && Boolean(effectivePayload?.issue?.pull_request);
+        const isIssueContext = effectiveEventName === "issues" || (effectiveEventName === "issue_comment" && !isIssueCommentOnPR);
+        const isPRContext = PR_EVENT_NAMES.has(effectiveEventName) || isIssueCommentOnPR;
+        const isDiscussionContext = effectiveEventName === "discussion" || effectiveEventName === "discussion_comment";
+        if (!isIssueContext && !isPRContext && !isDiscussionContext) {
+          return buildIntentErrorResponse(
+            `add_comment requires an issue, pull request, or discussion context but the workflow is running on a "${effectiveEventName}" event. ` +
+              `The add-comment handler uses target: triggering which only applies when an issue, pull request, or discussion triggered the workflow. ` +
+              `To report results from this workflow, use create_discussion or create_issue instead. ` +
+              `If you need to comment on a specific item, provide an explicit item_number.`
+          );
+        }
+      }
+    }
+
     // Build the entry with a temporary_id
     const entry = { ...(args || {}), type: "add_comment" };
+    const wildcardTargetValidationError = validateWildcardTargetRequirement(entry);
+    if (wildcardTargetValidationError) {
+      return wildcardTargetValidationError;
+    }
+    const intentValidationError = validateAddCommentIntent(entry);
+    if (intentValidationError) {
+      return buildIntentErrorResponse(intentValidationError);
+    }
 
     // Use helper to validate or generate temporary_id
     const tempIdResult = getOrGenerateTemporaryId(entry, "add_comment");
@@ -1008,7 +1797,7 @@ function createHandlers(server, appendSafeOutput, config = {}) {
     server.debug(`temporary_id for add_comment: ${entry.temporary_id}`);
 
     // Append to safe outputs
-    appendSafeOutput(entry);
+    appendSafeOutputCounted(entry);
 
     // Return the temporary_id to the agent so it can reference this comment
     return {
@@ -1023,6 +1812,81 @@ function createHandlers(server, appendSafeOutput, config = {}) {
         },
       ],
     };
+  };
+
+  /**
+   * Session-scoped counter for buffered inline review comments.
+   * Incremented by createPullRequestReviewCommentHandler, read by submitPullRequestReviewHandler
+   * to guard against empty review submissions at the MCP server phase.
+   */
+  let inlineReviewCommentCount = 0;
+
+  /**
+   * Handler for create_pull_request_review_comment tool (MCP server phase).
+   * Increments the session-scoped inline comment counter so that the subsequent
+   * submitPullRequestReviewHandler can detect an otherwise-empty review.
+   * Per Safe Outputs Specification MCE1: enforces constraints during tool invocation
+   * to provide immediate feedback to the LLM before recording to NDJSON.
+   */
+  const createPullRequestReviewCommentHandler = args => {
+    const result = defaultHandler("create_pull_request_review_comment")(args);
+    // Increment only after the default handler returns successfully; if it throws
+    // (e.g. due to large-content rejection or an append write error) the counter
+    // must not advance so the empty-review guard remains accurate.
+    if (!result?.isError) {
+      inlineReviewCommentCount++;
+    }
+    return result;
+  };
+
+  /**
+   * Handler for submit_pull_request_review tool (MCP server phase).
+   * Validates the review before writing it to the NDJSON output so that the agent
+   * receives an immediate MCP error rather than a silent 422 at finalization time.
+   *
+   * Checks performed:
+   *  1. REQUEST_CHANGES requires a non-empty body (GitHub API requirement).
+   *  2. If the review body is empty AND no inline comments were buffered during this
+   *     session, the review would be contentless and GitHub would return 422 — reject
+   *     early (mirrors Sub-pattern A guard in pr_review_buffer.cjs).
+   *
+   * Per Safe Outputs Specification MCE1: enforces constraints during tool invocation
+   * to provide immediate feedback to the LLM before recording to NDJSON.
+   */
+  const submitPullRequestReviewHandler = args => {
+    const body = (args && typeof args.body === "string" ? args.body : "").trim();
+    const event = args && args.event ? String(args.event).toUpperCase() : "COMMENT";
+
+    const VALID_REVIEW_EVENTS = ["APPROVE", "REQUEST_CHANGES", "COMMENT"];
+    if (!VALID_REVIEW_EVENTS.includes(event)) {
+      throw {
+        code: -32602,
+        message: `${ERR_VALIDATION}: submit_pull_request_review: invalid event '${args.event}'. Must be one of: ${VALID_REVIEW_EVENTS.join(", ")}`,
+      };
+    }
+
+    if (event === "REQUEST_CHANGES" && !body) {
+      throw {
+        code: -32602,
+        message: `${ERR_VALIDATION}: submit_pull_request_review: 'body' is required when event is REQUEST_CHANGES`,
+      };
+    }
+
+    if (!body && inlineReviewCommentCount === 0) {
+      throw {
+        code: -32602,
+        message:
+          `${ERR_VALIDATION}: submit_pull_request_review: review body is empty and no ` +
+          `create_pull_request_review_comment calls were made — GitHub would return 422 for a contentless review. ` +
+          `Provide a non-empty 'body' or call create_pull_request_review_comment before submitting.`,
+      };
+    }
+
+    // Reset the counter after a successful review submission so that subsequent
+    // reviews in the same MCP session start with a clean slate.
+    inlineReviewCommentCount = 0;
+
+    return defaultHandler("submit_pull_request_review")(args);
   };
 
   /**
@@ -1050,6 +1914,7 @@ function createHandlers(server, appendSafeOutput, config = {}) {
 
   /**
    * Handler for upload_artifact tool.
+   * Spec cross-reference: not part of the numbered outcome types in Safe Output Outcome Evaluation v1.0.0.
    *
    * When the agent calls upload_artifact with an absolute path (e.g.,
    * /tmp/gh-aw/python/charts/loc_by_language.png), the file lives only inside the
@@ -1082,8 +1947,8 @@ function createHandlers(server, appendSafeOutput, config = {}) {
         };
       }
 
-      const stat = fs.lstatSync(filePath);
-      if (stat.isSymbolicLink()) {
+      const stat = lstatGuard(filePath);
+      if (stat === null) {
         throw {
           code: -32602,
           message: `${ERR_VALIDATION}: upload_artifact: symlinks are not allowed: ${filePath}`,
@@ -1111,7 +1976,7 @@ function createHandlers(server, appendSafeOutput, config = {}) {
       server.debug(`upload_artifact: staged ${filePath} as ${destName}`);
     }
 
-    appendSafeOutput(entry);
+    appendSafeOutputCounted(entry);
 
     const temporaryId = entry.temporary_id || null;
     return {
@@ -1127,6 +1992,100 @@ function createHandlers(server, appendSafeOutput, config = {}) {
     };
   };
 
+  /**
+   * Handler for update_issue tool
+   * Spec cross-reference: Safe Output Outcome Evaluation §update_issue.
+   * Per Safe Outputs Specification MCE1: Enforces context constraints during tool invocation
+   * to provide immediate feedback to the LLM before recording to NDJSON.
+   * Rejects `target: triggering` (the default) when the workflow has no issue context
+   * (e.g. on schedule or push events), so the agent receives an actionable error
+   * instead of a downstream Process Safe Outputs failure.
+   */
+  const updateIssueHandler = args => {
+    const updateIssueConfig = getSafeOutputsToolConfig(config, "update_issue");
+    const effectiveTarget = updateIssueConfig.target || "triggering";
+
+    if (effectiveTarget === "triggering") {
+      let invocationContext = null;
+      try {
+        invocationContext = resolveInvocationContext(context);
+      } catch (err) {
+        // A validation error (e.g. disallowed target_repo / SEC-005) is a real failure — surface it.
+        if (err?.message?.startsWith(ERR_VALIDATION)) {
+          return buildIntentErrorResponse(err.message);
+        }
+        // Unexpected structural error: skip validation and let downstream handle gracefully.
+      }
+      if (invocationContext != null) {
+        const { effectiveEventName, effectivePayload } = resolveEffectiveContext(invocationContext, context);
+        const isIssueCommentOnPR = effectiveEventName === "issue_comment" && Boolean(effectivePayload?.issue?.pull_request);
+        const isIssueContext = effectiveEventName === "issues" || (effectiveEventName === "issue_comment" && !isIssueCommentOnPR);
+
+        if (!isIssueContext) {
+          return buildIntentErrorResponse(
+            `update_issue requires an issue context but the workflow is running on a "${effectiveEventName}" event. ` +
+              `The update-issue handler uses target: triggering which only applies when an issue triggered the workflow. ` +
+              `To report results from this workflow, use create_discussion or create_issue instead. ` +
+              `If you need to update a specific issue, the workflow must configure update-issue: target: '*' and you must supply issue_number.`
+          );
+        }
+      }
+    }
+
+    return defaultHandler("update_issue")(args || {});
+  };
+
+  /**
+   * Handler for update_pull_request tool
+   * Spec cross-reference: Safe Output Outcome Evaluation §update_pull_request.
+   * Per Safe Outputs Specification MCE1: Enforces constraints during tool invocation
+   * to provide immediate feedback to the LLM before recording to NDJSON.
+   * Uses hasUpdatePullRequestFields to validate that at least one of 'title', 'body',
+   * or 'update_branch' is provided before recording to NDJSON.
+   * Rejects `target: triggering` (the default) when the workflow has no pull request context
+   * (e.g. on schedule or push events), so the agent receives an actionable error
+   * instead of a downstream Process Safe Outputs failure.
+   */
+  const updatePullRequestHandler = args => {
+    if (!hasUpdatePullRequestFields(args)) {
+      throw {
+        code: -32602,
+        message: `${ERR_VALIDATION}: update_pull_request requires at least one of: 'title', 'body', 'update_branch' fields`,
+      };
+    }
+
+    const updatePRConfig = getSafeOutputsToolConfig(config, "update_pull_request");
+    const effectivePRTarget = updatePRConfig.target || "triggering";
+    if (effectivePRTarget === "triggering") {
+      let invocationContext = null;
+      try {
+        invocationContext = resolveInvocationContext(context);
+      } catch (err) {
+        // A validation error (e.g. disallowed target_repo / SEC-005) is a real failure — surface it.
+        if (err?.message?.startsWith(ERR_VALIDATION)) {
+          return buildIntentErrorResponse(err.message);
+        }
+        // Unexpected structural error: skip validation and let downstream handle gracefully.
+      }
+      if (invocationContext != null) {
+        const { effectiveEventName, effectivePayload } = resolveEffectiveContext(invocationContext, context);
+        const isIssueCommentOnPR = effectiveEventName === "issue_comment" && Boolean(effectivePayload?.issue?.pull_request);
+        const isPRContext = PR_EVENT_NAMES.has(effectiveEventName) || isIssueCommentOnPR;
+
+        if (!isPRContext) {
+          return buildIntentErrorResponse(
+            `update_pull_request requires a pull request context but the workflow is running on a "${effectiveEventName}" event. ` +
+              `The update-pull-request handler uses target: triggering which only applies when a pull request triggered the workflow. ` +
+              `To report results from this workflow, use create_discussion or create_issue instead. ` +
+              `If you need to update a specific pull request, the workflow must configure update-pull-request: target: '*' and you must supply pull_request_number.`
+          );
+        }
+      }
+    }
+
+    return defaultHandler("update_pull_request")(args || {});
+  };
+
   return {
     defaultHandler,
     uploadAssetHandler,
@@ -1134,9 +2093,18 @@ function createHandlers(server, appendSafeOutput, config = {}) {
     createPullRequestHandler,
     pushToPullRequestBranchHandler,
     pushRepoMemoryHandler,
+    createIssueHandler,
     createProjectHandler,
     addCommentHandler,
+    createPullRequestReviewCommentHandler,
+    submitPullRequestReviewHandler,
+    updateIssueHandler,
+    updatePullRequestHandler,
   };
 }
 
-module.exports = { createHandlers };
+module.exports = {
+  buildIntentErrorResponse,
+  createHandlers,
+  hasUpdatePullRequestFields,
+};

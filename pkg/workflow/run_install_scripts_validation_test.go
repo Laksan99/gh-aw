@@ -13,38 +13,18 @@ import (
 func TestResolveRunInstallScripts(t *testing.T) {
 	tests := []struct {
 		name                    string
-		frontmatter             map[string]any
 		runtimes                map[string]any
 		mergedRunInstallScripts bool
 		expectedRunScript       bool
 	}{
 		{
 			name:                    "default: run_scripts is false",
-			frontmatter:             map[string]any{},
 			runtimes:                map[string]any{},
 			mergedRunInstallScripts: false,
 			expectedRunScript:       false,
 		},
 		{
-			name: "global run-install-scripts: true",
-			frontmatter: map[string]any{
-				"run-install-scripts": true,
-			},
-			runtimes:                map[string]any{},
-			mergedRunInstallScripts: false,
-			expectedRunScript:       true,
-		},
-		{
-			name:        "global run-install-scripts: false",
-			frontmatter: map[string]any{"run-install-scripts": false},
-			runtimes:    map[string]any{},
-
-			mergedRunInstallScripts: false,
-			expectedRunScript:       false,
-		},
-		{
-			name:        "per-runtime node run-install-scripts: true",
-			frontmatter: map[string]any{},
+			name: "per-runtime node run-install-scripts: true",
 			runtimes: map[string]any{
 				"node": map[string]any{
 					"run-install-scripts": true,
@@ -54,8 +34,7 @@ func TestResolveRunInstallScripts(t *testing.T) {
 			expectedRunScript:       true,
 		},
 		{
-			name:        "per-runtime python run-install-scripts: true (no effect for npm installs)",
-			frontmatter: map[string]any{},
+			name: "per-runtime python run-install-scripts: true (no effect for npm installs)",
 			runtimes: map[string]any{
 				"python": map[string]any{
 					"run-install-scripts": true,
@@ -66,17 +45,17 @@ func TestResolveRunInstallScripts(t *testing.T) {
 		},
 		{
 			name:                    "merged run-install-scripts from imported shared workflow",
-			frontmatter:             map[string]any{},
 			runtimes:                map[string]any{},
 			mergedRunInstallScripts: true,
 			expectedRunScript:       true,
 		},
 		{
-			name: "merged run-install-scripts OR global: both true",
-			frontmatter: map[string]any{
-				"run-install-scripts": true,
+			name: "merged and node-level: both true",
+			runtimes: map[string]any{
+				"node": map[string]any{
+					"run-install-scripts": true,
+				},
 			},
-			runtimes:                map[string]any{},
 			mergedRunInstallScripts: true,
 			expectedRunScript:       true,
 		},
@@ -84,7 +63,7 @@ func TestResolveRunInstallScripts(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			result := resolveRunInstallScripts(tt.frontmatter, tt.runtimes, tt.mergedRunInstallScripts)
+			result := resolveRunInstallScripts(tt.runtimes, tt.mergedRunInstallScripts)
 			assert.Equal(t, tt.expectedRunScript, result, "resolveRunInstallScripts() result mismatch")
 		})
 	}
@@ -98,6 +77,7 @@ func TestGenerateNpmInstallSteps_IgnoreScriptsByDefault(t *testing.T) {
 		"claude",
 		false, // no Node.js setup step
 		false, // runInstallScripts=false (default)
+		true,  // cooldown enabled by default
 	)
 
 	require.Len(t, steps, 1, "Expected 1 install step")
@@ -105,6 +85,7 @@ func TestGenerateNpmInstallSteps_IgnoreScriptsByDefault(t *testing.T) {
 
 	assert.Contains(t, installStep, "--ignore-scripts", "Expected --ignore-scripts flag by default")
 	assert.Contains(t, installStep, "npm install --ignore-scripts -g @anthropic-ai/claude-code@latest")
+	assert.Contains(t, installStep, "NPM_CONFIG_MIN_RELEASE_AGE: '3'")
 }
 
 func TestGenerateNpmInstallSteps_RunInstallScriptsEnabled(t *testing.T) {
@@ -115,6 +96,7 @@ func TestGenerateNpmInstallSteps_RunInstallScriptsEnabled(t *testing.T) {
 		"claude",
 		false, // no Node.js setup step
 		true,  // runInstallScripts=true
+		true,  // cooldown enabled by default
 	)
 
 	require.Len(t, steps, 1, "Expected 1 install step")
@@ -122,6 +104,7 @@ func TestGenerateNpmInstallSteps_RunInstallScriptsEnabled(t *testing.T) {
 
 	assert.NotContains(t, installStep, "--ignore-scripts", "Expected no --ignore-scripts flag when runInstallScripts=true")
 	assert.Contains(t, installStep, "npm install -g @anthropic-ai/claude-code@latest")
+	assert.Contains(t, installStep, "NPM_CONFIG_MIN_RELEASE_AGE: '3'")
 }
 
 func TestGenerateNpmInstallStepsWithScope_LocalInstall(t *testing.T) {
@@ -133,6 +116,7 @@ func TestGenerateNpmInstallStepsWithScope_LocalInstall(t *testing.T) {
 		false, // no Node.js setup
 		false, // local install (not global)
 		false, // runInstallScripts=false
+		false, // cooldown disabled
 	)
 
 	require.Len(t, steps, 1, "Expected 1 install step")
@@ -140,6 +124,7 @@ func TestGenerateNpmInstallStepsWithScope_LocalInstall(t *testing.T) {
 
 	assert.Contains(t, installStep, "--ignore-scripts", "Expected --ignore-scripts flag")
 	assert.NotContains(t, installStep, " -g ", "Expected local install (no -g flag)")
+	assert.NotContains(t, installStep, "NPM_CONFIG_MIN_RELEASE_AGE", "Cooldown env should be omitted when disabled")
 }
 
 func TestValidateRunInstallScripts_Warning(t *testing.T) {
@@ -175,7 +160,11 @@ func TestValidateRunInstallScripts_NotSet(t *testing.T) {
 	assert.Equal(t, 0, c.GetWarningCount(), "Should not increment warning count")
 }
 
-func TestFrontmatterConfig_RunInstallScripts(t *testing.T) {
+func TestFrontmatterConfig_RunInstallScripts_TopLevel_Ignored(t *testing.T) {
+	// Top-level run-install-scripts is no longer a supported field; it must be set
+	// under runtimes.node instead. Unknown top-level keys are silently ignored by
+	// the JSON unmarshaler, so parsing should succeed without populating any
+	// run-install-scripts flag on the config itself.
 	frontmatter := map[string]any{
 		"run-install-scripts": true,
 		"engine":              "claude",
@@ -184,9 +173,6 @@ func TestFrontmatterConfig_RunInstallScripts(t *testing.T) {
 	config, err := ParseFrontmatterConfig(frontmatter)
 	require.NoError(t, err, "Should parse frontmatter without error")
 	require.NotNil(t, config, "Config should not be nil")
-
-	require.NotNil(t, config.RunInstallScripts, "RunInstallScripts should be set")
-	assert.True(t, *config.RunInstallScripts, "RunInstallScripts should be true")
 }
 
 func TestRuntimeConfig_RunInstallScripts(t *testing.T) {

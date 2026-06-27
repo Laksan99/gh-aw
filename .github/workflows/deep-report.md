@@ -1,4 +1,6 @@
 ---
+private: true
+emoji: "🔬"
 description: Intelligence gathering agent that continuously reviews and aggregates information from agent-generated reports in discussions
 on:
   schedule:
@@ -73,11 +75,12 @@ imports:
       toolsets: [all]
   - ../skills/jqschema/SKILL.md
   - shared/discussions-data-fetch.md
+  - shared/mcp/agentdb.md
   - shared/weekly-issues-data-fetch.md
   - shared/reporting.md
 
 
-  - shared/observability-otlp.md
+  - shared/otlp.md
 ---
 
 # DeepReport - Intelligence Gathering Agent
@@ -105,7 +108,7 @@ Analyze recent discussions in this repository, focusing on:
 - **Report** discussions (category: reports) - Various agent analysis reports
 - **General** discussions - Other agent outputs
 
-Pre-fetched discussions data is available at `/tmp/gh-aw/discussions-data/discussions.json` (populated by the discussions-data-fetch step). Use this file as the primary source for discussion analysis.
+Pre-fetched discussions data is available at `/tmp/gh-aw/agent/discussions-data/discussions.json` (populated by the discussions-data-fetch step). Use this file as the primary source for discussion analysis.
 
 ### Secondary: Workflow Logs
 
@@ -117,7 +120,7 @@ Use the gh-aw MCP server to access workflow execution logs:
 
 ### Tertiary: Repository Issues
 
-Pre-fetched issues data from the last 7 days is available at `/tmp/gh-aw/weekly-issues-data/issues.json`.
+Pre-fetched issues data from the last 7 days is available at `/tmp/gh-aw/agent/weekly-issues-data/issues.json`.
 
 Use this data to:
 - Analyze recent issue activity and trends
@@ -125,40 +128,7 @@ Use this data to:
 - Track issue resolution rates
 - Correlate issues with workflow activity
 
-**Data Schema:**
-```json
-[
-  {
-    "number": "number",
-    "title": "string",
-    "state": "string (OPEN or CLOSED)",
-    "url": "string",
-    "body": "string",
-    "createdAt": "string (ISO 8601 timestamp)",
-    "updatedAt": "string (ISO 8601 timestamp)",
-    "closedAt": "string (ISO 8601 timestamp, null if open)",
-    "author": { "login": "string", "name": "string" },
-    "labels": [{ "name": "string", "color": "string" }],
-    "assignees": [{ "login": "string" }],
-    "comments": [{ "body": "string", "createdAt": "string", "author": { "login": "string" } }]
-  }
-]
-```
-
-**Example jq queries:**
-```bash
-# Count total issues
-jq 'length' /tmp/gh-aw/weekly-issues-data/issues.json
-
-# Get open issues
-jq '[.[] | select(.state == "OPEN")]' /tmp/gh-aw/weekly-issues-data/issues.json
-
-# Count by state
-jq 'group_by(.state) | map({state: .[0].state, count: length})' /tmp/gh-aw/weekly-issues-data/issues.json
-
-# Get unique authors
-jq '[.[].author.login] | unique' /tmp/gh-aw/weekly-issues-data/issues.json
-```
+Schema is available at `/tmp/gh-aw/agent/weekly-issues-data/issues-schema.json`.
 
 ## Intelligence Collection Process
 
@@ -177,29 +147,19 @@ jq '[.[].author.login] | unique' /tmp/gh-aw/weekly-issues-data/issues.json
 
 ### Step 1: Gather Discussion Intelligence
 
-1. Load discussions from the pre-fetched data file at `/tmp/gh-aw/discussions-data/discussions.json`
+1. Load discussions from the pre-fetched data file at `/tmp/gh-aw/agent/discussions-data/discussions.json`
 2. Filter for discussions from the past 7 days using the `createdAt` or `updatedAt` fields
 3. For each discussion:
-   - Extract key metrics and findings
-   - Identify the reporting agent (from tracker-id or title)
-   - Note any warnings, alerts, or notable items
-   - Record timestamps for trend analysis
+    - Extract key metrics and findings
+    - Identify the reporting agent (from tracker-id or title)
+    - Note any warnings, alerts, or notable items
+    - Record timestamps for trend analysis
+4. Use AgentDB MCP tools to perform large-scale semantic search over the discussion corpus:
+   - Ingest the filtered discussion data into AgentDB memory
+   - Run semantic and hybrid searches for recurring themes, regressions, and anomalies
+   - Use AgentDB search results to prioritize the most important discussion clusters for deeper analysis
 
-**Example jq queries:**
-```bash
-# Get all discussions
-jq 'length' /tmp/gh-aw/discussions-data/discussions.json
-
-# Get discussions from the past 7 days
-DATE_7_DAYS_AGO=$(date -d '7 days ago' '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null || date -v-7d '+%Y-%m-%dT%H:%M:%SZ')
-jq --arg date "$DATE_7_DAYS_AGO" '[.[] | select(.updatedAt >= $date)]' /tmp/gh-aw/discussions-data/discussions.json
-
-# Get discussions by category slug (e.g. "reports", "audits", "daily-news")
-jq '[.[] | select(.categorySlug == "reports")]' /tmp/gh-aw/discussions-data/discussions.json
-
-# Get AI-generated discussions only
-jq '[.[] | select(.isAgenticWorkflow == true)]' /tmp/gh-aw/discussions-data/discussions.json
-```
+Filter by date using: `jq --arg d "$(date -d '7 days ago' '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null || date -v-7d '+%Y-%m-%dT%H:%M:%SZ')" '[.[] | select(.updatedAt >= $d)]'`
 
 ### Step 2: Gather Workflow Intelligence
 
@@ -213,13 +173,7 @@ Use the gh-aw `logs` tool to:
 
 ### Step 2.5: Analyze Repository Issues
 
-Load and analyze the pre-fetched issues data:
-1. Read `/tmp/gh-aw/weekly-issues-data/issues.json`
-2. Analyze:
-   - Issue creation/closure trends over the week
-   - Most common labels and categories
-   - Authors and assignees activity
-   - Issues requiring attention (unlabeled, stale, or urgent)
+Use the `issues-analyst` sub-agent to analyze `/tmp/gh-aw/agent/weekly-issues-data/issues.json` and produce a structured issues summary.
 
 ### Step 3: Cross-Reference and Analyze
 
@@ -235,30 +189,6 @@ Connect the dots between different data sources:
    - Repetitive manual tasks that can be automated
    - Issues or discussions that need attention (labeling, triage, responses)
 
-### Step 3.5: Extract Actionable Agentic Tasks
-
-**CRITICAL**: Based on your analysis, identify exactly **7 actionable tasks** (quick wins) and **CREATE GITHUB ISSUES** for each one:
-
-1. **Prioritize by impact and effort**: Look for high-impact, low-effort improvements
-2. **Be specific**: Tasks should be concrete with clear success criteria
-3. **Consider agent capabilities**: Tasks should be suitable for AI agent execution
-4. **Base on data**: Use insights from discussions, workflows, and issues
-5. **Focus on quick wins**: Tasks that can be completed quickly (< 4 hours of agent time)
-
-**Common quick win categories:**
-- **Code/Configuration improvements**: Consolidate patterns, add missing configs, optimize settings
-- **Documentation gaps**: Add or update missing documentation
-- **Issue/Discussion triage**: Label, organize, or respond to backlog items
-- **Workflow optimization**: Reduce token usage, improve caching, fix inefficiencies
-- **Cleanup tasks**: Remove duplicates, archive stale items, organize files
-
-**For each task, CREATE A GITHUB ISSUE** with:
-- **Title**: Clear, action-oriented name
-- **Body**: Description, expected impact, suggested agent, and estimated effort
-- Reference this deep-report analysis run
-
-**If no actionable tasks found**: Skip issue creation and note in the report that the project is operating optimally.
-
 ### Step 4: Store Insights in Repo Memory
 
 Save your findings to `/tmp/gh-aw/repo-memory/default/memory/deep-report/` as markdown files:
@@ -269,14 +199,44 @@ Save your findings to `/tmp/gh-aw/repo-memory/default/memory/deep-report/` as ma
 
 **Note:** Only markdown (.md) files are allowed in the repo-memory folder. Use markdown tables, lists, and formatting to structure your data.
 
+## Actionable Task Creation
+
+Based on your analysis, identify exactly **7 actionable tasks** (quick wins) and **CREATE GITHUB ISSUES** for each one. Focus on **quick wins** — tasks that are:
+- **Specific and well-defined** — Clear scope with measurable outcome
+- **Achievable by an agent** — Can be automated or assisted by AI
+- **High impact, low effort** — Maximum benefit with minimal implementation time
+- **Data-driven** — Based on patterns and insights from this analysis
+- **Independent** — Can be completed without blocking dependencies
+
+**Common quick win categories:**
+- **Code/Configuration improvements**: Consolidate patterns, add missing configs, optimize settings
+- **Documentation gaps**: Add or update missing documentation
+- **Issue/Discussion triage**: Label, organize, or respond to backlog items
+- **Workflow optimization**: Reduce token usage, improve caching, fix inefficiencies
+- **Cleanup tasks**: Remove duplicates, archive stale items, organize files
+
+For each task, **CREATE A GITHUB ISSUE** using the safe-outputs create-issue capability. Each issue should contain:
+
+1. **Title** — Clear, action-oriented name (e.g., "Reduce token usage in daily-news workflow")
+2. **Body** — Include:
+   - **Description**: 2-3 sentences explaining what needs to be done and why
+   - **Expected Impact**: What improvement or benefit this will deliver
+   - **Suggested Agent**: Which existing agent could handle this, or "New Agent" if needed
+   - **Estimated Effort**: Quick (< 1 hour), Medium (1-4 hours), or Fast (< 30 min)
+   - **Data Source**: Reference to this deep-report analysis run
+
+**If no actionable tasks are identified** (the project is in excellent shape): skip issue creation and note in the report that the project is operating optimally.
+
+**Maximum: 7 issues.** Choose the most impactful tasks.
+
 ## Report Structure
 
-{{#if experiments.output_format == "executive_brief"}}
+{{#if experiments.output_format == 'executive_brief'}}
 Generate a **condensed intelligence brief** with these sections only:
 1. **🔍 Executive Summary** — 3 sentences: overall health, top finding, urgent action.
 2. **🚨 Top 5 Findings** — Flat bullet list, one line each, most impactful first.
 3. **✅ Actionable Agentic Tasks** — Exactly 7 items as before.
-{{#elseif experiments.output_format == "annotated_brief"}}
+{{#elseif experiments.output_format == 'annotated_brief'}}
 Generate a **condensed intelligence brief with inline citations** with these sections only:
 1. **🔍 Executive Summary** — 3 sentences with at least one cited source link per sentence.
 2. **🚨 Top 5 Findings** — Flat bullet list, one line each, each ending with `([source](url))`.
@@ -331,35 +291,7 @@ Based on trend analysis, provide:
 
 ### ✅ Actionable Agentic Tasks (Quick Wins)
 
-**CRITICAL**: Identify exactly **7 actionable tasks** that could be immediately assigned to an AI agent to improve the project. Focus on **quick wins** - tasks that are:
-- **Specific and well-defined** - Clear scope with measurable outcome
-- **Achievable by an agent** - Can be automated or assisted by AI
-- **High impact, low effort** - Maximum benefit with minimal implementation time
-- **Data-driven** - Based on patterns and insights from this analysis
-- **Independent** - Can be completed without blocking dependencies
-
-**REQUIRED ACTION**: For each identified task, **CREATE A GITHUB ISSUE** using the safe-outputs create-issue capability. Each issue should contain:
-
-1. **Title** - Clear, action-oriented name (e.g., "Reduce token usage in daily-news workflow")
-2. **Body** - Include the following sections:
-   - **Description**: 2-3 sentences explaining what needs to be done and why
-   - **Expected Impact**: What improvement or benefit this will deliver
-   - **Suggested Agent**: Which existing agent could handle this, or suggest "New Agent" if needed
-   - **Estimated Effort**: Quick (< 1 hour), Medium (1-4 hours), or Fast (< 30 min)
-   - **Data Source**: Reference to this deep-report analysis run
-
-**If no actionable tasks are identified** (the project is in excellent shape):
-- Do NOT create any issues
-- In the discussion report, explicitly state: "No actionable tasks identified - the project is operating optimally."
-
-**Examples of good actionable tasks:**
-- "Consolidate duplicate error handling patterns in 5 workflow files"
-- "Add missing cache configuration to 3 high-frequency workflows"
-- "Create automated labels for 10 unlabeled issues based on content analysis"
-- "Optimize token usage in verbose agent prompts (identified 4 candidates)"
-- "Add missing documentation for 2 frequently-used MCP tools"
-
-**Remember**: The maximum is 7 issues. Choose the most impactful tasks.
+Exactly 7 items — see task creation instructions above.
 
 ### 📚 Source Attribution
 
@@ -370,26 +302,24 @@ List all reports and data sources analyzed:
 - Repo-memory data used from previous analyses (stored in memory/deep-report branch)
 {{/if}}
 
-## Output Guidelines
-
-- Use clear, professional language suitable for a technical audience
-- Include specific metrics and numbers where available
-- Provide links to source discussions and workflow runs
-- Use emojis sparingly to categorize findings
-- Keep the report focused and actionable
-- Highlight items that require human attention
-
-## Important Notes
-
-- Focus on **insights**, not just data aggregation
-- Look for **connections** between different agent reports
-- **Prioritize** findings by potential impact
-- Be **objective** - report both positive and negative trends
-- **Cite sources** for all major claims
-
 ## Final Steps
 
 1. **Create GitHub Issues**: For each of the 7 actionable tasks identified (if any), create a GitHub issue using the safe-outputs create-issue capability
 2. **Create Discussion Report**: Create a new GitHub discussion titled "DeepReport Intelligence Briefing - [Today's Date]" in the "reports" category with your full analysis (including the identified actionable tasks)
 
 {{#runtime-import shared/noop-reminder.md}}
+
+## agent: `issues-analyst`
+---
+model: small
+description: Analyzes repository issues JSON and produces a structured markdown summary of counts, labels, unlabeled/stale items, and top authors
+---
+You are an issues analysis assistant. Read `/tmp/gh-aw/agent/weekly-issues-data/issues.json` using bash and produce a concise markdown summary with these sections:
+
+- **Issue counts by state**: total open vs closed
+- **Top 5 labels by frequency**: label name and count
+- **Issues with no labels**: list titles and numbers
+- **Issues open > 7 days**: list titles and numbers
+- **Most active authors (top 3)**: login and issue count
+
+Output only the markdown summary, no preamble or explanation.

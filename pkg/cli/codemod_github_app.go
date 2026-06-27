@@ -91,7 +91,7 @@ func renameAppToGitHubApp(lines []string) ([]string, bool) {
 		trimmed := strings.TrimSpace(line)
 
 		// Skip empty lines without resetting state
-		if len(trimmed) == 0 {
+		if trimmed == "" {
 			result = append(result, line)
 			continue
 		}
@@ -178,11 +178,4 @@ func renameAppToGitHubApp(lines []string) ([]string, bool) {
 	}
 
 	return result, modified
-}
-
-// isDescendant returns true if childIndent is deeper (more indented) than parentIndent.
-// It is used as a "belongs to this block" check — any line more indented than the parent
-// is treated as being within the parent's scope.
-func isDescendant(childIndent, parentIndent string) bool {
-	return len(childIndent) > len(parentIndent)
 }

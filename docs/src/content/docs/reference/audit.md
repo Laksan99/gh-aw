@@ -1,11 +1,14 @@
 ---
-title: Audit Commands
+title: Auditing Workflows
 description: Reference for the gh aw audit commands — single-run analysis, behavioral diff, and cross-run security reports.
 sidebar:
   order: 297
 ---
 
 The `gh aw audit` commands download workflow run artifacts and logs, analyze MCP tool usage and network behavior, and produce structured reports suited for security reviews, debugging, and feeding to AI agents.
+
+> [!NOTE]
+> AI Credits (AIC) are the primary spend metric in gh-aw. Legacy Effective Tokens (ET) fields remain available for backward compatibility in report output.
 
 ## `gh aw audit <run-id-or-url> [<run-id-or-url>...]`
 
@@ -82,7 +85,7 @@ gh aw audit 12345 12346 --repo owner/repo      # Specify repository
 The Metrics section includes an `ambient_context` object when available. Ambient context captures the first LLM inference footprint for the run:
 - `ambient_context.input_tokens` — input tokens for the first invocation
 - `ambient_context.cached_tokens` — cache-read tokens reused by the first invocation
-- `ambient_context.effective_tokens` — `input_tokens + cached_tokens`
+- `ambient_context.effective_tokens` — legacy ET field (`input_tokens + cached_tokens`) retained for compatibility
 
 **Diff output** includes:
 - New and removed network domains
@@ -91,8 +94,9 @@ The Metrics section includes an `ambient_context` object when available. Ambient
 - Anomaly flags (new denied domains, previously-denied domains now allowed)
 - MCP tool invocation changes (new/removed tools, call count and error count diffs)
 - Run metrics comparison (token usage, duration, turns)
-- Token usage breakdown: input tokens, output tokens, cache read/write tokens, effective tokens, total API requests, and cache efficiency per run
-- Tokens per turn: effective tokens divided by turn count for each run, with the change between runs
+- Token usage and spend breakdown: input tokens, output tokens, cache read/write tokens, AIC, legacy effective tokens (ET), total API requests, and cache efficiency per run
+- Tokens per turn: legacy ET divided by turn count for each run, with the change between runs
+- AIC reporting: AI Credits are shown alongside token metrics for spend tracking
 - Tool call breakdown: per-tool call counts (new, removed, and changed tools) with max input/output sizes
 - Bash command breakdown: aggregated call counts and max input/output sizes for each distinct bash command invoked
 
@@ -121,7 +125,7 @@ This feature is built into the `gh aw logs` command via the `--format` flag.
 
 The report output includes an executive summary, domain inventory, metrics trends, MCP server health, and per-run breakdown. It detects cross-run anomalies such as domain access spikes, elevated MCP error rates, and connection rate changes.
 
-For each run in detailed logs JSON output, an `ambient_context` object is included when token usage data is available. It reflects only the first LLM invocation in the run (`input_tokens`, `cached_tokens`, `effective_tokens`).
+For each run in detailed logs JSON output, an `ambient_context` object is included when token usage data is available. It reflects only the first LLM invocation in the run (`input_tokens`, `cached_tokens`, and legacy `effective_tokens`).
 
 **`--stdin` mode:** Pass `--stdin` to supply an explicit list of run IDs or URLs instead of letting the command discover runs from the GitHub API. Date, count, and workflow-name filters are ignored; `--engine`, `--firewall`, `--safe-output`, and other content filters still apply. Blank lines and `#`-prefixed lines are ignored. Bare numeric IDs require `--repo owner/repo`.
 
@@ -143,9 +147,148 @@ gh aw logs --format markdown --repo owner/repo --count 10
 
 ## Related Documentation
 
-- [Cost Management](/gh-aw/reference/cost-management/) — Track token usage and inference spend
+- [Cost Management](/gh-aw/reference/cost-management/) — Track AIC-first spend and token usage
 - [Artifacts](/gh-aw/reference/artifacts/) — Artifact names, directory structures, and token usage file locations (`token-usage.jsonl` in `firewall-audit-logs`)
-- [Effective Tokens Specification](/gh-aw/reference/effective-tokens-specification/) — How effective tokens are computed
+- [AI Credits Specification](/gh-aw/specs/ai-credits-specification/) — Primary AIC computation details
+- [Effective Tokens Specification](/gh-aw/specs/effective-tokens-specification/) — Legacy ET computation details
 - [Network](/gh-aw/reference/network/) — Firewall and domain allow/deny configuration
 - [MCP Gateway](/gh-aw/reference/mcp-gateway/) — MCP server health and debugging
 - [CLI Commands](/gh-aw/setup/cli/) — Full CLI reference
+
+## Consuming Audit Reports in Workflows
+
+When running locally, all three audit commands accept `--json` to write structured output to stdout. Pipe through `jq` to extract the fields a model needs.
+
+| Command | Use case |
+| --------- | ---------- |
+| `gh aw audit <run-id> --json` | Single run — `key_findings`, `recommendations`, `metrics` |
+| `gh aw logs [workflow] --last 10 --json` | Trend analysis — `per_run_breakdown`, `domain_inventory` |
+| `gh aw audit <id1> <id2> --json` | Before/after — `run_metrics_diff`, `firewall_diff` |
+
+Inside GitHub Actions workflows, agents access these commands through the `agentic-workflows` MCP tool rather than calling the CLI directly.
+
+### Posting findings as a PR comment
+
+```aw wrap
+---
+description: Post audit findings as a PR comment after each agent run
+
+on:
+  workflow_run:
+    workflows: ['my-workflow']
+    types: [completed]
+
+engine: copilot
+
+tools:
+  github:
+    toolsets: [pull_requests]
+  agentic-workflows:
+
+permissions:
+  contents: read
+  actions: read
+  pull-requests: write
+---
+
+# Summarize Audit Findings
+
+Use the `agentic-workflows` MCP tool `audit` with run ID ${{ github.event.workflow_run.id }}, identify the pull request that triggered it, and post a comment summarizing key findings and blocked domains. Highlight issues with severity `high` or `critical`. If there are no findings, post a brief "no issues found" comment.
+```
+
+### Detecting regressions with diff
+
+```aw wrap
+---
+description: Detect regressions between two workflow runs
+
+on:
+  workflow_dispatch:
+    inputs:
+      base_run_id:
+        description: 'Baseline run ID'
+        required: true
+      current_run_id:
+        description: 'Current run ID to compare'
+        required: true
+
+engine: copilot
+
+tools:
+  github:
+    toolsets: [issues]
+  agentic-workflows:
+
+permissions:
+  contents: read
+  actions: read
+  issues: write
+---
+
+# Regression Detection
+
+Use the `agentic-workflows` MCP tool `audit` with run IDs ${{ inputs.base_run_id }} and ${{ inputs.current_run_id }} to compare the two runs. Check for new blocked domains, increased MCP error rates, cost increase > 20%, or token usage increase > 50%. If regressions are found, open a GitHub issue with a table from `run_metrics_diff`, affected domains from `firewall_diff`, and affected MCP tools from `mcp_tools_diff`.
+```
+
+### Filing issues from audit findings
+
+```aw wrap
+---
+description: File GitHub issues for high-severity audit findings
+
+on:
+  workflow_run:
+    workflows: ['my-workflow']
+    types: [completed]
+
+engine: copilot
+
+tools:
+  github:
+    toolsets: [issues]
+  agentic-workflows:
+
+permissions:
+  contents: read
+  actions: read
+  issues: write
+---
+
+# Auto-File Issues for Critical Findings
+
+Use the `agentic-workflows` MCP tool `audit` with run ID ${{ github.event.workflow_run.id }}. Filter `key_findings` for severity `high` or `critical`. For each finding without a matching open issue, create one with the finding title, description, impact, and recommendations, labelled `audit-finding`. If no critical findings, call the `noop` safe output tool.
+```
+
+### Weekly audit monitoring agent
+
+```aw wrap
+---
+description: Weekly audit digest with trend analysis
+
+on:
+  schedule: weekly
+
+engine: copilot
+
+tools:
+  github:
+    toolsets: [discussions]
+  agentic-workflows:
+  cache-memory:
+    key: audit-monitoring-trends
+
+permissions:
+  contents: read
+  actions: read
+  discussions: write
+---
+
+# Weekly Audit Monitoring Digest
+
+1. Use the `agentic-workflows` MCP tool `logs` with parameters `workflow: my-workflow, last: 10` and read `/tmp/gh-aw/cache-memory/audit-trends.json` as the previous baseline.
+2. Detect: cost spikes (`cost_spike: true` in `per_run_breakdown`), new denied domains in `domain_inventory`, MCP servers with `error_rate > 0.10` or `unreliable: true`, and week-over-week changes in `error_trend.runs_with_errors`.
+3. Create a GitHub discussion "Audit Digest — [YYYY-MM-DD]" with an executive summary, anomalies table, and MCP health table.
+4. Update `/tmp/gh-aw/cache-memory/audit-trends.json` with rolling averages (cost, tokens, error count, deny rate), keeping only the last 30 days.
+```
+
+Top-level fields (`key_findings`, `recommendations`, `metrics`, `firewall_analysis`, `mcp_tool_usage`) are stable; nested sub-fields may be extended but are not removed without deprecation. Add `--parse` to populate `behavior_fingerprint` and `agentic_assessments`. Cross-run JSON can be large — extract only the slices your model needs.

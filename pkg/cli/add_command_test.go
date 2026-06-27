@@ -7,9 +7,11 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/github/gh-aw/pkg/testutil"
+	"github.com/github/gh-aw/pkg/workflow"
 	"github.com/spf13/cobra"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -80,6 +82,15 @@ func TestNewAddCommand(t *testing.T) {
 	assert.NotNil(t, stopAfterFlag, "Should have 'stop-after' flag")
 }
 
+func TestNewAddCommand_MentionsEnterpriseSourceResolution(t *testing.T) {
+	cmd := NewAddCommand(validateEngineStub)
+	require.NotNil(t, cmd)
+
+	assert.Contains(t, cmd.Long, "Note: In GitHub Enterprise repos, shorthand source specs resolve on your enterprise host by default.")
+	assert.Contains(t, cmd.Long, "For github/*, githubnext/*, and microsoft/* sources, shorthand resolves on github.com.")
+	assert.Contains(t, cmd.Long, "Use full https://github.com/... source URLs for other public github.com workflows.")
+}
+
 func TestAddWorkflows(t *testing.T) {
 	tests := []struct {
 		name          string
@@ -94,10 +105,10 @@ func TestAddWorkflows(t *testing.T) {
 			errorContains: "at least one workflow",
 		},
 		{
-			name:          "repo-only spec (requires workflow path)",
-			workflows:     []string{"owner/repo"},
+			name:          "invalid repo spec missing repo name",
+			workflows:     []string{"owner"},
 			expectError:   true,
-			errorContains: "workflow specification must be in format",
+			errorContains: "not a valid workflow path or repository package",
 		},
 	}
 
@@ -151,6 +162,7 @@ func TestAddResolvedWorkflows(t *testing.T) {
 
 			opts := AddOptions{}
 			_, err := AddResolvedWorkflows(
+				context.Background(),
 				[]string{"test/repo/test-workflow"},
 				resolved,
 				opts,
@@ -461,7 +473,7 @@ func TestAddWorkflowWithTracking_SourceFieldVariants(t *testing.T) {
 			}
 			opts := AddOptions{DisableSecurityScanner: true}
 
-			err := addWorkflowWithTracking(resolved, nil, opts)
+			err := addWorkflowWithTracking(context.Background(), resolved, nil, opts)
 			require.NoError(t, err, "addWorkflowWithTracking should succeed")
 
 			written, err := os.ReadFile(filepath.Join(workflowsDir, tt.spec.WorkflowName+".md"))
@@ -515,7 +527,7 @@ func TestAddWorkflowWithTracking_UsesActualFetchedPath(t *testing.T) {
 	opts := AddOptions{
 		DisableSecurityScanner: true,
 	}
-	err := addWorkflowWithTracking(resolved, nil, opts)
+	err := addWorkflowWithTracking(context.Background(), resolved, nil, opts)
 	require.NoError(t, err, "addWorkflowWithTracking should succeed")
 
 	// Read the written file
@@ -529,4 +541,226 @@ func TestAddWorkflowWithTracking_UsesActualFetchedPath(t *testing.T) {
 	assert.NotContains(t, string(written),
 		"source: owner/repo/my-workflow.md",
 		"source field must NOT use the short-form path that causes 404 on gh aw update")
+}
+
+// TestAddWorkflowWithTracking_ActionWorkflow verifies that action workflow (.yml) files are
+// copied as-is to the target directory without frontmatter processing or compilation.
+func TestAddWorkflowWithTracking_ActionWorkflow(t *testing.T) {
+	tempDir := testutil.TempDir(t, "test-action-workflow-*")
+	workflowsDir := setupMinimalGitRepo(t, tempDir)
+
+	rawYML := []byte("name: CI\non: [push]\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps: []\n")
+
+	spec := &WorkflowSpec{
+		RepoSpec: RepoSpec{
+			RepoSlug: "owner/repo",
+			Version:  "main",
+		},
+		WorkflowPath: ".github/workflows/ci.yml",
+		WorkflowName: "ci",
+	}
+	sourceInfo := &FetchedWorkflow{
+		Content:    rawYML,
+		CommitSHA:  "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+		IsLocal:    false,
+		SourcePath: ".github/workflows/ci.yml",
+	}
+	resolved := &ResolvedWorkflow{
+		Spec:             spec,
+		Content:          rawYML,
+		SourceInfo:       sourceInfo,
+		IsActionWorkflow: true,
+	}
+
+	err := addWorkflowWithTracking(context.Background(), resolved, nil, AddOptions{})
+	require.NoError(t, err)
+
+	// The .yml file should be written verbatim
+	written, err := os.ReadFile(filepath.Join(workflowsDir, "ci.yml"))
+	require.NoError(t, err)
+	assert.YAMLEq(t, string(rawYML), string(written), "action workflow content should be copied verbatim")
+
+	// No .md or .lock.yml should be created
+	_, errMD := os.Stat(filepath.Join(workflowsDir, "ci.md"))
+	assert.True(t, os.IsNotExist(errMD), "no .md file should be created for action workflows")
+	_, errLock := os.Stat(filepath.Join(workflowsDir, "ci.lock.yml"))
+	assert.True(t, os.IsNotExist(errLock), "no .lock.yml should be created for action workflows")
+}
+
+// TestAddWorkflowWithTracking_ActionWorkflow_Force verifies that the --force flag overwrites
+// an existing action workflow file.
+func TestAddWorkflowWithTracking_ActionWorkflow_Force(t *testing.T) {
+	tempDir := testutil.TempDir(t, "test-action-workflow-force-*")
+	workflowsDir := setupMinimalGitRepo(t, tempDir)
+
+	oldContent := []byte("name: Old\n")
+	newContent := []byte("name: New\n")
+
+	destFile := filepath.Join(workflowsDir, "ci.yml")
+	require.NoError(t, os.WriteFile(destFile, oldContent, 0644))
+
+	spec := &WorkflowSpec{WorkflowPath: ".github/workflows/ci.yml", WorkflowName: "ci"}
+	resolved := &ResolvedWorkflow{
+		Spec:             spec,
+		Content:          newContent,
+		SourceInfo:       &FetchedWorkflow{Content: newContent, IsLocal: false, SourcePath: ".github/workflows/ci.yml"},
+		IsActionWorkflow: true,
+	}
+
+	// Without --force: should fail
+	err := addWorkflowWithTracking(context.Background(), resolved, nil, AddOptions{})
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "already exists")
+
+	// With --force: should overwrite
+	err = addWorkflowWithTracking(context.Background(), resolved, nil, AddOptions{Force: true})
+	require.NoError(t, err)
+	written, err := os.ReadFile(destFile)
+	require.NoError(t, err)
+	assert.Equal(t, newContent, written)
+}
+
+func TestAddSkillFileWithTracking_PreservesPathFromSkillsRoot(t *testing.T) {
+	gitRoot := testutil.TempDir(t, "test-add-skill-path-*")
+	resolved := &ResolvedWorkflow{
+		Spec: &WorkflowSpec{
+			WorkflowPath: "vendor/foo/skills/foo/scripts/run.sh",
+		},
+		SkillName: "foo",
+		Content:   []byte("#!/usr/bin/env sh\necho ok\n"),
+	}
+
+	err := addSkillFileWithTracking(resolved, nil, AddOptions{Quiet: true}, gitRoot)
+	require.NoError(t, err)
+
+	skillRoot := filepath.Join(gitRoot, workflow.GetEngineSkillDir(""), "foo")
+	expectedFile := filepath.Join(skillRoot, "scripts", "run.sh")
+	unexpectedFile := filepath.Join(skillRoot, "skills", "foo", "scripts", "run.sh")
+
+	_, err = os.Stat(expectedFile)
+	require.NoError(t, err, "expected nested skill file should exist")
+	content, err := os.ReadFile(expectedFile)
+	require.NoError(t, err, "expected nested skill file should be readable")
+	assert.Equal(t, []byte("#!/usr/bin/env sh\necho ok\n"), content, "expected nested skill file content should match")
+	_, err = os.Stat(unexpectedFile)
+	assert.True(t, os.IsNotExist(err), "unexpected first-match path should not be created")
+}
+
+func TestAddSkillFileWithTracking_RejectsInvalidPaths(t *testing.T) {
+	t.Run("rejects path that escapes skill directory", func(t *testing.T) {
+		gitRoot := testutil.TempDir(t, "test-add-skill-traversal-*")
+		resolved := &ResolvedWorkflow{
+			Spec: &WorkflowSpec{
+				WorkflowPath: "skills/foo/../../.github/workflows/evil.yml",
+			},
+			SkillName: "foo",
+			Content:   []byte("malicious"),
+		}
+
+		err := addSkillFileWithTracking(resolved, nil, AddOptions{Quiet: true}, gitRoot)
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "escapes destination skill directory")
+	})
+
+	t.Run("rejects source path when skill root cannot be determined", func(t *testing.T) {
+		gitRoot := testutil.TempDir(t, "test-add-skill-missing-root-*")
+		resolved := &ResolvedWorkflow{
+			Spec: &WorkflowSpec{
+				WorkflowPath: "skills/bar/SKILL.md",
+			},
+			SkillName: "foo",
+			Content:   []byte("content"),
+		}
+
+		err := addSkillFileWithTracking(resolved, nil, AddOptions{Quiet: true}, gitRoot)
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "failed to determine relative path")
+	})
+}
+
+func TestAddCopilotRequestsPermissionToContent(t *testing.T) {
+	t.Run("adds permission to workflow without existing permissions block", func(t *testing.T) {
+		content := "---\nengine: copilot\n---\nDo the thing.\n"
+		result, err := addCopilotRequestsPermissionToContent(content)
+		require.NoError(t, err)
+		assert.Contains(t, result, "permissions:")
+		assert.Contains(t, result, "copilot-requests: write")
+	})
+
+	t.Run("adds permission to workflow with existing permissions block", func(t *testing.T) {
+		content := "---\nengine: copilot\npermissions:\n  contents: read\n---\nDo the thing.\n"
+		result, err := addCopilotRequestsPermissionToContent(content)
+		require.NoError(t, err)
+		assert.Contains(t, result, "copilot-requests: write")
+		assert.Contains(t, result, "contents: read")
+	})
+
+	t.Run("is idempotent when permission already present", func(t *testing.T) {
+		content := "---\nengine: copilot\npermissions:\n  copilot-requests: write\n---\nDo the thing.\n"
+		result, err := addCopilotRequestsPermissionToContent(content)
+		require.NoError(t, err)
+		count := strings.Count(result, "copilot-requests: write")
+		assert.Equal(t, 1, count, "copilot-requests: write should appear exactly once")
+	})
+
+	t.Run("returns error when permissions is a non-mapping scalar", func(t *testing.T) {
+		content := "---\nengine: copilot\npermissions: read-all\n---\nDo the thing.\n"
+		_, err := addCopilotRequestsPermissionToContent(content)
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "non-mapping scalar")
+	})
+}
+
+func TestAddWorkflowWithTracking_CopilotRequestsPermission(t *testing.T) {
+	t.Run("injects copilot-requests permission when option is set", func(t *testing.T) {
+		dir := testutil.TempDir(t, "test-copilot-requests-perm-*")
+		setupMinimalGitRepo(t, dir)
+
+		content := "---\nengine: copilot\n---\nDo the thing.\n"
+		resolved := &ResolvedWorkflow{
+			Spec:    &WorkflowSpec{WorkflowPath: "workflows/my-workflow.md", WorkflowName: "my-workflow"},
+			Content: []byte(content),
+			SourceInfo: &FetchedWorkflow{
+				IsLocal: true,
+			},
+		}
+
+		err := addWorkflowWithTracking(context.Background(), resolved, nil, AddOptions{
+			Quiet:                        true,
+			AddCopilotRequestsPermission: true,
+			DisableSecurityScanner:       true,
+		})
+		require.NoError(t, err)
+
+		workflowsDir := filepath.Join(dir, ".github", "workflows")
+		written, readErr := os.ReadFile(filepath.Join(workflowsDir, "my-workflow.md"))
+		require.NoError(t, readErr)
+		assert.Contains(t, string(written), "copilot-requests: write")
+	})
+
+	t.Run("does not inject permission when option is false", func(t *testing.T) {
+		dir := testutil.TempDir(t, "test-copilot-requests-noperm-*")
+		setupMinimalGitRepo(t, dir)
+
+		content := "---\nengine: copilot\n---\nDo the thing.\n"
+		resolved := &ResolvedWorkflow{
+			Spec:    &WorkflowSpec{WorkflowPath: "workflows/my-workflow2.md", WorkflowName: "my-workflow2"},
+			Content: []byte(content),
+			SourceInfo: &FetchedWorkflow{
+				IsLocal: true,
+			},
+		}
+
+		err := addWorkflowWithTracking(context.Background(), resolved, nil, AddOptions{
+			Quiet:                        true,
+			AddCopilotRequestsPermission: false,
+			DisableSecurityScanner:       true,
+		})
+		require.NoError(t, err)
+
+		workflowsDir := filepath.Join(dir, ".github", "workflows")
+		written, readErr := os.ReadFile(filepath.Join(workflowsDir, "my-workflow2.md"))
+		require.NoError(t, readErr)
+		assert.NotContains(t, string(written), "copilot-requests: write")
+	})
 }

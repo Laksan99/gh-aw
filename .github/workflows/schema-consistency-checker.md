@@ -1,4 +1,5 @@
 ---
+emoji: "✅"
 description: Detects inconsistencies between JSON schema, implementation code, and documentation
 on:
   schedule: daily
@@ -9,9 +10,11 @@ permissions:
   issues: read
   pull-requests: read
 engine:
-  id: claude
-max-effective-tokens: 20000000
+  id: pi
+  model: copilot/gpt-5.4
+max-ai-credits: 1500
 tools:
+  cli-proxy: true
   edit:
   bash: ["*"]
   github:
@@ -28,7 +31,7 @@ imports:
     with:
       title-prefix: "[Schema Consistency] "
       expires: 1d
-  - shared/observability-otlp.md
+  - shared/otlp.md
 pre-agent-steps:
   - name: Precompute schema analysis data
     run: |
@@ -131,7 +134,9 @@ pre-agent-steps:
           in_used_not_schema: (.field_gaps.in_used_not_schema | length)
         }
       }' /tmp/gh-aw/agent/schema-diff.json
-
+sandbox:
+  agent:
+    sudo: false
 ---
 # Schema Consistency Checker
 

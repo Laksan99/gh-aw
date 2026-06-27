@@ -6,6 +6,7 @@ import (
 	"sort"
 	"strings"
 
+	"github.com/github/gh-aw/pkg/constants"
 	"github.com/github/gh-aw/pkg/sliceutil"
 	"github.com/github/gh-aw/pkg/stringutil"
 )
@@ -39,7 +40,9 @@ func generateSafeOutputsConfig(data *WorkflowData) (string, error) {
 	// Standard handler configs — sourced from handlerRegistry (same as GH_AW_SAFE_OUTPUTS_HANDLER_CONFIG)
 	for handlerName, builder := range handlerRegistry {
 		if handlerCfg := builder(data.SafeOutputs); handlerCfg != nil {
-			excludeFiles := extractStringSliceFromConfig(handlerCfg, "_protected_files_exclude")
+			injectCurrentCheckoutPatchWorkspacePath(handlerName, handlerCfg, data)
+			injectCheckoutMapping(handlerName, handlerCfg, data)
+			excludeFiles := ParseStringArrayFromConfig(handlerCfg, "_protected_files_exclude", nil)
 			// Strip the internal sentinel key used by the handler manager for compile-time
 			// exclusion processing — it must not be forwarded to the runtime config.json.
 			delete(handlerCfg, "_protected_files_exclude")
@@ -154,22 +157,7 @@ func generateSafeOutputsConfig(data *WorkflowData) (string, error) {
 	// Mentions configuration: controls which @mentions are allowed in AI output.
 	// This is consumed by the ingestion step, not by standard handlers.
 	if data.SafeOutputs.Mentions != nil {
-		mentionsConfig := make(map[string]any)
-		if data.SafeOutputs.Mentions.Enabled != nil {
-			mentionsConfig["enabled"] = *data.SafeOutputs.Mentions.Enabled
-		}
-		if data.SafeOutputs.Mentions.AllowTeamMembers != nil {
-			mentionsConfig["allowTeamMembers"] = *data.SafeOutputs.Mentions.AllowTeamMembers
-		}
-		if data.SafeOutputs.Mentions.AllowContext != nil {
-			mentionsConfig["allowContext"] = *data.SafeOutputs.Mentions.AllowContext
-		}
-		if len(data.SafeOutputs.Mentions.Allowed) > 0 {
-			mentionsConfig["allowed"] = data.SafeOutputs.Mentions.Allowed
-		}
-		if data.SafeOutputs.Mentions.Max != nil {
-			mentionsConfig["max"] = *data.SafeOutputs.Mentions.Max
-		}
+		mentionsConfig := buildMentionsHandlerConfig(data.SafeOutputs.Mentions)
 		if len(mentionsConfig) > 0 {
 			safeOutputsConfig["mentions"] = mentionsConfig
 		}
@@ -194,7 +182,7 @@ func generateSafeOutputsConfig(data *WorkflowData) (string, error) {
 		for _, memory := range data.RepoMemoryConfig.Memories {
 			memories = append(memories, map[string]any{
 				"id":             memory.ID,
-				"dir":            "/tmp/gh-aw/repo-memory/" + memory.ID,
+				"dir":            constants.TmpRepoMemoryDir + memory.ID,
 				"max_file_size":  memory.MaxFileSize,
 				"max_patch_size": memory.MaxPatchSize,
 				"max_file_count": memory.MaxFileCount,
@@ -209,7 +197,10 @@ func generateSafeOutputsConfig(data *WorkflowData) (string, error) {
 	if len(safeOutputsConfig) == 0 {
 		return "", nil
 	}
-	configJSON, _ := json.Marshal(safeOutputsConfig)
+	configJSON, err := json.Marshal(safeOutputsConfig)
+	if err != nil {
+		return "", fmt.Errorf("marshaling safe-outputs config: %w", err)
+	}
 	safeOutputsConfigLog.Printf("Safe outputs config generation complete: %d tool types configured", len(safeOutputsConfig))
 	return string(configJSON), nil
 }
@@ -254,7 +245,11 @@ func generateCustomJobToolDefinition(jobName string, jobConfig *SafeJobConfig) m
 	}
 
 	var requiredFields []string
-	properties := inputSchema["properties"].(map[string]any)
+	properties, ok := inputSchema["properties"].(map[string]any)
+	if !ok {
+		properties = make(map[string]any)
+		inputSchema["properties"] = properties
+	}
 
 	for inputName, inputDef := range jobConfig.Inputs {
 		property := map[string]any{}

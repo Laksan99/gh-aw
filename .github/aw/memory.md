@@ -4,7 +4,7 @@ description: Guide for choosing the right persistent memory strategy in agentic 
 
 # Persistent Memory in Agentic Workflows
 
-Consult this file when designing a workflow that needs to **persist state across runs** — deduplication, incremental processing, cross-run context, or knowledge accumulation.
+For workflows that **persist state across runs** — deduplication, incremental processing, cross-run context, or knowledge accumulation.
 
 > ⚠️ **`repo-memory` does NOT mean "cache-memory"**. They are two distinct tools with different backends, tradeoffs, and use cases. `cache-memory` is almost always the right first choice.
 
@@ -96,6 +96,10 @@ tools:
 
 - Single cache: `/tmp/gh-aw/cache-memory/`
 - Multiple caches: `/tmp/gh-aw/cache-memory/{id}/`
+
+### Branch scoping
+
+Caches are **branch-scoped**: a run restores from caches saved on the same branch, with GitHub Actions also allowing fallback restore from the default branch (typically `main`). A non-default branch's first restore usually comes from the default branch; subsequent saves fork a branch-local lineage. For workflows that depend on warmed state, prefer scheduling on the default branch so each run reuses and updates one lineage instead of fragmenting state across feature branches.
 
 ### Deduplication example (scheduled workflow)
 
@@ -246,6 +250,7 @@ tools:
     branch-name: memory/agent-notes   # Optional: custom branch name
     target-repo: owner/other-repo     # Optional: store in another repo
     allowed-extensions: [".json", ".md"]
+    format-json: true                 # Optional: pretty-print committed .json files (2-space indent) for readable diffs (default: false)
     max-file-size: 10240              # bytes
     max-file-count: 100
 ```
@@ -257,10 +262,10 @@ The compiler automatically creates a separate `push_repo_memory` job with `conte
 | ✅ Pros | ❌ Cons |
 |---|---|
 | Persists indefinitely (no expiry) | Produces Git commits — repository noise |
-| Auditable: Git history shows every change | Produces Git commits — repository noise |
-| Survives cache invalidation | Slower: requires Git clone + push |
-| Human-readable via GitHub branch UI | Not available for Copilot engine (requires GitHub tools) |
-| Can target a different repository | More complex setup |
+| Auditable: Git history shows every change | Slower: requires Git clone + push |
+| Survives cache invalidation | Not available for Copilot engine (requires GitHub tools) |
+| Human-readable via GitHub branch UI | More complex setup |
+| Can target a different repository | |
 
 ---
 
@@ -292,9 +297,9 @@ Files follow GitHub Wiki Markdown conventions: use `[[Page Name]]` syntax for in
 | ✅ Pros | ❌ Cons |
 |---|---|
 | Browsable in the GitHub Wiki UI | Produces Git commits to wiki repo |
-| Great for human-readable knowledge bases | Produces Git commits to wiki repo |
-| Standard Markdown with wiki link syntax | Restricted to `.md` files in practice |
-| Separate from main repo history | Less suitable for structured JSON state |
+| Great for human-readable knowledge bases | Restricted to `.md` files in practice |
+| Standard Markdown with wiki link syntax | Less suitable for structured JSON state |
+| Separate from main repo history | |
 
 ---
 

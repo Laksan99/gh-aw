@@ -4,8 +4,10 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/github/gh-aw/pkg/logger"
 	"github.com/goccy/go-yaml"
+
+	"github.com/github/gh-aw/pkg/logger"
+	"github.com/github/gh-aw/pkg/setutil"
 )
 
 var runtimeDeduplicationLog = logger.New("workflow:runtime_deduplication")
@@ -68,7 +70,8 @@ func DeduplicateRuntimeSetupStepsFromCustomSteps(customSteps string, runtimeRequ
 	}
 
 	// Track which runtimes to filter from requirements (user has custom setup)
-	filteredRuntimeIDs := make(map[string]bool)
+	filteredRuntimeIDs := make(map[string]struct {
+	})
 
 	// Filter out steps that use runtime setup actions
 	// BUT: Preserve steps that have user-specified customizations
@@ -142,12 +145,22 @@ func DeduplicateRuntimeSetupStepsFromCustomSteps(customSteps string, runtimeRequ
 									hasCustomization = true
 								}
 							}
+							// For Node.js, node-version-file is a version selector and should
+							// be treated as a customization so we preserve the user's setup step.
+							// If we remove it and regenerate a setup step, the generated
+							// node-version value can override this file-based selector.
+							if req.Runtime.ID == "node" {
+								if nodeVersionFile, ok := withMap["node-version-file"].(string); ok && strings.TrimSpace(nodeVersionFile) != "" {
+									hasCustomization = true
+								}
+							}
 						}
 
 						if hasCustomization {
 							// User has truly customized the setup action - preserve it
 							shouldPreserve = true
-							filteredRuntimeIDs[req.Runtime.ID] = true
+							filteredRuntimeIDs[req.Runtime.ID] = struct {
+							}{}
 							runtimeDeduplicationLog.Printf("  Preserving user-customized runtime setup step: %s", usesStr)
 							preservedCount++
 							break
@@ -197,7 +210,7 @@ func DeduplicateRuntimeSetupStepsFromCustomSteps(customSteps string, runtimeRequ
 	// Filter runtime requirements to exclude those with user-customized setup actions
 	var filteredRequirements []RuntimeRequirement
 	for _, req := range runtimeRequirements {
-		if !filteredRuntimeIDs[req.Runtime.ID] {
+		if !setutil.Contains(filteredRuntimeIDs, req.Runtime.ID) {
 			filteredRequirements = append(filteredRequirements, req)
 		} else {
 			runtimeDeduplicationLog.Printf("  Excluding runtime %s from generated setup steps (user has custom setup)", req.Runtime.ID)

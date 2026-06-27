@@ -8,8 +8,10 @@ import (
 	"os/exec"
 	"strings"
 
+	"github.com/github/gh-aw/pkg/errorutil"
 	"github.com/github/gh-aw/pkg/logger"
 	"github.com/github/gh-aw/pkg/parser"
+	"github.com/github/gh-aw/pkg/setutil"
 	"github.com/github/gh-aw/pkg/workflow"
 )
 
@@ -35,7 +37,7 @@ func checkSecretExists(secretName string) (bool, error) {
 		var exitError *exec.ExitError
 		if errors.As(err, &exitError) {
 			if strings.Contains(string(exitError.Stderr), "403") {
-				return false, errors.New("403 access denied")
+				return false, errors.New("HTTP 403: access denied")
 			}
 		}
 		return false, fmt.Errorf("failed to list secrets: %w", err)
@@ -64,29 +66,32 @@ func checkSecretExists(secretName string) (bool, error) {
 func extractSecretsFromConfig(config parser.RegistryMCPServerConfig) []SecretInfo {
 	secretsLog.Printf("Extracting secrets from MCP config: command=%s", config.Command)
 	var secrets []SecretInfo
-	seen := make(map[string]bool)
+	seen := make(map[string]struct {
+	})
 
 	// Extract from HTTP headers
 	for key, value := range config.Headers {
 		secretName := workflow.ExtractSecretName(value)
-		if secretName != "" && !seen[secretName] {
+		if secretName != "" && !setutil.Contains(seen, secretName) {
 			secrets = append(secrets, SecretInfo{
 				Name:   secretName,
 				EnvKey: key,
 			})
-			seen[secretName] = true
+			seen[secretName] = struct {
+			}{}
 		}
 	}
 
 	// Extract from environment variables
 	for key, value := range config.Env {
 		secretName := workflow.ExtractSecretName(value)
-		if secretName != "" && !seen[secretName] {
+		if secretName != "" && !setutil.Contains(seen, secretName) {
 			secrets = append(secrets, SecretInfo{
 				Name:   secretName,
 				EnvKey: key,
 			})
-			seen[secretName] = true
+			seen[secretName] = struct {
+			}{}
 		}
 	}
 
@@ -109,8 +114,8 @@ func checkSecretsAvailability(secrets []SecretInfo, useActionsSecrets bool) []Se
 		if useActionsSecrets {
 			exists, err := checkSecretExists(secrets[i].Name)
 			if err != nil {
-				// If we get a 403 error, skip silently
-				if !strings.Contains(err.Error(), "403") {
+				// If we get a 403 error, skip silently (no permission to check)
+				if errorutil.IsForbiddenError(err) {
 					continue
 				}
 			}

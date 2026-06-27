@@ -1,4 +1,6 @@
 ---
+private: true
+emoji: "🤖"
 timeout-minutes: 5
 on:
   roles: all
@@ -17,6 +19,7 @@ on:
     issues: [owner, member, collaborator]
   skip-roles: [admin, maintainer, write, triage]
   skip-bots: [github-actions, copilot, dependabot, renovate, github-copilot-enterprise, copilot-swe-agent]
+max-daily-ai-credits: 10000
 user-rate-limit:
   max-runs-per-window: 5
   window: 60
@@ -29,7 +32,7 @@ network:
     - defaults
     - github
 imports:
-  - shared/observability-otlp.md
+  - shared/otlp.md
 tools:
   cli-proxy: true
   cache-memory:
@@ -54,8 +57,11 @@ safe-outputs:
     allowed-reasons: [spam]
   threat-detection: false
 checkout: false
-
-
+features:
+  gh-aw-detection: true
+sandbox:
+  agent:
+    sudo: false
 ---
 
 # AI Moderator
@@ -208,5 +214,11 @@ If no spam was detected, you may still update the log to remove stale entries, b
 - New contributors may have less polished writing - this doesn't necessarily indicate AI generation
 - Provide clear reasoning for each detection in your analysis
 - Only take action if you have high confidence in the detection
+
+## Report Formatting
+
+- Use h3 (###) or lower for all headers in your analysis output to maintain proper document hierarchy.
+- Wrap long sections in `<details><summary>Section Name</summary>` tags to improve readability and reduce scrolling.
+- Structure: Brief summary (always visible) → Key findings (always visible) → Detailed analysis (in `<details>`) → Actions taken (always visible)
 
 {{#runtime-import shared/noop-reminder.md}}

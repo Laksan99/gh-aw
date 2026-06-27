@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"strings"
 
+	"github.com/github/gh-aw/pkg/constants"
 	"github.com/github/gh-aw/pkg/fileutil"
 	"github.com/github/gh-aw/pkg/parser"
 )
@@ -52,7 +53,7 @@ type findWorkflowFileResult struct {
 	ymlExists  bool
 }
 
-// findWorkflowFile searches for a workflow file in .github/workflows directory only
+// findWorkflowFile searches for a workflow file in the configured workflows directory only.
 // Returns paths and existence flags for .md, .lock.yml, and .yml files
 func findWorkflowFile(workflowName string, currentWorkflowPath string) (*findWorkflowFileResult, error) {
 	dispatchWorkflowValidationLog.Printf("Finding workflow file: name=%s, current_path=%s", workflowName, currentWorkflowPath)
@@ -61,13 +62,13 @@ func findWorkflowFile(workflowName string, currentWorkflowPath string) (*findWor
 	// Get the current workflow's directory
 	currentDir := filepath.Dir(currentWorkflowPath)
 
-	// Get repo root by going up from current directory
-	// Assume structure: <repo-root>/.github/workflows/file.md or <repo-root>/.github/aw/file.md
+	// Get repo root by going up from the current workflow directory.
+	// Assume structure: <repo-root>/<configured-workflows-dir>/file.md or <repo-root>/.github/aw/file.md.
 	githubDir := filepath.Dir(currentDir) // .github
 	repoRoot := filepath.Dir(githubDir)   // repo root
 
-	// Only search in .github/workflows (standard GitHub Actions location)
-	searchDir := filepath.Join(repoRoot, ".github", "workflows")
+	// Only search in the configured workflows directory.
+	searchDir := filepath.Join(repoRoot, constants.GetWorkflowDir())
 
 	// Build paths for the workflows directory
 	mdPath := filepath.Clean(filepath.Join(searchDir, workflowName+".md"))
@@ -76,6 +77,7 @@ func findWorkflowFile(workflowName string, currentWorkflowPath string) (*findWor
 
 	// Validate paths are within the search directory (prevent path traversal)
 	if !isPathWithinDir(mdPath, searchDir) || !isPathWithinDir(lockPath, searchDir) || !isPathWithinDir(ymlPath, searchDir) {
+		dispatchWorkflowValidationLog.Printf("Rejecting workflow name '%s': resolved paths escape search dir %s", workflowName, searchDir)
 		return result, fmt.Errorf("invalid workflow name '%s' (path traversal not allowed)", workflowName)
 	}
 
@@ -99,6 +101,7 @@ func mdHasWorkflowDispatch(mdPath string) (bool, error) {
 	dispatchWorkflowValidationLog.Printf("Checking for workflow_dispatch trigger in: %s", mdPath)
 	content, err := os.ReadFile(mdPath) // #nosec G304 -- mdPath is validated via isPathWithinDir in findWorkflowFile
 	if err != nil {
+		dispatchWorkflowValidationLog.Printf("Failed to read %s: %v", mdPath, err)
 		return false, err
 	}
 	result, err := parser.ExtractFrontmatterFromContent(string(content))
@@ -116,41 +119,10 @@ func mdHasWorkflowDispatch(mdPath string) (bool, error) {
 // the workflow_dispatch inputs schema, mirroring extractWorkflowDispatchInputs for .md sources.
 func extractMDWorkflowDispatchInputs(mdPath string) (map[string]any, error) {
 	dispatchWorkflowValidationLog.Printf("Extracting workflow_dispatch inputs from: %s", mdPath)
-	content, err := os.ReadFile(mdPath) // #nosec G304 -- mdPath is validated via isPathWithinDir in findWorkflowFile
+	inputs, err := extractInputsFromMarkdown(mdPath, "workflow_dispatch")
 	if err != nil {
 		return nil, err
 	}
-	result, err := parser.ExtractFrontmatterFromContent(string(content))
-	if err != nil || result == nil {
-		return make(map[string]any), nil
-	}
-	onSection, hasOn := result.Frontmatter["on"]
-	if !hasOn {
-		dispatchWorkflowValidationLog.Printf("No 'on' section found in: %s", mdPath)
-		return make(map[string]any), nil
-	}
-	onMap, ok := onSection.(map[string]any)
-	if !ok {
-		return make(map[string]any), nil
-	}
-	workflowDispatch, hasWorkflowDispatch := onMap["workflow_dispatch"]
-	if !hasWorkflowDispatch {
-		dispatchWorkflowValidationLog.Printf("No workflow_dispatch trigger in: %s", mdPath)
-		return make(map[string]any), nil
-	}
-	workflowDispatchMap, ok := workflowDispatch.(map[string]any)
-	if !ok {
-		return make(map[string]any), nil
-	}
-	inputs, hasInputs := workflowDispatchMap["inputs"]
-	if !hasInputs {
-		dispatchWorkflowValidationLog.Printf("No inputs defined in workflow_dispatch for: %s", mdPath)
-		return make(map[string]any), nil
-	}
-	inputsMap, ok := inputs.(map[string]any)
-	if !ok {
-		return make(map[string]any), nil
-	}
-	dispatchWorkflowValidationLog.Printf("Extracted %d workflow_dispatch input(s) from: %s", len(inputsMap), mdPath)
-	return inputsMap, nil
+	dispatchWorkflowValidationLog.Printf("Extracted %d workflow_dispatch input(s) from: %s", len(inputs), mdPath)
+	return inputs, nil
 }

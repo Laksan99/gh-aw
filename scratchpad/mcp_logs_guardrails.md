@@ -6,7 +6,7 @@ This document describes the output size guardrail implemented for the MCP server
 
 When using the MCP server to fetch workflow logs, the output can exceed GitHub's API limits, especially when:
 - Fetching logs for many workflow runs
-- Runs contain extensive tool usage data
+- Runs contain large volumes of tool usage data
 - Multiple workflows are being analyzed
 
 Large outputs can:
@@ -122,7 +122,7 @@ Returns just the aggregate metrics without individual run data.
 }
 ```
 
-Returns a simplified list of runs with just the essential fields.
+Returns a list of runs containing only the `database_id`, `workflow_name`, and `status` fields.
 
 ### 3. Get Only Failed Runs
 

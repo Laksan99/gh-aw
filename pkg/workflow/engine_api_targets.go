@@ -1,6 +1,10 @@
 package workflow
 
-import "strings"
+import (
+	"strings"
+
+	"github.com/github/gh-aw/pkg/constants"
+)
 
 // extractAPITargetHost extracts the hostname from a custom API base URL in engine.env.
 // This supports custom OpenAI-compatible or Anthropic-compatible endpoints (e.g., internal
@@ -108,6 +112,27 @@ func extractAPIBasePath(workflowData *WorkflowData, envVar string) string {
 	return ""
 }
 
+// extractAPITargetAuthHeader extracts the authHeader value from the sandbox.agent.targets
+// frontmatter section for a given provider (e.g. "openai" or "anthropic"). It reads:
+//
+//	sandbox.agent.targets.<provider>.authHeader
+//
+// Returns the header name string (e.g. "api-key") or empty string if not configured.
+func extractAPITargetAuthHeader(workflowData *WorkflowData, provider string) string {
+	if workflowData == nil || workflowData.SandboxConfig == nil || workflowData.SandboxConfig.Agent == nil {
+		return ""
+	}
+	targets := workflowData.SandboxConfig.Agent.Targets
+	if targets == nil {
+		return ""
+	}
+	target, ok := targets[provider]
+	if !ok || target == nil {
+		return ""
+	}
+	return target.AuthHeader
+}
+
 // GetCopilotAPITarget returns the effective Copilot API target hostname, checking in order:
 //  1. engine.api-target (explicit, takes precedence)
 //  2. GITHUB_COPILOT_BASE_URL in engine.env (implicit, derived from the configured Copilot base URL)
@@ -116,7 +141,7 @@ func extractAPIBasePath(workflowData *WorkflowData, envVar string) string {
 //   - Codex:    OPENAI_BASE_URL     → --openai-api-target
 //   - Claude:   ANTHROPIC_BASE_URL  → --anthropic-api-target
 //   - Copilot:  GITHUB_COPILOT_BASE_URL → --copilot-api-target (fallback when api-target not set)
-//   - Gemini:   GEMINI_API_BASE_URL → --gemini-api-target (default: generativelanguage.googleapis.com)
+//   - Antigravity:   ANTIGRAVITY_API_BASE_URL → --antigravity-api-target (default: generativelanguage.googleapis.com)
 //
 // Returns empty string if neither source is configured.
 func GetCopilotAPITarget(workflowData *WorkflowData) string {
@@ -132,13 +157,90 @@ func GetCopilotAPITarget(workflowData *WorkflowData) string {
 	return extractAPITargetHost(workflowData, "GITHUB_COPILOT_BASE_URL")
 }
 
+func extractLiteralEngineEnvHost(workflowData *WorkflowData, envVar string) string {
+	env := getEngineEnvOverrides(workflowData)
+	if env == nil {
+		return ""
+	}
+	rawValue, ok := env[envVar]
+	if !ok || rawValue == "" {
+		return ""
+	}
+	if strings.Contains(rawValue, "${{") {
+		awfHelpersLog.Printf("Skipping %s host extraction from GitHub expression value", envVar)
+		return ""
+	}
+	return extractAPITargetHost(workflowData, envVar)
+}
+
+// GetCopilotAllowlistTargets returns the Copilot-specific hosts that must be present in the
+// firewall allow-list for execution to succeed.
+//
+// This includes:
+//  1. The BYOK provider host from COPILOT_PROVIDER_BASE_URL in engine.env, when configured.
+//  2. The Copilot API target from engine.api-target or GITHUB_COPILOT_BASE_URL.
+//
+// The BYOK provider host is added first because it is the actual outbound destination for
+// Copilot CLI requests in BYOK mode. Duplicate hosts are removed.
+func GetCopilotAllowlistTargets(workflowData *WorkflowData) []string {
+	var targets []string
+	seen := make(map[string]struct{})
+
+	addTarget := func(target string) {
+		if target == "" {
+			return
+		}
+		if _, exists := seen[target]; exists {
+			return
+		}
+		seen[target] = struct{}{}
+		targets = append(targets, target)
+	}
+
+	addTarget(extractLiteralEngineEnvHost(workflowData, constants.CopilotProviderBaseURL))
+	addTarget(GetCopilotAPITarget(workflowData))
+
+	return targets
+}
+
+// DefaultAntigravityAPITarget is the default Antigravity API endpoint hostname.
+// AWF's proxy sidecar needs this target to forward Antigravity API requests, since
+// unlike OpenAI/Anthropic/Copilot, the proxy has no built-in default handler for Antigravity.
+const DefaultAntigravityAPITarget = "generativelanguage.googleapis.com"
+
 // DefaultGeminiAPITarget is the default Gemini API endpoint hostname.
-// AWF's proxy sidecar needs this target to forward Gemini API requests, since
-// unlike OpenAI/Anthropic/Copilot, the proxy has no built-in default handler for Gemini.
-const DefaultGeminiAPITarget = "generativelanguage.googleapis.com"
+// Deprecated: Use DefaultAntigravityAPITarget. This constant is kept for backward compatibility.
+const DefaultGeminiAPITarget = DefaultAntigravityAPITarget
+
+// GetAntigravityAPITarget returns the effective Antigravity API target hostname for the LLM gateway proxy.
+// Unlike other engines where AWF has built-in default routing, Antigravity requires an explicit target.
+//
+// Resolution order:
+//  1. ANTIGRAVITY_API_BASE_URL in engine.env (custom endpoint)
+//  2. Default: generativelanguage.googleapis.com (when engine is "antigravity")
+//
+// Returns empty string if the engine is not Antigravity and no custom ANTIGRAVITY_API_BASE_URL is configured.
+func GetAntigravityAPITarget(workflowData *WorkflowData, engineName string) string {
+	awfHelpersLog.Printf("Getting Antigravity API target for engine: %s", engineName)
+	// Check for custom ANTIGRAVITY_API_BASE_URL in engine.env
+	if customTarget := extractAPITargetHost(workflowData, "ANTIGRAVITY_API_BASE_URL"); customTarget != "" {
+		awfHelpersLog.Printf("Using custom Antigravity API target from ANTIGRAVITY_API_BASE_URL: %s", customTarget)
+		return customTarget
+	}
+
+	// Default to the standard Antigravity API endpoint when engine is Antigravity
+	if engineName == "antigravity" {
+		awfHelpersLog.Printf("Using default Antigravity API target: %s", DefaultAntigravityAPITarget)
+		return DefaultAntigravityAPITarget
+	}
+
+	awfHelpersLog.Print("No Antigravity API target configured (engine is not antigravity and no custom URL)")
+	return ""
+}
 
 // GetGeminiAPITarget returns the effective Gemini API target hostname for the LLM gateway proxy.
-// Unlike other engines where AWF has built-in default routing, Gemini requires an explicit target.
+// Deprecated: Use GetAntigravityAPITarget for new Antigravity engine workflows.
+// This function is retained for backward compatibility with existing Gemini engine workflows.
 //
 // Resolution order:
 //  1. GEMINI_API_BASE_URL in engine.env (custom endpoint)
@@ -161,4 +263,47 @@ func GetGeminiAPITarget(workflowData *WorkflowData, engineName string) string {
 
 	awfHelpersLog.Print("No Gemini API target configured (engine is not gemini and no custom URL)")
 	return ""
+}
+
+// getEngineAPIHosts returns the primary AI inference API hostnames for the given engine and
+// workflow data. These are the hosts that appear in the firewall audit log when the engine
+// makes authenticated API calls. The returned slice is used to populate GH_AW_ENGINE_API_HOSTS
+// so the failure handler can detect credential authentication rejections without relying solely
+// on hardcoded host patterns.
+//
+// Resolution order (per engine):
+//   - engine.api-target (explicit GHES / enterprise override) takes precedence
+//   - Default public API hostname(s) for the engine
+func getEngineAPIHosts(data *WorkflowData, engine CodingAgentEngine) []string {
+	if engine == nil {
+		return nil
+	}
+
+	// Explicit api-target overrides the engine-specific default for all engine types.
+	if data != nil && data.EngineConfig != nil && data.EngineConfig.APITarget != "" {
+		return []string{data.EngineConfig.APITarget}
+	}
+
+	switch engine.(type) {
+	case *CopilotEngine:
+		// Return the full set of known Copilot inference endpoints so that any variant
+		// (enterprise, business, individual, or the routing hub) is covered.
+		return []string{
+			"api.enterprise.githubcopilot.com",
+			"api.githubcopilot.com",
+			"api.business.githubcopilot.com",
+			"api.individual.githubcopilot.com",
+		}
+	case *ClaudeEngine:
+		return []string{"api.anthropic.com"}
+	case *CodexEngine:
+		return []string{"api.openai.com"}
+	case *GeminiEngine:
+		return []string{DefaultGeminiAPITarget}
+	case *AntigravityEngine:
+		return []string{DefaultAntigravityAPITarget}
+	default:
+		// Custom or unknown engine — no known API hosts without explicit api-target.
+		return nil
+	}
 }

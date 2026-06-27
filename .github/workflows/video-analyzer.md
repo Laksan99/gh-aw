@@ -1,4 +1,6 @@
 ---
+private: true
+emoji: "🎬"
 description: Analyzes video files using ffmpeg to extract metadata, frames, and other technical information
 on:
   workflow_dispatch:
@@ -18,7 +20,7 @@ engine: copilot
 imports:
   - shared/ffmpeg.md
 
-  - shared/observability-otlp.md
+  - shared/otlp.md
 tools:
   cli-proxy: true
   bash: true

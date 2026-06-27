@@ -1,98 +1,140 @@
 ---
-name: Go Logger Enhancement
-description: Analyzes and enhances Go logging practices across the codebase for improved debugging and observability
+private: true
 on:
   schedule: daily
-  workflow_dispatch:
-
+  workflow_dispatch: null
 permissions:
   contents: read
   issues: read
   pull-requests: read
-
-engine: claude
-
+imports:
+- shared/otlp.md
 safe-outputs:
   create-pull-request:
-    expires: 2d
-    title-prefix: "[log] "
-    labels: [enhancement, automation]
     draft: false
-
+    expires: 2d
+    labels:
+    - enhancement
+    - automation
+    title-prefix: "[log] "
 steps:
-  - name: Setup Node.js
-    uses: actions/setup-node@v6.4.0
-    with:
-      node-version: "24"
-      cache: npm
-      cache-dependency-path: actions/setup/js/package-lock.json
-  - name: Setup Go
-    uses: actions/setup-go@v6.4.0
-    with:
-      go-version-file: go.mod
-      cache: true
-  - name: Install npm dependencies
-    run: npm ci
-    working-directory: ./actions/setup/js
+- name: Build deterministic logger manifest
+  id: logger_manifest
+  run: |
+    set -euo pipefail
+    cache_dir="/tmp/gh-aw/cache-memory/go-logger"
+    out_dir="/tmp/gh-aw/agent/go-logger"
+    mkdir -p "$cache_dir" "$out_dir"
 
+    current_sha="$(git rev-parse HEAD)"
+    current_files="$out_dir/current-files.txt"
+    processed_files="$cache_dir/processed-files.txt"
+    find pkg -name '*.go' -type f ! -name '*_test.go' | sort > "$current_files"
+    [ -f "$processed_files" ] || : > "$processed_files"
+
+    new_files="$out_dir/new-files.txt"
+    comm -23 "$current_files" "$processed_files" > "$new_files" || true
+
+    last_sha=""
+    if [ -f "$cache_dir/last-run.json" ]; then
+      last_sha="$(jq -r '.commit_sha // empty' "$cache_dir/last-run.json" 2>/dev/null || true)"
+    fi
+
+    files_needing_logger="$out_dir/files-needing-logger.txt"
+    files_missing_logger_import="$out_dir/files-missing-logger-import.txt"
+    call_sites="$out_dir/call-sites.tsv"
+    : > "$files_needing_logger"
+    : > "$files_missing_logger_import"
+    : > "$call_sites"
+
+    while IFS= read -r rel; do
+      [ -f "$rel" ] || continue
+      if ! grep -q "var log = logger.New" "$rel"; then
+        echo "$rel" >> "$files_needing_logger"
+      fi
+      if grep -q "log\\." "$rel" && ! grep -q '"github.com/github/gh-aw/pkg/logger"' "$rel"; then
+        echo "$rel" >> "$files_missing_logger_import"
+      fi
+      while IFS=: read -r line_number match_line; do
+        function_name="$(printf '%s' "$match_line" | sed -E 's/^[[:space:]]*func[[:space:]]+([A-Za-z0-9_]+).*/\\1/')"
+        printf "%s\\t%s\\t%s\\n" "$rel" "$line_number" "$function_name" >> "$call_sites"
+      done < <(grep -nE "^[[:space:]]*func[[:space:]]+[A-Za-z0-9_]+" "$rel" || true)
+    done < "$current_files"
+
+    jq -n \
+      --argjson files_needing_logger "$(jq -R -s 'split("\n") | map(select(length > 0))' "$files_needing_logger")" \
+      --argjson missing_logger_import "$(jq -R -s 'split("\n") | map(select(length > 0))' "$files_missing_logger_import")" \
+      --argjson candidate_call_sites "$(jq -R -s 'split("\n") | map(select(length > 0) | split("\t") | {file: .[0], line: (.[1] | tonumber), function: .[2]})' "$call_sites")" \
+      '{files_needing_logger: $files_needing_logger, missing_logger_import: $missing_logger_import, candidate_call_sites: $candidate_call_sites}' \
+      > "$out_dir/manifest.json"
+
+    should_run=true
+    if [ "$current_sha" = "$last_sha" ] && [ ! -s "$new_files" ]; then
+      should_run=false
+    fi
+    echo "{\"should_run\": \"$should_run\", \"current_sha\": \"$current_sha\", \"last_sha\": \"$last_sha\", \"manifest\": \"$out_dir/manifest.json\", \"new_files\": \"$new_files\"}" > "$out_dir/preflight.json"
+    echo "should_run=$should_run" >> "$GITHUB_OUTPUT"
+- name: Setup Node.js
+  uses: actions/setup-node@v6.4.0
+  with:
+    cache: npm
+    cache-dependency-path: actions/setup/js/package-lock.json
+    node-version: "24"
+- name: Setup Go
+  uses: actions/setup-go@v6.4.0
+  with:
+    cache: true
+    go-version-file: go.mod
+- name: Install npm dependencies
+  run: npm ci
+  working-directory: ./actions/setup/js
+description: Analyzes and enhances Go logging practices across the codebase for improved debugging and observability
+emoji: 📝
+engine: claude
+name: Go Logger Enhancement
+timeout-minutes: 15
 tools:
+  bash:
+  - cat /tmp/gh-aw/agent/go-logger/preflight.json
+  - cat /tmp/gh-aw/agent/go-logger/manifest.json
+  - cat /tmp/gh-aw/agent/go-logger/new-files.txt
+  - make build
+  - make fmt
+  - make recompile
+  - ./gh-aw compile
+  - git
+  cache-memory: null
   cli-proxy: true
+  edit: null
   github:
     mode: gh-proxy
-    toolsets: [default]
-  edit:
-  bash:
-    - "find pkg -name '*.go' -type f ! -name '*_test.go'"
-    - "grep -r 'var log = logger.New' pkg --include='*.go'"
-    - "grep -n 'func ' pkg/*.go"
-    - "head -n * pkg/**/*.go"
-    - "wc -l pkg/**/*.go"
-    - "make build"
-    - "make recompile"
-    - "./gh-aw compile *"
-    - "git"
-  cache-memory:
-
-imports:
-  - shared/go-make.md
-
-  - shared/observability-otlp.md
-timeout-minutes: 15
-
-
+    toolsets:
+    - default
 ---
-
 # Go Logger Enhancement
 
 You are an AI agent that improves Go code by adding debug logging statements to help with troubleshooting and development.
 
 ## Validation Commands
 
-Use **bash** for all build, test, and validation commands in this workflow. Do **not** use `mcpscripts-make` or `mcpscripts-go` for validation — MCP connections can time out after ~5 minutes of inactivity during long file-exploration phases, causing end-of-session validation to fail with `MCP error -32003: context canceled`.
+Use **bash** for all build and validation commands in this workflow to avoid MCP connection timeouts during long file-exploration phases.
 
 ```bash
-make build          # Build the project
-make test-unit      # Run unit tests
-make recompile      # Recompile workflows
-DEBUG=* ./gh-aw compile dev  # Test workflow compilation with debug logging
+make build && make fmt       # Build the project and check formatting
+make recompile               # Recompile workflows only if you changed .md files
 ```
 
-## Efficiency First: Check Cache
+## Efficiency First: Use Pre-flight Outputs
 
-Before analyzing files:
+Before analyzing files, read `/tmp/gh-aw/agent/go-logger/preflight.json` and `/tmp/gh-aw/agent/go-logger/manifest.json`.
 
-1. Check `/tmp/gh-aw/cache-memory/go-logger/` for previous logging sessions
-2. Read `processed-files.json` to see which files were already enhanced
-3. Read `last-run.json` for the last commit SHA processed
-4. If cache files are missing (cold cache / first run), initialize defaults and continue. This is expected and should **not** be reported as `missing_data`.
-5. Only report `missing_data` for cache-memory when files exist but are unreadable/corrupted (for example malformed JSON that cannot be recovered).
-6. If current commit SHA matches and no new .go files exist, exit early with success
-7. Update cache after processing:
-   - Save list of processed files to `processed-files.json`
-   - Save current commit SHA to `last-run.json`
-   - Save summary of changes made
-
-This prevents re-analyzing already-processed files and reduces token usage significantly.
+- The pre-flight step already computed whether this run should proceed.
+- If cache files are missing (cold cache / first run), treat that as expected and continue.
+- Only report `missing_data` when cache files exist but are unreadable/corrupted.
+- Update cache after processing:
+  - Save list of processed files to `processed-files.txt`
+  - Save current commit SHA to `last-run.json`
+  - Save summary of changes made
 
 ## Mission
 
@@ -107,87 +149,16 @@ Add meaningful debug logging calls to Go files in the `pkg/` directory following
 
 ## Logger Guidelines from AGENTS.md
 
-### Logger Declaration
-
-If a file doesn't have a logger, add this at the top of the file (after imports):
-
-```go
-import "github.com/github/gh-aw/pkg/logger"
-
-var log = logger.New("pkg:filename")
-```
-
-Replace `pkg:filename` with the actual package and filename:
-- For `pkg/workflow/compiler.go` → `"workflow:compiler"`
-- For `pkg/cli/compile.go` → `"cli:compile"`
-- For `pkg/parser/frontmatter.go` → `"parser:frontmatter"`
-
-### Logger Usage Patterns
-
-**Good logging examples:**
-
-```go
-// Log function entry with parameters (no side effects)
-func ProcessFile(path string, count int) error {
-    log.Printf("Processing file: path=%s, count=%d", path, count)
-    // ... function body ...
-}
-
-// Log important state changes
-log.Printf("Compiled %d workflows successfully", len(workflows))
-
-// Log before expensive operations (check if enabled first)
-if log.Enabled() {
-    log.Printf("Starting compilation with config: %+v", config)
-}
-
-// Log control flow decisions
-log.Print("Cache hit, skipping recompilation")
-log.Printf("No matching pattern found, using default: %s", defaultValue)
-```
-
-**What NOT to do:**
-
-```go
-// WRONG - causes side effects
-log.Printf("Files: %s", expensiveOperation())  // Don't call functions in log args
-
-// WRONG - not meaningful
-log.Print("Here")  // Too vague
-
-// WRONG - duplicates user-facing messages
-fmt.Fprintln(os.Stderr, console.FormatInfoMessage("Compiling..."))
-log.Print("Compiling...")  // Redundant with user message above
-```
-
-### When to Add Logging
-
-Add logging for:
-1. **Function entry** - Especially for public functions with parameters
-2. **Important control flow** - Branches, loops, error paths
-3. **State changes** - Before/after modifying important state
-4. **Performance-sensitive sections** - Before/after expensive operations
-5. **Debugging context** - Information that would help troubleshoot issues
-
-Do NOT add logging for:
-1. **Simple getters/setters** - Too verbose
-2. **Already logged operations** - Don't duplicate existing logs
-3. **User-facing messages** - Debug logs are separate from console output
-4. **Test files** - Skip all `*_test.go` files
+Read the **Debug Logging** section of `AGENTS.md` with the read or bash tools, then follow its logger naming convention (`pkg:filename`), usage patterns, and "When to Add Logging" guidance.
 
 ## Task Steps
 
-### 1. Find Candidate Go Files
+### 1. Read Deterministic Candidate Manifest
 
-Use bash to identify Go files that could benefit from additional logging:
-
-```bash
-# Find all non-test Go files in pkg/
-find pkg -name '*.go' -type f ! -name '*_test.go'
-
-# Check which files already have loggers
-grep -r 'var log = logger.New' pkg --include='*.go'
-```
+Use `/tmp/gh-aw/agent/go-logger/manifest.json` as the source of truth for:
+- `files_needing_logger`
+- `missing_logger_import`
+- `candidate_call_sites`
 
 ### 2. Select Files for Enhancement
 
@@ -225,107 +196,29 @@ For each file:
    - Don't over-log - focus on the most useful information
    - Ensure messages are meaningful and helpful for debugging
 
-### 5. Early Validation (After First File)
-
-After editing your **first file**, run a quick build to catch compilation errors early — before spending time on more files:
-
-```bash
-make build
-```
-
-This surfaces syntax errors or import issues immediately, saving time if the first edit has a problem.
-
-### 6. Complete Validation (After All Files)
+### 5. Validation (After All Files)
 
 After adding logging to **all selected files**, validate your changes before creating a PR:
 
-1. **Build the project to ensure no compilation errors:**
+1. **Build the project and check formatting:**
    ```bash
-   make build
+   make build && make fmt
    ```
-   This compiles the Go code and catches any syntax errors or import issues.
+   This catches compilation errors and import formatting issues without the full unit test suite.
 
-2. **Run unit tests to ensure nothing broke:**
-   ```bash
-   make test-unit
-   ```
-   This validates that your changes don't break existing functionality.
-
-3. **Test the workflow compilation with debug logging enabled:**
-   ```bash
-   DEBUG=* ./gh-aw compile dev
-   ```
-   This validates that:
-   - The binary was built successfully
-   - The compile command works correctly
-   - Debug logging from your changes appears in the output
-
-4. **If needed, recompile workflows:**
+2. **If needed, recompile workflows:**
    ```bash
    make recompile
    ```
+   Only run this if you changed any `.md` workflow files during this session.
 
-### 7. Create Pull Request
+### 6. Create Pull Request
 
 After validating your changes:
 
 1. The safe-outputs create-pull-request will automatically create a PR
 2. Ensure your changes follow the guidelines above
 3. The PR title will automatically have the "[log] " prefix
-
-## Example Transformation
-
-**Before:**
-```go
-package workflow
-
-import (
-    "fmt"
-    "os"
-)
-
-func CompileWorkflow(path string) error {
-    data, err := os.ReadFile(path)
-    if err != nil {
-        return err
-    }
-    
-    // Process workflow
-    result := process(data)
-    return nil
-}
-```
-
-**After:**
-```go
-package workflow
-
-import (
-    "fmt"
-    "os"
-    
-    "github.com/github/gh-aw/pkg/logger"
-)
-
-var log = logger.New("workflow:compiler")
-
-func CompileWorkflow(path string) error {
-    log.Printf("Compiling workflow: %s", path)
-    
-    data, err := os.ReadFile(path)
-    if err != nil {
-        log.Printf("Failed to read workflow file: %s", err)
-        return err
-    }
-    
-    log.Printf("Read %d bytes from workflow file", len(data))
-    
-    // Process workflow
-    result := process(data)
-    log.Print("Workflow compilation completed successfully")
-    return nil
-}
-```
 
 ## Quality Checklist
 
@@ -338,9 +231,7 @@ Before creating the PR, verify:
 - [ ] Logging messages are meaningful and helpful
 - [ ] No duplicate logging with existing logs
 - [ ] Import statements are properly formatted
-- [ ] Changes validated with `make build` (no compilation errors)
-- [ ] Changes validated with `make test-unit` (tests pass)
-- [ ] Workflow compilation tested with `DEBUG=* ./gh-aw compile dev`
+- [ ] Changes validated with `make build && make fmt`
 
 ## Important Notes
 
@@ -349,6 +240,26 @@ Before creating the PR, verify:
 - The safe-outputs create-pull-request will automatically create the PR
 - Focus on quality over quantity - 5 well-logged files is better than 10 poorly-logged files
 - Remember: debug logs are for developers, not end users
+
+## Structured Patch Output
+
+When proposing per-file logger changes, use this compact schema in your reasoning/output to reduce verbose prose:
+
+```json
+{
+  "patches": [
+    {
+      "file": "pkg/path/file.go",
+      "logger_name": "pkg:filename",
+      "add_import": true,
+      "add_logger_var": true,
+      "call_sites": [
+        {"line": 123, "function": "Run", "message": "enter Run"}
+      ]
+    }
+  ]
+}
+```
 
 Good luck enhancing the codebase with better logging!
 

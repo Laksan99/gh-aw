@@ -10,12 +10,15 @@ const {
   resolveClaudePromptFileArgs,
   stripPromptFileArgs,
   isRateLimitError,
+  isAuthenticationFailedError,
   isMaxTurnsExit,
   isNoDeferredMarkerError,
+  isInvalidModelError,
   isSignalTerminationExitCode,
   shouldRetryWithContinue,
   countPermissionDeniedIssues,
   hasNumerousPermissionDeniedIssues,
+  extractDeniedCommands,
   buildMissingToolPermissionIssuePayload,
 } = require("./claude_harness.cjs");
 
@@ -51,23 +54,23 @@ function runHarnessWithStub({ stubScript, prompt = "fix the bug", extraArgs = []
 
 describe("claude_harness.cjs", () => {
   describe("resolveClaudePromptFileArgs", () => {
-    it("replaces --prompt-file with the file's content as the last positional arg", () => {
+    it("replaces --prompt-file with ['--', content] as the last two positional args", () => {
       const promptFile = path.join(os.tmpdir(), `claude-harness-prompt-${Date.now()}.txt`);
       fs.writeFileSync(promptFile, "fix the bug", "utf8");
       try {
         const result = resolveClaudePromptFileArgs(["--print", "--prompt-file", promptFile, "--output-format", "stream-json"]);
-        expect(result).toEqual(["--print", "--output-format", "stream-json", "fix the bug"]);
+        expect(result).toEqual(["--print", "--output-format", "stream-json", "--", "fix the bug"]);
       } finally {
         fs.rmSync(promptFile);
       }
     });
 
-    it("appends prompt content as the last arg when other positional args precede it", () => {
+    it("appends -- and prompt content as the last two args", () => {
       const promptFile = path.join(os.tmpdir(), `claude-harness-prompt-${Date.now()}.txt`);
       fs.writeFileSync(promptFile, "my task", "utf8");
       try {
         const result = resolveClaudePromptFileArgs(["--prompt-file", promptFile]);
-        expect(result).toEqual(["my task"]);
+        expect(result).toEqual(["--", "my task"]);
       } finally {
         fs.rmSync(promptFile);
       }
@@ -95,6 +98,22 @@ describe("claude_harness.cjs", () => {
         expect(() => resolveClaudePromptFileArgs(["--prompt-file", dir])).toThrow(`--prompt-file '${dir}' is not readable`);
       } finally {
         fs.rmdirSync(dir);
+      }
+    });
+
+    it("places -- between --mcp-config and prompt to prevent ENAMETOOLONG (Claude Code 2.x variadic flag)", () => {
+      // Claude Code 2.x treats any non-flag positional argument that follows
+      // --mcp-config as a second config file path. A large prompt without the --
+      // separator would exceed PATH_MAX (~4096 bytes) and fail with ENAMETOOLONG.
+      const promptFile = path.join(os.tmpdir(), `claude-harness-prompt-${Date.now()}.txt`);
+      const longPrompt = "<system>".padEnd(5000, "x");
+      fs.writeFileSync(promptFile, longPrompt, "utf8");
+      try {
+        const result = resolveClaudePromptFileArgs(["--mcp-config", "/tmp/mcp-servers.json", "--prompt-file", promptFile]);
+        // The -- must immediately precede the prompt content, not adjacent to --mcp-config.
+        expect(result).toEqual(["--mcp-config", "/tmp/mcp-servers.json", "--", longPrompt]);
+      } finally {
+        fs.rmSync(promptFile);
       }
     });
   });
@@ -164,6 +183,38 @@ describe("claude_harness.cjs", () => {
     });
   });
 
+  describe("isAuthenticationFailedError", () => {
+    it("returns true for authentication failed with request id", () => {
+      expect(isAuthenticationFailedError("Authentication failed (Request ID: C818:3ED713:19D401B:1C446B7:69D653CA)")).toBe(true);
+    });
+
+    describe("isInvalidModelError", () => {
+      it("returns true for model-not-supported errors", () => {
+        expect(isInvalidModelError("Execution failed: CAPIError: 400 The requested model is not supported.")).toBe(true);
+      });
+
+      it("returns true for invalid model name errors", () => {
+        expect(isInvalidModelError("invalid model name 'claude-sonnet-999'")).toBe(true);
+        expect(isInvalidModelError("model 'claude-ultra' does not exist")).toBe(true);
+        expect(isInvalidModelError("model claude-fake is not supported")).toBe(true);
+        expect(isInvalidModelError("model gemini-v99 is unavailable")).toBe(true);
+        expect(isInvalidModelError("model 'claude-3-5-sonnet@20241022' not found")).toBe(true);
+      });
+
+      it("returns false for unrelated errors", () => {
+        expect(isInvalidModelError("rate_limit_error")).toBe(false);
+        expect(isInvalidModelError("Error: invalid model response format")).toBe(false);
+        expect(isInvalidModelError('{"type":"result","subtype":"error_max_turns","is_error":true}')).toBe(false);
+        expect(isInvalidModelError("")).toBe(false);
+      });
+    });
+
+    it("returns false for unrelated output", () => {
+      expect(isAuthenticationFailedError("No authentication information found")).toBe(false);
+      expect(isAuthenticationFailedError("rate_limit_error")).toBe(false);
+    });
+  });
+
   describe("isNoDeferredMarkerError", () => {
     it("returns true for the canonical no-deferred-marker error message", () => {
       const output =
@@ -230,6 +281,54 @@ describe("claude_harness.cjs", () => {
       const payload = JSON.parse(buildMissingToolPermissionIssuePayload());
       expect(payload.type).toBe("missing_tool");
       expect(payload.reason).toContain("missing tool/permission issue");
+      expect(payload.denied_commands).toEqual([]);
+    });
+
+    it("builds missing_tool payload with denied commands", () => {
+      const payload = JSON.parse(buildMissingToolPermissionIssuePayload(["go version", "ls /usr/local/go"]));
+      expect(payload.type).toBe("missing_tool");
+      expect(payload.denied_commands).toEqual(["go version", "ls /usr/local/go"]);
+    });
+  });
+
+  describe("extractDeniedCommands", () => {
+    it("returns empty array for empty output", () => {
+      expect(extractDeniedCommands("")).toEqual([]);
+      expect(extractDeniedCommands(null)).toEqual([]);
+    });
+
+    it("extracts command from line with box-drawing pipe marker (│) before permission denied", () => {
+      const output = ["\u2713 Some successful step", "\u2717 Check if go command works (shell)", "  \u2502 go version 2>&1", "  \u2514 Permission denied and could not request permission from user"].join("\n");
+      expect(extractDeniedCommands(output)).toEqual(["go version 2>&1"]);
+    });
+
+    it("extracts command with plain pipe (|) before permission denied", () => {
+      const output = ["| ls -la", "Permission denied"].join("\n");
+      expect(extractDeniedCommands(output)).toEqual(["ls -la"]);
+    });
+
+    it("deduplicates repeated denied commands", () => {
+      const output = ["  \u2502 go version", "  Permission denied", "  \u2502 go version", "  Permission denied", "  \u2502 go version", "  Permission denied"].join("\n");
+      expect(extractDeniedCommands(output)).toEqual(["go version"]);
+    });
+
+    it("extracts multiple distinct denied commands", () => {
+      const output = ["  \u2502 go version 2>&1", "  Permission denied", "  \u2502 ls /usr/local/go/bin/go", "  Permission denied", "  \u2502 which go", "  Permission denied"].join("\n");
+      const result = extractDeniedCommands(output);
+      expect(result).toContain("go version 2>&1");
+      expect(result).toContain("ls /usr/local/go/bin/go");
+      expect(result).toContain("which go");
+    });
+
+    it("returns empty array when no pipe markers are present before permission denied", () => {
+      const output = "Some output\nPermission denied\nMore output";
+      expect(extractDeniedCommands(output)).toEqual([]);
+    });
+
+    it("does not capture suffix of a command containing an internal pipe", () => {
+      // "find . -name '*.go' | sort" should not match by splitting on the internal |
+      const output = ["  find . -name '*.go' | sort", "  Permission denied"].join("\n");
+      expect(extractDeniedCommands(output)).toEqual([]);
     });
   });
 
@@ -370,6 +469,91 @@ process.exit(0);
         continueDisabledPermanently: false,
       });
       expect(result).toBe(false);
+    });
+  });
+
+  describe("auth failure retry policy", () => {
+    const MAX_RETRIES = 3;
+
+    /**
+     * @param {{hasOutput: boolean, exitCode: number, output: string}} result
+     * @param {number} attempt
+     * @returns {boolean}
+     */
+    function shouldRetry(result, attempt) {
+      if (result.exitCode === 0) return false;
+      if (attempt === 0 && isAuthenticationFailedError(result.output)) return false;
+      return attempt < MAX_RETRIES && result.hasOutput;
+    }
+
+    it("does not retry when first attempt fails authentication", () => {
+      const result = { exitCode: 1, hasOutput: true, output: "Authentication failed (Request ID: 123)" };
+      expect(shouldRetry(result, 0)).toBe(false);
+    });
+  });
+
+  describe("noop pre-flight and retry guard", () => {
+    it("skips the agent when a noop is already in safe-outputs before the run", () => {
+      const tempDir = makeHarnessTempDir("claude-noop-preflight-");
+      const safeOutputsPath = path.join(tempDir, "safe-outputs.jsonl");
+      fs.writeFileSync(safeOutputsPath, '{"type":"noop","message":"nothing to do"}\n', "utf8");
+      const stubPath = path.join(tempDir, "stub.cjs");
+      const promptPath = path.join(tempDir, "prompt.txt");
+      const callsPath = path.join(tempDir, "calls.jsonl");
+      fs.writeFileSync(
+        stubPath,
+        `const fs = require("fs");
+const callsPath = process.env.CLAUDE_HARNESS_STUB_CALLS;
+fs.appendFileSync(callsPath, JSON.stringify({args: process.argv.slice(2)}) + "\\n");
+process.exit(0);`,
+        "utf8"
+      );
+      fs.writeFileSync(promptPath, "fix the bug", "utf8");
+
+      const result = spawnSync(process.execPath, ["claude_harness.cjs", process.execPath, stubPath, "--print", "--prompt-file", promptPath], {
+        cwd: path.dirname(require.resolve("./claude_harness.cjs")),
+        env: { ...process.env, CLAUDE_HARNESS_STUB_CALLS: callsPath, GH_AW_SAFE_OUTPUTS: safeOutputsPath },
+        encoding: "utf8",
+        timeout: 10000,
+      });
+      // Agent stub should never have been invoked
+      const stubCallCount = fs.existsSync(callsPath) ? fs.readFileSync(callsPath, "utf8").trim().split("\n").filter(Boolean).length : 0;
+      expect(stubCallCount).toBe(0);
+      expect(result.status).toBe(0);
+      expect(result.stderr).toContain("pre-flight: noop message found in safe-outputs");
+    });
+
+    it("does not retry after a failed run when a noop was written to safe-outputs", () => {
+      const tempDir = makeHarnessTempDir("claude-noop-retry-");
+      const safeOutputsPath = path.join(tempDir, "safe-outputs.jsonl");
+      const stubPath = path.join(tempDir, "stub.cjs");
+      const promptPath = path.join(tempDir, "prompt.txt");
+      const callsPath = path.join(tempDir, "calls.jsonl");
+      // Stub writes a noop on the first call then fails; harness must not retry.
+      fs.writeFileSync(
+        stubPath,
+        `const fs = require("fs");
+const callsPath = process.env.CLAUDE_HARNESS_STUB_CALLS;
+const safeOutputsPath = process.env.GH_AW_SAFE_OUTPUTS;
+fs.appendFileSync(callsPath, JSON.stringify({args: process.argv.slice(2)}) + "\\n");
+fs.appendFileSync(safeOutputsPath, JSON.stringify({type:"noop",message:"nothing to do"}) + "\\n");
+process.exit(1);`,
+        "utf8"
+      );
+      fs.writeFileSync(promptPath, "fix the bug", "utf8");
+
+      const result = spawnSync(process.execPath, ["claude_harness.cjs", process.execPath, stubPath, "--print", "--prompt-file", promptPath], {
+        cwd: path.dirname(require.resolve("./claude_harness.cjs")),
+        env: { ...process.env, CLAUDE_HARNESS_STUB_CALLS: callsPath, GH_AW_SAFE_OUTPUTS: safeOutputsPath },
+        encoding: "utf8",
+        timeout: 10000,
+      });
+      const callCount = fs.readFileSync(callsPath, "utf8").trim().split("\n").filter(Boolean).length;
+      // Only one attempt — no retries after noop detected
+      expect(callCount).toBe(1);
+      // Harness exits 0 because noop means the work is done
+      expect(result.status).toBe(0);
+      expect(result.stderr).toContain("noop message found in safe-outputs — not retrying");
     });
   });
 });

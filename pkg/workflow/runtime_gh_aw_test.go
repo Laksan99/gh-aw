@@ -3,6 +3,7 @@
 package workflow
 
 import (
+	"context"
 	"strings"
 	"testing"
 
@@ -27,7 +28,7 @@ func TestRuntimesConfigToMap_GhAw(t *testing.T) {
 		GhAw: &RuntimeConfig{
 			Version:       "v1.2.3",
 			If:            "github.event_name == 'push'",
-			ActionRepo:    "github/gh-aw/actions/setup-cli",
+			ActionRepo:    "github/gh-aw-actions/setup-cli",
 			ActionVersion: "v0.72.1",
 		},
 	})
@@ -38,7 +39,7 @@ func TestRuntimesConfigToMap_GhAw(t *testing.T) {
 	require.True(t, ok)
 	assert.Equal(t, "v1.2.3", ghAw["version"])
 	assert.Equal(t, "github.event_name == 'push'", ghAw["if"])
-	assert.Equal(t, "github/gh-aw/actions/setup-cli", ghAw["action-repo"])
+	assert.Equal(t, "github/gh-aw-actions/setup-cli", ghAw["action-repo"])
 	assert.Equal(t, "v0.72.1", ghAw["action-version"])
 }
 
@@ -104,17 +105,17 @@ func TestGenerateRuntimeSetupSteps_GhAw_DevBuildsFromSource(t *testing.T) {
 	steps := GenerateRuntimeSetupSteps([]RuntimeRequirement{{
 		Runtime: ghAwRuntime,
 		Version: "",
-	}})
+	}}, nil)
 	require.NotEmpty(t, steps)
 
 	content := strings.Join(steps[0], "\n")
 	assert.Contains(t, content, "Build and install gh-aw CLI from source")
-	assert.Contains(t, content, "gh extension remove gh-aw || true")
+	assert.Contains(t, content, "gh extension remove aw || true")
 	assert.Contains(t, content, "make build")
 	assert.Contains(t, content, "gh extension install .")
 	assert.Contains(t, content, "gh aw version")
 	assert.Contains(t, content, "GH_TOKEN: ${{ github.token }}")
-	assert.NotContains(t, content, "github/gh-aw/actions/setup-cli@")
+	assert.NotContains(t, content, "setup-cli@")
 }
 
 func TestGenerateRuntimeSetupSteps_GhAw_ReleaseUsesSetupCLI(t *testing.T) {
@@ -134,10 +135,44 @@ func TestGenerateRuntimeSetupSteps_GhAw_ReleaseUsesSetupCLI(t *testing.T) {
 	steps := GenerateRuntimeSetupSteps([]RuntimeRequirement{{
 		Runtime: ghAwRuntime,
 		Version: "",
-	}})
+	}}, nil)
 	require.NotEmpty(t, steps)
 
 	content := strings.Join(steps[0], "\n")
-	assert.Contains(t, content, "uses: github/gh-aw/actions/setup-cli@")
+	assert.Contains(t, content, "uses: github/gh-aw-actions/setup-cli@")
+	assert.Contains(t, content, "version: 'v0.72.1'")
+}
+
+func TestGenerateRuntimeSetupSteps_GhAw_ReleaseUsesWorkflowDataPin(t *testing.T) {
+	originalVersion := GetVersion()
+	originalRelease := IsRelease()
+	t.Cleanup(func() {
+		SetVersion(originalVersion)
+		SetIsRelease(originalRelease)
+	})
+
+	SetVersion("v0.72.1")
+	SetIsRelease(true)
+
+	ghAwRuntime := findRuntimeByID("gh-aw")
+	require.NotNil(t, ghAwRuntime)
+
+	cache := NewActionCache(t.TempDir())
+	sha := "0123456789abcdef0123456789abcdef01234567"
+	cache.Set("github/gh-aw-actions/setup-cli", "v0.72.1", sha)
+
+	data := &WorkflowData{
+		Ctx:            context.Background(),
+		ActionResolver: NewActionResolver(cache),
+	}
+
+	steps := GenerateRuntimeSetupSteps([]RuntimeRequirement{{
+		Runtime: ghAwRuntime,
+		Version: "",
+	}}, data)
+	require.NotEmpty(t, steps)
+
+	content := strings.Join(steps[0], "\n")
+	assert.Contains(t, content, "uses: github/gh-aw-actions/setup-cli@"+sha)
 	assert.Contains(t, content, "version: 'v0.72.1'")
 }

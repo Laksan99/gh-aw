@@ -15,8 +15,11 @@
 
 "use strict";
 
+require("./shim.cjs");
+
 const fs = require("fs");
 const path = require("path");
+const { withRetry, sleep } = require("./error_recovery.cjs");
 
 // AWF API proxy management endpoint for discovering configured LLM providers and available models.
 // The api-proxy sidecar exposes /reflect on its management port (port 10000) inside the AWF
@@ -26,9 +29,18 @@ const AWF_API_PROXY_REFLECT_URL = "http://api-proxy:10000/reflect";
 // co-located with other AWF firewall observability data so it is included in the agent artifact.
 const AWF_REFLECT_OUTPUT_PATH = "/tmp/gh-aw/sandbox/firewall/awf-reflect.json";
 // Milliseconds to wait for the /reflect endpoint before giving up.
-const AWF_REFLECT_TIMEOUT_MS = 5000;
+const AWF_REFLECT_TIMEOUT_MS = 60000;
 // Milliseconds to wait for each models_url fallback fetch (shorter than the main reflect timeout).
 const AWF_MODELS_URL_TIMEOUT_MS = 3000;
+// Maximum attempts for models_url fallback fetches when the proxy is not yet ready.
+const AWF_MODELS_URL_MAX_ATTEMPTS = 5;
+// Base delay between models_url fallback retries. Uses exponential backoff.
+const AWF_MODELS_URL_RETRY_BASE_MS = 250;
+// Cap for exponential backoff delay between retries.
+const AWF_MODELS_URL_RETRY_MAX_MS = 2000;
+// Delay before the first models_url probe when using GitHub OIDC auth with the local api-proxy.
+// This reduces startup-race 503s while the proxy completes OIDC token exchange.
+const AWF_MODELS_URL_OIDC_INITIAL_DELAY_MS_DEFAULT = 5000;
 // Gemini model name prefix stripped from model IDs in the Gemini models API response.
 // Example: { name: "models/gemini-1.5-pro" } → "gemini-1.5-pro"
 const GEMINI_MODEL_NAME_PREFIX = "models/";
@@ -84,32 +96,95 @@ function extractModelIds(json) {
  * @returns {Promise<string[]|null>}
  */
 async function fetchModelsFromUrl(modelsUrl, timeoutMs, logger) {
-  const ac = new AbortController();
-  const timer = setTimeout(() => {
-    logger(`awf-reflect: models fetch timed out for ${modelsUrl}`);
-    ac.abort();
-  }, timeoutMs);
+  let isInitialProbeDelayed = false;
   try {
-    const res = await fetch(modelsUrl, { signal: ac.signal });
-    if (!res.ok) {
-      logger(`awf-reflect: models fetch returned ${res.status} for ${modelsUrl}`);
-      return null;
+    const modelsHost = new URL(modelsUrl).hostname.toLowerCase();
+    isInitialProbeDelayed = process.env.AWF_AUTH_TYPE === "github-oidc" && modelsHost === "api-proxy";
+  } catch {
+    // Ignore invalid URL parsing and proceed without startup delay.
+  }
+  if (isInitialProbeDelayed) {
+    const configuredDelay = Number.parseInt(process.env.AWF_MODELS_URL_OIDC_INITIAL_DELAY_MS || "", 10);
+    const initialProbeDelay = Number.isFinite(configuredDelay) && configuredDelay >= 0 ? configuredDelay : AWF_MODELS_URL_OIDC_INITIAL_DELAY_MS_DEFAULT;
+    if (initialProbeDelay > 0) {
+      logger(`awf-reflect: delaying initial models probe for ${modelsUrl} by ${initialProbeDelay}ms (AWF_AUTH_TYPE=github-oidc)`);
+      await sleep(initialProbeDelay);
     }
-    const json = await res.json();
-    const models = extractModelIds(json);
-    if (models) {
-      logger(`awf-reflect: fetched ${models.length} model(s) from ${modelsUrl}`);
-    }
-    return models;
+  }
+
+  let attemptCounter = 0;
+  const retryConfig = {
+    maxRetries: AWF_MODELS_URL_MAX_ATTEMPTS - 1,
+    // withRetry multiplies delay before the next attempt, so divide by 2 here
+    // to preserve the intended first backoff of AWF_MODELS_URL_RETRY_BASE_MS.
+    initialDelayMs: Math.ceil(AWF_MODELS_URL_RETRY_BASE_MS / 2),
+    maxDelayMs: AWF_MODELS_URL_RETRY_MAX_MS,
+    backoffMultiplier: 2,
+    jitterMs: 0,
+    shouldRetry: error => {
+      const original = error?.originalError || error;
+      const status = original?.status ?? original?.response?.status ?? null;
+      const shouldRetry = status === 503;
+      if (shouldRetry && attemptCounter < AWF_MODELS_URL_MAX_ATTEMPTS) {
+        logger(`awf-reflect: models fetch returned 503 for ${modelsUrl}; retrying (attempt ${attemptCounter + 1}/${AWF_MODELS_URL_MAX_ATTEMPTS})`);
+      }
+      return shouldRetry;
+    },
+  };
+
+  try {
+    return await withRetry(
+      async () => {
+        attemptCounter += 1;
+        const ac = new AbortController();
+        const timer = setTimeout(() => {
+          logger(`awf-reflect: models fetch timed out for ${modelsUrl}`);
+          ac.abort();
+        }, timeoutMs);
+        try {
+          const res = await fetch(modelsUrl, { signal: ac.signal });
+          if (!res.ok) {
+            if (res.status === 503) {
+              const err = Object.assign(new Error(`models fetch returned 503 for ${modelsUrl}`), { status: 503 });
+              throw err;
+            }
+            logger(`awf-reflect: models fetch returned ${res.status} for ${modelsUrl}`);
+            return null;
+          }
+          const json = await res.json();
+          const models = extractModelIds(json);
+          if (models) {
+            logger(`awf-reflect: fetched ${models.length} model(s) from ${modelsUrl}`);
+          }
+          return models;
+        } catch (err) {
+          const e = /** @type {Error} */ err;
+          if (e.name === "AbortError") {
+            return null; // already logged above
+          }
+          const status = e?.status ?? e?.response?.status ?? null;
+          if (status === 503) {
+            throw e;
+          }
+          logger(`awf-reflect: models fetch error for ${modelsUrl}: ${e.message}`);
+          return null;
+        } finally {
+          clearTimeout(timer);
+        }
+      },
+      retryConfig,
+      `awf-reflect models fetch for ${modelsUrl}`
+    );
   } catch (err) {
     const e = /** @type {Error} */ err;
-    if (e.name === "AbortError") {
-      return null; // already logged above
+    const original = e?.originalError || e;
+    const status = original?.status ?? original?.response?.status ?? null;
+    if (status === 503) {
+      logger(`awf-reflect: models fetch returned 503 for ${modelsUrl}`);
+      return null;
     }
     logger(`awf-reflect: models fetch error for ${modelsUrl}: ${e.message}`);
     return null;
-  } finally {
-    clearTimeout(timer);
   }
 }
 
@@ -142,8 +217,9 @@ async function enrichReflectModels(reflectData, timeoutMs, logger) {
 /**
  * Fetch the AWF API proxy /reflect endpoint and persist the response to disk.
  *
- * The /reflect endpoint is exposed by the api-proxy sidecar on its management port (10000)
- * and returns the list of configured LLM providers together with their available model lists.
+ * The /reflect endpoint is exposed by the api-proxy sidecar on each started provider port.
+ * The active provider's gateway port should be used rather than a hardcoded port, since
+ * port 10000 (the OpenAI sidecar) is only started when OpenAI credentials are configured.
  * This information is saved to AWF_REFLECT_OUTPUT_PATH so the post-run GitHub Actions step
  * (awf_reflect_summary.cjs) can include it in the step summary without requiring the
  * containers to still be running.
@@ -164,7 +240,16 @@ async function enrichReflectModels(reflectData, timeoutMs, logger) {
  *   logger?: (msg: string) => void,
  *   writeFileSync?: (path: string, data: string, options: object) => void,
  * }=} options
- * @returns {Promise<void>}
+ * @returns {Promise<{
+ *   ok: boolean,
+ *   reflectUrl: string,
+ *   outputPath: string,
+ *   bytesWritten?: number,
+ *   reflectData?: object,
+ *   reason?: "unexpected_status"|"timeout"|"request_failed",
+ *   status?: number,
+ *   error?: string,
+ * }>}
  */
 async function fetchAWFReflect(options) {
   const reflectUrl = (options && options.reflectUrl) || AWF_API_PROXY_REFLECT_URL;
@@ -177,7 +262,9 @@ async function fetchAWFReflect(options) {
   logger(`awf-reflect: fetching ${reflectUrl} (timeout=${timeoutMs}ms)`);
 
   const ac = new AbortController();
+  let timedOut = false;
   const timer = setTimeout(() => {
+    timedOut = true;
     logger(`awf-reflect: request timed out after ${timeoutMs}ms`);
     ac.abort();
   }, timeoutMs);
@@ -186,7 +273,13 @@ async function fetchAWFReflect(options) {
     const res = await fetch(reflectUrl, { signal: ac.signal });
     if (!res.ok) {
       logger(`awf-reflect: unexpected status ${res.status}, skipping`);
-      return;
+      return {
+        ok: false,
+        reflectUrl,
+        outputPath,
+        reason: "unexpected_status",
+        status: res.status,
+      };
     }
     const reflectData = await res.json();
     // Attempt to fill in null models for configured providers by fetching directly
@@ -197,15 +290,107 @@ async function fetchAWFReflect(options) {
     fs.mkdirSync(path.dirname(outputPath), { recursive: true });
     writeFile(outputPath, enrichedBody, { encoding: "utf8" });
     logger(`awf-reflect: saved ${enrichedBody.length}B to ${outputPath}`);
+    return {
+      ok: true,
+      reflectUrl,
+      outputPath,
+      bytesWritten: enrichedBody.length,
+      reflectData,
+    };
   } catch (err) {
     const e = /** @type {Error} */ err;
     if (e.name === "AbortError") {
-      return; // already logged above
+      return {
+        ok: false,
+        reflectUrl,
+        outputPath,
+        reason: "timeout",
+        error: timedOut ? `request timed out after ${timeoutMs}ms` : e.message,
+      };
     }
     logger(`awf-reflect: request failed: ${e.message}`);
+    return {
+      ok: false,
+      reflectUrl,
+      outputPath,
+      reason: "request_failed",
+      error: e.message,
+    };
   } finally {
     clearTimeout(timer);
   }
+}
+
+/**
+ * Resolve Copilot SDK BYOK custom provider configuration from AWF /reflect data.
+ * Chooses a configured endpoint and maps it to an OpenAI-compatible provider base URL.
+ * Returns null when no suitable endpoint is found (e.g. no reflect data, or endpoints not
+ * configured).
+ *
+ * Requires live reflect data passed directly via `reflectData`.
+ *
+ * @param {{
+ *   model?: string,
+ *   provider?: string,
+ *   reflectData: object | null | undefined,
+ *   logger?: (msg: string) => void,
+ * }} [options]
+ * @returns {{ model: string, provider: { type: "openai", baseUrl: string } } | null}
+ */
+function resolveCopilotSDKCustomProviderFromReflect(options) {
+  const configuredModel = typeof options?.model === "string" ? options.model.trim() : "";
+  const configuredProvider = typeof options?.provider === "string" ? options.provider.trim().toLowerCase() : "";
+  const logger = (options && options.logger) || DEFAULT_REFLECT_LOGGER;
+
+  const reflectData = options?.reflectData;
+  if (reflectData == null) {
+    logger("sdk-mode: no reflect data provided; cannot resolve custom provider");
+    return null;
+  }
+
+  const endpoints = Array.isArray(reflectData?.endpoints) ? reflectData.endpoints.filter(ep => ep && ep.configured === true) : [];
+  if (endpoints.length === 0) {
+    logger("sdk-mode: no configured endpoints in awf-reflect data; cannot resolve custom provider");
+    return null;
+  }
+
+  const endpoint =
+    (configuredModel ? endpoints.find(ep => Array.isArray(ep.models) && ep.models.includes(configuredModel)) : null) ||
+    (configuredProvider ? endpoints.find(ep => String(ep.provider || "").toLowerCase() === configuredProvider) : null) ||
+    endpoints.find(ep => String(ep.provider || "").toLowerCase() === "copilot") ||
+    endpoints[0];
+
+  let baseUrl = "";
+  if (typeof endpoint?.models_url === "string" && endpoint.models_url) {
+    try {
+      baseUrl = new URL(endpoint.models_url).origin;
+    } catch {
+      // ignore malformed URL and fall back to port-based construction below
+    }
+  }
+  if (!baseUrl && endpoint?.port != null) {
+    baseUrl = `http://api-proxy:${String(endpoint.port)}`;
+  }
+  if (!baseUrl) {
+    logger("sdk-mode: unable to derive provider baseUrl from awf-reflect endpoint data; cannot resolve custom provider");
+    return null;
+  }
+
+  let model = configuredModel;
+  if (!model && Array.isArray(endpoint?.models)) {
+    const firstModel = endpoint.models.find(m => typeof m === "string" && m.trim().length > 0);
+    model = typeof firstModel === "string" ? firstModel.trim() : "";
+  }
+  if (!model) {
+    logger("sdk-mode: unable to derive model for custom provider from awf-reflect; cannot resolve custom provider");
+    return null;
+  }
+
+  logger(`sdk-mode: custom provider resolved from awf-reflect (provider=${String(endpoint.provider || "unknown")} baseUrl=${baseUrl} model=${model})`);
+  return {
+    model,
+    provider: { type: "openai", baseUrl },
+  };
 }
 
 if (typeof module !== "undefined" && module.exports) {
@@ -214,10 +399,14 @@ if (typeof module !== "undefined" && module.exports) {
     AWF_REFLECT_OUTPUT_PATH,
     AWF_REFLECT_TIMEOUT_MS,
     AWF_MODELS_URL_TIMEOUT_MS,
+    AWF_MODELS_URL_MAX_ATTEMPTS,
+    AWF_MODELS_URL_RETRY_BASE_MS,
+    AWF_MODELS_URL_RETRY_MAX_MS,
     GEMINI_MODEL_NAME_PREFIX,
     enrichReflectModels,
     extractModelIds,
     fetchAWFReflect,
     fetchModelsFromUrl,
+    resolveCopilotSDKCustomProviderFromReflect,
   };
 }

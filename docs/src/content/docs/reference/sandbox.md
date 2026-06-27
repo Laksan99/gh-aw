@@ -22,7 +22,9 @@ Configure the coding agent sandbox type to control how the AI engine is isolated
 sandbox:
   agent: awf
 
-# Disable coding agent sandbox (firewall only) - use with caution
+# Disable coding agent sandbox - requires an operator-authored justification
+features:
+  dangerously-disable-sandbox-agent: "controlled environment with no internet access"
 sandbox:
   agent: false
 
@@ -35,7 +37,23 @@ If `sandbox` is not specified in your workflow, it defaults to `sandbox.agent: a
 
 **Disabling Coding Agent Sandbox**
 
-Setting `sandbox.agent: false` disables only the agent firewall while keeping the MCP gateway enabled. This reduces security isolation and should only be used when necessary. The MCP gateway cannot be disabled and remains active in all workflows.
+Setting `sandbox.agent: false` disables the agent firewall while keeping the MCP gateway enabled. This removes a trust boundary and should only be used when strictly necessary.
+
+To disable the agent sandbox, you **must** add `features.dangerously-disable-sandbox-agent` with a literal justification string of at least 20 characters. The justification must explain why the trust boundary is being removed and is stored for diagnostics and audit. The following values are rejected by the compiler:
+
+- Boolean `true` — no longer accepted as a legacy shorthand
+- Expressions such as `${{ inputs.reason }}` — must be a static literal
+- Strings shorter than 20 characters after trimming whitespace
+
+```yaml wrap
+features:
+  dangerously-disable-sandbox-agent: "controlled environment with no internet access"
+sandbox:
+  agent: false
+```
+
+> [!WARNING]
+> Disabling the agent sandbox removes a security trust boundary. The `dangerously-disable-sandbox-agent` value is a permanent, reviewable record of why this workflow runs without the agent firewall. Write a reason that will be meaningful to future reviewers.
 
 ### MCP Gateway (Experimental)
 
@@ -126,6 +144,25 @@ jobs:
 
 Use `go build` or `python3` - both are available.
 ```
+
+#### Go cache paths in AWF (`GOMODCACHE` / `GOCACHE`)
+
+When using `actions/setup-go` in AWF, pin Go cache paths explicitly so restore behavior is predictable:
+
+```yaml wrap
+jobs:
+  setup:
+    steps:
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.25'
+          cache: false
+      - run: |
+          echo "GOMODCACHE=$HOME/go/pkg/mod" >> "$GITHUB_ENV"
+          echo "GOCACHE=$HOME/.cache/go-build" >> "$GITHUB_ENV"
+```
+
+Then cache those paths via top-level `cache:` (see [Frontmatter cache configuration](/gh-aw/reference/frontmatter/)). Keep cache keys scoped to trusted contexts and avoid sharing writeable keys between untrusted and protected runs.
 
 ## MCP Gateway
 
@@ -280,7 +317,7 @@ timeout-minutes: 30
 Run the full test suite and fix any failures.
 ```
 
-See [Self-Hosted Runners](/gh-aw/guides/self-hosted-runners/) for setup instructions, including Docker and `sudo` requirements.
+See [Self-Hosted Runners](/gh-aw/reference/self-hosted-runners/) for setup instructions, including Docker and `sudo` requirements.
 
 ### Caching Build Artifacts Between Runs
 
@@ -313,5 +350,5 @@ Review the failing tests and apply a fix. Build artifacts are pre-cached.
 - [Network Permissions](/gh-aw/reference/network/) - Configure network access controls
 - [AI Engines](/gh-aw/reference/engines/) - Engine-specific configuration
 - [Tools](/gh-aw/reference/tools/) - Configure MCP tools and servers
-- [Self-Hosted Runners](/gh-aw/guides/self-hosted-runners/) - Use custom hardware for long-running jobs
+- [Self-Hosted Runners](/gh-aw/reference/self-hosted-runners/) - Use custom hardware for long-running jobs
 - [Frontmatter Reference](/gh-aw/reference/frontmatter/#run-configuration-run-name-runs-on-runs-on-slim-timeout-minutes) - `timeout-minutes` syntax

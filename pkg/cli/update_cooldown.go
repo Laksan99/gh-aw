@@ -15,6 +15,8 @@ import (
 
 var cooldownLog = logger.New("cli:update_cooldown")
 
+const coolDownFlagUsage = "Cooldown period before applying a new release (e.g., 7d, 24h, 0 to disable). Does not apply to actions/* or github/* repositories"
+
 // parseCoolDownFlag parses a cooldown duration string.
 // Accepts day-suffix notation ("7d") or Go duration format ("168h", "0").
 // Returns 0 for "0", "0d", or "0h" (cooldown disabled).
@@ -48,10 +50,14 @@ type githubReleaseInfo struct {
 	PublishedAt time.Time `json:"published_at"`
 }
 
-// getReleasePublishedAtFn fetches the published_at timestamp for a release tag.
-// It is a package-level variable so that tests can replace it without network calls.
-var getReleasePublishedAtFn = func(ctx context.Context, repo, tag string) (time.Time, error) {
-	return getReleasePublishedAt(ctx, repo, tag)
+type coolDownDeps struct {
+	getReleasePublishedAt func(ctx context.Context, repo, tag string) (time.Time, error)
+}
+
+func defaultCoolDownDeps() coolDownDeps {
+	return coolDownDeps{
+		getReleasePublishedAt: getReleasePublishedAt,
+	}
 }
 
 func getReleasePublishedAt(ctx context.Context, repo, tag string) (time.Time, error) {
@@ -106,12 +112,16 @@ func checkReleaseCoolDownWithDate(repo, tag string, publishedAt time.Time, coolD
 // The function is fail-open: if the publication date cannot be fetched (e.g.
 // due to network issues), the update is allowed and InCoolDown is false.
 func checkReleaseCoolDown(ctx context.Context, repo, tag string, coolDown time.Duration) coolDownCheckResult {
+	return checkReleaseCoolDownWithDeps(ctx, defaultCoolDownDeps(), repo, tag, coolDown)
+}
+
+func checkReleaseCoolDownWithDeps(ctx context.Context, deps coolDownDeps, repo, tag string, coolDown time.Duration) coolDownCheckResult {
 	if coolDown <= 0 {
 		return coolDownCheckResult{}
 	}
 
 	base := gitutil.ExtractBaseRepo(repo)
-	publishedAt, err := getReleasePublishedAtFn(ctx, base, tag)
+	publishedAt, err := deps.getReleasePublishedAt(ctx, base, tag)
 	if err != nil {
 		cooldownLog.Printf("Failed to get published date for %s@%s (allowing update): %v", repo, tag, err)
 		return coolDownCheckResult{}

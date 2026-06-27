@@ -1,4 +1,6 @@
 ---
+private: true
+emoji: "⚡"
 name: Daily Caveman Optimizer
 description: Applies caveman optimization to instruction files in .github/aw and .github/agents — making them more concise without losing technical accuracy. Round-robins through files daily and creates a PR when improvements are found.
 on:
@@ -6,14 +8,32 @@ on:
     - cron: daily
   workflow_dispatch:
 
+max-daily-ai-credits: 10000
 permissions:
   contents: read
   pull-requests: read
   issues: read
 
 tracker-id: daily-caveman-optimizer
-engine: claude
+engine:
+  id: claude
+  model: "${{ needs.activation.outputs.model_size }}"
 strict: true
+experiments:
+  model_size:
+    variants: [claude-sonnet-4.6, claude-haiku-4.5]
+    description: "Tests whether Claude Haiku produces equivalent instruction conciseness improvements at lower token cost versus Claude Sonnet."
+    hypothesis: "H0: no change in PR creation rate or run success rate. H1: Claude Haiku reduces AI credit usage >=30% with equivalent run success rate (>=0.90)."
+    metric: ai_credits_total
+    secondary_metrics: [run_success_rate, run_duration_ms]
+    guardrail_metrics:
+      - name: run_success_rate
+        threshold: ">=0.90"
+      - name: empty_output_rate
+        threshold: "<=0.10"
+    min_samples: 20
+    weight: [50, 50]
+    start_date: "2026-06-04"
 
 network:
   allowed:
@@ -32,6 +52,9 @@ safe-outputs:
       - .github/agents/**
   noop:
 
+sandbox:
+  agent:
+    sudo: false
 tools:
   cli-proxy: true
   cache-memory: true
@@ -45,11 +68,9 @@ tools:
 timeout-minutes: 30
 
 imports:
-  - shared/otel.md
-
-  - shared/observability-otlp.md
-firewall:
-  effective-token-steering: true
+  - shared/otlp.md
+features:
+  gh-aw-detection: true
 ---
 
 # Daily Caveman Optimizer 🪨

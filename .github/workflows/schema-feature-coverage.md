@@ -1,4 +1,6 @@
 ---
+private: true
+emoji: "📊"
 description: Ensures 100% schema feature coverage across existing agentic workflows by creating PRs for any uncovered fields
 on:
   schedule: weekly on monday around 07:00
@@ -14,7 +16,7 @@ network:
     - defaults
     - github
 imports:
-  - shared/observability-otlp.md
+  - shared/otlp.md
 tools:
   cli-proxy: true
   bash: ["*"]

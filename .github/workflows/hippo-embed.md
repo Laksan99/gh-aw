@@ -1,4 +1,6 @@
 ---
+private: true
+emoji: "🦛"
 name: Hippo Embed
 description: Maintenance workflow to audit low-quality entries and embed all Hippo memories to restore semantic recall quality
 on:
@@ -7,9 +9,11 @@ on:
 permissions:
   contents: read
 
+  copilot-requests: write
 tracker-id: hippo-embed
 engine:
-  id: copilot
+  id: pi
+  model: copilot/gpt-5.4
   bare: true
 
 timeout-minutes: 60
@@ -26,10 +30,14 @@ network:
     - node
 
 sandbox:
-  agent: awf
+  agent:
+    id: awf
+    sudo: false
 
 tools:
   cli-proxy: true
+  github:
+    mode: gh-proxy
   bash:
     - "*"
 
@@ -39,12 +47,10 @@ steps:
       npm install -g @xenova/transformers
 
 imports:
+  - shared/pmg.md
   - shared/hippo-memory.md
 
-  - shared/observability-otlp.md
-features:
-  copilot-requests: true
-
+  - shared/otlp.md
 ---
 
 {{#runtime-import? .github/shared-instructions.md}}

@@ -1,4 +1,6 @@
 ---
+private: true
+emoji: "🔍"
 description: "⚠️ DEPRECATED: Use PR Code Quality Reviewer (pr-code-quality-reviewer) instead. Performs critical code review with a focus on edge cases, potential bugs, and code quality issues"
 on:
   slash_command:
@@ -13,20 +15,23 @@ imports:
   - uses: shared/pr-review-base.md
     with:
       min-integrity: approved
-  - shared/observability-otlp.md
+  - shared/otlp.md
 tools:
   cli-proxy: true
 safe-outputs:
   create-pull-request-review-comment:
     max: 5
   messages:
-    footer: "> 😤 *Reluctantly reviewed by [{workflow_name}]({run_url})*{effective_tokens_suffix}{history_link}"
+    footer: "> 😤 *Reluctantly reviewed by [{workflow_name}]({run_url})*{ai_credits_suffix}{history_link}"
     run-started: "😤 *sigh* [{workflow_name}]({run_url}) is begrudgingly looking at this {event_type}... This better be worth my time."
     run-success: "😤 Fine. [{workflow_name}]({run_url}) finished the review. It wasn't completely terrible. I guess. 🙄"
     run-failure: "😤 Great. [{workflow_name}]({run_url}) {status}. As if my day couldn't get any worse..."
 timeout-minutes: 10
 
 
+sandbox:
+  agent:
+    sudo: false
 ---
 
 > ⚠️ **Deprecated**: This agent is superseded by the [PR Code Quality Reviewer](pr-code-quality-reviewer.md), which consolidates code quality and nitpick reviews into a single pass. Use `/review` instead of `/grumpy` for new PRs. This agent is kept for backward compatibility but will be removed in a future release.

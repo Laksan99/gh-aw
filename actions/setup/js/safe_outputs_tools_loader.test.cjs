@@ -108,6 +108,20 @@ describe("safe_outputs_tools_loader", () => {
       expect(result[1].handler).toBeUndefined();
     });
 
+    it("should attach create_issue handler", () => {
+      const tools = [{ name: "create_issue", description: "Create issue" }];
+      const handlers = {
+        createIssueHandler: vi.fn(),
+        createPullRequestHandler: vi.fn(),
+        pushToPullRequestBranchHandler: vi.fn(),
+        uploadAssetHandler: vi.fn(),
+      };
+
+      const result = attachHandlers(tools, handlers);
+
+      expect(result[0].handler).toBe(handlers.createIssueHandler);
+    });
+
     it("should attach push_to_pull_request_branch handler", () => {
       const tools = [{ name: "push_to_pull_request_branch", description: "Push to PR" }];
       const handlers = {
@@ -190,6 +204,26 @@ describe("safe_outputs_tools_loader", () => {
       expect(defaultHandler).toHaveBeenCalledWith("dispatch_workflow");
     });
 
+    it("should not attach dispatch_workflow handler for whitespace-only _workflow_name", () => {
+      const tools = [{ name: "test_workflow", description: "Test workflow", _workflow_name: "   " }];
+      const mockHandlerFunction = vi.fn();
+      const defaultHandler = vi.fn(() => mockHandlerFunction);
+      const handlers = {
+        createPullRequestHandler: vi.fn(),
+        pushToPullRequestBranchHandler: vi.fn(),
+        uploadAssetHandler: vi.fn(),
+        defaultHandler: defaultHandler,
+      };
+
+      const result = attachHandlers(tools, handlers);
+
+      expect(result[0].handler).toBeDefined();
+      result[0].handler({ test_param: "value" });
+      expect(mockHandlerFunction).toHaveBeenCalledWith({ test_param: "value" });
+      expect(defaultHandler).toHaveBeenCalledWith("test_workflow");
+      expect(defaultHandler).not.toHaveBeenCalledWith("dispatch_workflow");
+    });
+
     it("should wrap args in inputs property for dispatch_workflow handler", () => {
       const tools = [{ name: "ci_workflow", description: "CI workflow", _workflow_name: "ci" }];
       const mockHandlerFunction = vi.fn();
@@ -262,6 +296,214 @@ describe("safe_outputs_tools_loader", () => {
         workflow_name: "undefined-test",
       });
     });
+
+    it("should drop unknown keys for strict schema tools", () => {
+      const createIssueHandler = vi.fn();
+      const tools = [
+        {
+          name: "create_issue",
+          description: "Create issue",
+          inputSchema: {
+            type: "object",
+            properties: {
+              title: { type: "string" },
+              body: { type: "string" },
+            },
+            additionalProperties: false,
+          },
+        },
+      ];
+      const handlers = {
+        createIssueHandler,
+      };
+
+      const result = attachHandlers(tools, handlers);
+      result[0].handler({
+        title: "hello",
+        body: "world",
+        unknown_field: "extra",
+      });
+
+      expect(createIssueHandler).toHaveBeenCalledWith({
+        title: "hello",
+        body: "world",
+      });
+      expect(createIssueHandler).not.toHaveBeenCalledWith(
+        expect.objectContaining({
+          unknown_field: expect.anything(),
+        })
+      );
+    });
+
+    it("should log stripped key names for strict schema tools", () => {
+      const createIssueHandler = vi.fn();
+      const logger = { debug: vi.fn() };
+      const tools = [
+        {
+          name: "create_issue",
+          description: "Create issue",
+          inputSchema: {
+            type: "object",
+            properties: {
+              title: { type: "string" },
+            },
+            additionalProperties: false,
+          },
+        },
+      ];
+      const handlers = {
+        createIssueHandler,
+      };
+
+      const result = attachHandlers(tools, handlers, logger);
+      result[0].handler({
+        title: "hello",
+        unknown_field_a: "extra-a",
+        unknown_field_b: "extra-b",
+      });
+
+      expect(logger.debug).toHaveBeenCalledWith('Stripped unknown keys for strict schema tool \'create_issue\': ["unknown_field_a","unknown_field_b"]');
+    });
+
+    it("should drop unknown keys before wrapping dispatch_workflow inputs", () => {
+      const mockHandlerFunction = vi.fn();
+      const defaultHandler = vi.fn(() => mockHandlerFunction);
+      const tools = [
+        {
+          name: "dispatch_ci",
+          description: "Dispatch CI",
+          _workflow_name: "ci",
+          inputSchema: {
+            type: "object",
+            properties: {
+              issue_number: { type: "string" },
+            },
+            additionalProperties: false,
+          },
+        },
+      ];
+      const handlers = {
+        defaultHandler,
+      };
+
+      const result = attachHandlers(tools, handlers);
+      result[0].handler({
+        issue_number: "123",
+        unknown_input: "extra",
+      });
+
+      expect(mockHandlerFunction).toHaveBeenCalledWith({
+        workflow_name: "ci",
+        inputs: {
+          issue_number: "123",
+        },
+      });
+      expect(mockHandlerFunction).not.toHaveBeenCalledWith(
+        expect.objectContaining({
+          inputs: expect.objectContaining({
+            unknown_input: expect.anything(),
+          }),
+        })
+      );
+    });
+
+    it("should log stripped key names before wrapping dispatch_workflow inputs", () => {
+      const mockHandlerFunction = vi.fn();
+      const defaultHandler = vi.fn(() => mockHandlerFunction);
+      const logger = { debug: vi.fn() };
+      const tools = [
+        {
+          name: "dispatch_ci",
+          description: "Dispatch CI",
+          _workflow_name: "ci",
+          inputSchema: {
+            type: "object",
+            properties: {
+              issue_number: { type: "string" },
+            },
+            additionalProperties: false,
+          },
+        },
+      ];
+      const handlers = {
+        defaultHandler,
+      };
+
+      const result = attachHandlers(tools, handlers, logger);
+      result[0].handler({
+        issue_number: "123",
+        unknown_input: "extra",
+      });
+
+      expect(logger.debug).toHaveBeenCalledWith("Stripped unknown keys for strict schema tool 'dispatch_ci': [\"unknown_input\"]");
+    });
+
+    it("should sanitize strict-schema args for tools using defaultHandler fallback", () => {
+      const mockHandlerFunction = vi.fn();
+      const defaultHandler = vi.fn(() => mockHandlerFunction);
+      const tools = [
+        {
+          name: "some_tool",
+          description: "Some tool",
+          inputSchema: {
+            type: "object",
+            properties: {
+              allowed: { type: "string" },
+            },
+            additionalProperties: false,
+          },
+        },
+      ];
+      const handlers = {
+        defaultHandler,
+      };
+
+      const result = attachHandlers(tools, handlers);
+      result[0].handler({
+        allowed: "value",
+        unknown_input: "extra",
+      });
+
+      expect(defaultHandler).toHaveBeenCalledWith("some_tool");
+      expect(mockHandlerFunction).toHaveBeenCalledWith({
+        allowed: "value",
+      });
+      expect(mockHandlerFunction).not.toHaveBeenCalledWith(
+        expect.objectContaining({
+          unknown_input: expect.anything(),
+        })
+      );
+    });
+
+    it("should attach create_pull_request_review_comment handler", () => {
+      const tools = [{ name: "create_pull_request_review_comment", description: "Create review comment" }];
+      const handlers = {
+        createPullRequestHandler: vi.fn(),
+        pushToPullRequestBranchHandler: vi.fn(),
+        uploadAssetHandler: vi.fn(),
+        createPullRequestReviewCommentHandler: vi.fn(),
+        submitPullRequestReviewHandler: vi.fn(),
+      };
+
+      const result = attachHandlers(tools, handlers);
+
+      expect(result[0].handler).toBe(handlers.createPullRequestReviewCommentHandler);
+    });
+
+    it("should attach submit_pull_request_review handler", () => {
+      const tools = [{ name: "submit_pull_request_review", description: "Submit PR review" }];
+      const handlers = {
+        createPullRequestHandler: vi.fn(),
+        pushToPullRequestBranchHandler: vi.fn(),
+        uploadAssetHandler: vi.fn(),
+        createPullRequestReviewCommentHandler: vi.fn(),
+        submitPullRequestReviewHandler: vi.fn(),
+      };
+
+      const result = attachHandlers(tools, handlers);
+
+      expect(result[0].handler).toBe(handlers.submitPullRequestReviewHandler);
+    });
   });
 
   describe("registerPredefinedTools", () => {
@@ -278,7 +520,13 @@ describe("safe_outputs_tools_loader", () => {
 
       registerPredefinedTools(mockServer, tools, config, registerTool, normalizeTool);
 
-      expect(registerTool).toHaveBeenCalledWith(mockServer, tools[0]);
+      expect(registerTool).toHaveBeenCalledWith(
+        mockServer,
+        expect.objectContaining({
+          name: "create_pull_request",
+          description: expect.stringContaining("real pull request intent"),
+        })
+      );
       expect(registerTool).not.toHaveBeenCalledWith(mockServer, tools[1]);
     });
 
@@ -292,7 +540,13 @@ describe("safe_outputs_tools_loader", () => {
 
       registerPredefinedTools(mockServer, tools, config, registerTool, normalizeTool);
 
-      expect(registerTool).toHaveBeenCalledWith(mockServer, tools[0]);
+      expect(registerTool).toHaveBeenCalledWith(
+        mockServer,
+        expect.objectContaining({
+          name: "create_pull_request",
+          description: expect.stringContaining("real pull request intent"),
+        })
+      );
     });
 
     it("should not register disabled tools", () => {
@@ -333,6 +587,22 @@ describe("safe_outputs_tools_loader", () => {
       expect(registerTool).not.toHaveBeenCalledWith(mockServer, tools[2]);
     });
 
+    it("should not register dispatch_workflow tools with whitespace-only _workflow_name", () => {
+      const tools = [{ name: "test_workflow", description: "Test workflow", _workflow_name: "   " }];
+      const config = {
+        dispatch_workflow: {
+          workflows: ["test-workflow"],
+          max: 1,
+        },
+      };
+      const registerTool = vi.fn();
+      const normalizeTool = name => name.replace(/-/g, "_");
+
+      registerPredefinedTools(mockServer, tools, config, registerTool, normalizeTool);
+
+      expect(registerTool).not.toHaveBeenCalled();
+    });
+
     it("should not register dispatch_workflow tools when dispatch_workflow is not in config", () => {
       const tools = [{ name: "test_workflow", description: "Test workflow", _workflow_name: "test-workflow" }];
       const config = {
@@ -366,8 +636,80 @@ describe("safe_outputs_tools_loader", () => {
 
       // Should register both the regular tool and dispatch_workflow tool
       expect(registerTool).toHaveBeenCalledTimes(2);
-      expect(registerTool).toHaveBeenCalledWith(mockServer, tools[0]);
+      expect(registerTool).toHaveBeenCalledWith(
+        mockServer,
+        expect.objectContaining({
+          name: "create_pull_request",
+          description: expect.stringContaining("real pull request intent"),
+        })
+      );
       expect(registerTool).toHaveBeenCalledWith(mockServer, tools[1]);
+    });
+
+    it("should enrich create_pull_request description with target repo and safety guidance", () => {
+      const tools = [
+        {
+          name: "create_pull_request",
+          description: "Create PR",
+          inputSchema: { properties: { repo: { description: "Target repo" } } },
+        },
+      ];
+      const config = {
+        create_pull_request: {
+          "target-repo": "octo/docs",
+        },
+      };
+      const registerTool = vi.fn();
+      const normalizeTool = name => name.replace(/-/g, "_");
+
+      registerPredefinedTools(mockServer, tools, config, registerTool, normalizeTool);
+
+      const registeredTool = registerTool.mock.calls[0][1];
+      expect(registeredTool.description).toContain("configured to create pull requests in 'octo/docs'");
+      expect(registeredTool.description).toContain("Do not use it for tests, auth checks, or probing");
+      expect(registeredTool.inputSchema.properties.repo.description).toContain("Configured default: 'octo/docs'");
+    });
+
+    it("should enrich other write-intent tool descriptions with safety guidance", () => {
+      const tools = [
+        { name: "create_issue", description: "Create issue" },
+        { name: "add_comment", description: "Add comment" },
+        { name: "push_to_pull_request_branch", description: "Push to PR" },
+      ];
+      const config = {
+        create_issue: {},
+        add_comment: {},
+        push_to_pull_request_branch: {},
+      };
+      const registerTool = vi.fn();
+      const normalizeTool = name => name.replace(/-/g, "_");
+
+      registerPredefinedTools(mockServer, tools, config, registerTool, normalizeTool);
+
+      expect(registerTool).toHaveBeenNthCalledWith(
+        1,
+        mockServer,
+        expect.objectContaining({
+          name: "create_issue",
+          description: expect.stringContaining("real issue intent"),
+        })
+      );
+      expect(registerTool).toHaveBeenNthCalledWith(
+        2,
+        mockServer,
+        expect.objectContaining({
+          name: "add_comment",
+          description: expect.stringContaining("real comment intent"),
+        })
+      );
+      expect(registerTool).toHaveBeenNthCalledWith(
+        3,
+        mockServer,
+        expect.objectContaining({
+          name: "push_to_pull_request_branch",
+          description: expect.stringContaining("real PR branch update intent"),
+        })
+      );
     });
   });
 

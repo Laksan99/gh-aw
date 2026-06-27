@@ -1,4 +1,6 @@
 ---
+private: true
+emoji: "🧪"
 name: Smoke CI
 description: Smoke CI workflow that exercises pull request safe outputs through an agent session
 on:
@@ -31,7 +33,7 @@ engine:
     /tmp/gh-aw/comment-memory/default.md; fi; else safeoutputs noop --message "smoke-ci:
     push event - no PR context, no action needed"; fi'
 imports:
-  - shared/observability-otlp.md
+  - shared/otlp.md
 tools:
   cache-memory: true
   comment-memory: true
@@ -68,7 +70,8 @@ safe-outputs:
   threat-detection: false
 timeout-minutes: 5
 strict: true
-
+features:
+  gh-aw-detection: false
 ---
 
 For all events, call the tools in this exact order:
@@ -87,6 +90,19 @@ For pull_request events, then call these safe output tools in this exact order:
 For scheduled runs (non-pull_request), use GitHub MCP to find the newest open pull request in `${{ github.repository }}`:
 - If one exists, call `update_pull_request` for that PR number with `operation: "append"` and a short body line including the run URL.
 - If none exists, call `noop` with a short message indicating no PR was available.
+
+## Formatting Requirements
+
+- **Header Levels**: Use h3 (`###`) or lower for all headers in your report to maintain proper document hierarchy. Never use h1 (`#`) or h2 (`##`) headers.
+- **Progressive Disclosure**: Wrap long sections or verbose details in `<details><summary>Section Name</summary>` tags to improve readability and reduce scrolling.
+- Keep critical information visible (summary, key outcomes, and recommendations) and use collapsible sections for secondary details.
+
+### Recommended Report Structure
+
+1. **Overview**: 1-2 paragraphs summarizing key findings (always visible)
+2. **Critical Information**: Key metrics, status, critical issues (always visible)
+3. **Details**: Use `<details><summary>Section Name</summary>` for expanded content
+4. **Recommendations**: Actionable next steps (always visible)
 
 Do not run any shell commands.
 Do not call any tools other than `cache-memory`, `repo-memory`, `github`, `create_issue`, `update_issue`, `add_comment`, `add_labels`, `remove_labels`, `update_pull_request`, or `noop`.

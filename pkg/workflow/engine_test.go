@@ -6,8 +6,32 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/github/gh-aw/pkg/constants"
 	"github.com/github/gh-aw/pkg/types"
 )
+
+func TestGetAgenticEngine_UnknownEngineHasGuidance(t *testing.T) {
+	compiler := NewCompiler()
+
+	_, err := compiler.getAgenticEngine("copiilot")
+	if err == nil {
+		t.Fatal("expected unknown engine to return an error")
+	}
+
+	errMsg := err.Error()
+	if !strings.Contains(errMsg, "invalid engine: copiilot") {
+		t.Errorf("error should identify the invalid engine, got: %s", errMsg)
+	}
+	if !strings.Contains(errMsg, "Did you mean: copilot?") {
+		t.Errorf("error should include suggestion, got: %s", errMsg)
+	}
+	if !strings.Contains(errMsg, "Valid engines are:") {
+		t.Errorf("error should list valid engines, got: %s", errMsg)
+	}
+	if !strings.Contains(errMsg, string(constants.DocsEnginesURL)) {
+		t.Errorf("error should include docs URL, got: %s", errMsg)
+	}
+}
 
 // TestEngineVersionTypeHandling tests that engine.version correctly handles
 // numeric types (int, float) and string types as specified in the schema.
@@ -518,11 +542,43 @@ func TestTokenWeightsSingleQuoteEscapingInYAML(t *testing.T) {
 
 	// The generated YAML must not contain an un-escaped single quote inside a single-quoted value.
 	// In YAML, a single quote inside a single-quoted scalar is represented as ”.
+	if !strings.Contains(output, "GH_AW_INFO_TOKEN_WEIGHTS") {
+		t.Errorf("Expected GH_AW_INFO_TOKEN_WEIGHTS in YAML output when multipliers are configured, got:\n%s", output)
+	}
 	if !strings.Contains(output, "bob''s-model") {
 		t.Errorf("Expected single quote to be escaped as '' in YAML output, got:\n%s", output)
 	}
 	// There must be no dangling unescaped single quote inside the GH_AW_INFO_TOKEN_WEIGHTS value
 	if strings.Contains(output, "bob's-model") {
 		t.Errorf("Unescaped single quote found in YAML output:\n%s", output)
+	}
+}
+
+func TestTokenWeightsEnvOmittedWhenOnlyTokenClassWeightsConfigured(t *testing.T) {
+	compiler := NewCompiler()
+	registry := GetGlobalEngineRegistry()
+	engine, err := registry.GetEngine("claude")
+	if err != nil {
+		t.Fatalf("Failed to get claude engine: %v", err)
+	}
+
+	workflowData := &WorkflowData{
+		Name: "Test Workflow",
+		EngineConfig: &EngineConfig{
+			ID: "claude",
+			TokenWeights: &types.TokenWeights{
+				TokenClassWeights: &types.TokenClassWeights{
+					Output: 6.0,
+				},
+			},
+		},
+	}
+
+	var out strings.Builder
+	compiler.generateCreateAwInfo(&out, workflowData, engine)
+	output := out.String()
+
+	if strings.Contains(output, "GH_AW_INFO_TOKEN_WEIGHTS") {
+		t.Errorf("Did not expect GH_AW_INFO_TOKEN_WEIGHTS in YAML output when only token-class-weights are configured, got:\n%s", output)
 	}
 }

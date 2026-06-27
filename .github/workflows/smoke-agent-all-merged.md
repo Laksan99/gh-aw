@@ -1,6 +1,12 @@
 ---
+private: true
+emoji: "🧪"
 description: "Guard policy smoke test: repos=all, min-integrity=merged (most restrictive)"
 on:
+  slash_command:
+    name: smoke-agent-all-merged
+    strategy: centralized
+    events: [issues, issue_comment, pull_request, pull_request_comment]
   workflow_dispatch:
   pull_request:
     types: [labeled]
@@ -28,13 +34,15 @@ safe-outputs:
     hide-older-comments: true
     max: 2
   messages:
-    footer: "> 🤖 *Guard policy smoke test by [{workflow_name}]({run_url})*{effective_tokens_suffix}{history_link}"
+    footer: "> 🤖 *Guard policy smoke test by [{workflow_name}]({run_url})*{ai_credits_suffix}{history_link}"
     run-started: "🔍 [{workflow_name}]({run_url}) testing guard policy: `repos=all, min-integrity=merged`..."
     run-success: "✅ [{workflow_name}]({run_url}) completed guard policy test."
     run-failure: "❌ [{workflow_name}]({run_url}) {status}. Check the logs for details."
 timeout-minutes: 10
 imports:
-  - shared/observability-otlp.md
+  - shared/otlp.md
+features:
+  gh-aw-detection: false
 ---
 
 # Guard Policy Smoke Test: all/merged (most restrictive)

@@ -6,9 +6,11 @@ import (
 	"strings"
 
 	"github.com/github/gh-aw/pkg/logger"
+	"github.com/github/gh-aw/pkg/setutil"
 )
 
 var templateLog = logger.New("workflow:template")
+var inlineSubAgentPattern = regexp.MustCompile("(?m)^##[ \t]+agent:[ \t]+`[a-z][a-z0-9_-]*`[ \t]*$")
 
 // wrapExpressionsInTemplateConditionals transforms template conditionals by wrapping
 // expressions in ${{ }}. For example:
@@ -99,7 +101,8 @@ func (c *Compiler) generateInterpolationAndTemplateStep(yaml *strings.Builder, e
 	// Check if we need template rendering
 	hasTemplatePattern := strings.Contains(data.MarkdownContent, "{{#if ")
 	hasGitHubContext := hasGitHubTool(data.ParsedTools)
-	hasTemplates := hasTemplatePattern || hasGitHubContext
+	hasInlineSubAgents := inlineSubAgentPattern.MatchString(data.MarkdownContent)
+	hasTemplates := hasTemplatePattern || hasGitHubContext || hasInlineSubAgents
 
 	// Skip if neither interpolation nor template rendering is needed
 	if !hasExpressions && !hasTemplates {
@@ -107,8 +110,8 @@ func (c *Compiler) generateInterpolationAndTemplateStep(yaml *strings.Builder, e
 		return
 	}
 
-	templateLog.Printf("Generating interpolation and template step: expressions=%d, hasPattern=%v, hasGitHubContext=%v",
-		len(expressionMappings), hasTemplatePattern, hasGitHubContext)
+	templateLog.Printf("Generating interpolation and template step: expressions=%d, hasPattern=%v, hasGitHubContext=%v, hasInlineSubAgents=%v",
+		len(expressionMappings), hasTemplatePattern, hasGitHubContext, hasInlineSubAgents)
 
 	yaml.WriteString("      - name: Interpolate variables and render templates\n")
 	fmt.Fprintf(yaml, "        uses: %s\n", getCachedActionPin("actions/github-script", data))
@@ -119,12 +122,13 @@ func (c *Compiler) generateInterpolationAndTemplateStep(yaml *strings.Builder, e
 	}
 
 	// Add environment variables for extracted expressions (deduplicated by EnvVar)
-	seen := make(map[string]bool)
+	seen := make(map[string]struct{})
 	for _, mapping := range expressionMappings {
-		if seen[mapping.EnvVar] {
+		if setutil.Contains(seen, mapping.EnvVar) {
 			continue
 		}
-		seen[mapping.EnvVar] = true
+		seen[mapping.EnvVar] = struct{}{}
+
 		// Write the environment variable with the original GitHub expression
 		fmt.Fprintf(yaml, "          %s: ${{ %s }}\n", mapping.EnvVar, mapping.Content)
 	}

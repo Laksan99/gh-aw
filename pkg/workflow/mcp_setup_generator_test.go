@@ -524,6 +524,7 @@ tools:
 	socketPathUnixSnippet := `unix://* ) DOCKER_SOCK_PATH="${DOCKER_HOST#unix://}"`
 	socketGIDComputeSnippet := `DOCKER_SOCK_GID=$(stat -c '%g' "$DOCKER_SOCK_PATH" 2>/dev/null || echo '0')`
 	dockerHostEnvSnippet := `-e DOCKER_HOST=unix:///var/run/docker.sock`
+	containerNameSnippet := `--name awmg-mcpg`
 	require.Contains(t, yamlStr, defaultGatewayPortSnippet,
 		"Default MCP gateway port should be exported as 8080")
 	require.Contains(t, yamlStr, uidComputeSnippet,
@@ -546,6 +547,8 @@ tools:
 		"Docker command should mount the resolved Docker socket path")
 	require.Contains(t, yamlStr, dockerHostEnvSnippet,
 		"Docker command should set DOCKER_HOST to the fixed mount destination inside the gateway")
+	require.Contains(t, yamlStr, containerNameSnippet,
+		"Docker command should assign a well-known name to the gateway container for cleanup")
 	require.Less(t, strings.Index(yamlStr, uidComputeSnippet), strings.Index(yamlStr, userSnippet),
 		"MCP_GATEWAY_UID should be computed before it is used in the docker command")
 	require.Less(t, strings.Index(yamlStr, runnerGIDComputeSnippet), strings.Index(yamlStr, userSnippet),
@@ -556,6 +559,52 @@ tools:
 		"DOCKER_SOCK_GID should be computed before it is used in the docker command")
 	require.Less(t, strings.Index(yamlStr, groupAddSnippet), strings.Index(yamlStr, mountSnippet),
 		"Docker command should add supplementary group before mounting the Docker socket")
+}
+
+func TestMCPGatewayDockerCommandUsesBridgeInNetworkIsolationMode(t *testing.T) {
+	frontmatter := `---
+on: workflow_dispatch
+engine: copilot
+sandbox:
+  agent:
+    sudo: false
+tools:
+  github:
+    mode: remote
+    toolsets: [repos]
+---
+
+# Test Docker Socket Group
+`
+
+	compiler := NewCompiler()
+
+	tmpDir := t.TempDir()
+	inputFile := filepath.Join(tmpDir, "test.md")
+
+	err := os.WriteFile(inputFile, []byte(frontmatter), 0644)
+	require.NoError(t, err, "Failed to write test input file")
+
+	err = compiler.CompileWorkflow(inputFile)
+	require.NoError(t, err, "Compilation should succeed")
+
+	outputFile := stringutil.MarkdownToLockFile(inputFile)
+	content, err := os.ReadFile(outputFile)
+	require.NoError(t, err, "Failed to read output file")
+	yamlStr := string(content)
+
+	require.Contains(t, yamlStr, `docker run -i --rm --network bridge`,
+		"Docker command should use bridge networking in network isolation mode")
+	require.Contains(t, yamlStr, `-p 127.0.0.1:`,
+		"Docker command should publish gateway port to host in network isolation mode")
+	require.NotContains(t, yamlStr, `--network host`,
+		"Docker command should not use host networking in network isolation mode")
+	require.NotContains(t, yamlStr, `--add-host host.docker.internal:127.0.0.1`,
+		"Docker command should not inject host.docker.internal mapping in network isolation mode")
+	require.Contains(t, yamlStr, `export MCP_GATEWAY_DOMAIN="awmg-mcpg"`,
+		"MCP gateway domain should use the internal container name in network isolation mode")
+	require.Contains(t, yamlStr, `export MCP_GATEWAY_HOST_DOMAIN="localhost"`,
+		"MCP gateway host domain should be localhost in network isolation mode so host-side clients can connect")
 }
 
 // TestMultipleHTTPMCPSecretsPassedToGatewayContainer verifies that multiple HTTP MCP servers
@@ -620,14 +669,10 @@ Test that multiple secrets are passed to gateway container.
 		"DD_APP_KEY should be passed to container")
 }
 
-// TestSafeOutputsHTTPServerPassesOutputEnvVar verifies that the "Start Safe Outputs MCP HTTP Server"
-// step explicitly sets GH_AW_SAFE_OUTPUTS so the background Node.js process writes outputs.jsonl
-// to the exact same path that downstream ingestion steps read from.
-//
-// Regression test for: safe outputs MCP server returns success but outputs.jsonl is empty (v0.65.5).
-// Root cause: without this env var the server fell back to process.env.RUNNER_TEMP which could
-// differ from the value captured by set-runtime-paths when RUNNER_TEMP is not exported explicitly.
-func TestSafeOutputsHTTPServerPassesOutputEnvVar(t *testing.T) {
+// TestSafeOutputsMCPContainerUsesRuntimePaths verifies that safe-outputs is configured as a
+// containerized MCP server and still receives the same runtime paths used by downstream
+// collection steps.
+func TestSafeOutputsMCPContainerUsesRuntimePaths(t *testing.T) {
 	frontmatter := `---
 on: issues
 engine: claude
@@ -656,27 +701,28 @@ Test that GH_AW_SAFE_OUTPUTS is passed to the HTTP server startup step.
 	content, err := os.ReadFile(outputFile)
 	require.NoError(t, err, "Failed to read output file")
 	yamlStr := string(content)
+	pinnedGhAwNodeImage := resolveMCPGatewayContainerImage(constants.DefaultGhAwNodeImage, nil)
 
-	// Verify the "Start Safe Outputs MCP HTTP Server" step exists
-	assert.Contains(t, yamlStr, "Start Safe Outputs MCP HTTP Server",
-		"Should have safe outputs server startup step")
-
-	// The critical fix: GH_AW_SAFE_OUTPUTS must be in the startup step's env block
-	// so the Node.js server process writes outputs.jsonl to the exact path that the
-	// ingestion step reads from.
-	assert.Contains(t, yamlStr,
-		"GH_AW_SAFE_OUTPUTS: ${{ steps.set-runtime-paths.outputs.GH_AW_SAFE_OUTPUTS }}",
-		"Start Safe Outputs step must include GH_AW_SAFE_OUTPUTS in env block so the server writes to the correct path")
-
-	// Verify the export is also present so the background process inherits the env var
-	assert.Contains(t, yamlStr, "export GH_AW_SAFE_OUTPUTS",
-		"GH_AW_SAFE_OUTPUTS must be exported so the background Node.js server process inherits it")
-
-	// Sanity check: other required env vars are still present
-	assert.Contains(t, yamlStr, "GH_AW_SAFE_OUTPUTS_PORT:",
-		"GH_AW_SAFE_OUTPUTS_PORT should be in startup step env block")
-	assert.Contains(t, yamlStr, "GH_AW_SAFE_OUTPUTS_CONFIG_PATH:",
-		"GH_AW_SAFE_OUTPUTS_CONFIG_PATH should be in startup step env block")
+	assert.Contains(t, yamlStr, `"safeoutputs": {`,
+		"Should configure safeoutputs as an MCP server")
+	assert.Contains(t, yamlStr, `"container": "`+pinnedGhAwNodeImage+`"`,
+		"Safe outputs should run in the gh-aw node container")
+	assert.Contains(t, yamlStr, `"GH_AW_SAFE_OUTPUTS": "\${GH_AW_SAFE_OUTPUTS}"`,
+		"Safe outputs MCP server should receive the runtime output path")
+	assert.Contains(t, yamlStr, `"GH_AW_SAFE_OUTPUTS_CONFIG_PATH": "\${GH_AW_SAFE_OUTPUTS_CONFIG_PATH}"`,
+		"Safe outputs MCP server should receive the runtime config path")
+	assert.Contains(t, yamlStr, `"GH_AW_SAFE_OUTPUTS_TOOLS_PATH": "\${GH_AW_SAFE_OUTPUTS_TOOLS_PATH}"`,
+		"Safe outputs MCP server should receive the runtime tools path")
+	assert.Contains(t, yamlStr, `"GH_AW_POLICY_ALLOW_CREATE_PULL_REQUEST": "\${GH_AW_POLICY_ALLOW_CREATE_PULL_REQUEST}"`,
+		"Safe outputs MCP server should receive the runtime create-pull-request policy")
+	assert.Contains(t, yamlStr, `"RUNNER_TEMP": "\${RUNNER_TEMP}"`,
+		"Safe outputs MCP server should receive RUNNER_TEMP for staging helpers")
+	assert.NotContains(t, yamlStr, "Start Safe Outputs MCP HTTP Server",
+		"Should not launch safe outputs via a dedicated startup step")
+	assert.NotContains(t, yamlStr, "safe-outputs-config.outputs.safe_outputs_port",
+		"Should not depend on safe outputs port outputs")
+	assert.NotContains(t, yamlStr, "safe-outputs-config.outputs.safe_outputs_api_key",
+		"Should not depend on safe outputs API key outputs")
 }
 
 // TestOIDCEnvVarsPassedToGatewayContainer verifies that ACTIONS_ID_TOKEN_REQUEST_URL and
@@ -783,4 +829,95 @@ Test that OIDC env vars are NOT added when no server uses github-oidc auth.
 		"ACTIONS_ID_TOKEN_REQUEST_URL should NOT be in docker command without github-oidc auth")
 	assert.NotContains(t, yamlStr, "-e ACTIONS_ID_TOKEN_REQUEST_TOKEN",
 		"ACTIONS_ID_TOKEN_REQUEST_TOKEN should NOT be in docker command without github-oidc auth")
+}
+
+// TestOTLPHeadersEnvVarPassedToGatewayContainer verifies that OTEL_EXPORTER_OTLP_HEADERS is
+// passed to the MCP gateway container when observability.otlp is configured. This ensures
+// that OTLP auth credentials are securely delivered via the container env rather than being
+// embedded in the stdin JSON config pipe.
+func TestOTLPHeadersEnvVarPassedToGatewayContainer(t *testing.T) {
+	frontmatter := `---
+on: workflow_dispatch
+engine: copilot
+tools:
+  github:
+    mode: remote
+    toolsets: [repos]
+observability:
+  otlp:
+    endpoint: "https://otel.example.com:4318"
+    headers: "${{ secrets.OTEL_HEADERS }}"
+---
+
+# Test OTLP Headers Env Var
+
+Test that OTEL_EXPORTER_OTLP_HEADERS is forwarded to the MCP gateway container.
+`
+
+	compiler := NewCompiler()
+
+	tmpDir := t.TempDir()
+	inputFile := filepath.Join(tmpDir, "test.md")
+
+	err := os.WriteFile(inputFile, []byte(frontmatter), 0644)
+	require.NoError(t, err, "Failed to write test input file")
+
+	err = compiler.CompileWorkflow(inputFile)
+	require.NoError(t, err, "Compilation should succeed")
+
+	outputFile := stringutil.MarkdownToLockFile(inputFile)
+	content, err := os.ReadFile(outputFile)
+	require.NoError(t, err, "Failed to read output file")
+	yamlStr := string(content)
+
+	// Verify OTEL_EXPORTER_OTLP_HEADERS is passed to the docker container via -e flag
+	assert.Contains(t, yamlStr, "-e OTEL_EXPORTER_OTLP_HEADERS",
+		"OTEL_EXPORTER_OTLP_HEADERS should be passed to gateway container via -e flag")
+
+	// Verify the docker command includes the -e flag before the container image
+	dockerCmdPattern := `docker run.*-e OTEL_EXPORTER_OTLP_HEADERS.*ghcr\.io/github/gh-aw-mcpg`
+	assert.Regexp(t, dockerCmdPattern, yamlStr,
+		"Docker command should include -e OTEL_EXPORTER_OTLP_HEADERS before the container image")
+
+	// Verify the headers value is NOT embedded in the JSON config pipe (security requirement)
+	assert.NotContains(t, yamlStr, `"headers": "${OTEL_EXPORTER_OTLP_HEADERS}"`,
+		"headers must not be embedded in the gateway JSON config")
+}
+
+// TestOTLPHeadersEnvVarNotPassedWithoutOTLP verifies that OTEL_EXPORTER_OTLP_HEADERS is NOT
+// added to the docker command when observability.otlp is not configured.
+func TestOTLPHeadersEnvVarNotPassedWithoutOTLP(t *testing.T) {
+	frontmatter := `---
+on: workflow_dispatch
+engine: copilot
+tools:
+  github:
+    mode: remote
+    toolsets: [repos]
+---
+
+# Test No OTLP
+
+Test that OTEL_EXPORTER_OTLP_HEADERS is NOT added when no OTLP is configured.
+`
+
+	compiler := NewCompiler()
+
+	tmpDir := t.TempDir()
+	inputFile := filepath.Join(tmpDir, "test.md")
+
+	err := os.WriteFile(inputFile, []byte(frontmatter), 0644)
+	require.NoError(t, err, "Failed to write test input file")
+
+	err = compiler.CompileWorkflow(inputFile)
+	require.NoError(t, err, "Compilation should succeed")
+
+	outputFile := stringutil.MarkdownToLockFile(inputFile)
+	content, err := os.ReadFile(outputFile)
+	require.NoError(t, err, "Failed to read output file")
+	yamlStr := string(content)
+
+	// Verify OTEL_EXPORTER_OTLP_HEADERS is NOT in the docker command
+	assert.NotContains(t, yamlStr, "-e OTEL_EXPORTER_OTLP_HEADERS",
+		"OTEL_EXPORTER_OTLP_HEADERS should NOT be in docker command without OTLP config")
 }

@@ -9,6 +9,30 @@ import (
 
 var safeOutputsDomainsValidationLog = newValidationLogger("safe_outputs_domains")
 
+const (
+	SafeOutputsURLsPolicyAllowedOnly         = "allowed-only"
+	SafeOutputsURLsPolicyAllowedOrCodeRegion = "allowed-or-code-region"
+)
+
+// validateSafeOutputsURLs validates the urls policy in safe-outputs.
+func validateSafeOutputsURLs(config *SafeOutputsConfig) error {
+	if config == nil || config.URLs == "" {
+		return nil
+	}
+
+	switch config.URLs {
+	case SafeOutputsURLsPolicyAllowedOnly, SafeOutputsURLsPolicyAllowedOrCodeRegion:
+		return nil
+	default:
+		return fmt.Errorf(
+			"safe-outputs.urls: invalid value %q (expected one of: %q, %q)",
+			config.URLs,
+			SafeOutputsURLsPolicyAllowedOnly,
+			SafeOutputsURLsPolicyAllowedOrCodeRegion,
+		)
+	}
+}
+
 // validateSafeOutputsAllowedDomains validates the allowed-domains configuration in safe-outputs.
 // Supports ecosystem identifiers (e.g., "python", "node", "default-safe-outputs") like network.allowed.
 func (c *Compiler) validateSafeOutputsAllowedDomains(config *SafeOutputsConfig) error {
@@ -93,6 +117,9 @@ func validateSafeOutputsTarget(config *SafeOutputsConfig) error {
 	if config.RemoveLabels != nil {
 		configs = append(configs, targetConfig{"remove-labels", config.RemoveLabels.Target})
 	}
+	if config.ReplaceLabel != nil {
+		configs = append(configs, targetConfig{"replace-label", config.ReplaceLabel.Target})
+	}
 	if config.AddReviewer != nil {
 		configs = append(configs, targetConfig{"add-reviewer", config.AddReviewer.Target})
 	}
@@ -128,6 +155,9 @@ func validateSafeOutputsTarget(config *SafeOutputsConfig) error {
 	}
 	if config.PushToPullRequestBranch != nil {
 		configs = append(configs, targetConfig{"push-to-pull-request-branch", config.PushToPullRequestBranch.Target})
+	}
+	if config.MergePullRequest != nil {
+		configs = append(configs, targetConfig{"merge-pull-request", config.MergePullRequest.Target})
 	}
 	// Validate each target field
 	for _, cfg := range configs {
@@ -215,9 +245,6 @@ func validateSafeOutputsMergePullRequest(config *SafeOutputsConfig) error {
 	}
 
 	if err := validateNonEmptyStringList("required-labels", c.RequiredLabels); err != nil {
-		return err
-	}
-	if err := validateNonEmptyStringList("allowed-labels", c.AllowedLabels); err != nil {
 		return err
 	}
 	if err := validateRefGlobList("allowed-branches", c.AllowedBranches); err != nil {

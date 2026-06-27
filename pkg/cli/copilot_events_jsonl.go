@@ -66,10 +66,12 @@ type copilotEventsJSONLEntryData struct {
 	Success bool   `json:"success"`
 	Model   string `json:"model,omitempty"`
 
+	// user.message / assistant.message / reasoning fields
+	Content string `json:"content,omitempty"`
+
 	// session.shutdown fields
-	ShutdownType         string                          `json:"shutdownType,omitempty"`
-	TotalPremiumRequests int                             `json:"totalPremiumRequests,omitempty"`
-	ModelMetrics         map[string]*copilotModelMetrics `json:"modelMetrics,omitempty"`
+	ShutdownType string                          `json:"shutdownType,omitempty"`
+	ModelMetrics map[string]*copilotModelMetrics `json:"modelMetrics,omitempty"`
 }
 
 // copilotModelMetrics holds per-model usage statistics from the session.shutdown event.
@@ -157,18 +159,18 @@ func findFileInDir(dir, name string) string {
 	return found
 }
 
-// parseEventsJSONLFile parses a Copilot events.jsonl file and extracts log metrics.
+// parseEventsJSONLMetrics parses a Copilot events.jsonl file and extracts log metrics.
 //
 // events.jsonl provides precise, structured data about a Copilot CLI session:
 //   - "session.start":          session metadata (sessionId, copilotVersion)
 //   - "user.message":           one per conversation turn (used to count turns)
 //   - "tool.execution_start":   a tool invocation (data.toolName)
 //   - "tool.execution_complete": completion of a tool call
-//   - "session.shutdown":       session summary (totalPremiumRequests, modelMetrics)
+//   - "session.shutdown":       session summary (modelMetrics)
 //
 // Returns the extracted metrics and nil on success, or empty metrics and an
 // error if the file cannot be read or contains no recognizable events.
-func parseEventsJSONLFile(path string, verbose bool) (workflow.LogMetrics, error) {
+func parseEventsJSONLMetrics(path string, verbose bool) (workflow.LogMetrics, error) {
 	copilotEventsJSONLLog.Printf("Parsing events.jsonl from: %s", path)
 
 	var metrics workflow.LogMetrics
@@ -250,8 +252,6 @@ func parseEventsJSONLFile(path string, verbose bool) (workflow.LogMetrics, error
 
 		case "session.shutdown":
 			// Aggregate token usage across all models from modelMetrics.
-			// modelMetrics provides the most accurate token counts; fall back to
-			// totalPremiumRequests only when modelMetrics is absent.
 			for model, m := range entry.Data.ModelMetrics {
 				if m.Usage != nil {
 					modelTokens := m.Usage.InputTokens + m.Usage.OutputTokens
@@ -260,14 +260,8 @@ func parseEventsJSONLFile(path string, verbose bool) (workflow.LogMetrics, error
 						model, m.Usage.InputTokens, m.Usage.OutputTokens)
 				}
 			}
-			if totalTokens == 0 && entry.Data.TotalPremiumRequests > 0 {
-				// Fallback: use premium requests as a proxy when token counts are unavailable
-				totalTokens = entry.Data.TotalPremiumRequests
-				copilotEventsJSONLLog.Printf("session.shutdown: using totalPremiumRequests=%d as token proxy",
-					entry.Data.TotalPremiumRequests)
-			}
-			copilotEventsJSONLLog.Printf("session.shutdown: type=%s totalPremiumRequests=%d totalTokens=%d",
-				entry.Data.ShutdownType, entry.Data.TotalPremiumRequests, totalTokens)
+			copilotEventsJSONLLog.Printf("session.shutdown: type=%s totalTokens=%d",
+				entry.Data.ShutdownType, totalTokens)
 		}
 	}
 

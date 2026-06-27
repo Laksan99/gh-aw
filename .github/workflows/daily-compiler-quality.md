@@ -1,61 +1,105 @@
 ---
-name: Daily Compiler Quality Check
-description: Analyzes compiler code daily to assess if it meets human-written quality standards, creates discussion reports, and uses cache memory to avoid re-analyzing unchanged files
 on:
   schedule: daily
-  workflow_dispatch:
+  workflow_dispatch: null
+max-ai-credits: 1000
+max-daily-ai-credits: 10000
 permissions:
   contents: read
   discussions: read
   issues: read
   pull-requests: read
-tracker-id: daily-compiler-quality
-engine: copilot
+  copilot-requests: write
 imports:
-  - uses: shared/daily-audit-base.md
-    with:
-      title-prefix: "[daily-compiler-quality] "
-      expires: 1d
-  - shared/go-source-analysis.md
-  - shared/observability-otlp.md
+- uses: shared/daily-audit-base.md
+  with:
+    expires: 1d
+    title-prefix: "[daily-compiler-quality] "
+- shared/go-source-analysis.md
+- shared/otlp.md
+safe-outputs:
+  create-discussion:
+    category: audits
+    close-older-discussions: true
+    expires: 1d
+    fallback-to-issue: true
+    max: 1
+    min-body-length: 200
+    title-prefix: "[daily-compiler-quality] "
+  noop:
+description: Analyzes compiler code daily to assess if it meets human-written quality standards, creates discussion reports, and uses cache memory to avoid re-analyzing unchanged files
+emoji: 📊
+engine:
+  id: copilot
+  copilot-sdk: true
+experiments:
+  output_format:
+    analysis_type: mann_whitney
+    description: Tests whether a concise executive-summary report outperforms the current exhaustive per-file report on discussion engagement and token efficiency
+    guardrail_metrics:
+    - name: run_success_rate
+      threshold: ">=0.85"
+    - name: empty_output_rate
+      threshold: <=0.05
+    hypothesis: "H0: no change in discussion engagement. H1: concise variant achieves equal engagement with ≥30% fewer output tokens"
+    issue: 32390
+    metric: discussion_engagement_score
+    min_samples: 20
+    secondary_metrics:
+    - output_token_count
+    - run_duration_ms
+    - run_success_rate
+    start_date: "2026-05-16"
+    tags:
+    - output-quality
+    - token-efficiency
+    - daily-workflows
+    variants:
+    - detailed
+    - concise
+    weight:
+    - 50
+    - 50
+name: Daily Compiler Quality Check
+strict: true
+timeout-minutes: 30
 tools:
+  bash:
+  - set
+  - find
+  - wc
+  - git
+  - mkdir
+  - cat
+  - jq
+  - mv
+  - echo
+  - bc
+  - sed
+  - printf
+  - date
+  - grep
+  - head
+  - ls
+  - pwd
+  - sort
+  - tail
+  - uniq
+  - yq
+  cache-memory: true
   cli-proxy: true
   github:
     mode: gh-proxy
     toolsets:
-      - discussions
-  cache-memory: true
-  bash:
-    - "find pkg/workflow -name 'compiler*.go' ! -name '*_test.go' -type f"
-    - "wc -l pkg/workflow/compiler*.go"
-    - "wc -l < pkg/workflow/"
-    - "git log --since='7 days ago' --format='%h %s' -- pkg/workflow/compiler*.go"
-    - "git log --since='7 days ago' --oneline --name-only -- pkg/workflow/compiler*.go"
-    - "git log -1 --format=%H --"
-    - "mkdir -p /tmp/gh-aw/cache-memory/compiler-quality"
-    - "cat /tmp/gh-aw/cache-memory/"
-    - "cat > /tmp/gh-aw/cache-memory/"
-    - "jq"
-    - "mv /tmp/gh-aw/cache-memory/"
-    - "echo"
-    - "bc"
-safe-outputs:
-  create-discussion:
-    category: "audits"
-    title-prefix: "[daily-compiler-quality] "
-    expires: 1d
-    close-older-discussions: true
-    fallback-to-issue: true
-    max: 1
-    min-body-length: 200
-timeout-minutes: 30
-strict: true
+    - discussions
+tracker-id: daily-compiler-quality
 features:
-  copilot-requests: true
-
-firewall:
-  effective-token-steering: true
+  gh-aw-detection: true
+sandbox:
+  agent:
+    sudo: false
 ---
+
 {{#runtime-import? .github/shared-instructions.md}}
 
 # Daily Compiler Quality Check Agent 🔍
@@ -327,10 +371,27 @@ Generate a comprehensive discussion report with findings.
 
 ### Output Contract (Required)
 
-1. Emit **exactly one** `create_discussion` safe-output item.
-2. Do **not** emit placeholder or draft bodies (for example: `test`, `.`, `todo`, or similar short placeholders).
-3. Only emit `create_discussion` after the final report body is complete and fully rendered.
-4. The workflow enforces a **minimum 200-character body length**, so very short outputs (placeholder or otherwise) will fail safe-outputs.
+1. Call safe-output tools **directly**. Use the `create_discussion` or `noop` tool itself — **never** use `bash`, `shell`, or `safeoutputs ...` CLI commands to invoke safe outputs.
+2. If the final report body is complete and valid, emit **exactly one** direct `create_discussion` tool call.
+3. Do **not** emit placeholder or draft bodies (for example: `test`, `.`, `todo`, or similar short placeholders).
+4. Only call `create_discussion` after the final report body is complete and fully rendered.
+5. If you cannot produce a valid discussion body, or decide no discussion should be created, call `noop` directly with a brief explanation instead of returning plain text.
+6. The workflow enforces a **minimum 200-character body length**, so very short outputs (placeholder or otherwise) will fail safe-outputs.
+7. **Before finishing, confirm you called either `create_discussion` or `noop`.** If not, call `noop` immediately with a short explanation. Never end the run with plain text only.
+
+### Direct Tool Call Examples
+
+Use the `create_discussion` tool directly:
+
+```json
+{"title":"Daily Compiler Code Quality Report - YYYY-MM-DD","category":"audits","body":"...full markdown report..."}
+```
+
+If you do not create a discussion, use `noop` directly:
+
+```json
+{"message":"No discussion created: [brief explanation]"}
+```
 
 ### Discussion Title
 
@@ -360,6 +421,7 @@ Daily Compiler Code Quality Report - YYYY-MM-DD
 
 ---
 
+{{#if experiments.output_format == 'detailed' }}
 ### Files Analyzed Today
 
 <details>
@@ -537,6 +599,31 @@ Based on historical analysis, these files consistently score below 70:
    - Ensure all exported functions have godoc comments
    - Add examples for complex functions
 
+{{/if}}
+{{#if experiments.output_format == 'concise' }}
+### Summary Table
+
+| File | Score | Rating | Top Issue |
+|------|-------|--------|-----------|
+| compiler_orchestrator.go | 82/100 | ✅ Good | File size 859 lines |
+| compiler_jobs.go | 78/100 | ✅ Good | Missing docstrings |
+| compiler_yaml.go | 68/100 | ⚠️ Acceptable | Weak error wrapping |
+[One row per file analyzed today — replace example rows with actual Serena analysis results]
+
+**Avg score**: 76/100 · **Files meeting threshold**: 2/3
+[Replace with real average score and threshold count from today's analysis]
+
+### Top 3 Issues
+1. File size — split `compiler_orchestrator.go` (859 lines)
+2. Missing godoc on 3 exported functions
+3. Weak error context in `compiler_yaml.go`
+[Replace with the actual top 3 issues identified across all analyzed files]
+
+### Recommended Action
+Priority: add godoc comments (estimated 30 min).
+[Replace with the single highest-priority actionable recommendation from today's analysis]
+{{/if}}
+
 ---
 
 <details>
@@ -591,6 +678,12 @@ The compiler codebase maintains **good overall quality** with an average score o
 
 - **Report Formatting**: Use h3 (###) or lower for all headers in your report to maintain proper document hierarchy. Wrap long sections in `<details><summary>Section Name</summary>` tags to improve readability and reduce scrolling.
 
+### Tool Guardrails (Required)
+
+- Do **not** use inline Python shell snippets such as `shell(python3 -c "...")` or similar one-liners for reading/parsing files.
+- When you need file discovery or file content, prefer native tools (`glob`, `grep`, `view`) instead of ad-hoc shell scripting.
+- If Serena (the semantic MCP code-analysis server) is unavailable, use allowed shell utilities (`grep`, `sed`, `head`, `tail`) rather than Python wrappers.
+
 ### Analysis Best Practices
 
 - **Be Objective**: Use concrete metrics from Serena, not subjective opinions
@@ -615,7 +708,7 @@ The compiler codebase maintains **good overall quality** with an average score o
 
 ### Error Handling
 
-- If Serena is unavailable, fall back to basic static analysis with bash/grep
+- If Serena (the semantic MCP code-analysis server) is unavailable, fall back to basic static analysis with bash/grep
 - If a file cannot be analyzed, document the issue and skip to next file
 - If cache is corrupted, reinitialize and start fresh analysis
 

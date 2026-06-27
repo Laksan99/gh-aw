@@ -1,4 +1,6 @@
 ---
+private: true
+emoji: "✏️"
 name: ACE Editor Session
 description: Generates an ACE editor session link when invoked with /ace command on pull request comments
 on:
@@ -6,6 +8,8 @@ on:
     strategy: centralized
     name: ace
     events: [pull_request_comment]
+max-daily-ai-credits: 10000
+timeout-minutes: 10
 strict: false
 permissions:
   pull-requests: read
@@ -20,7 +24,7 @@ jobs:
       issues: write
     steps:
       - name: Post ACE editor session link
-        uses: actions/github-script@v9
+        uses: actions/github-script@v9.0.0
         with:
           script: |
             const prNumber = context.payload.issue.number;
@@ -37,12 +41,12 @@ jobs:
               body: `👋 Hey @${actor}! Here's your ACE editor session link for this pull request:\n\n🔗 **${aceUrl}**\n\nCopy and paste this link into Slack to invite your teammates into the session! 🚀`,
             });
 imports:
-  - shared/observability-otlp.md
+  - shared/otlp.md
+sandbox:
+  agent:
+    sudo: false
 tools:
   cli-proxy: true
-firewall:
-  effective-token-steering: true
-
 ---
 
 Classic action that generates an ACE editor session link on pull request comment slash command.

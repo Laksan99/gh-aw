@@ -1,4 +1,6 @@
 ---
+private: true
+emoji: "🧹"
 description: Daily JavaScript unbloater that cleans one .cjs file per day, prioritizing files with @ts-nocheck to enable type checking
 on:
   schedule: daily
@@ -7,12 +9,14 @@ permissions:
   contents: read
   actions: read
 tracker-id: jsweep-daily
-engine: copilot
+engine:
+  id: copilot
+  copilot-sdk: true
 runtimes:
   node:
     version: "20"
 imports:
-  - shared/observability-otlp.md
+  - shared/otlp.md
 tools:
   cli-proxy: true
   github:
@@ -29,6 +33,7 @@ safe-outputs:
   create-pull-request:
     expires: 2d
     title-prefix: "[jsweep] "
+    branch-prefix: "signed/"
     labels: [unbloat, automation]
     draft: true
     if-no-changes: "ignore"
@@ -39,6 +44,9 @@ timeout-minutes: 20
 strict: true
 
 
+sandbox:
+  agent:
+    sudo: false
 ---
 
 # jsweep - JavaScript Unbloater
@@ -90,7 +98,7 @@ fi
 - Exclude test files (`*.test.cjs`)
 - Exclude files already listed in `cleaned_files` in the loaded state
 - **Priority 1**: Pick files with `@ts-nocheck` or `// @ts-nocheck` comments (these need type checking enabled)
-- **Priority 2**: If no uncleaned files with `@ts-nocheck` remain, pick the **one file** whose most recent git commit is oldest, using a deterministic `git log -1 --format='%ct' -- <file>` query over the candidate set sorted by path (do not use filesystem modification timestamps)
+- **Priority 2**: If no uncleaned files with `@ts-nocheck` remain, pick **one file at random** from the top 10 most recently modified candidates by ranking files with `git log -1 --format='%ct' -- <file>` (do not use filesystem modification timestamps)
 
 If no uncleaned files remain, start over with the oldest cleaned file (reset `cleaned_files` to only the one just chosen).
 
@@ -192,19 +200,38 @@ CLEANED_FILE="<basename>"
 CACHE_STATUS="<hit or miss>"
 
 export STATE_FILE TODAY RUN_ID CLEANED_FILE CACHE_STATUS
-python3 - << 'PYEOF'
-import json, os
-# Intentionally compact for token efficiency; behavior must remain unchanged.
-s={"cleaned_files":[],"last_run":"","last_file":"","cache_hit_history":[]}
-try: s=json.load(open(os.environ["STATE_FILE"]))
-except Exception: pass
-if os.environ["CLEANED_FILE"] not in [e["file"] for e in s.get("cleaned_files",[])]:
-    s.setdefault("cleaned_files",[]).append({"file":os.environ["CLEANED_FILE"],"cleaned_at":os.environ["TODAY"]})
-s["last_run"]=os.environ["TODAY"]; s["last_file"]=os.environ["CLEANED_FILE"]
-s.setdefault("cache_hit_history",[]).append({"run_id":os.environ["RUN_ID"],"date":os.environ["TODAY"],"status":os.environ["CACHE_STATUS"]})
-s["cache_hit_history"]=s["cache_hit_history"][-14:]
-json.dump(s, open(os.environ["STATE_FILE"], "w"), indent=2); print(json.dumps(s, indent=2))
-PYEOF
+node - << 'JSEOF'
+const fs = require('fs')
+
+const stateFile = process.env.STATE_FILE
+const today = process.env.TODAY
+const runId = process.env.RUN_ID
+const cleanedFile = process.env.CLEANED_FILE
+const cacheStatus = process.env.CACHE_STATUS
+
+let state = { cleaned_files: [], last_run: '', last_file: '', cache_hit_history: [] }
+try {
+  state = JSON.parse(fs.readFileSync(stateFile, 'utf8'))
+} catch (error) {
+  // ENOENT is expected on cold start; missing state file is not an error condition.
+  if (error.code !== 'ENOENT') {
+    console.warn(`Warning: could not load state from ${stateFile}; using default state. ${error.message}`)
+  }
+}
+
+if (!state.cleaned_files.some((entry) => entry.file === cleanedFile)) {
+  state.cleaned_files.push({ file: cleanedFile, cleaned_at: today })
+}
+
+state.last_run = today
+state.last_file = cleanedFile
+state.cache_hit_history.push({ run_id: runId, date: today, status: cacheStatus })
+state.cache_hit_history = state.cache_hit_history.slice(-14)
+
+const serialized = JSON.stringify(state, null, 2)
+fs.writeFileSync(stateFile, serialized)
+console.log(serialized)
+JSEOF
 ```
 
 2. **Log final cache contents** to confirm the write succeeded:
@@ -242,9 +269,14 @@ If the pull request cannot be created (e.g., one already exists, validation fail
 - **Do not retry more than once**
 - Call the `noop` safe-output tool to report what happened, then STOP
 
+**Final Safe-Output Guardrail (required):**
+- This workflow must always emit at least one safe output before exiting.
+- If you are about to stop and have not called any safe-output tool yet, call `noop` with a brief explanation, then STOP.
+
 ## Important Constraints
 
 - **PRIORITIZE files with `@ts-nocheck`** - These files need type checking enabled. Remove `@ts-nocheck`, add proper type annotations, and fix all type errors.
+- **Do not use destructive cleanup commands** like `rm -rf /tmp/...`; if cleanup is required, only remove known files/directories with narrowly-scoped commands (for example, `rm -f /tmp/gh-aw/cache-memory/jsweep-state.json`).
 - **DO NOT change logic** - only make the code cleaner and more maintainable
 - **Always add or improve tests** - the file must have comprehensive test coverage with at least 5-10 test cases
 - **Preserve all functionality** - ensure the file works exactly as before

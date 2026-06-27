@@ -1,4 +1,6 @@
 ---
+private: true
+emoji: "🔒"
 name: Weekly Safe Outputs Specification Review
 description: Reviews changes to the Safe Outputs specification and ensures the conformance checker script is up to date
 on:
@@ -20,12 +22,14 @@ network:
     - github
 
 sandbox:
-  agent: awf  # Firewall enabled
+  agent:  # Firewall enabled
+    id: awf
+    sudo: false
 
 imports:
   - shared/github-guard-policy.md
 
-  - shared/observability-otlp.md
+  - shared/otlp.md
 tools:
   cli-proxy: true
   edit:
@@ -75,7 +79,7 @@ Use git to identify changes to the Safe Outputs specification:
 
 ```bash
 # Check for changes in the last 7 days
-git log --since="7 days ago" --oneline --no-pager -- docs/src/content/docs/reference/safe-outputs-specification.md
+git log --since="7 days ago" --oneline --no-pager -- docs/src/content/docs/specs/safe-outputs-specification.md
 ```
 
 If there are no changes in the specification file:
@@ -90,7 +94,7 @@ If there are changes:
 
 Review the specification file located at:
 ```
-docs/src/content/docs/reference/safe-outputs-specification.md
+docs/src/content/docs/specs/safe-outputs-specification.md
 ```
 
 Focus on sections containing normative requirements (look for RFC 2119 keywords):
@@ -220,7 +224,7 @@ Ran the updated script successfully:
 
 ### Related Files
 
-- Specification: `docs/src/content/docs/reference/safe-outputs-specification.md`
+- Specification: `docs/src/content/docs/specs/safe-outputs-specification.md`
 - Conformance Script: `scripts/check-safe-outputs-conformance.sh`
 ```
 

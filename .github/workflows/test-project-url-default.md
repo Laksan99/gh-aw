@@ -1,11 +1,14 @@
 ---
+private: true
+emoji: "🧪"
 name: Test Project URL Explicit Requirement
 engine: copilot
 on:
   workflow_dispatch:
+timeout-minutes: 10
 
 imports:
-  - shared/observability-otlp.md
+  - shared/otlp.md
 tools:
   cli-proxy: true
 safe-outputs:
@@ -15,7 +18,11 @@ safe-outputs:
   create-project-status-update:
     max: 1
     project: "https://github.com/orgs/<ORG>/projects/<NUMBER>"
-
+features:
+  gh-aw-detection: true
+sandbox:
+  agent:
+    sudo: false
 ---
 
 # Test Explicit Project URL Requirement

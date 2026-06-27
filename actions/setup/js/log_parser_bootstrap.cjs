@@ -72,6 +72,36 @@ async function runLogParser(options) {
     return count;
   }
 
+  /**
+   * Returns true if the log entries show the agent ran at least one turn.
+   *
+   * "At least one turn" is used (rather than "all work finished") because the
+   * log only records the turn count, not whether every intended task succeeded.
+   * The check is sufficient to distinguish a post-completion MCP relaunch
+   * failure (the agent was already executing) from a startup failure where the
+   * MCP never launched and the agent ran zero turns.
+   *
+   * Handles both log formats:
+   *   - Legacy format (Codex, Copilot, etc.): { type: "result", num_turns: N }
+   *   - Copilot event format (Claude): { type: "session.result", data: { numTurns: N } }
+   *
+   * @param {Array|null|undefined} entries
+   * @returns {boolean}
+   */
+  function agentRanToCompletion(entries) {
+    if (!entries || !Array.isArray(entries) || entries.length === 0) {
+      return false;
+    }
+    return entries.some(e => {
+      if (!e || typeof e !== "object") return false;
+      // Legacy format
+      if (e.type === "result" && typeof e.num_turns === "number" && e.num_turns > 0) return true;
+      // Copilot event format (Claude)
+      if (e.type === "session.result" && e.data && typeof e.data.numTurns === "number" && e.data.numTurns > 0) return true;
+      return false;
+    });
+  }
+
   try {
     const logPath = process.env.GH_AW_AGENT_OUTPUT;
     if (!logPath) {
@@ -147,6 +177,69 @@ async function runLogParser(options) {
       logEntries = result.logEntries || null;
     }
 
+    // Enrich agent-stdio.log with a normalized result entry when the engine does not
+    // write one directly (e.g. Copilot, Pi).  The OTEL conclusion span
+    // (send_otlp_span.cjs → readAgentRuntimeMetrics) reads agent-stdio.log for the
+    // gh-aw.turns attribute and token usage; without this entry those fields are zero
+    // for every engine except Claude Code, leaving 80 % of fleet runs un-triageable.
+    //
+    // Safety rules:
+    //  1. Only append when agent-stdio.log does NOT already contain a result entry
+    //     (avoids double-counting on Claude Code runs where the entry is written by
+    //     the --debug-file flag).
+    //  2. The appended line must be a standalone JSON object on its own line so that
+    //     the existing line-oriented parser in readAgentRuntimeMetrics can find it.
+    //  3. All errors are non-fatal – telemetry enrichment must never break workflows.
+    if (logEntries && Array.isArray(logEntries)) {
+      const resultEntry = logEntries.find(e => e && typeof e === "object" && e.type === "result" && (typeof e.num_turns === "number" || e.usage));
+      if (resultEntry) {
+        const normalizedResultEntry = {
+          type: "result",
+          num_turns: typeof resultEntry.num_turns === "number" && Number.isFinite(resultEntry.num_turns) && resultEntry.num_turns >= 0 ? resultEntry.num_turns : 0,
+          usage: {
+            input_tokens: typeof resultEntry.usage?.input_tokens === "number" && Number.isFinite(resultEntry.usage.input_tokens) && resultEntry.usage.input_tokens >= 0 ? resultEntry.usage.input_tokens : 0,
+            output_tokens: typeof resultEntry.usage?.output_tokens === "number" && Number.isFinite(resultEntry.usage.output_tokens) && resultEntry.usage.output_tokens >= 0 ? resultEntry.usage.output_tokens : 0,
+          },
+        };
+        const stdioLogPath = "/tmp/gh-aw/agent-stdio.log";
+        try {
+          let alreadyHasResult = false;
+          if (fs.existsSync(stdioLogPath)) {
+            const stdioContent = fs.readFileSync(stdioLogPath, "utf8");
+            alreadyHasResult = stdioContent.split("\n").some(line => {
+              const objectStart = line.indexOf("{");
+              const arrayStart = line.indexOf("[");
+              let start = -1;
+              if (objectStart >= 0 && arrayStart >= 0) {
+                start = Math.min(objectStart, arrayStart);
+              } else if (objectStart >= 0) {
+                start = objectStart;
+              } else {
+                start = arrayStart;
+              }
+              if (start < 0) return false;
+              try {
+                const parsed = JSON.parse(line.slice(start));
+                if (Array.isArray(parsed)) {
+                  return parsed.some(entry => entry && typeof entry === "object" && entry.type === "result");
+                }
+                return parsed && parsed.type === "result";
+              } catch {
+                return false;
+              }
+            });
+          }
+          if (!alreadyHasResult) {
+            fs.mkdirSync(path.dirname(stdioLogPath), { recursive: true });
+            fs.appendFileSync(stdioLogPath, JSON.stringify(normalizedResultEntry) + "\n");
+            core.info(`[log-parser] Wrote ${parserName} result entry to agent-stdio.log: num_turns=${normalizedResultEntry.num_turns ?? "n/a"}`);
+          }
+        } catch (err) {
+          core.warning(`[log-parser] Failed to enrich agent-stdio.log with result entry: ${getErrorMessage(err)}`);
+        }
+      }
+    }
+
     // Read safe outputs file if available
     let safeOutputsContent = "";
     let safeOutputEntriesCount = 0;
@@ -164,8 +257,8 @@ async function runLogParser(options) {
       // Generate lightweight plain text summary for core.info and Copilot CLI style for step summary
       if (logEntries && Array.isArray(logEntries) && logEntries.length > 0) {
         // Extract model from init entry if available
-        const initEntry = logEntries.find(entry => entry.type === "system" && entry.subtype === "init");
-        const model = initEntry?.model || null;
+        const initEntry = logEntries.find(entry => (entry.type === "system" && entry.subtype === "init") || entry.type === "session.init");
+        const model = initEntry?.model || initEntry?.data?.model || null;
 
         const plainTextSummary = generatePlainTextSummary(logEntries, {
           model,
@@ -246,6 +339,13 @@ async function runLogParser(options) {
       const failedServers = mcpFailures.join(", ");
       if (safeOutputEntriesCount > 0) {
         core.warning(`MCP server(s) failed to launch (${failedServers}), but agent completed with ${safeOutputEntriesCount} safe output ${safeOutputEntriesCount === 1 ? "entry" : "entries"}`);
+      } else if (agentRanToCompletion(logEntries)) {
+        // The agent ran turns to completion even though an MCP server failed to launch.
+        // This is a post-completion relaunch/health-probe failure — the MCP server was
+        // healthy during execution (the agent used it throughout the run) and the failure
+        // occurred after the work was done.  Treat as non-fatal so genuine task success
+        // is not masked by a transient infrastructure event.
+        core.warning(`MCP server(s) failed to launch (${failedServers}), but agent completed turns — treating as non-fatal post-completion relaunch`);
       } else {
         core.setFailed(`${ERR_API}: MCP server(s) failed to launch: ${failedServers}`);
       }

@@ -12,6 +12,7 @@ type RuntimeConfig struct {
 	If                string `json:"if,omitempty"`                  // Optional GitHub Actions if condition (e.g., "hashFiles('go.mod') != ''")
 	ActionRepo        string `json:"action-repo,omitempty"`         // Override the GitHub Actions repository (e.g., "actions/setup-node")
 	ActionVersion     string `json:"action-version,omitempty"`      // Override the action version (e.g., "v4")
+	Cooldown          *bool  `json:"cooldown,omitempty"`            // If false, disable the default dependency cooldown for installs associated with this runtime
 	RunInstallScripts *bool  `json:"run-install-scripts,omitempty"` // If true, allow pre/post install scripts for this runtime (supply chain risk; emits warning or error in strict mode)
 }
 
@@ -112,6 +113,9 @@ type GuardrailMetric struct {
 	// Name is the metric to guard (e.g. "success_rate", "empty_output_rate").
 	Name string `json:"name"`
 
+	// Direction declares whether lower or higher values are preferred ("min" or "max").
+	Direction string `json:"direction,omitempty"`
+
 	// Threshold is a comparison expression (e.g. ">=0.95", "==0").
 	Threshold string `json:"threshold"`
 }
@@ -204,6 +208,13 @@ type OTLPEndpointConfig struct {
 	Headers any `json:"headers,omitempty"`
 }
 
+// OTLPGitHubAppConfig holds optional runtime GitHub app auth configuration for OTLP export.
+// GitHub Actions OIDC token minting is implied when this block is present.
+type OTLPGitHubAppConfig struct {
+	// Audience is an optional OIDC audience passed to core.getIDToken(audience).
+	Audience string `json:"audience,omitempty"`
+}
+
 // OTLPConfig holds configuration for OTLP (OpenTelemetry Protocol) trace export.
 type OTLPConfig struct {
 	// Endpoint accepts one of three forms:
@@ -225,6 +236,47 @@ type OTLPConfig struct {
 	//   - a comma-separated list of key=value pairs (e.g. "Authorization=Bearer <token>")
 	// Both forms are injected as the standard OTEL_EXPORTER_OTLP_HEADERS environment variable.
 	Headers any `json:"headers,omitempty"`
+
+	// IfMissing controls runtime behavior when OTLP endpoint/header values are
+	// missing (for example because a referenced secret is unset). Supported values:
+	//   - "error" (default): fail workflow startup
+	//   - "warn": log a warning and skip MCP gateway OTLP config
+	//   - "ignore": skip MCP gateway OTLP config without warning
+	// This setting affects MCP gateway setup only. Other OTLP-aware steps still
+	// receive workflow-level OTEL_* environment variables.
+	IfMissing string `json:"if-missing,omitempty"`
+
+	// Attributes defines additional custom key-value string attributes to attach
+	// to every OTLP span emitted by this workflow (setup, agent, and conclusion).
+	// Values support template variables using {{ variable }} syntax, where the
+	// variable name is any OTLP attribute key already computed for the span
+	// (e.g. {{ gh-aw.episode.id }}, {{ github.actor }}).
+	//
+	// Example – emit Langfuse session/user attributes alongside the standard ones:
+	//   attributes:
+	//     langfuse.session.id: "{{ gh-aw.episode.id }}"
+	//     session.id:          "{{ gh-aw.episode.id }}"
+	//     langfuse.user.id:    "{{ github.actor }}"
+	//     user.id:             "{{ github.actor }}"
+	Attributes map[string]string `json:"attributes,omitempty"`
+
+	// ResourceAttributes defines additional OTEL_RESOURCE_ATTRIBUTES entries to
+	// append to the standard gh-aw/GitHub resource attributes.
+	//
+	// Values may be static strings or GitHub Actions expressions such as
+	// ${{ github.repository }}. Do not use secrets.* or vars.* expressions here:
+	// resource attributes are exported to external tracing backends and are not
+	// treated as secret values.
+	ResourceAttributes map[string]string `json:"resource-attributes,omitempty"`
+
+	// GitHubApp configures runtime OTLP authentication via the `github-app` key.
+	// Supported values:
+	//   github-app:
+	//     audience: "api://AzureADTokenExchange" # optional
+	//
+	// When configured, gh-aw mints an OIDC token before actions/setup and passes
+	// it to setup so OTLP requests can include an Authorization bearer token.
+	GitHubApp *OTLPGitHubAppConfig `json:"github-app,omitempty"`
 }
 
 // ObservabilityConfig represents workflow observability options.
@@ -238,20 +290,24 @@ type FrontmatterConfig struct {
 	// Core workflow fields
 	Name        string `json:"name,omitempty"`
 	Description string `json:"description,omitempty"`
+	Emoji       string `json:"emoji,omitempty"` // Optional emoji to represent the workflow visually
 	// Engine accepts both a plain string engine name (e.g. "copilot") and an object-style
 	// configuration (e.g. {id: copilot, max-continuations: 2}).  Using any prevents
 	// JSON unmarshal failures when the engine is an object, which would otherwise cause
 	// ParseFrontmatterConfig to return nil and break features that depend on it (e.g. OTLP).
-	Engine            any               `json:"engine,omitempty"`
-	Source            string            `json:"source,omitempty"`
-	Redirect          string            `json:"redirect,omitempty"`
-	TrackerID         string            `json:"tracker-id,omitempty"`
-	Version           string            `json:"version,omitempty"`
-	TimeoutMinutes    *TemplatableInt32 `json:"timeout-minutes,omitempty"`
-	Strict            *bool             `json:"strict,omitempty"`              // Pointer to distinguish unset from false
-	Private           *bool             `json:"private,omitempty"`             // If true, workflow cannot be added to other repositories
-	RunInstallScripts *bool             `json:"run-install-scripts,omitempty"` // If true, allow pre/post install scripts globally (supply chain risk; emits warning or error in strict mode)
-	Labels            []string          `json:"labels,omitempty"`
+	Engine             any               `json:"engine,omitempty"`
+	Source             string            `json:"source,omitempty"`
+	Redirect           string            `json:"redirect,omitempty"`
+	TrackerID          string            `json:"tracker-id,omitempty"`
+	Version            string            `json:"version,omitempty"`
+	TimeoutMinutes     *TemplatableInt32 `json:"timeout-minutes,omitempty"`
+	MaxAICredits       *TemplatableInt32 `json:"max-ai-credits,omitempty"`
+	MaxTurnCacheMisses *int32            `json:"max-turn-cache-misses,omitempty"`
+	MaxDailyAICredits  *TemplatableInt32 `json:"max-daily-ai-credits,omitempty"`
+	MaxToolDenials     *TemplatableInt32 `json:"max-tool-denials,omitempty"`
+	Strict             *bool             `json:"strict,omitempty"`  // Pointer to distinguish unset from false
+	Private            *bool             `json:"private,omitempty"` // If true, workflow cannot be added to other repositories
+	Labels             []string          `json:"labels,omitempty"`
 
 	// Configuration sections - using strongly-typed structs
 	Tools            *ToolsConfig       `json:"tools,omitempty"`
@@ -275,16 +331,13 @@ type FrontmatterConfig struct {
 	Sandbox *SandboxConfig      `json:"sandbox,omitempty"`
 
 	// Feature flags and other settings
-	Features map[string]any `json:"features,omitempty"` // Dynamic feature flags
-	// Deprecated: as of v1.1.0, inline sub-agents are always enabled.
-	// Remove this field from frontmatter. Setting false causes a compilation error.
-	InlineSubAgents *bool             `json:"inline-sub-agents,omitempty"`
-	Env             map[string]string `json:"env,omitempty"`
-	Secrets         map[string]any    `json:"secrets,omitempty"`
+	Features map[string]any    `json:"features,omitempty"` // Dynamic feature flags
+	Env      map[string]string `json:"env,omitempty"`
+	Secrets  map[string]any    `json:"secrets,omitempty"`
 
 	// Workflow execution settings
-	RunsOn        string         `json:"runs-on,omitempty"`
-	RunsOnSlim    string         `json:"runs-on-slim,omitempty"` // Runner for all framework/generated jobs (activation, safe-outputs, unlock, etc.)
+	RunsOn        any            `json:"runs-on,omitempty"`      // Supports string, array, or object GitHub Actions runner forms
+	RunsOnSlim    any            `json:"runs-on-slim,omitempty"` // Runner for all framework/generated jobs; supports the same forms as runs-on
 	RunName       string         `json:"run-name,omitempty"`
 	PreSteps      []any          `json:"pre-steps,omitempty"`       // Pre-workflow steps (run before checkout)
 	Steps         []any          `json:"steps,omitempty"`           // Custom workflow steps
@@ -317,11 +370,12 @@ type FrontmatterConfig struct {
 	// Experiments during frontmatter parsing.  Keys match those of Experiments.
 	ExperimentConfigs map[string]*ExperimentConfig `json:"-"`
 
-	// Model aliases and fallback policies.
-	// Keys are alias names (empty string "" = default policy); values are ordered lists of
-	// model patterns or alias references to try in sequence.
-	// Merged with the builtin model aliases at compile time; frontmatter entries take precedence.
-	Models map[string][]string `json:"models,omitempty"`
+	// ModelCosts holds model pricing data in the same structure as models.json.
+	// Declared in frontmatter as the `models` field (json:"models,omitempty") using a top-level
+	// `providers` key. At runtime the activation job merges this with the built-in models.json
+	// so that custom or adjusted cost values are reflected in effective-token accounting.
+	// Structure: {"providers": {"<provider>": {"models": {"<model>": {"cost": {...}}}}}}
+	ModelCosts map[string]any `json:"models,omitempty"`
 
 	// Rate limiting configuration
 	RateLimit *RateLimitConfig `json:"user-rate-limit,omitempty"`

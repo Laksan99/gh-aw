@@ -75,6 +75,16 @@ When enabled, the workflow compiles as `workflow_dispatch`-centric, and the comp
 shared `agentic_commands.yml` workflow that listens to merged slash-command events and
 dispatches matching target workflows with `aw_context`.
 
+When centralized routing is active, a builtin `/help` command is also enabled. It posts a comment in the current issue, pull request, or discussion with the supported slash commands (both centralized and non-centralized) and their descriptions, plus a link to this documentation.
+
+To disable the builtin handler, set the top-level `help_command` field in `.github/workflows/aw.json`:
+
+```json
+{
+  "help_command": false
+}
+```
+
 ```yaml wrap
 on:
   slash_command:
@@ -188,18 +198,39 @@ To disable the reaction entirely, use `reaction: none`.
 
 See [Reactions and Status Comments](/gh-aw/reference/triggers/#reactions-reaction) for all available reactions and detailed behavior.
 
-## Slash Commands in SideRepoOps
+## Customizing the Run-Again Hint (`placeholder`)
 
-GitHub Actions only delivers events to the repository where they occur. With [SideRepoOps](/gh-aw/patterns/side-repo-ops/) — where workflows live in a separate side repository — events from the main repository are never delivered there. **Slash command triggers cannot be used directly in a SideRepoOps workflow.**
+When a workflow has a `slash_command:` trigger, the default footer on generated issues and pull requests includes a hint showing how to invoke the workflow again:
+
+> <sub>Comment <em>/my-bot</em> to run again</sub>
+
+Override the trailing `"to run again"` suffix with `placeholder:`:
+
+```yaml wrap
+on:
+  slash_command:
+    name: review-bot
+    placeholder: to review this PR
+```
+
+The footer hint then reads:
+
+> <sub>Comment <em>/review-bot</em> to review this PR</sub>
+
+The hint is appended only by the default footer template. Custom footer templates are unaffected.
+
+## Slash Commands from a Side Repository
+
+GitHub Actions only delivers events to the repository where they occur. When workflows live in a separate side repository, events from the main repository are never delivered there. **Slash command triggers cannot be used directly in a workflow hosted in a side repository.**
 
 The recommended solution is a **bridge pattern**: a thin relay workflow in the main repository receives the slash command and forwards it to the side repository via `workflow_dispatch`.
 
-See [Slash Commands in SideRepoOps](/gh-aw/patterns/side-repo-ops/#slash-commands) for a full walkthrough with examples and trade-offs.
+See [Triage from Side Repo](/gh-aw/examples/multi-repo/triage-from-side-repo/) for a full walkthrough with examples and trade-offs.
 
 ## Related Documentation
 
 - [Frontmatter](/gh-aw/reference/frontmatter/) - All configuration options for workflows
 - [Workflow Structure](/gh-aw/reference/workflow-structure/) - Directory layout and organization
 - [CLI Commands](/gh-aw/setup/cli/) - CLI commands for workflow management
-- [SideRepoOps](/gh-aw/patterns/side-repo-ops/) - Running workflows from a separate repository
+- [MultiRepoOps](/gh-aw/patterns/multi-repo-ops/) — Running workflows from a separate repository
 - [ChatOps](/gh-aw/patterns/chat-ops/) - Interactive automation with slash commands

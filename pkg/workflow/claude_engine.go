@@ -9,6 +9,7 @@ import (
 
 	"github.com/github/gh-aw/pkg/constants"
 	"github.com/github/gh-aw/pkg/logger"
+	"github.com/github/gh-aw/pkg/workflow/compilerenv"
 )
 
 var claudeLog = logger.New("workflow:claude_engine")
@@ -44,26 +45,60 @@ func (e *ClaudeEngine) GetModelEnvVarName() string {
 	return constants.ClaudeCLIModelEnvVar
 }
 
+// ResolveLLMProvider returns the effective provider for Claude inference.
+// Default is anthropic, overridable via engine.model-provider.
+func (e *ClaudeEngine) ResolveLLMProvider(workflowData *WorkflowData) string {
+	return resolveEngineLLMProvider(workflowData, LLMProviderAnthropic)
+}
+
 // GetAPMTarget returns "claude" so that apm-action packs Claude-specific primitives.
 func (e *ClaudeEngine) GetAPMTarget() string {
 	return "claude"
 }
 
-// GetRequiredSecretNames returns the list of secrets required by the Claude engine
-// This includes ANTHROPIC_API_KEY and optionally MCP_GATEWAY_API_KEY and mcp-scripts secrets
+// GetRequiredSecretNames returns the list of secrets required by the Claude engine.
+// When Anthropic WIF (github-oidc + provider=anthropic) is configured, no static API key
+// is needed and only common MCP secrets are returned.
 func (e *ClaudeEngine) GetRequiredSecretNames(workflowData *WorkflowData) []string {
-	return append([]string{"ANTHROPIC_API_KEY"}, collectCommonMCPSecrets(workflowData)...)
+	provider := e.ResolveLLMProvider(workflowData)
+	if provider == LLMProviderAnthropic && isAnthropicWIF(workflowData) {
+		return collectCommonMCPSecrets(workflowData)
+	}
+	return append(llmProviderSecretNames(provider), collectCommonMCPSecrets(workflowData)...)
+}
+
+// GetSupportedEnvVarKeys returns the engine.env variable names that the Claude engine
+// supports as defined in the AWF specification.
+func (e *ClaudeEngine) GetSupportedEnvVarKeys() []string {
+	return []string{
+		constants.AnthropicAPIKey,
+	}
 }
 
 // GetSecretValidationStep returns the secret validation step for the Claude engine.
-// Returns an empty step if custom command is specified.
+// Returns an empty step if custom command is specified or if Anthropic WIF is configured.
 func (e *ClaudeEngine) GetSecretValidationStep(workflowData *WorkflowData) GitHubActionStep {
+	provider := e.ResolveLLMProvider(workflowData)
+	if provider == LLMProviderAnthropic && isAnthropicWIF(workflowData) {
+		return GitHubActionStep{}
+	}
+	providerSecrets := llmProviderSecretNames(provider)
 	return BuildDefaultSecretValidationStep(
 		workflowData,
-		[]string{"ANTHROPIC_API_KEY"},
+		providerSecrets,
 		"Claude Code",
-		"https://github.github.com/gh-aw/reference/engines/#anthropic-claude-code",
+		llmProviderDocsURL(provider),
 	)
+}
+
+// isAnthropicWIF returns true when the workflow is configured to use Anthropic
+// Workload Identity Federation (github-oidc auth type with provider=anthropic).
+func isAnthropicWIF(workflowData *WorkflowData) bool {
+	if workflowData == nil || workflowData.EngineConfig == nil || workflowData.EngineConfig.Auth == nil {
+		return false
+	}
+	auth := workflowData.EngineConfig.Auth
+	return auth.Type == "github-oidc" && auth.Provider == "anthropic"
 }
 
 func (e *ClaudeEngine) GetInstallationSteps(workflowData *WorkflowData) []GitHubActionStep {
@@ -88,8 +123,9 @@ func (e *ClaudeEngine) GetInstallationSteps(workflowData *WorkflowData) []GitHub
 		version,
 		"Install Claude Code CLI",
 		"claude",
-		true, // Include Node.js setup
-		true, // Claude Code requires post-install scripts for native binaries
+		true,  // Include Node.js setup
+		true,  // Claude Code requires post-install scripts for native binaries
+		false, // Agentic engine installs should not apply npm release-age cooldown
 	)
 	return BuildNpmEngineInstallStepsWithAWF(npmSteps, workflowData)
 }
@@ -143,10 +179,12 @@ func (e *ClaudeEngine) GetExecutionSteps(workflowData *WorkflowData, logFile str
 		claudeArgs = append(claudeArgs, "--max-turns", workflowData.EngineConfig.MaxTurns)
 	}
 
-	// Add MCP configuration only if there are MCP servers
+	// Add MCP configuration only if there are MCP servers.
+	// Keep this argument outside shellJoinArgs so ${RUNNER_TEMP} expands at runtime.
+	mcpConfigArg := ""
 	if HasMCPServers(workflowData) {
 		claudeLog.Print("Adding MCP configuration")
-		claudeArgs = append(claudeArgs, "--mcp-config", "${RUNNER_TEMP}/gh-aw/mcp-config/mcp-servers.json")
+		mcpConfigArg = ` --mcp-config "${RUNNER_TEMP}/gh-aw/mcp-config/mcp-servers.json"`
 	}
 
 	// Add allowed tools configuration
@@ -171,22 +209,20 @@ func (e *ClaudeEngine) GetExecutionSteps(workflowData *WorkflowData, logFile str
 
 	// Add permission mode for non-interactive execution.
 	//
-	// We use "acceptEdits" by default so that Claude Code honours --allowed-tools as
-	// the effective MCP tool boundary.  In "bypassPermissions" mode the allowlist is
-	// silently ignored — every tool exposed by the MCP gateway is reachable regardless
-	// of the workflow's declared tool configuration.
-	//
-	// Exception: when the workflow grants unrestricted bash access (bash: "*"), the
-	// agent can reach any tool via the shell regardless, so --allowed-tools provides
-	// no meaningful security boundary.  In that case we switch back to
-	// "bypassPermissions" which auto-approves all permission requests and produces a
-	// smoother headless execution experience.
+	// Default to "acceptEdits" so Claude Code honours --allowed-tools as the effective
+	// MCP tool boundary. Workflows that explicitly set tools.edit=false default to
+	// "auto" because they don't rely on acceptEdits write auto-approval behavior.
 	permissionMode := "acceptEdits"
-	if hasBashWildcardInTools(workflowData.Tools) {
-		claudeLog.Print("Unrestricted bash detected: using bypassPermissions mode")
-		permissionMode = "bypassPermissions"
+	if isEditToolExplicitlyDisabled(workflowData.Tools) {
+		claudeLog.Print("tools.edit=false detected: using auto permission mode")
+		permissionMode = "auto"
+	}
+	if workflowData.EngineConfig != nil && workflowData.EngineConfig.PermissionMode != "" {
+		permissionMode = workflowData.EngineConfig.PermissionMode
+		claudeLog.Printf("Using engine.permission-mode override: %s", permissionMode)
 	}
 	claudeArgs = append(claudeArgs, "--permission-mode", permissionMode)
+	permissionModeValueIndex := len(claudeArgs) - 1
 
 	// Add output format for structured output
 	// Use "stream-json" to output JSONL format (newline-delimited JSON objects)
@@ -200,9 +236,17 @@ func (e *ClaudeEngine) GetExecutionSteps(workflowData *WorkflowData, logFile str
 		claudeArgs = append(claudeArgs, "--bare")
 	}
 
-	// Add custom args from engine configuration before the prompt
+	// Add custom args from engine configuration before the prompt.
+	// Strip any user-supplied --permission-mode flags so exactly one flag is emitted.
 	if workflowData.EngineConfig != nil && len(workflowData.EngineConfig.Args) > 0 {
-		claudeArgs = append(claudeArgs, workflowData.EngineConfig.Args...)
+		// stripClaudePermissionModeArgs returns an empty permission-mode string when no
+		// override flag is present.
+		engineArgs, permissionModeFromArgs := stripClaudePermissionModeArgs(workflowData.EngineConfig.Args)
+		if permissionModeFromArgs != "" && workflowData.EngineConfig.PermissionMode == "" {
+			claudeLog.Printf("Using legacy engine.args permission mode override: %s", permissionModeFromArgs)
+			claudeArgs[permissionModeValueIndex] = permissionModeFromArgs
+		}
+		claudeArgs = append(claudeArgs, engineArgs...)
 	}
 
 	// The prompt is always read from prompt.txt, which is assembled by the compiler in the
@@ -234,16 +278,19 @@ func (e *ClaudeEngine) GetExecutionSteps(workflowData *WorkflowData, logFile str
 		// Harness-wrapped execution: the harness reads --prompt-file and passes its content
 		// as the last positional arg on the initial run.  On --continue retries it omits the
 		// prompt so Claude Code resumes from its on-disk session state.
+		// The harness sets cwd=GITHUB_WORKSPACE when spawning the claude process, so no
+		// shell-level cd prefix is needed.
 		execPrefix := fmt.Sprintf(`%s %s/%s %s`, nodeRuntimeResolutionCommand, SetupActionDestinationShell, harnessScriptName, commandName)
-		claudeCommand = fmt.Sprintf("%s %s --prompt-file /tmp/gh-aw/aw-prompts/prompt.txt", execPrefix, shellJoinArgs(claudeArgs))
+		claudeCommand = fmt.Sprintf("%s %s%s --prompt-file /tmp/gh-aw/aw-prompts/prompt.txt", execPrefix, shellJoinArgs(claudeArgs), mcpConfigArg)
 	} else {
 		// Without harness: use shell expansion for the prompt (no retry logic).
+		// Apply workspace prefix here since there is no JS harness to set the cwd.
 		//
 		// The prompt command is appended raw after shellJoinArgs because it contains
 		// shell variable references ("$(cat ...)") that must NOT be escaped —
 		// single-quoting them would prevent shell expansion at runtime.
 		promptCommand := `"$(cat /tmp/gh-aw/aw-prompts/prompt.txt)"`
-		claudeCommand = fmt.Sprintf("%s %s", shellJoinArgs(append([]string{commandName}, claudeArgs...)), promptCommand)
+		claudeCommand = getWorkspaceCommandPrefixFor(workflowData.EngineConfig) + fmt.Sprintf("%s%s %s", shellJoinArgs(append([]string{commandName}, claudeArgs...)), mcpConfigArg, promptCommand)
 	}
 
 	// When model is not configured, use the GH_AW_MODEL_AGENT_CLAUDE fallback env var
@@ -301,7 +348,7 @@ func (e *ClaudeEngine) GetExecutionSteps(workflowData *WorkflowData, logFile str
 			PathSetup:      "touch " + AgentStepSummaryPath, // Runs BEFORE AWF on the host
 			// Exclude every env var whose step-env value is a secret so the agent
 			// cannot read raw token values via bash tools (env / printenv).
-			ExcludeEnvVarNames: ComputeAWFExcludeEnvVarNames(workflowData, []string{"ANTHROPIC_API_KEY"}),
+			ExcludeEnvVarNames: ComputeAWFExcludeEnvVarNames(workflowData, llmProviderSecretNames(e.ResolveLLMProvider(workflowData))),
 		})
 	} else {
 		// Run Claude command without AWF wrapper
@@ -318,8 +365,9 @@ func (e *ClaudeEngine) GetExecutionSteps(workflowData *WorkflowData, logFile str
 	}
 
 	// Build environment variables map
+	provider := e.ResolveLLMProvider(workflowData)
 	env := map[string]string{
-		"ANTHROPIC_API_KEY":       "${{ secrets.ANTHROPIC_API_KEY }}",
+		"ANTHROPIC_API_KEY":       llmProviderSecretExpression(provider, workflowData),
 		"DISABLE_TELEMETRY":       "1",
 		"DISABLE_ERROR_REPORTING": "1",
 		"DISABLE_BUG_COMMAND":     "1",
@@ -330,7 +378,7 @@ func (e *ClaudeEngine) GetExecutionSteps(workflowData *WorkflowData, logFile str
 		// "Fast mode unavailable: Fast mode is not available in the Agent SDK",
 		// which crashes the agent mid-session on every API call.
 		"CLAUDE_CODE_DISABLE_FAST_MODE": "1",
-		"GH_AW_PROMPT":                  "/tmp/gh-aw/aw-prompts/prompt.txt",
+		"GH_AW_PROMPT":                  constants.AwPromptsFile,
 		// Tag the step as a GitHub AW agentic execution for discoverability by agents
 		"GITHUB_AW": "true",
 		// Override GITHUB_STEP_SUMMARY with a path that exists inside the sandbox.
@@ -339,7 +387,13 @@ func (e *ClaudeEngine) GetExecutionSteps(workflowData *WorkflowData, logFile str
 		// $GITHUB_STEP_SUMMARY after secret redaction.
 		"GITHUB_STEP_SUMMARY": AgentStepSummaryPath,
 		"GITHUB_WORKSPACE":    "${{ github.workspace }}",
+		"RUNNER_TEMP":         "${{ runner.temp }}",
 	}
+	env["GH_AW_LLM_PROVIDER"] = provider
+	if isFirewallEnabled(workflowData) && provider != LLMProviderAnthropic {
+		env["ANTHROPIC_BASE_URL"] = llmProviderGatewayBaseURL(provider)
+	}
+	injectWorkflowCallNetworkAllowedEnv(env, workflowData)
 	// Indicate the phase: "agent" for the main run, "detection" for threat detection
 	// Include the compiler version so agents can identify which gh-aw version generated the workflow
 	if workflowData.IsDetectionRun {
@@ -355,7 +409,7 @@ func (e *ClaudeEngine) GetExecutionSteps(workflowData *WorkflowData, logFile str
 
 	// Add GH_AW_MCP_CONFIG for MCP server configuration only if there are MCP servers
 	if HasMCPServers(workflowData) {
-		env["GH_AW_MCP_CONFIG"] = "${{ runner.temp }}/gh-aw/mcp-config/mcp-servers.json"
+		env["GH_AW_MCP_CONFIG"] = constants.McpServersJsonPathExpr
 	}
 
 	// In sandbox (AWF) mode, set git identity environment variables so the first git commit
@@ -388,21 +442,11 @@ func (e *ClaudeEngine) GetExecutionSteps(workflowData *WorkflowData, logFile str
 	// Add GH_AW_SAFE_OUTPUTS if output is needed
 	applySafeOutputEnvToMap(env, workflowData)
 
-	// Add GH_AW_STARTUP_TIMEOUT environment variable (in seconds) if startup-timeout is specified
-	// Supports both literal integers and GitHub Actions expressions (e.g. "${{ inputs.startup-timeout }}")
-	if workflowData.ToolsStartupTimeout != "" {
-		env["GH_AW_STARTUP_TIMEOUT"] = workflowData.ToolsStartupTimeout
-	}
+	// Propagate W3C trace context so engine spans nest under the gh-aw.agent.setup span.
+	applyTraceContextEnvToMap(env)
 
-	// Add GH_AW_TOOL_TIMEOUT environment variable (in seconds) if timeout is specified
-	// Supports both literal integers and GitHub Actions expressions (e.g. "${{ inputs.tool-timeout }}")
-	if workflowData.ToolsTimeout != "" {
-		env["GH_AW_TOOL_TIMEOUT"] = workflowData.ToolsTimeout
-	}
-
-	if workflowData.EngineConfig != nil && workflowData.EngineConfig.MaxTurns != "" {
-		env["GH_AW_MAX_TURNS"] = workflowData.EngineConfig.MaxTurns
-	}
+	applyOptionalEngineToolTimeouts(env, workflowData)
+	applyEngineMaxTurnsEnv(env, workflowData)
 
 	// Set the model environment variable.
 	// When model is configured, use the native ANTHROPIC_MODEL env var - the Claude CLI reads it
@@ -417,34 +461,15 @@ func (e *ClaudeEngine) GetExecutionSteps(workflowData *WorkflowData, logFile str
 		// No model configured - use fallback GitHub variable with shell expansion
 		isDetectionJob := workflowData.SafeOutputs == nil
 		if isDetectionJob {
-			env[constants.EnvVarModelDetectionClaude] = fmt.Sprintf("${{ vars.%s || '' }}", constants.EnvVarModelDetectionClaude)
+			env[constants.EnvVarModelDetectionClaude] = compilerenv.BuildModelOverrideExpressionEmptyFallback(constants.EnvVarModelDetectionClaude, compilerenv.DefaultModelClaude)
 		} else {
-			env[constants.EnvVarModelAgentClaude] = fmt.Sprintf("${{ vars.%s || '' }}", constants.EnvVarModelAgentClaude)
+			env[constants.EnvVarModelAgentClaude] = compilerenv.BuildModelOverrideExpressionEmptyFallback(constants.EnvVarModelAgentClaude, compilerenv.DefaultModelClaude)
 		}
 	}
 
-	// Add custom environment variables from engine config
-	if workflowData.EngineConfig != nil && len(workflowData.EngineConfig.Env) > 0 {
-		maps.Copy(env, workflowData.EngineConfig.Env)
-	}
-
-	// Add custom environment variables from agent config
-	agentConfig := getAgentConfig(workflowData)
-	if agentConfig != nil && len(agentConfig.Env) > 0 {
-		maps.Copy(env, agentConfig.Env)
-		claudeLog.Printf("Added %d custom env vars from agent config", len(agentConfig.Env))
-	}
-
-	// Add mcp-scripts secrets to env for passthrough to MCP servers
-	if IsMCPScriptsEnabled(workflowData.MCPScripts) {
-		mcpScriptsSecrets := collectMCPScriptsSecrets(workflowData.MCPScripts)
-		for varName, secretExpr := range mcpScriptsSecrets {
-			// Only add if not already in env
-			if _, exists := env[varName]; !exists {
-				env[varName] = secretExpr
-			}
-		}
-	}
+	applyEngineCwdEnv(env, workflowData)
+	applyEngineAndAgentEnv(env, workflowData, claudeLog)
+	applyMCPScriptsSecretEnv(env, workflowData)
 
 	// Generate the step for Claude CLI execution
 	stepName := "Execute Claude Code CLI"
@@ -494,6 +519,12 @@ func (e *ClaudeEngine) GetLogParserScriptId() string {
 	return "parse_claude_log"
 }
 
+// GetErrorDetectionScriptId returns the JavaScript script name for detecting
+// post-run agent errors from the host runner (including invalid/unsupported model names).
+func (e *ClaudeEngine) GetErrorDetectionScriptId() string {
+	return "detect_agent_errors"
+}
+
 // GetHarnessScriptName returns the filename of the JavaScript harness script that wraps
 // the Claude Code CLI with retry logic for transient Anthropic API errors (overload, rate limit).
 func (e *ClaudeEngine) GetHarnessScriptName() string {
@@ -503,4 +534,44 @@ func (e *ClaudeEngine) GetHarnessScriptName() string {
 // GetSquidLogsSteps returns the steps for uploading and parsing Squid logs (after secret redaction)
 func (e *ClaudeEngine) GetSquidLogsSteps(workflowData *WorkflowData) []GitHubActionStep {
 	return defaultGetSquidLogsSteps(workflowData, claudeLog)
+}
+
+func isEditToolExplicitlyDisabled(tools map[string]any) bool {
+	if tools == nil {
+		return false
+	}
+
+	editConfig, hasEdit := tools["edit"]
+	if !hasEdit {
+		return false
+	}
+
+	enabled, isBool := editConfig.(bool)
+	return isBool && !enabled
+}
+
+// stripClaudePermissionModeArgs removes all --permission-mode flags from args
+// (both "--permission-mode <value>" and "--permission-mode=<value>" forms).
+// It returns the filtered argument list and the last permission-mode value found.
+// The returned permission-mode value is an empty string when no such flag exists.
+func stripClaudePermissionModeArgs(args []string) ([]string, string) {
+	filtered := make([]string, 0, len(args))
+	permissionMode := ""
+
+	for i := 0; i < len(args); i++ {
+		arg := args[i]
+		switch {
+		case arg == "--permission-mode":
+			if i+1 < len(args) {
+				permissionMode = args[i+1]
+				i++
+			}
+		case strings.HasPrefix(arg, "--permission-mode="):
+			permissionMode = strings.TrimPrefix(arg, "--permission-mode=")
+		default:
+			filtered = append(filtered, arg)
+		}
+	}
+
+	return filtered, permissionMode
 }

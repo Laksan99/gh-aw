@@ -1,7 +1,7 @@
 // @ts-check
 /// <reference types="@actions/github-script" />
 
-const { createEngineLogParser, generateConversationMarkdown, generateInformationSection, formatInitializationSummary, formatToolUse } = require("./log_parser_shared.cjs");
+const { createEngineLogParser, generateConversationMarkdown, generateInformationSection, formatInitializationSummary, formatToolUse, convertLegacyLogEntriesToCopilotEvents } = require("./log_parser_shared.cjs");
 
 const main = createEngineLogParser({
   parserName: "Pi",
@@ -57,7 +57,8 @@ function parsePiLog(logContent) {
 
   const resultEntry = rawEntries.find(e => e.type === "result");
 
-  const conversationResult = generateConversationMarkdown(logEntries, {
+  const canonicalLogEntries = convertLegacyLogEntriesToCopilotEvents(logEntries, { sourceEngine: "pi" });
+  const conversationResult = generateConversationMarkdown(canonicalLogEntries, {
     formatToolCallback: (toolUse, toolResult) => formatToolUse(toolUse, toolResult, { includeDetailedParameters: false }),
     formatInitCallback: initEntry => formatInitializationSummary(initEntry, { includeSlashCommands: false }),
   });
@@ -75,13 +76,21 @@ function parsePiLog(logContent) {
       num_turns: stats.turns || 0,
     };
     markdown += generateInformationSection(syntheticEntry);
+
+    // Append a normalized result entry so log_parser_bootstrap.cjs can write it
+    // to agent-stdio.log for OTEL gh-aw.turns / token-usage enrichment.
+    canonicalLogEntries.push({
+      type: "result",
+      num_turns: syntheticEntry.num_turns,
+      usage: syntheticEntry.usage,
+    });
   } else {
     markdown += generateInformationSection(null);
   }
 
   return {
     markdown,
-    logEntries,
+    logEntries: canonicalLogEntries,
     mcpFailures: [],
     maxTurnsHit: false,
   };

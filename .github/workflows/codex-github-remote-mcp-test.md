@@ -1,13 +1,19 @@
 ---
+private: true
+emoji: "🧪"
 description: Test Codex engine with GitHub remote MCP server
 on:
   workflow_dispatch:
+max-daily-ai-credits: 10000
 permissions:
   contents: read
   issues: read
 engine: codex
 imports:
-  - shared/observability-otlp.md
+  - shared/otlp.md
+sandbox:
+  agent:
+    sudo: false
 tools:
   cli-proxy: true
   github:
@@ -16,7 +22,8 @@ tools:
 timeout-minutes: 5
 strict: true
 
-
+features:
+  gh-aw-detection: true
 ---
 
 # Codex GitHub Remote MCP Test

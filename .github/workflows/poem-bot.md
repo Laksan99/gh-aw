@@ -1,4 +1,5 @@
 ---
+emoji: "🎭"
 description: Generates creative poems on specified themes when invoked with /poem-bot command
 # Custom triggers: command with events filter, workflow_dispatch
 on:
@@ -27,8 +28,8 @@ permissions:
 
 # AI engine configuration
 engine:
-  id: copilot
-  model: gpt-5
+  id: pi
+  model: copilot/gpt-5.4
   bare: true
 
 # Import shared reporting guidelines
@@ -36,7 +37,7 @@ imports:
   - shared/reporting.md
 
 # Deny all network access
-  - shared/observability-otlp.md
+  - shared/otlp.md
 network: {}
 
 # Tools configuration
@@ -142,7 +143,7 @@ safe-outputs:
 
   # Custom messages in poetic style
   messages:
-    footer: "> 🪶 *Verses penned by [{workflow_name}]({run_url})*{effective_tokens_suffix}{history_link}"
+    footer: "> 🪶 *Verses penned by [{workflow_name}]({run_url})*{ai_credits_suffix}{history_link}"
     run-started: "🎭 Hear ye! The muse stirs! [{workflow_name}]({run_url}) takes quill in hand for this {event_type}..."
     run-success: "🪶 The poem is writ! [{workflow_name}]({run_url}) has composed verses most fair. Applause! 👏"
     run-failure: "🎭 Alas! [{workflow_name}]({run_url}) {status}. The muse has fled, leaving verses unsung..."
@@ -150,8 +151,9 @@ safe-outputs:
 # Global timeout
 timeout-minutes: 10
 strict: true
-
-
+sandbox:
+  agent:
+    sudo: false
 ---
 
 # Poem Bot - A Creative Agentic Workflow

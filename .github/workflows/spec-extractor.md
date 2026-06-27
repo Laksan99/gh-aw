@@ -1,4 +1,6 @@
 ---
+private: true
+emoji: "📋"
 name: Package Specification Extractor
 description: Extracts and maintains README.md specifications for each Go package under pkg/ using round-robin scheduling and cache-memory
 on:
@@ -10,6 +12,7 @@ permissions:
   issues: read
   pull-requests: read
 
+  copilot-requests: write
 tracker-id: spec-extractor
 engine: copilot
 strict: true
@@ -18,7 +21,7 @@ imports:
   - shared/reporting.md
   - shared/go-source-analysis.md
 
-  - shared/observability-otlp.md
+  - shared/otlp.md
 network:
   allowed:
     - defaults
@@ -31,7 +34,7 @@ pre-agent-steps:
       PACKAGES=(agentdrain cli console constants envutil fileutil gitutil logger parser repoutil semverutil sliceutil stringutil styles testutil timeutil tty types typeutil workflow)
       TOTAL=${#PACKAGES[@]}
       CACHE_DIR=/tmp/gh-aw/cache-memory/spec-extractor
-      CONTEXT=/tmp/pkg-context.md
+      CONTEXT=/tmp/gh-aw/agent/pkg-context.md
 
       # Initialize or load rotation state
       mkdir -p "$CACHE_DIR/extractions"
@@ -134,7 +137,7 @@ tools:
   cache-memory: true
   edit:
   bash:
-    - "cat /tmp/pkg-context.md"
+    - "cat /tmp/gh-aw/agent/pkg-context.md"
     - "git diff HEAD -- pkg/*/README.md"
     - "git status"
 
@@ -149,9 +152,6 @@ safe-outputs:
         - README.md    # this workflow writes pkg/*/README.md specification files
 
 timeout-minutes: 30
-features:
-  copilot-requests: true
-
 ---
 
 # Package Specification Extractor
@@ -169,7 +169,7 @@ You are the Package Specification Extractor — an expert technical writer agent
 All source analysis has been pre-collected by the setup step. Read the context file:
 
 ```bash
-cat /tmp/pkg-context.md
+cat /tmp/gh-aw/agent/pkg-context.md
 ```
 
 The file contains:
@@ -245,7 +245,7 @@ Write each README.md following W3C specification writing principles:
 
 ### Update Rotation State
 
-After writing all README.md files, update the cache using the rotation values from `/tmp/pkg-context.md`:
+After writing all README.md files, update the cache using the rotation values from `/tmp/gh-aw/agent/pkg-context.md`:
 
 - Write `/tmp/gh-aw/cache-memory/spec-extractor/rotation.json` with the `next last_index` and processed packages
 - Write per-package extraction metadata to `/tmp/gh-aw/cache-memory/spec-extractor/extractions/<package>.json`

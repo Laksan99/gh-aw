@@ -6,7 +6,7 @@
 // # Spinner Component
 //
 // The spinner provides visual feedback during long-running operations with a minimal
-// dot animation (⣾ ⣽ ⣻ ⢿ ⡿ ⣟ ⣯ ⣷). It automatically adapts to the environment:
+// dot animation (⠋ ⠙ ⠹ ⠸ ⠼ ⠴ ⠦ ⠧ ⠇ ⠏). It automatically adapts to the environment:
 //   - TTY Detection: Spinners only animate in terminal environments (disabled in pipes/redirects)
 //   - Accessibility: Respects ACCESSIBLE environment variable to disable animations
 //   - Color Adaptation: Uses lipgloss adaptive colors for light/dark terminal themes
@@ -72,10 +72,6 @@ func (m spinnerModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.message = string(msg)
 		m.render()
 		return m, nil
-	case tea.KeyPressMsg:
-		if msg.String() == "ctrl+c" {
-			return m, tea.Quit
-		}
 	case spinner.TickMsg:
 		var cmd tea.Cmd
 		m.spinner, cmd = m.spinner.Update(msg)
@@ -127,22 +123,27 @@ func NewSpinner(message string) *SpinnerWrapper {
 
 func (s *SpinnerWrapper) Start() {
 	if s.enabled && s.program != nil {
-		s.mu.Lock()
-		if s.running {
-			s.mu.Unlock()
+		shouldStart := func() bool {
+			s.mu.Lock()
+			defer s.mu.Unlock()
+			if s.running {
+				return false
+			}
+			s.running = true
+			s.wg.Add(1)
+			return true
+		}()
+		if !shouldStart {
 			spinnerLog.Print("Spinner already running, skipping Start")
 			return
 		}
-		s.running = true
-		s.wg.Add(1)
-		s.mu.Unlock()
 		spinnerLog.Print("Starting spinner")
 		go func() {
 			defer s.wg.Done()
 			defer func() {
 				s.mu.Lock()
+				defer s.mu.Unlock()
 				s.running = false
-				s.mu.Unlock()
 			}()
 			defer func() {
 				if r := recover(); r != nil {
@@ -156,31 +157,40 @@ func (s *SpinnerWrapper) Start() {
 
 func (s *SpinnerWrapper) Stop() {
 	if s.enabled && s.program != nil {
-		s.mu.Lock()
-		if s.running {
+		wasRunning := func() bool {
+			s.mu.Lock()
+			defer s.mu.Unlock()
+			if !s.running {
+				return false
+			}
 			s.running = false
-			s.mu.Unlock()
+			return true
+		}()
+		if wasRunning {
 			spinnerLog.Print("Stopping spinner")
 			s.program.Quit()
 			s.wg.Wait() // Wait for the goroutine to complete
 			fmt.Fprintf(os.Stderr, "%s%s", ansiCarriageReturn, ansiClearLine)
-		} else {
-			s.mu.Unlock()
 		}
 	}
 }
 
 func (s *SpinnerWrapper) StopWithMessage(msg string) {
 	if s.enabled && s.program != nil {
-		s.mu.Lock()
-		if s.running {
+		wasRunning := func() bool {
+			s.mu.Lock()
+			defer s.mu.Unlock()
+			if !s.running {
+				return false
+			}
 			s.running = false
-			s.mu.Unlock()
+			return true
+		}()
+		if wasRunning {
 			s.program.Quit()
 			s.wg.Wait() // Wait for the goroutine to complete
 			fmt.Fprintf(os.Stderr, "%s%s%s\n", ansiCarriageReturn, ansiClearLine, msg)
 		} else {
-			s.mu.Unlock()
 			// Still print the message even if spinner wasn't running
 			fmt.Fprintf(os.Stderr, "%s\n", msg)
 		}
@@ -192,9 +202,11 @@ func (s *SpinnerWrapper) StopWithMessage(msg string) {
 
 func (s *SpinnerWrapper) UpdateMessage(message string) {
 	if s.enabled && s.program != nil {
-		s.mu.Lock()
-		running := s.running
-		s.mu.Unlock()
+		running := func() bool {
+			s.mu.Lock()
+			defer s.mu.Unlock()
+			return s.running
+		}()
 		if running {
 			s.program.Send(updateMessageMsg(message))
 		}

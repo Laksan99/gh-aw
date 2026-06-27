@@ -6,6 +6,7 @@ import (
 	"archive/zip"
 	"context"
 	"errors"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -13,6 +14,8 @@ import (
 
 	"github.com/github/gh-aw/pkg/fileutil"
 	"github.com/github/gh-aw/pkg/testutil"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 func TestDownloadWorkflowLogs(t *testing.T) {
@@ -304,6 +307,97 @@ func TestRetryCriticalArtifactsSkipsExisting(t *testing.T) {
 			t.Errorf("expected directory %s to still exist after retry", name)
 		}
 	}
+}
+
+func TestDownloadArtifactsByName_LogsArtifactNamesInCI(t *testing.T) {
+	fakeBinDir := testutil.TempDir(t, "fake-gh-*")
+	fakeGH := filepath.Join(fakeBinDir, "gh")
+	argsLogPath := filepath.Join(fakeBinDir, "gh-args.log")
+	fakeGHScript := "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"" + argsLogPath + "\"\nexit 0\n"
+	require.NoError(t, os.WriteFile(fakeGH, []byte(fakeGHScript), 0o755))
+
+	originalPath := os.Getenv("PATH")
+	t.Setenv("PATH", fakeBinDir+string(os.PathListSeparator)+originalPath)
+	t.Setenv("GITHUB_ACTIONS", "true")
+
+	reader, writer, err := os.Pipe()
+	require.NoError(t, err)
+	originalStderr := os.Stderr
+	os.Stderr = writer
+	t.Cleanup(func() {
+		os.Stderr = originalStderr
+	})
+
+	err = downloadArtifactsByName(context.Background(), 12345, t.TempDir(), []string{"usage"}, false, "", "", "")
+	require.NoError(t, err)
+
+	require.NoError(t, writer.Close())
+	output, err := io.ReadAll(reader)
+	require.NoError(t, err)
+	assert.Contains(t, string(output), "Downloading artifact: usage")
+
+	argsLog, err := os.ReadFile(argsLogPath)
+	require.NoError(t, err)
+	assert.Contains(t, string(argsLog), "run download 12345 --name usage")
+}
+
+func TestDownloadRunArtifacts_CachedUsageFallbackToActivation(t *testing.T) {
+	tmpDir := testutil.TempDir(t, "usage-fallback-*")
+
+	usageDir := filepath.Join(tmpDir, "usage")
+	require.NoError(t, os.MkdirAll(usageDir, 0o755))
+	require.NoError(t, os.WriteFile(filepath.Join(usageDir, "usage.jsonl"), []byte("{}\n"), 0o644))
+
+	fakeBinDir := testutil.TempDir(t, "fake-gh-*")
+	fakeGH := filepath.Join(fakeBinDir, "gh")
+	argsLogPath := filepath.Join(fakeBinDir, "gh-args.log")
+	fakeGHScript := "#!/bin/sh\n" +
+		"printf '%s\\n' \"$*\" >> \"" + argsLogPath + "\"\n" +
+		"if [ \"$1\" = \"api\" ]; then\n" +
+		"  printf '%s\\n' \"abc123-activation\"\n" +
+		"  exit 0\n" +
+		"fi\n" +
+		"if [ \"$1\" = \"run\" ] && [ \"$2\" = \"download\" ]; then\n" +
+		"  name=\"\"\n" +
+		"  dir=\"\"\n" +
+		"  while [ $# -gt 0 ]; do\n" +
+		"    if [ \"$1\" = \"--name\" ]; then\n" +
+		"      name=\"$2\"\n" +
+		"      shift 2\n" +
+		"      continue\n" +
+		"    fi\n" +
+		"    if [ \"$1\" = \"--dir\" ]; then\n" +
+		"      dir=\"$2\"\n" +
+		"      shift 2\n" +
+		"      continue\n" +
+		"    fi\n" +
+		"    shift\n" +
+		"  done\n" +
+		"  mkdir -p \"$dir/$name\"\n" +
+		"  printf '%s' '{\"engine_id\":\"claude\"}' > \"$dir/$name/aw_info.json\"\n" +
+		"  : > \"$dir/.fallback-download-$name\"\n" +
+		"  exit 0\n" +
+		"fi\n" +
+		"exit 1\n"
+	require.NoError(t, os.WriteFile(fakeGH, []byte(fakeGHScript), 0o755))
+
+	originalPath := os.Getenv("PATH")
+	t.Setenv("PATH", fakeBinDir+string(os.PathListSeparator)+originalPath)
+
+	err := downloadRunArtifacts(context.Background(), 12345, tmpDir, false, "github", "gh-aw", "", []string{"usage"})
+	require.NoError(t, err)
+
+	assert.FileExists(t, filepath.Join(tmpDir, "aw_info.json"))
+	assert.FileExists(t, filepath.Join(tmpDir, ".fallback-download-abc123-activation"))
+	assert.NoDirExists(t, filepath.Join(tmpDir, "abc123-activation"))
+	awInfo, err := os.ReadFile(filepath.Join(tmpDir, "aw_info.json"))
+	require.NoError(t, err)
+	assert.JSONEq(t, `{"engine_id":"claude"}`, string(awInfo))
+
+	argsLog, err := os.ReadFile(argsLogPath)
+	require.NoError(t, err)
+	assert.Contains(t, string(argsLog), "api --paginate repos/github/gh-aw/actions/runs/12345/artifacts")
+	assert.Contains(t, string(argsLog), "run download 12345 --name abc123-activation")
 }
 
 func TestListWorkflowRunsWithPagination(t *testing.T) {

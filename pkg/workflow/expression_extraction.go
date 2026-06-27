@@ -3,26 +3,23 @@ package workflow
 import (
 	"crypto/sha256"
 	"encoding/hex"
-	"encoding/json"
 	"fmt"
 	"os"
-	"reflect"
 	"regexp"
-	"sort"
+	"slices"
 	"strings"
 
 	"github.com/github/gh-aw/pkg/console"
+	"github.com/github/gh-aw/pkg/importinpututil"
 	"github.com/github/gh-aw/pkg/logger"
+	"github.com/github/gh-aw/pkg/setutil"
 )
 
 var expressionExtractionLog = logger.New("workflow:expression_extraction")
 
 // Pre-compiled regexes for performance (avoid recompilation in hot paths)
 var (
-	// expressionExtractionRegex matches GitHub Actions expressions: ${{ ... }}
-	// Uses (?s) flag for dotall mode, non-greedy matching
-	expressionExtractionRegex = regexp.MustCompile(`\$\{\{(.*?)\}\}`)
-	awContextExpressionRegex  = regexp.MustCompile(`github\.aw\.context\.([a-zA-Z0-9_]+)([^a-zA-Z0-9_-]|$)`)
+	awContextExpressionRegex = regexp.MustCompile(`github\.aw\.context\.([a-zA-Z0-9_]+)([^a-zA-Z0-9_-]|$)`)
 )
 
 // ExpressionMapping represents a mapping between a GitHub expression and its environment variable
@@ -47,72 +44,110 @@ func NewExpressionExtractor() *ExpressionExtractor {
 	}
 }
 
+// contentTransformer is a function that rewrites an expression's content string.
+// It receives the current content and returns the (possibly) transformed content.
+// If no transformation applies it returns the input unchanged.
+type contentTransformer func(string) string
+
+// defaultContentTransformers is the ordered pipeline of content transformations
+// applied to every expression before it is mapped to an env var.
+// Transformers are applied in sequence; the output of one becomes the input of
+// the next. To extend the pipeline without modifying ExtractExpressions, append
+// to this slice before calling NewExpressionExtractor.
+var defaultContentTransformers = []contentTransformer{
+	transformActivationOutputs,
+	transformExperimentsExpression,
+	transformAwContextExpression,
+}
+
+// applyContentTransformers runs content through each transformer in order,
+// logging changes, and returns the fully-transformed content.
+func applyContentTransformers(content string, transformers []contentTransformer) string {
+	for _, t := range transformers {
+		if transformed := t(content); transformed != content {
+			expressionExtractionLog.Printf("Transformed expression: %s -> %s", content, transformed)
+			content = transformed
+		}
+	}
+	return content
+}
+
+// addSubExpressionMappings registers a synthetic ExpressionMapping for every
+// qualifying terminal sub-expression inside a compound expression so that the
+// runtime evaluator can resolve each operand via a deterministic GH_AW_* env var.
+//
+// For compound expressions (one that is not a simple identifier), the runtime
+// evaluator (runtime_import.cjs evaluateExpression()) recurses on || / && operands
+// and looks up "GH_AW_" + toUpperCase(expr.replace(/\./g, "_")) for each terminal.
+// Without this method only the hash env var for the full compound expression is
+// present in the step's env block, so individual operands always appear unresolved.
+func (e *ExpressionExtractor) addSubExpressionMappings(content string) {
+	if simpleIdentifierRegex.MatchString(content) {
+		return
+	}
+	for _, subExpr := range extractTerminalSubExpressions(content) {
+		syntheticOriginal := "${{ " + subExpr + " }}"
+		if _, exists := e.mappings[syntheticOriginal]; !exists {
+			// Sub-expressions are guaranteed to be simple identifiers by
+			// extractTerminalSubExpressions, so generateEnvVarName produces a
+			// deterministic pretty name (e.g. GH_AW_STEPS_SANITIZED_OUTPUTS_TEXT).
+			e.mappings[syntheticOriginal] = &ExpressionMapping{
+				Original: syntheticOriginal,
+				EnvVar:   e.generateEnvVarName(subExpr),
+				Content:  subExpr,
+			}
+		}
+	}
+}
+
+// processMatch handles a single regex match from the expression extraction regex.
+// It applies content transformations, emits any deprecation warnings, registers
+// the primary mapping, and expands compound expressions into sub-expression
+// mappings. It is a no-op for empty content or already-seen expressions.
+func (e *ExpressionExtractor) processMatch(originalExpr, rawContent string) {
+	content := strings.TrimSpace(rawContent)
+	if content == "" {
+		expressionExtractionLog.Printf("Skipping empty expression: %s", originalExpr)
+		return
+	}
+
+	originalContent := content
+	content = applyContentTransformers(content, defaultContentTransformers)
+
+	// Skip if we've already seen this expression (also prevents duplicate deprecation warnings)
+	if _, exists := e.mappings[originalExpr]; exists {
+		return
+	}
+
+	// Emit deprecation warning once per unique deprecated activation-output expression
+	if content != originalContent && strings.HasPrefix(content, "steps.sanitized.outputs.") {
+		fmt.Fprintln(os.Stderr, console.FormatWarningMessage(
+			fmt.Sprintf("Deprecated expression ${{ %s }}: use ${{ %s }} instead.", originalContent, content),
+		))
+	}
+
+	e.mappings[originalExpr] = &ExpressionMapping{
+		Original: originalExpr,
+		EnvVar:   e.generateEnvVarName(content),
+		Content:  content,
+	}
+
+	e.addSubExpressionMappings(content)
+}
+
 // ExtractExpressions extracts all ${{ ... }} expressions from the markdown content
-// and creates environment variable mappings for each unique expression
+// and creates environment variable mappings for each unique expression.
 func (e *ExpressionExtractor) ExtractExpressions(markdown string) ([]*ExpressionMapping, error) {
 	expressionExtractionLog.Printf("Extracting expressions from markdown: content_length=%d", len(markdown))
 
-	// Use pre-compiled regex from package level for performance
-	matches := expressionExtractionRegex.FindAllStringSubmatch(markdown, -1)
+	matches := ExpressionPattern.FindAllStringSubmatch(markdown, -1)
 	expressionExtractionLog.Printf("Found %d expression matches", len(matches))
 
 	for _, match := range matches {
 		if len(match) < 2 {
 			continue
 		}
-
-		// Extract the full original expression including ${{ }}
-		originalExpr := match[0]
-
-		// Extract the content (without ${{ }})
-		content := strings.TrimSpace(match[1])
-		originalContent := content
-
-		// Apply activation output transformation for backward compatibility
-		// This transforms needs.activation.outputs.{text|title|body} to steps.sanitized.outputs.{text|title|body}
-		// Users should now use steps.sanitized.outputs.* directly; this transformation exists only for
-		// backward compatibility with existing workflows.
-		if t := transformActivationOutputs(content); t != content {
-			expressionExtractionLog.Printf("Transformed expression: %s -> %s", content, t)
-			content = t
-		}
-
-		// Detect experiments.NAME expressions and remap them to steps.pick-experiment.outputs.NAME
-		// so the substitution step reads the variant value from the pick_experiment step output.
-		if t := transformExperimentsExpression(content); t != content {
-			expressionExtractionLog.Printf("Transformed experiment expression: %s -> %s", content, t)
-			content = t
-		}
-
-		// Expand github.aw.context.<field> syntax sugar to parsed aw_context access.
-		if t := transformAwContextExpression(content); t != content {
-			expressionExtractionLog.Printf("Transformed aw_context expression: %s -> %s", content, t)
-			content = t
-		}
-
-		// Skip if we've already seen this expression (also prevents duplicate deprecation warnings)
-		if _, exists := e.mappings[originalExpr]; exists {
-			continue
-		}
-
-		// Emit deprecation warning once per unique deprecated activation-output expression
-		if content != originalContent && strings.HasPrefix(content, "steps.sanitized.outputs.") {
-			fmt.Fprintln(os.Stderr, console.FormatWarningMessage(
-				fmt.Sprintf("Deprecated expression ${{ %s }}: use ${{ %s }} instead.", originalContent, content),
-			))
-		}
-
-		// Generate environment variable name
-		envVar := e.generateEnvVarName(content)
-
-		// Create mapping
-		mapping := &ExpressionMapping{
-			Original: originalExpr,
-			EnvVar:   envVar,
-			Content:  content,
-		}
-
-		e.mappings[originalExpr] = mapping
+		e.processMatch(match[0], match[1])
 	}
 
 	// Convert map to sorted slice for consistent ordering
@@ -122,8 +157,15 @@ func (e *ExpressionExtractor) ExtractExpressions(markdown string) ([]*Expression
 	}
 
 	// Sort by original expression for deterministic output
-	sort.Slice(result, func(i, j int) bool {
-		return result[i].Original < result[j].Original
+	slices.SortFunc(result, func(a, b *ExpressionMapping) int {
+		switch {
+		case a.Original < b.Original:
+			return -1
+		case a.Original > b.Original:
+			return 1
+		default:
+			return 0
+		}
 	})
 
 	expressionExtractionLog.Printf("Extracted %d unique expressions", len(result))
@@ -272,6 +314,74 @@ func transformAwContextExpression(expr string) string {
 // Each identifier must start with a letter or underscore, followed by alphanumeric or underscore
 var simpleIdentifierRegex = regexp.MustCompile(`^[a-zA-Z_][a-zA-Z0-9_]*(\.[a-zA-Z_][a-zA-Z0-9_]*)*$`)
 
+// runtimeEvalEnvVarPrefixRegex matches the expression prefixes for which the runtime
+// evaluator (runtime_import.cjs evaluateExpression) resolves values via deterministic
+// GH_AW_* environment variable names (rather than via the GitHub context object).
+// See the `if (trimmed.startsWith("needs.") || ...)` block in evaluateExpression().
+var runtimeEvalEnvVarPrefixRegex = regexp.MustCompile(`^(?:needs|steps|inputs)\.`)
+
+// isQualifyingSubExpression reports whether expr is a simple property-access chain
+// (matching simpleIdentifierRegex) that starts with needs.*, steps.*, or inputs.*.
+// These are the sub-expressions for which the runtime evaluator looks up a deterministic
+// GH_AW_* environment variable name.
+func isQualifyingSubExpression(expr string) bool {
+	return expr != "" &&
+		simpleIdentifierRegex.MatchString(expr) &&
+		runtimeEvalEnvVarPrefixRegex.MatchString(expr)
+}
+
+// extractTerminalSubExpressions returns the simple-identifier sub-expressions from a
+// compound expression (one containing `||` or `&&` operators, and optionally parentheses)
+// that the runtime evaluator resolves via deterministic GH_AW_* environment variable names.
+//
+// It delegates parsing to the existing ParseExpression / VisitExpressionTree helpers in
+// expression_parser.go so that all operator precedence, parenthesis grouping, and quoted
+// string handling are handled consistently with the rest of the workflow expression system.
+//
+// Only leaf ExpressionNode values that:
+//
+//  1. are valid simple property-access chains (matching simpleIdentifierRegex), and
+//  2. start with needs.*, steps.*, or inputs.*
+//
+// are returned. github.* sub-expressions are deliberately excluded because the runtime
+// evaluator resolves them through the GitHub context object, not through env vars.
+//
+// Examples:
+//
+//	"steps.sanitized.outputs.text || inputs.command"
+//	→ ["steps.sanitized.outputs.text", "inputs.command"]
+//
+//	"(steps.sanitized.outputs.text || inputs.command) && inputs.flag"
+//	→ ["steps.sanitized.outputs.text", "inputs.command", "inputs.flag"]
+//
+//	"github.event.issue.number || inputs.item_number"
+//	→ ["inputs.item_number"]
+//
+//	"steps.pick-experiment.outputs.name == 'concise'"
+//	→ []  (hyphenated segment; not a simpleIdentifier)
+func extractTerminalSubExpressions(content string) []string {
+	tree, err := ParseExpression(content)
+	if err != nil {
+		// Unparseable expression (e.g. malformed input) — return empty safely.
+		expressionExtractionLog.Printf("Could not parse expression %q for sub-expression extraction (skipping): %v", content, err)
+		return nil
+	}
+
+	seen := make(map[string]struct {
+	})
+	var result []string
+	_ = VisitExpressionTree(tree, func(node *ExpressionNode) error {
+		expr := strings.TrimSpace(node.Expression)
+		if isQualifyingSubExpression(expr) && !setutil.Contains(seen, expr) {
+			seen[expr] = struct {
+			}{}
+			result = append(result, expr)
+		}
+		return nil
+	})
+	return result
+}
+
 // generateEnvVarName generates a unique environment variable name for an expression
 // For simple JavaScript property access chains (e.g., "github.event.issue.number"),
 // it generates a pretty name like "GH_AW_GITHUB_EVENT_ISSUE_NUMBER".
@@ -310,8 +420,15 @@ func (e *ExpressionExtractor) ReplaceExpressionsWithEnvVars(markdown string) str
 	for _, mapping := range e.mappings {
 		mappings = append(mappings, mapping)
 	}
-	sort.Slice(mappings, func(i, j int) bool {
-		return len(mappings[i].Original) > len(mappings[j].Original)
+	slices.SortFunc(mappings, func(a, b *ExpressionMapping) int {
+		switch {
+		case len(a.Original) > len(b.Original):
+			return -1
+		case len(a.Original) < len(b.Original):
+			return 1
+		default:
+			return 0
+		}
 	})
 
 	// Replace each expression with its environment variable reference
@@ -323,14 +440,6 @@ func (e *ExpressionExtractor) ReplaceExpressionsWithEnvVars(markdown string) str
 
 	return result
 }
-
-// awInputsExprRegex matches ${{ github.aw.inputs.<key> }} expressions
-var awInputsExprRegex = regexp.MustCompile(`\$\{\{\s*github\.aw\.inputs\.([a-zA-Z0-9_-]+)\s*\}\}`)
-
-// awImportInputsExprRegex matches ${{ github.aw.import-inputs.<key> }} and
-// ${{ github.aw.import-inputs.<key>.<subkey> }} expressions (import-schema form).
-// Captures the full dotted path (e.g. "count" or "config.apiKey").
-var awImportInputsExprRegex = regexp.MustCompile(`\$\{\{\s*github\.aw\.import-inputs\.([a-zA-Z0-9_-]+(?:\.[a-zA-Z0-9_-]+)?)\s*\}\}`)
 
 // applyWorkflowDispatchFallbacks enhances entity number expressions with an
 // "|| inputs.item_number" fallback when the workflow has a workflow_dispatch
@@ -395,9 +504,9 @@ func SubstituteImportInputs(content string, importInputs map[string]any) string 
 	}
 
 	// Substitute ${{ github.aw.inputs.<key> }} (legacy form)
-	result := awInputsExprRegex.ReplaceAllStringFunc(content, substituteFunc(awInputsExprRegex, "inputs"))
+	result := AWInputsExpressionPattern.ReplaceAllStringFunc(content, substituteFunc(AWInputsExpressionPattern, "inputs"))
 	// Substitute ${{ github.aw.import-inputs.<key> }} (import-schema form)
-	result = awImportInputsExprRegex.ReplaceAllStringFunc(result, substituteFunc(awImportInputsExprRegex, "import-inputs"))
+	result = AWImportInputsExpressionPattern.ReplaceAllStringFunc(result, substituteFunc(AWImportInputsExpressionPattern, "import-inputs"))
 
 	return result
 }
@@ -410,45 +519,12 @@ func SubstituteImportInputs(content string, importInputs map[string]any) string 
 // goccy/go-yaml may produce typed slices (e.g. []string) instead of []any, so
 // a reflection fallback converts any slice kind to []any before JSON marshaling.
 func marshalImportInputValue(value any) string {
-	switch v := value.(type) {
-	case []any:
-		if b, err := json.Marshal(v); err == nil {
-			return string(b)
-		}
-	case map[string]any:
-		if b, err := json.Marshal(v); err == nil {
-			return string(b)
-		}
-	case nil:
+	if formatted, ok := importinpututil.FormatResolvedValue(value); ok {
+		return formatted
+	}
+	if value == nil {
 		// Null import input — return empty string rather than panicking.
 		return ""
-	default:
-		// Handle typed slices (e.g. []string) that goccy/go-yaml may produce
-		// instead of []any, and typed maps.
-		rv := reflect.ValueOf(v)
-		switch rv.Kind() {
-		case reflect.Slice:
-			normalized := make([]any, rv.Len())
-			for i := range rv.Len() {
-				normalized[i] = rv.Index(i).Interface()
-			}
-			if b, err := json.Marshal(normalized); err == nil {
-				return string(b)
-			}
-		case reflect.Map:
-			keys := make([]string, 0, rv.Len())
-			for _, key := range rv.MapKeys() {
-				keys = append(keys, key.String())
-			}
-			sort.Strings(keys)
-			normalized := make(map[string]any, rv.Len())
-			for _, k := range keys {
-				normalized[k] = rv.MapIndex(reflect.ValueOf(k)).Interface()
-			}
-			if b, err := json.Marshal(normalized); err == nil {
-				return string(b)
-			}
-		}
 	}
 	return fmt.Sprintf("%v", value)
 }
@@ -459,20 +535,5 @@ func marshalImportInputValue(value any) string {
 // supporting one level of nesting as defined by import-schema object types.
 // Returns the resolved value and true on success, or nil and false when the path is not found.
 func resolveImportInputPath(importInputs map[string]any, path string) (any, bool) {
-	topKey, subKey, hasDot := strings.Cut(path, ".")
-	if !hasDot {
-		// Scalar: direct lookup
-		value, ok := importInputs[topKey]
-		return value, ok
-	}
-	// Object sub-key: one-level deep lookup
-	topValue, ok := importInputs[topKey]
-	if !ok {
-		return nil, false
-	}
-	if obj, ok := topValue.(map[string]any); ok {
-		value, ok := obj[subKey]
-		return value, ok
-	}
-	return nil, false
+	return importinpututil.ResolvePathValue(importInputs, path)
 }

@@ -2,9 +2,10 @@ package workflow
 
 import (
 	"fmt"
-	"sort"
 	"strconv"
 	"strings"
+
+	"github.com/github/gh-aw/pkg/sliceutil"
 )
 
 var safeOutputsMaxValidationLog = newValidationLogger("safe_outputs_max")
@@ -124,6 +125,11 @@ func validateSafeOutputsMax(config *SafeOutputsConfig) error {
 			return err
 		}
 	}
+	if config.CreateCheckRun != nil {
+		if err := checkMaxField("create_check_run", config.CreateCheckRun.Max); err != nil {
+			return err
+		}
+	}
 	if config.CreateCodeScanningAlerts != nil {
 		if err := checkMaxField("create_code_scanning_alert", config.CreateCodeScanningAlerts.Max); err != nil {
 			return err
@@ -209,6 +215,11 @@ func validateSafeOutputsMax(config *SafeOutputsConfig) error {
 			return err
 		}
 	}
+	if config.ReplaceLabel != nil {
+		if err := checkMaxField("replace_label", config.ReplaceLabel.Max); err != nil {
+			return err
+		}
+	}
 	if config.ReplyToPullRequestReviewComment != nil {
 		if err := checkMaxField("reply_to_pull_request_review_comment", config.ReplyToPullRequestReviewComment.Max); err != nil {
 			return err
@@ -278,11 +289,7 @@ func validateSafeOutputsMax(config *SafeOutputsConfig) error {
 	// Validate max on dispatch_repository tools (different structure: map of tools).
 	// Use sorted tool names for deterministic error reporting.
 	if config.DispatchRepository != nil {
-		sortedToolNames := make([]string, 0, len(config.DispatchRepository.Tools))
-		for toolName := range config.DispatchRepository.Tools {
-			sortedToolNames = append(sortedToolNames, toolName)
-		}
-		sort.Strings(sortedToolNames)
+		sortedToolNames := sliceutil.SortedKeys(config.DispatchRepository.Tools)
 
 		for _, toolName := range sortedToolNames {
 			tool := config.DispatchRepository.Tools[toolName]

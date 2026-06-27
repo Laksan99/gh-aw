@@ -1,4 +1,6 @@
 ---
+private: true
+emoji: "⚠️"
 description: Example workflow demonstrating proper permission provisioning and security best practices
 timeout-minutes: 5
 on:
@@ -8,7 +10,7 @@ permissions:
   issues: read
   pull-requests: read
 imports:
-  - shared/observability-otlp.md
+  - shared/otlp.md
 tools:
   cli-proxy: true
   github:

@@ -2,7 +2,15 @@ package workflow
 
 import (
 	"errors"
+	"fmt"
+	"os"
 	"strings"
+)
+
+const (
+	githubRepositoryExpression              = "${{ github.repository }}"
+	githubLockdownGuardPolicyWarningMessage = `'tools.github.lockdown: true' is set; GitHub guard policy fields ('allowed-repos', 'min-integrity', 'blocked-users', 'trusted-users', 'approval-labels') will be ignored.
+Guard policies are only evaluated when lockdown is not active.`
 )
 
 // validateGitHubReadOnly validates that read-only: false is not set for the GitHub tool.
@@ -36,6 +44,45 @@ func validateGitHubToolConfig(tools *Tools, workflowName string) error {
 	return nil
 }
 
+// hasGitHubGuardPolicyFields reports whether any GitHub guard-policy fields are
+// configured on the tool. It is used to detect lockdown/guard-policy
+// combinations that should surface a compile-time warning.
+func hasGitHubGuardPolicyFields(github *GitHubToolConfig) bool {
+	if github == nil {
+		return false
+	}
+
+	// This is a presence check, not a validity check. Explicit but invalid values
+	// (for example an empty string or wrong type injected programmatically) still
+	// count as configured guard-policy fields and are validated later.
+	hasRepos := github.AllowedRepos != nil
+	hasMinIntegrity := github.MinIntegrity != ""
+	hasBlockedUsers := len(github.BlockedUsers) > 0 || github.BlockedUsersExpr != ""
+	hasApprovalLabels := len(github.ApprovalLabels) > 0 || github.ApprovalLabelsExpr != ""
+	hasTrustedUsers := len(github.TrustedUsers) > 0 || github.TrustedUsersExpr != ""
+
+	return hasRepos || hasMinIntegrity || hasBlockedUsers || hasApprovalLabels || hasTrustedUsers
+}
+
+func hasGitHubLockdownGuardPolicyConflict(github *GitHubToolConfig) bool {
+	return github != nil && github.Lockdown && hasGitHubGuardPolicyFields(github)
+}
+
+func emitGitHubLockdownGuardPolicyWarning(compiler *Compiler, tools *Tools, markdownPath string) {
+	if tools == nil || tools.GitHub == nil || !hasGitHubLockdownGuardPolicyConflict(tools.GitHub) {
+		return
+	}
+
+	if compiler == nil {
+		toolsValidationLog.Printf("Skipping lockdown/guard-policy warning because compiler is nil for workflow: %s", markdownPath)
+		return
+	}
+
+	toolsValidationLog.Printf("Emitting lockdown/guard-policy warning for workflow: %s", markdownPath)
+	compiler.IncrementWarningCount()
+	fmt.Fprintln(os.Stderr, formatCompilerMessage(markdownPath, "warning", githubLockdownGuardPolicyWarningMessage))
+}
+
 // validateGitHubGuardPolicy validates the GitHub guard policy configuration.
 // Guard policy fields (allowed-repos, min-integrity) are specified flat under github:.
 // Note: 'repos' is a deprecated alias for 'allowed-repos'.
@@ -46,6 +93,10 @@ func validateGitHubGuardPolicy(tools *Tools, workflowName string) error {
 	}
 
 	github := tools.GitHub
+	if hasGitHubLockdownGuardPolicyConflict(github) {
+		toolsValidationLog.Printf("lockdown enabled with guard policy fields in workflow: %s", workflowName)
+	}
+
 	// AllowedRepos is populated from either 'allowed-repos' (preferred) or deprecated 'repos' during parsing
 	hasRepos := github.AllowedRepos != nil
 	hasMinIntegrity := github.MinIntegrity != ""
@@ -127,9 +178,9 @@ func validateGitHubGuardPolicy(tools *Tools, workflowName string) error {
 func validateReposScope(repos any, workflowName string) error {
 	// Case 1: String value ("all" or "public")
 	if reposStr, ok := repos.(string); ok {
-		if reposStr != "all" && reposStr != "public" {
+		if reposStr != "all" && reposStr != "public" && !isExactGitHubRepositoryExpression(reposStr) {
 			toolsValidationLog.Printf("Invalid repos string '%s' in workflow: %s", reposStr, workflowName)
-			return errors.New("invalid guard policy: 'github.allowed-repos' string must be 'all' or 'public'. Got: '" + reposStr + "'")
+			return errors.New("invalid guard policy: 'github.allowed-repos' string must be 'all', 'public', or '${{ github.repository }}'. Got: '" + reposStr + "'")
 		}
 		return nil
 	}
@@ -179,6 +230,10 @@ func validateReposScope(repos any, workflowName string) error {
 
 // validateRepoPattern validates a single repository pattern
 func validateRepoPattern(pattern string, workflowName string) error {
+	if isExactGitHubRepositoryExpression(pattern) {
+		return nil
+	}
+
 	// Pattern must be lowercase
 	if strings.ToLower(pattern) != pattern {
 		toolsValidationLog.Printf("Repository pattern '%s' is not lowercase in workflow: %s", pattern, workflowName)
@@ -236,6 +291,46 @@ func isValidOwnerOrRepo(s string) bool {
 		}
 	}
 	return true
+}
+
+func isExactGitHubRepositoryExpression(value string) bool {
+	return value == githubRepositoryExpression
+}
+
+func normalizeGitHubRepositoryInReposScope(repos any) any {
+	switch r := repos.(type) {
+	case string:
+		if isExactGitHubRepositoryExpression(r) {
+			return githubRepositoryExpression
+		}
+		return r
+	case []string:
+		normalized := make([]string, len(r))
+		for i, repo := range r {
+			if isExactGitHubRepositoryExpression(repo) {
+				normalized[i] = githubRepositoryExpression
+				continue
+			}
+			normalized[i] = repo
+		}
+		return normalized
+	case []any:
+		normalized := make([]any, len(r))
+		for i, repo := range r {
+			if repoStr, ok := repo.(string); ok {
+				if isExactGitHubRepositoryExpression(repoStr) {
+					normalized[i] = githubRepositoryExpression
+					continue
+				}
+				normalized[i] = repoStr
+				continue
+			}
+			normalized[i] = repo
+		}
+		return normalized
+	default:
+		return repos
+	}
 }
 
 // Note: validateGitToolForSafeOutputs was removed because git commands are automatically

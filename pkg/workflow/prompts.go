@@ -13,7 +13,7 @@ var promptsLog = logger.New("workflow:prompts")
 // contextual instructions to the agent's prompt file during execution.
 //
 // Prompts are organized by feature area:
-// - Safe outputs: Instructions for using the safeoutputs MCP server
+// - Safe outputs: Instructions for using the safeoutputs CLI tool
 // - Cache memory: Instructions for persistent cache folder access
 // - Tool prompts: Instructions for specific tools (edit, playwright)
 // - PR context: Instructions for pull request branch context
@@ -31,21 +31,6 @@ func hasPlaywrightTool(parsedTools *Tools) bool {
 	hasPlaywright := parsedTools.Playwright != nil
 	promptsLog.Printf("Playwright tool enabled: %v", hasPlaywright)
 	return hasPlaywright
-}
-
-// ============================================================================
-// Tool Prompts - Agentic Workflows
-// ============================================================================
-
-// hasAgenticWorkflowsTool checks if the agentic workflows tool is enabled in the tools configuration
-func hasAgenticWorkflowsTool(parsedTools *Tools) bool {
-	if parsedTools == nil {
-		promptsLog.Print("Checking for agentic-workflows tool: no parsed tools provided")
-		return false
-	}
-	hasAgenticWorkflows := parsedTools.AgenticWorkflows != nil
-	promptsLog.Printf("Agentic-workflows tool enabled: %v", hasAgenticWorkflows)
-	return hasAgenticWorkflows
 }
 
 // ============================================================================

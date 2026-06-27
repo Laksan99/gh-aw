@@ -11,6 +11,7 @@ import (
 
 	"github.com/github/gh-aw/pkg/console"
 	"github.com/github/gh-aw/pkg/constants"
+	"github.com/github/gh-aw/pkg/github"
 	"github.com/github/gh-aw/pkg/logger"
 	"github.com/spf13/cobra"
 )
@@ -28,10 +29,8 @@ For each safe output (created issue, PR, comment, label, etc.), checks the curre
 state of the GitHub object to determine whether the action was accepted, rejected,
 ignored, or is still pending.
 
-This answers the question: "Did this workflow's actions actually help?"
-
-Examples:
-  ` + string(constants.CLIExtensionPrefix) + ` outcomes 1234567890                # Check outcomes for a specific run
+This answers the question: "Did this workflow's actions actually help?"`,
+		Example: `  ` + string(constants.CLIExtensionPrefix) + ` outcomes 1234567890                # Check outcomes for a specific run
   ` + string(constants.CLIExtensionPrefix) + ` outcomes 1234567890 --json         # JSON output
   ` + string(constants.CLIExtensionPrefix) + ` outcomes 1234567890 --repo o/r     # Specify repository
   ` + string(constants.CLIExtensionPrefix) + ` outcomes 1234567890 -v             # Verbose output`,
@@ -59,11 +58,11 @@ Examples:
 		},
 	}
 
-	cmd.Flags().BoolP("verbose", "v", false, "Show detailed output")
 	addJSONFlag(cmd)
 	addRepoFlag(cmd)
 	addOutputFlag(cmd, "")
 	cmd.Flags().String("outcomes-dir", "", "Write outcome JSONL to this directory for OTLP export")
+	cmd.AddCommand(NewOutcomesHistorySubcommand())
 
 	return cmd
 }
@@ -156,7 +155,7 @@ func RunOutcomes(config OutcomesConfig) error {
 				Summary: OutcomeSummary{},
 			}
 			out, _ := json.MarshalIndent(data, "", "  ")
-			fmt.Println(string(out))
+			fmt.Fprintln(os.Stdout, string(out))
 		}
 		return nil
 	}
@@ -166,8 +165,9 @@ func RunOutcomes(config OutcomesConfig) error {
 	}
 
 	// Run the evaluations
-	reports := EvaluateOutcomes(items, repo)
-	outcomeSummary := ComputeOutcomeSummary(reports, 0) // TODO: pass actual cost when available
+	mapping := github.LoadObjectiveMappingFromConfig()
+	reports := EvaluateOutcomes(items, repo, mapping)
+	outcomeSummary := ComputeOutcomeSummary(reports, mapping)
 
 	// Write outcome JSONL if requested (for OTLP export or downstream processing).
 	// The --outcomes-dir flag takes precedence over the GH_AW_OUTCOMES_DIR env var.
@@ -196,7 +196,7 @@ func RunOutcomes(config OutcomesConfig) error {
 		if err != nil {
 			return fmt.Errorf("failed to marshal JSON: %w", err)
 		}
-		fmt.Println(string(out))
+		fmt.Fprintln(os.Stdout, string(out))
 		return nil
 	}
 

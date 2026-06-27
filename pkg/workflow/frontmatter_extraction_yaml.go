@@ -6,10 +6,12 @@ import (
 	"slices"
 	"strings"
 
+	"github.com/goccy/go-yaml"
+
 	"github.com/github/gh-aw/pkg/console"
 	"github.com/github/gh-aw/pkg/logger"
 	"github.com/github/gh-aw/pkg/parser"
-	"github.com/goccy/go-yaml"
+	"github.com/github/gh-aw/pkg/setutil"
 )
 
 var frontmatterLog = logger.New("workflow:frontmatter_extraction")
@@ -79,6 +81,12 @@ func (c *Compiler) extractTopLevelYAMLSection(frontmatter map[string]any, key st
 	// which causes validation errors since they start with numbers but contain spaces
 	yamlStr = parser.QuoteCronExpressions(yamlStr)
 
+	// For top-level env values, quote plain scalars containing ": " because YAML
+	// treats this token sequence as a mapping separator in plain style.
+	if key == "env" {
+		yamlStr = quoteEnvValuesContainingColonSpace(yamlStr)
+	}
+
 	// Clean up null values - replace `: null` with `:` for cleaner output
 	// GitHub Actions treats `workflow_dispatch:` and `workflow_dispatch: null` identically
 	yamlStr = CleanYAMLNullValues(yamlStr)
@@ -101,14 +109,15 @@ func (c *Compiler) extractTopLevelYAMLSection(frontmatter map[string]any, key st
 	return yamlStr
 }
 
-// commentOutProcessedFieldsInOnSection comments out draft, fork, forks, names, labels, manual-approval, stop-after, skip-if-match, skip-if-no-match, skip-roles, reaction, lock-for-agent, steps, permissions, and stale-check fields in the on section
+// commentOutProcessedFieldsInOnSection comments out draft, fork, forks, names, labels, manual-approval, stop-after, skip-if-match, skip-if-no-match, skip-roles, reaction, lock-for-agent, steps, permissions, needs, and stale-check fields in the on section
 // These fields are processed separately and should be commented for documentation
 // Exception: names fields in sections with __gh_aw_native_label_filter__ marker in frontmatter are NOT commented out
 func (c *Compiler) commentOutProcessedFieldsInOnSection(yamlStr string, frontmatter map[string]any) string {
 	frontmatterLog.Print("Processing 'on' section to comment out processed fields")
 
 	// Check frontmatter for native label filter markers
-	nativeLabelFilterSections := make(map[string]bool)
+	nativeLabelFilterSections := make(map[string]struct {
+	})
 	if onValue, exists := frontmatter["on"]; exists {
 		if onMap, ok := onValue.(map[string]any); ok {
 			for _, sectionKey := range []string{"issues", "pull_request", "discussion", "issue_comment"} {
@@ -116,7 +125,8 @@ func (c *Compiler) commentOutProcessedFieldsInOnSection(yamlStr string, frontmat
 					if sectionMap, ok := sectionValue.(map[string]any); ok {
 						if marker, hasMarker := sectionMap["__gh_aw_native_label_filter__"]; hasMarker {
 							if useNative, ok := marker.(bool); ok && useNative {
-								nativeLabelFilterSections[sectionKey] = true
+								nativeLabelFilterSections[sectionKey] = struct {
+								}{}
 								frontmatterLog.Printf("Section %s uses native label filtering", sectionKey)
 							}
 						}
@@ -145,6 +155,7 @@ func (c *Compiler) commentOutProcessedFieldsInOnSection(yamlStr string, frontmat
 	inRolesArray := false
 	inBotsArray := false
 	inLabelsArray := false
+	inNeedsArray := false
 	inGitHubApp := false
 	inOnSteps := false
 	inOnPermissions := false
@@ -153,7 +164,28 @@ func (c *Compiler) commentOutProcessedFieldsInOnSection(yamlStr string, frontmat
 	deploymentStatusIndent := -1
 	workflowRunIndent := -1
 	// activateEventSection resets all event-section flags and then activates the selected section.
+	// It also clears every top-level on: extension-array tracker (inBotsArray, inRolesArray,
+	// inSkipIfCheckFailing, etc.) before entering the new section.  This reset is required
+	// because each activateEventSection call ends with "continue", which bypasses the
+	// indent-based deactivation logic further down the loop.  Without the explicit reset here,
+	// a stale flag from a preceding bots:/roles:/skip-if-check-failing: block would cause that
+	// section's list items (e.g. "workflow_run.workflows: - CI") to be incorrectly commented out.
 	activateEventSection := func(section string, indent int) {
+		// Clear all top-level on: extension-array state so no sibling section leaks in.
+		inSkipRolesArray = false
+		inSkipBotsArray = false
+		inRolesArray = false
+		inBotsArray = false
+		inLabelsArray = false
+		inNeedsArray = false
+		// These trackers share the same exit-check-ordering issue: their deactivation
+		// logic runs after the "continue" that terminates each activateEventSection call,
+		// so they must also be reset here explicitly.
+		inSkipIfMatch = false
+		inSkipIfNoMatch = false
+		inSkipIfCheckFailing = false
+		inSkipAuthorAssociations = false
+
 		inPullRequest = section == "pull_request"
 		inIssues = section == "issues"
 		inDiscussion = section == "discussion"
@@ -298,6 +330,13 @@ func (c *Compiler) commentOutProcessedFieldsInOnSection(yamlStr string, frontmat
 			!inOnSteps && !inOnPermissions &&
 			lineIndent == 2 && trimmedLine == "labels:" {
 			inLabelsArray = true
+		}
+
+		// Check if we're entering needs array
+		if !inPullRequest && !inIssues && !inDiscussion && !inIssueComment &&
+			!inOnSteps && !inOnPermissions &&
+			lineIndent == 2 && strings.HasPrefix(trimmedLine, "needs:") {
+			inNeedsArray = true
 		}
 
 		// Check if we're entering on.steps array
@@ -482,6 +521,17 @@ func (c *Compiler) commentOutProcessedFieldsInOnSection(yamlStr string, frontmat
 			}
 		}
 
+		// Check if we're leaving the needs array by encountering another top-level field
+		if inNeedsArray && strings.TrimSpace(line) != "" {
+			// Get the indentation of the current line
+			lineIndent := len(line) - len(strings.TrimLeft(line, " \t"))
+
+			// If this is a non-dash line at the same level as needs (2 spaces), we're out of the array
+			if lineIndent == 2 && !strings.HasPrefix(trimmedLine, "-") && !strings.HasPrefix(trimmedLine, "needs:") && !strings.HasPrefix(trimmedLine, "#") {
+				inNeedsArray = false
+			}
+		}
+
 		// Check if we're leaving the on.steps array by encountering another top-level field
 		if inOnSteps && strings.TrimSpace(line) != "" {
 			lineIndent := len(line) - len(strings.TrimLeft(line, " \t"))
@@ -575,6 +625,13 @@ func (c *Compiler) commentOutProcessedFieldsInOnSection(yamlStr string, frontmat
 				// Comment out array items in labels
 				shouldComment = true
 				commentReason = " # Label filtering applied via job conditions"
+			} else if !inOnSteps && !inOnPermissions && lineIndent == 2 && strings.HasPrefix(trimmedLine, "needs:") {
+				shouldComment = true
+				commentReason = " # Needs processed as dependency in pre-activation job"
+			} else if inNeedsArray && strings.HasPrefix(trimmedLine, "-") {
+				// Comment out array items in needs
+				shouldComment = true
+				commentReason = " # Needs processed as dependency in pre-activation job"
 			} else if strings.HasPrefix(trimmedLine, "steps:") {
 				shouldComment = true
 				commentReason = " # Steps injected into pre-activation job"
@@ -640,7 +697,7 @@ func (c *Compiler) commentOutProcessedFieldsInOnSection(yamlStr string, frontmat
 			commentReason = " # Lock-for-agent processed as issue locking in activation job"
 		} else if (inPullRequest || inIssues || inDiscussion || inIssueComment) && strings.HasPrefix(trimmedLine, "names:") {
 			// Only comment out names if NOT using native label filtering for this section
-			if !nativeLabelFilterSections[currentSection] {
+			if !setutil.Contains(nativeLabelFilterSections, currentSection) {
 				shouldComment = true
 				commentReason = " # Label filtering applied via job conditions"
 			}
@@ -648,9 +705,9 @@ func (c *Compiler) commentOutProcessedFieldsInOnSection(yamlStr string, frontmat
 			// Check if we're in a names array (after "names:" line)
 			// Look back to see if the previous uncommented line was "names:"
 			// Only do this if NOT using native label filtering for this section
-			if !nativeLabelFilterSections[currentSection] {
+			if !setutil.Contains(nativeLabelFilterSections, currentSection) {
 				if len(result) > 0 {
-					for i := len(result) - 1; i >= 0; i-- {
+					for i := range slices.Backward(result) {
 						prevLine := result[i]
 						prevTrimmed := strings.TrimSpace(prevLine)
 
@@ -834,22 +891,41 @@ func (c *Compiler) extractIfCondition(frontmatter map[string]any) (string, error
 	return ifExpr, nil
 }
 
+// extractOnTriggerValue returns the raw value for on.<trigger> when the frontmatter
+// contains an "on" map with that trigger configured.
+func extractOnTriggerValue(frontmatter map[string]any, trigger string) (any, bool) {
+	onMap, ok := frontmatter["on"].(map[string]any)
+	if !ok {
+		return nil, false
+	}
+	value, ok := onMap[trigger]
+	return value, ok
+}
+
+// extractOnTriggerMap returns the on.<trigger> value as a map when the configured
+// trigger uses object syntax.
+func extractOnTriggerMap(frontmatter map[string]any, trigger string) (map[string]any, bool) {
+	value, ok := extractOnTriggerValue(frontmatter, trigger)
+	if !ok {
+		return nil, false
+	}
+	triggerMap, ok := value.(map[string]any)
+	return triggerMap, ok
+}
+
+// normalizeStringOrStringSlice converts a string or string-like array value into a
+// []string, ignoring non-string array elements.
+func normalizeStringOrStringSlice(raw any) []string {
+	if s, ok := raw.(string); ok {
+		return []string{s}
+	}
+	return parseStringSliceAny(raw, nil)
+}
+
 // extractDeploymentStatusStateCondition reads on.deployment_status.state and converts it
 // into a GitHub Actions expression string (without ${{ }} wrappers). Returns "" if not set.
 func extractDeploymentStatusStateCondition(frontmatter map[string]any) string {
-	onValue, ok := frontmatter["on"]
-	if !ok {
-		return ""
-	}
-	onMap, ok := onValue.(map[string]any)
-	if !ok {
-		return ""
-	}
-	dsValue, ok := onMap["deployment_status"]
-	if !ok {
-		return ""
-	}
-	dsMap, ok := dsValue.(map[string]any)
+	dsMap, ok := extractOnTriggerMap(frontmatter, "deployment_status")
 	if !ok {
 		return ""
 	}
@@ -859,12 +935,7 @@ func extractDeploymentStatusStateCondition(frontmatter map[string]any) string {
 	}
 
 	// GitHub Actions allows state as a single string or an array
-	var states []string
-	if s, ok := stateValue.(string); ok {
-		states = []string{s}
-	} else {
-		states = parseStringSliceAny(stateValue, nil)
-	}
+	states := normalizeStringOrStringSlice(stateValue)
 
 	if len(states) == 0 {
 		return ""
@@ -906,19 +977,7 @@ func isValidWorkflowRunConclusion(v string) bool {
 // extractWorkflowRunConclusionCondition reads on.workflow_run.conclusion and converts it
 // into a GitHub Actions expression string (without ${{ }} wrappers). Returns "" if not set.
 func extractWorkflowRunConclusionCondition(frontmatter map[string]any) (string, error) {
-	onValue, ok := frontmatter["on"]
-	if !ok {
-		return "", nil
-	}
-	onMap, ok := onValue.(map[string]any)
-	if !ok {
-		return "", nil
-	}
-	wrValue, ok := onMap["workflow_run"]
-	if !ok {
-		return "", nil
-	}
-	wrMap, ok := wrValue.(map[string]any)
+	wrMap, ok := extractOnTriggerMap(frontmatter, "workflow_run")
 	if !ok {
 		return "", nil
 	}
@@ -927,17 +986,7 @@ func extractWorkflowRunConclusionCondition(frontmatter map[string]any) (string, 
 		return "", nil
 	}
 
-	var conclusions []string
-	switch v := conclusionValue.(type) {
-	case string:
-		conclusions = []string{v}
-	case []any:
-		for _, s := range v {
-			if str, ok := s.(string); ok {
-				conclusions = append(conclusions, str)
-			}
-		}
-	}
+	conclusions := normalizeStringOrStringSlice(conclusionValue)
 
 	if len(conclusions) == 0 {
 		return "", nil
@@ -982,79 +1031,62 @@ func (c *Compiler) extractExpressionFromIfString(ifString string) string {
 }
 
 // extractCommandConfig extracts command configuration from frontmatter including name, events,
-// and centralized routing strategy for slash_command.
-func (c *Compiler) extractCommandConfig(frontmatter map[string]any) (commandNames []string, commandEvents []string, commandCentralized bool) {
+// centralized routing strategy, and optional footer placeholder for slash_command.
+func (c *Compiler) extractCommandConfig(frontmatter map[string]any) (commandNames []string, commandEvents []string, commandCentralized bool, commandPlaceholder string) {
 	frontmatterLog.Print("Extracting command configuration from frontmatter")
 	// Check new format: on.slash_command or on.slash_command.name (preferred)
 	// Also check legacy format: on.command or on.command.name (deprecated)
-	if onValue, exists := frontmatter["on"]; exists {
-		if onMap, ok := onValue.(map[string]any); ok {
-			var commandValue any
-			var hasCommand bool
-			var isDeprecated bool
+	commandValue, hasCommand := extractOnTriggerValue(frontmatter, "slash_command")
+	isDeprecated := false
+	if !hasCommand {
+		commandValue, hasCommand = extractOnTriggerValue(frontmatter, "command")
+		isDeprecated = hasCommand
+	}
+	if hasCommand {
+		// Show deprecation warning if using old field name
+		if isDeprecated {
+			fmt.Fprintln(os.Stderr, console.FormatWarningMessage("The 'command:' trigger field is deprecated. Please use 'slash_command:' instead."))
+			c.IncrementWarningCount()
+		}
 
-			// Check for slash_command first (preferred)
-			if slashCommandValue, hasSlashCommand := onMap["slash_command"]; hasSlashCommand {
-				commandValue = slashCommandValue
-				hasCommand = true
-				isDeprecated = false
-			} else if legacyCommandValue, hasLegacyCommand := onMap["command"]; hasLegacyCommand {
-				// Fall back to command (deprecated)
-				commandValue = legacyCommandValue
-				hasCommand = true
-				isDeprecated = true
+		// Check if command is a string (shorthand format)
+		if commandStr, ok := commandValue.(string); ok {
+			frontmatterLog.Printf("Extracted command name (shorthand): %s", commandStr)
+			return []string{commandStr}, nil, false, "" // nil means default (all events)
+		}
+		// Check if command is a map with a name key (object format)
+		if commandMap, ok := commandValue.(map[string]any); ok {
+			var events []string
+			centralized := false
+			placeholder := ""
+			names := normalizeStringOrStringSlice(commandMap["name"])
+
+			// Extract events field
+			if eventsValue, hasEvents := commandMap["events"]; hasEvents {
+				events = ParseCommandEvents(eventsValue)
 			}
 
-			if hasCommand {
-				// Show deprecation warning if using old field name
-				if isDeprecated {
-					fmt.Fprintln(os.Stderr, console.FormatWarningMessage("The 'command:' trigger field is deprecated. Please use 'slash_command:' instead."))
-					c.IncrementWarningCount()
-				}
-
-				// Check if command is a string (shorthand format)
-				if commandStr, ok := commandValue.(string); ok {
-					frontmatterLog.Printf("Extracted command name (shorthand): %s", commandStr)
-					return []string{commandStr}, nil, false // nil means default (all events)
-				}
-				// Check if command is a map with a name key (object format)
-				if commandMap, ok := commandValue.(map[string]any); ok {
-					var names []string
-					var events []string
-					centralized := false
-
-					if nameValue, hasName := commandMap["name"]; hasName {
-						// Handle string or array of strings
-						if nameStr, ok := nameValue.(string); ok {
-							names = []string{nameStr}
-						} else if nameArray, ok := nameValue.([]any); ok {
-							for _, nameItem := range nameArray {
-								if nameItemStr, ok := nameItem.(string); ok {
-									names = append(names, nameItemStr)
-								}
-							}
-						}
-					}
-
-					// Extract events field
-					if eventsValue, hasEvents := commandMap["events"]; hasEvents {
-						events = ParseCommandEvents(eventsValue)
-					}
-
-					if strategyRaw, hasStrategy := commandMap["strategy"]; hasStrategy {
-						if strategy, ok := strategyRaw.(string); ok && strings.EqualFold(strings.TrimSpace(strategy), "centralized") {
-							centralized = true
-						}
-					}
-
-					frontmatterLog.Printf("Extracted command config: names=%v, events=%v, centralized=%v", names, events, centralized)
-					return names, events, centralized
+			if strategyRaw, hasStrategy := commandMap["strategy"]; hasStrategy {
+				if strategy, ok := strategyRaw.(string); ok && strings.EqualFold(strings.TrimSpace(strategy), "centralized") {
+					centralized = true
 				}
 			}
+
+			// Extract optional placeholder for footer hint text
+			if placeholderRaw, hasPlaceholder := commandMap["placeholder"]; hasPlaceholder {
+				if placeholderStr, ok := placeholderRaw.(string); ok {
+					if trimmed := strings.TrimSpace(placeholderStr); trimmed != "" {
+						placeholder = trimmed
+					}
+				}
+			}
+
+			frontmatterLog.Printf("Extracted command config: names=%v, events=%v, centralized=%v, placeholder=%q", names, events, centralized, placeholder)
+			return names, events, centralized, placeholder
 		}
 	}
 
-	return nil, nil, false
+	return nil, nil, false, ""
 }
 
 // extractLabelCommandConfig extracts the label-command configuration from frontmatter
@@ -1067,15 +1099,7 @@ func (c *Compiler) extractCommandConfig(frontmatter map[string]any) (commandName
 // and removeLabel defaults to true when not specified.
 func (c *Compiler) extractLabelCommandConfig(frontmatter map[string]any) (labelNames []string, labelEvents []string, decentralized bool, removeLabel bool) {
 	frontmatterLog.Print("Extracting label-command configuration from frontmatter")
-	onValue, exists := frontmatter["on"]
-	if !exists {
-		return nil, nil, false, true
-	}
-	onMap, ok := onValue.(map[string]any)
-	if !ok {
-		return nil, nil, false, true
-	}
-	labelCommandValue, hasLabelCommand := onMap["label_command"]
+	labelCommandValue, hasLabelCommand := extractOnTriggerValue(frontmatter, "label_command")
 	if !hasLabelCommand {
 		return nil, nil, false, true
 	}
@@ -1088,32 +1112,13 @@ func (c *Compiler) extractLabelCommandConfig(frontmatter map[string]any) (labelN
 
 	// Map form: label_command: {name: "...", names: [...], events: [...], remove_label: bool}
 	if lcMap, ok := labelCommandValue.(map[string]any); ok {
-		var names []string
 		var events []string
 		decentralized := false
 		removeLabelVal := true // default to true
+		names := normalizeStringOrStringSlice(lcMap["name"])
 
-		if nameVal, hasName := lcMap["name"]; hasName {
-			if nameStr, ok := nameVal.(string); ok {
-				names = []string{nameStr}
-			} else if nameArray, ok := nameVal.([]any); ok {
-				for _, item := range nameArray {
-					if s, ok := item.(string); ok {
-						names = append(names, s)
-					}
-				}
-			}
-		}
 		if namesVal, hasNames := lcMap["names"]; hasNames {
-			if namesArray, ok := namesVal.([]any); ok {
-				for _, item := range namesArray {
-					if s, ok := item.(string); ok {
-						names = append(names, s)
-					}
-				}
-			} else if namesStr, ok := namesVal.(string); ok {
-				names = append(names, namesStr)
-			}
+			names = append(names, normalizeStringOrStringSlice(namesVal)...)
 		}
 
 		if eventsVal, hasEvents := lcMap["events"]; hasEvents {
@@ -1142,7 +1147,7 @@ func (c *Compiler) extractLabelCommandConfig(frontmatter map[string]any) (labelN
 // isGitHubAppNestedField returns true if the trimmed YAML line represents a known
 // nested field or array item inside an on.github-app object.
 func isGitHubAppNestedField(trimmedLine string) bool {
-	githubAppFields := []string{"app-id:", "client-id:", "private-key:", "owner:", "repositories:"}
+	githubAppFields := []string{"app-id:", "client-id:", "private-key:", "ignore-if-missing:", "owner:", "repositories:"}
 	for _, field := range githubAppFields {
 		if strings.HasPrefix(trimmedLine, field) {
 			return true

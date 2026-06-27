@@ -14,11 +14,15 @@ const { pushExtraEmptyCommit } = require("./extra_empty_commit.cjs");
 const { detectForkPR, checkBranchPushable } = require("./pr_helpers.cjs");
 const { resolveTargetRepoConfig, resolveAndValidateRepo } = require("./repo_helpers.cjs");
 const { createAuthenticatedGitHubClient } = require("./handler_auth.cjs");
-const { checkFileProtection } = require("./manifest_file_helpers.cjs");
+const { checkFileProtection, checkFileProtectionPostApply } = require("./manifest_file_helpers.cjs");
 const { buildWorkflowRunUrl } = require("./workflow_metadata_helpers.cjs");
 const { renderTemplateFromFile, buildProtectedFileList, getPromptPath } = require("./messages_core.cjs");
-const { ensureFullHistoryForBundle, getGitAuthEnv } = require("./git_helpers.cjs");
+const { ensureFullHistoryForBundle, extractBundlePrerequisiteCommits, isShallowOrSparseCheckout, linearizeRangeAsCommit } = require("./git_helpers.cjs");
+const { normalizeCommitSHA } = require("./commit_sha_helpers.cjs");
 const { findRepoCheckout } = require("./find_repo_checkout.cjs");
+const { getThreatDetectedMarker } = require("./threat_detection_warning.cjs");
+const { attachExecutionState } = require("./safe_output_execution_metadata.cjs");
+const { resolveTransportPaths } = require("./resolve_transport_paths.cjs");
 
 /**
  * @typedef {import('./types/handler-factory').HandlerFactoryFunction} HandlerFactoryFunction
@@ -36,7 +40,6 @@ const MISSING_REMOTE_REF_PATTERNS = [
   "fatal: couldn't find remote ref",
   "exit code 128",
 ];
-
 /**
  * @param {unknown} value
  * @returns {boolean}
@@ -60,8 +63,10 @@ function parseAwContext(rawAwContext) {
       return null;
     }
     const parsedObj = /** @type {Record<string, unknown>} */ parsed;
-    const itemType = typeof parsedObj.item_type === "string" ? parsedObj.item_type : "";
-    const itemNumber = parsePositiveInteger(parsedObj.item_number);
+    const itemTypeValue = parsedObj["item_type"];
+    const itemNumberValue = parsedObj["item_number"];
+    const itemType = typeof itemTypeValue === "string" ? itemTypeValue : "";
+    const itemNumber = parsePositiveInteger(itemNumberValue);
     return { item_type: itemType, item_number: itemNumber };
   }
 
@@ -98,6 +103,23 @@ function parsePositiveInteger(value) {
 }
 
 /**
+ * Uses git as the source of truth for the files modified by a fetched bundle ref.
+ *
+ * @param {{ getExecOutput: (command: string, args?: string[], options?: any) => Promise<{ stdout: string }> }} exec
+ * @param {Record<string, unknown>} gitOptions
+ * @param {string} rangeBaseRef
+ * @param {string} bundleRef
+ * @returns {Promise<string[]>}
+ */
+async function getBundlePreApplyFiles(exec, gitOptions, rangeBaseRef, bundleRef) {
+  const bundleDiffResult = await exec.getExecOutput("git", ["diff", "--name-only", "--no-renames", `${rangeBaseRef}..${bundleRef}`], gitOptions);
+  return bundleDiffResult.stdout
+    .split("\n")
+    .map(f => f.trim())
+    .filter(Boolean);
+}
+
+/**
  * Main handler factory for push_to_pull_request_branch
  * Returns a message handler function that processes individual push_to_pull_request_branch messages
  * @type {HandlerFactoryFunction}
@@ -106,13 +128,15 @@ async function main(config = {}) {
   // Extract configuration from config parameter
   const target = config.target || "triggering";
   const titlePrefix = config.title_prefix || "";
-  const envLabels = config.labels ? (Array.isArray(config.labels) ? config.labels : config.labels.split(",")).map(label => String(label).trim()).filter(label => label) : [];
+  const rawRequiredLabels = config.required_labels ?? config.labels;
+  const envLabels = rawRequiredLabels ? (Array.isArray(rawRequiredLabels) ? rawRequiredLabels : rawRequiredLabels.split(",")).map(label => String(label).trim()).filter(label => label) : [];
   const ifNoChanges = config.if_no_changes || "warn";
   const ignoreMissingBranchFailure = config.ignore_missing_branch_failure === true;
   const fallbackAsPullRequest = config.fallback_as_pull_request !== false;
   const checkBranchProtection = config.check_branch_protection !== false;
+  const signedCommits = config.signed_commits !== false;
   const commitTitleSuffix = config.commit_title_suffix || "";
-  const maxSizeKb = config.max_patch_size ? parseInt(String(config.max_patch_size), 10) : 1024;
+  const maxSizeKb = parsePositiveInteger(config.max_patch_size) ?? 4096;
   const maxCount = config.max || 0; // 0 means no limit
 
   // Cross-repo support: resolve target repository from config
@@ -120,12 +144,14 @@ async function main(config = {}) {
   const { defaultTargetRepo, allowedRepos } = resolveTargetRepoConfig(config);
   const githubClient = await createAuthenticatedGitHubClient(config);
 
-  // Build git auth env once for all network operations in this handler.
-  // clean_git_credentials.sh removes credentials from .git/config before the
-  // agent runs, so git fetch/push must authenticate via GIT_CONFIG_* env vars.
-  // Use the per-handler github-token (for cross-repo PAT) when available,
-  // falling back to GITHUB_TOKEN for the default workflow token.
-  const gitAuthEnv = getGitAuthEnv(config["github-token"]);
+  // Git network operations authenticate using the credentials actions/checkout
+  // persisted into .git/config for the safe_outputs job (persist-credentials: true,
+  // using the resolved push token). We intentionally do NOT inject an additional
+  // http.extraheader via GIT_CONFIG_* here: doing so duplicates the Authorization
+  // header already present in .git/config and causes the server to reject the request
+  // with "Duplicate header: Authorization" (HTTP 400) on git fetch/push. GitHub API
+  // ("gh") operations authenticate separately via the authenticated Octokit client above.
+  const gitAuthEnv = {};
 
   // Base branch from config (if set) - used only for logging at factory level
   // Dynamic base branch resolution happens per-message after resolving the actual target repo
@@ -148,6 +174,7 @@ async function main(config = {}) {
   core.info(`Ignore missing branch failure: ${ignoreMissingBranchFailure}`);
   core.info(`Fallback as pull request: ${fallbackAsPullRequest}`);
   core.info(`Check branch protection: ${checkBranchProtection}`);
+  core.info(`Push signed commits: ${signedCommits}`);
   if (commitTitleSuffix) {
     core.info(`Commit title suffix: ${commitTitleSuffix}`);
   }
@@ -176,12 +203,15 @@ async function main(config = {}) {
 
     processedCount++;
 
-    // Determine the patch file path from the message (set by the MCP server handler)
-    const patchFilePath = message.patch_path;
+    // Determine the patch and bundle file paths. The MCP server sets these on
+    // the entry it writes, but the validation step strips them as a defense
+    // against agent-forged values. Recover them by re-deriving from `branch`.
+    const transportPaths = resolveTransportPaths(message, defaultTargetRepo);
+    const patchFilePath = transportPaths.patchPath;
     core.info(`Patch file path: ${patchFilePath || "(not set)"}`);
 
     // Determine the bundle file path from the message (set when patch-format: bundle is configured)
-    const bundleFilePath = message.bundle_path;
+    const bundleFilePath = transportPaths.bundlePath;
     if (bundleFilePath) {
       core.info(`Bundle file path: ${bundleFilePath}`);
     }
@@ -189,10 +219,15 @@ async function main(config = {}) {
     // Check if bundle or patch file exists
     const hasBundleFile = !!(bundleFilePath && fs.existsSync(bundleFilePath));
     const hasPatchFile = !!(patchFilePath && fs.existsSync(patchFilePath));
+    const applyTransport = hasBundleFile ? "bundle" : "patch";
+    core.info(`Apply transport mode: ${applyTransport} (patch file present: ${hasPatchFile}, bundle file present: ${hasBundleFile})`);
+    if (bundleFilePath && !hasBundleFile) {
+      core.warning(`Bundle file path was provided but file is not present on disk: ${bundleFilePath}; falling back to patch transport`);
+    }
 
-    // Always require a patch file for policy enforcement. Bundle is used for apply-time
-    // transport, but allowed-files/protected-files checks must run on patch content
-    // (see validation block below that calls checkFileProtection on patchContent).
+    // Always require a patch file. The patch remains the preview/debug artifact and
+    // the first-pass validation input; bundle transport adds an authoritative
+    // pre-apply git diff check later after the bundle ref has been fetched.
     if (!hasPatchFile) {
       const msg = "No patch file found - cannot push without changes";
 
@@ -391,6 +426,7 @@ async function main(config = {}) {
     let branchName;
     let prTitle = "";
     let prLabels = [];
+    let branchStateBefore = null;
 
     if (!pullNumber) {
       return { success: false, error: "Pull request number is required but not found" };
@@ -415,14 +451,28 @@ async function main(config = {}) {
     const workflowRepo = process.env.GITHUB_REPOSITORY || "";
     if (itemRepo.toLowerCase() !== workflowRepo.toLowerCase()) {
       core.info(`Cross-repo push: looking for checkout of ${itemRepo}`);
-      const checkoutResult = findRepoCheckout(itemRepo, process.env.GITHUB_WORKSPACE, { allowedRepos: [...allowedRepos] });
-      if (!checkoutResult.success) {
-        return {
-          success: false,
-          error: `Repository '${itemRepo}' not found in workspace. Check out the target repo with actions/checkout and set its 'path' input so the checkout can be located. If checking out multiple repositories, ensure each actions/checkout step uses the appropriate 'path' input.`,
-        };
+      // First try the checkout mapping (faster than scanning the workspace)
+      const checkoutMappingConfig = config.checkout_mapping || null;
+      if (checkoutMappingConfig) {
+        const targetLower = itemRepo.toLowerCase();
+        const mappedPath = checkoutMappingConfig[targetLower];
+        if (mappedPath) {
+          const path = require("path");
+          repoCwd = path.resolve(process.env.GITHUB_WORKSPACE || process.cwd(), mappedPath);
+          core.info(`Using checkout mapping: ${itemRepo} -> ${mappedPath}`);
+        }
       }
-      repoCwd = checkoutResult.path;
+      // Fall back to workspace scan if not found in mapping
+      if (!repoCwd) {
+        const checkoutResult = findRepoCheckout(itemRepo, process.env.GITHUB_WORKSPACE, { allowedRepos: [...allowedRepos] });
+        if (!checkoutResult.success) {
+          return {
+            success: false,
+            error: `Repository '${itemRepo}' not found in workspace. Check out the target repo with actions/checkout and set its 'path' input so the checkout can be located. If checking out multiple repositories, ensure each actions/checkout step uses the appropriate 'path' input.`,
+          };
+        }
+        repoCwd = checkoutResult.path;
+      }
       core.info(`Found checkout for ${itemRepo} at: ${repoCwd}`);
     }
 
@@ -439,6 +489,9 @@ async function main(config = {}) {
       branchName = pullRequest.head.ref;
       prTitle = pullRequest.title || "";
       prLabels = pullRequest.labels.map(label => label.name);
+      if (typeof pullRequest.head?.sha === "string" && pullRequest.head.sha) {
+        branchStateBefore = { head_sha: pullRequest.head.sha };
+      }
     } catch (error) {
       core.info(`Warning: Could not fetch PR ${pullNumber} from ${itemRepo}: ${getErrorMessage(error)}`);
       return { success: false, error: `Failed to determine branch name for PR ${pullNumber} in ${itemRepo}` };
@@ -510,16 +563,14 @@ async function main(config = {}) {
       core.info(`✓ Labels validation passed: ${envLabels.join(", ")}`);
     }
 
-    // Deferred protected file protection – fallback-to-issue path.
-    // Create a review issue now that we have repoParts, pullNumber, and prTitle available.
-    if (protectedFilesForFallback && protectedFilesForFallback.length > 0) {
+    const createProtectedFilesFallbackIssue = async files => {
       const runUrl = buildWorkflowRunUrl(context, context.repo);
       const runId = context.runId;
       const patchFileName = patchFilePath ? patchFilePath.replace("/tmp/gh-aw/", "") : "aw-unknown.patch";
       const githubServer = process.env.GITHUB_SERVER_URL || "https://github.com";
       const prUrl = `${githubServer}/${repoParts.owner}/${repoParts.repo}/pull/${pullNumber}`;
       const issueTitle = `[gh-aw] Protected Files: ${prTitle || `PR #${pullNumber}`}`;
-      const fileList = buildProtectedFileList(protectedFilesForFallback, githubServer, repoParts.owner, repoParts.repo, branchName);
+      const fileList = buildProtectedFileList(files, githubServer, repoParts.owner, repoParts.repo, branchName);
       const templatePath = getPromptPath("manifest_protection_push_to_pr_fallback.md");
       const issueBody = renderTemplateFromFile(templatePath, {
         files: fileList,
@@ -546,17 +597,27 @@ async function main(config = {}) {
         );
         core.info(`Created manifest-protection review issue #${issue.number}: ${issue.html_url}`);
         await updateActivationComment(github, context, core, issue.html_url, issue.number, "issue");
-        return {
-          success: true,
-          fallback_used: true,
-          issue_number: issue.number,
-          issue_url: issue.html_url,
-        };
+        return attachExecutionState(
+          {
+            success: true,
+            fallback_used: true,
+            issue_number: issue.number,
+            issue_url: issue.html_url,
+          },
+          branchStateBefore,
+          branchStateBefore
+        );
       } catch (issueError) {
         const error = `Manifest file protection: failed to create review issue. Error: ${issueError instanceof Error ? issueError.message : String(issueError)}`;
         core.error(error);
         return { success: false, error };
       }
+    };
+
+    // Deferred protected file protection – fallback-to-issue path.
+    // Create a review issue now that we have repoParts, pullNumber, and prTitle available.
+    if (protectedFilesForFallback && protectedFilesForFallback.length > 0) {
+      return await createProtectedFilesFallbackIssue(protectedFilesForFallback);
     }
 
     const hasChanges = !isEmpty;
@@ -599,8 +660,8 @@ async function main(config = {}) {
     }
 
     // Fetch the specific target branch from origin
-    // Use GIT_CONFIG_* env vars for auth because .git/config credentials are
-    // cleaned by clean_git_credentials.sh before the agent runs.
+    // Authenticate using the credentials actions/checkout persisted into .git/config
+    // for the safe_outputs job; no GIT_CONFIG_* extraheader is injected (see gitAuthEnv above).
     try {
       core.info(`Fetching branch: ${branchName}`);
       await exec.exec("git", ["fetch", "origin", `${branchName}:refs/remotes/origin/${branchName}`], {
@@ -644,13 +705,53 @@ async function main(config = {}) {
     let newCommitCount = 0;
     let remoteHeadBeforePatch = "";
     let pushedCommitSha = "";
+    let rangeBaseRef = `origin/${branchName}`;
     if (hasChanges) {
       // Capture HEAD before applying changes to compute new-commit count later
       try {
         const { stdout } = await exec.getExecOutput("git", ["rev-parse", "HEAD"], baseGitOpts);
         remoteHeadBeforePatch = stdout.trim();
+        if (remoteHeadBeforePatch) {
+          rangeBaseRef = remoteHeadBeforePatch;
+          core.info(`Remote branch HEAD before apply: ${remoteHeadBeforePatch}`);
+        }
       } catch {
         // Non-fatal - extra empty commit will be skipped
+      }
+
+      // Pin patch application to the recorded base commit captured at patch-generation time.
+      // This avoids applying a patch generated from an older branch tip onto a newer remote tip.
+      // If the commit is unavailable (e.g. cross-repo/missing object), continue with current HEAD.
+      if (!hasBundleFile && message.base_commit) {
+        const recordedBaseCommit = normalizeCommitSHA(message.base_commit);
+        if (recordedBaseCommit) {
+          core.info(`Patch route base_commit resolved: ${recordedBaseCommit}`);
+          try {
+            try {
+              await exec.exec("git", ["fetch", "origin", recordedBaseCommit, "--depth=1"], {
+                env: { ...process.env, ...gitAuthEnv },
+                ...baseGitOpts,
+              });
+            } catch (fetchError) {
+              core.info(`Note: could not fetch base_commit ${recordedBaseCommit} explicitly (${getErrorMessage(fetchError)}); will verify local availability next`);
+            }
+            await exec.exec("git", ["cat-file", "-e", recordedBaseCommit], baseGitOpts);
+            const ancestryCheck = await exec.getExecOutput("git", ["merge-base", "--is-ancestor", recordedBaseCommit, `origin/${branchName}`], { ...baseGitOpts, ignoreReturnCode: true });
+            if (ancestryCheck.exitCode !== 0) {
+              throw new Error(`recorded base_commit ${recordedBaseCommit} is not an ancestor of origin/${branchName}; cannot safely re-anchor patch apply`);
+            }
+            if (remoteHeadBeforePatch && remoteHeadBeforePatch !== recordedBaseCommit) {
+              core.warning(`Remote PR branch advanced since patch generation (remote HEAD ${remoteHeadBeforePatch}, patch base ${recordedBaseCommit}); applying patch from recorded base commit`);
+            }
+            await exec.exec("git", ["reset", "--hard", recordedBaseCommit], baseGitOpts);
+            rangeBaseRef = recordedBaseCommit;
+            core.info(`Reset branch to recorded base_commit before patch apply: ${recordedBaseCommit}`);
+          } catch (baseCommitError) {
+            core.warning(`Unable to use recorded base_commit ${recordedBaseCommit}; applying patch on current branch HEAD: ${getErrorMessage(baseCommitError)}`);
+          }
+        } else if (String(message.base_commit).trim()) {
+          core.warning(`Ignoring invalid base_commit value for patch apply: ${String(message.base_commit).trim()}`);
+        }
       }
 
       if (hasBundleFile) {
@@ -659,26 +760,90 @@ async function main(config = {}) {
         core.info(`Applying changes from bundle: ${bundleFilePath}`);
         const bundleRef = `refs/bundles/push-${branchName.replace(/[^a-zA-Z0-9-]/g, "-")}`;
         try {
-          await ensureFullHistoryForBundle(exec, {
-            env: { ...process.env, ...gitAuthEnv },
-            ...baseGitOpts,
-          });
+          await ensureFullHistoryForBundle(
+            exec,
+            {
+              env: { ...process.env, ...gitAuthEnv },
+              ...baseGitOpts,
+            },
+            { baseRef: branchName, bundleFilePath }
+          );
 
-          // Fetch from bundle into a temporary ref
-          await exec.exec("git", ["fetch", bundleFilePath, `refs/heads/${message.branch}:${bundleRef}`], baseGitOpts);
+          // Fetch from bundle into a temporary ref.
+          // Use getExecOutput with ignoreReturnCode so we can read the actual stderr from git —
+          // exec() only throws "The process '...' failed with exit code 1" which loses the
+          // "lacks these prerequisite commits" text needed for the recovery path below.
+          const bundleFetchRef = `refs/heads/${branchName}:${bundleRef}`;
+          const initialBundleFetch = await exec.getExecOutput("git", ["fetch", bundleFilePath, bundleFetchRef], { ...baseGitOpts, ignoreReturnCode: true });
+          if (initialBundleFetch.exitCode !== 0) {
+            const initialFetchErrorOutput = initialBundleFetch.stderr || `exit code ${initialBundleFetch.exitCode}`;
+
+            // Recovery path for bundle prerequisite failures: fetch missing prerequisite
+            // commit objects, then retry with the original bundle ref.
+            // This handles the race where main advanced between agent-time and safe_outputs-time:
+            // the bundle's base commit may not be reachable from a fetch-depth:1 shallow clone
+            // (e.g. when the commit is on a ref not in the fetch refspec).
+            const prerequisiteCommits = extractBundlePrerequisiteCommits(initialFetchErrorOutput);
+            if (prerequisiteCommits.length > 0) {
+              core.warning(`Bundle fetch failed due to ${prerequisiteCommits.length} missing prerequisite commit(s); fetching prerequisites from origin and retrying`);
+              core.info(`Fetching ${prerequisiteCommits.length} prerequisite commit(s) from origin`);
+              // Use --filter=blob:none only when the local repo is already shallow or sparse —
+              // in a full clone we already have all blobs and must not convert the repo to a
+              // partial clone (which would trigger lazy blob fetches on later operations).
+              const prereqGitOpts = { env: { ...process.env, ...gitAuthEnv }, ...baseGitOpts };
+              const useBlobFilter = await isShallowOrSparseCheckout(exec, prereqGitOpts);
+              const prerequisiteFetchArgs = useBlobFilter ? ["fetch", "--filter=blob:none", "origin", ...prerequisiteCommits] : ["fetch", "origin", ...prerequisiteCommits];
+              if (useBlobFilter) {
+                core.info("Using --filter=blob:none for prerequisite fetch (shallow or sparse checkout detected)");
+              }
+              await exec.exec("git", prerequisiteFetchArgs, prereqGitOpts);
+              core.info("Fetched prerequisite commits from origin successfully");
+              await exec.exec("git", ["fetch", bundleFilePath, bundleFetchRef], baseGitOpts);
+              core.info("Bundle fetch retry succeeded after prerequisite recovery");
+            } else {
+              throw new Error(`Failed to fetch bundle: ${initialFetchErrorOutput}`);
+            }
+          }
           core.info(`Fetched bundle to ${bundleRef}`);
+
+          // SECURITY: Use git's own diff against the fetched bundle ref as the
+          // authoritative pre-apply file set for bundle transport. This keeps
+          // bundle pre-check and post-apply verification aligned even when the
+          // patch artifact under-detects files (for example, merge-resolution
+          // content preserved only by the bundle transport).
+          {
+            const bundleFiles = await getBundlePreApplyFiles(exec, baseGitOpts, rangeBaseRef, bundleRef);
+            if (bundleFiles.length > 0) {
+              core.info(`Pre-apply bundle verification: ${bundleFiles.length} file(s) detected from bundle transport`);
+              const bundleProtection = checkFileProtectionPostApply(bundleFiles, config);
+              if (bundleProtection.action === "deny") {
+                const filesStr = bundleProtection.files.join(", ");
+                const msg =
+                  bundleProtection.source === "post-apply"
+                    ? `Cannot push to pull request branch: bundle modifies files outside the allowed-files list (${filesStr}). Add the files to the allowed-files configuration field or remove them from the bundle.`
+                    : `Cannot push to pull request branch: bundle modifies protected files (${filesStr}). Add them to the allowed-files configuration field or set protected-files: fallback-to-issue to create a review issue instead.`;
+                core.error(msg);
+                return { success: false, error: msg };
+              }
+              if (bundleProtection.action === "fallback") {
+                core.warning(`Protected file protection triggered (fallback-to-issue): ${bundleProtection.files.join(", ")}. Will create review issue instead of pushing.`);
+                return await createProtectedFilesFallbackIssue(bundleProtection.files);
+              }
+            }
+          }
 
           // Point the checked-out branch at the bundle tip directly. In shallow
           // checkouts, merge --ff-only can fail to discover the ancestry even
           // when the bundle tip is based on the current branch tip and the
           // prerequisite exists locally.
+          core.info(`Updating local branch ref refs/heads/${branchName} to ${bundleRef} (expected previous tip: ${remoteHeadBeforePatch || "unknown"})`);
           const updateRefArgs = ["update-ref", `refs/heads/${branchName}`, bundleRef];
           if (remoteHeadBeforePatch) {
             updateRefArgs.push(remoteHeadBeforePatch);
           }
           await exec.exec("git", updateRefArgs, baseGitOpts);
           await exec.exec("git", ["reset", "--hard"], baseGitOpts);
-          core.info("Updated branch to bundle tip");
+          core.info(`Updated branch to bundle tip from ${bundleRef}`);
 
           // Clean up the temporary ref
           try {
@@ -802,6 +967,36 @@ async function main(config = {}) {
           }
         }
       } // end else (patch path)
+      core.info(`Apply transport completed; signed-push base ref: ${rangeBaseRef}`);
+
+      // POST-APPLY FILE PROTECTION: Verify actual files written match policy.
+      // This is the primary defense against parser-differential attacks where the JS
+      // patch parser and git am disagree on which files a patch contains.
+      // (see github/agentic-workflows#539)
+      {
+        const diffResult = await exec.getExecOutput("git", ["diff", "--name-only", "--no-renames", `${rangeBaseRef}..HEAD`], baseGitOpts);
+        const actualFiles = diffResult.stdout
+          .split("\n")
+          .map(f => f.trim())
+          .filter(Boolean);
+        if (actualFiles.length > 0) {
+          core.info(`Post-apply verification: ${actualFiles.length} file(s) actually modified`);
+          const postApplyProtection = checkFileProtectionPostApply(actualFiles, config);
+          if (postApplyProtection.action === "deny") {
+            const filesStr = postApplyProtection.files.join(", ");
+            const msg = `SECURITY: Post-apply file-protection check failed. ` + `The patch applied files that were not detected by the pre-apply parser: ${filesStr}. ` + `This may indicate a patch-parser bypass attempt. Aborting push.`;
+            core.error(msg);
+            // Reset to pre-apply state
+            await exec.exec("git", ["reset", "--hard", rangeBaseRef], baseGitOpts);
+            return { success: false, error: msg };
+          }
+          if (postApplyProtection.action === "fallback") {
+            core.warning(`Post-apply: Protected file protection triggered (fallback-to-issue): ${postApplyProtection.files.join(", ")}`);
+            await exec.exec("git", ["reset", "--hard", rangeBaseRef], baseGitOpts);
+            return await createProtectedFilesFallbackIssue(postApplyProtection.files);
+          }
+        }
+      }
 
       // When threat detection produced a warning, create a review PR instead of pushing
       // directly to the existing PR branch. This allows manual review of the changes
@@ -829,7 +1024,9 @@ async function main(config = {}) {
           const detectionReasonEnv = process.env.GH_AW_DETECTION_REASON || "unknown";
           const prBody = [
             "> [!CAUTION]",
-            "> **This PR requires manual review** because threat detection produced a warning.",
+            "> agentic threat detected",
+            "> Threat detection flagged this output in warn mode. Manual review is REQUIRED before any follow-up automation.",
+            `> ${getThreatDetectedMarker(detectionReasonEnv)}`,
             ">",
             `> **Reason:** ${detectionReasonEnv}`,
             ">",
@@ -879,6 +1076,42 @@ async function main(config = {}) {
         }
       }
 
+      // When signed commits are required, the GitHub GraphQL createCommitOnBranch mutation
+      // cannot represent merge commits.  If the range to be pushed contains merge commits
+      // (e.g. the agent ran `git merge origin/main` instead of `git rebase origin/main`),
+      // squash the entire range into a single regular commit that carries the same tree.
+      // This preserves the file-level outcome while producing a linear history that can
+      // be signed.  A warning is emitted so workflow authors and agents know that rebase
+      // should be preferred over merge in future runs.
+      if (signedCommits && hasChanges) {
+        const squashBase = rangeBaseRef;
+        try {
+          const { stdout: mergeCountOut } = await exec.getExecOutput("git", ["rev-list", "--merges", "--count", `${squashBase}..HEAD`], baseGitOpts);
+          const mergeCount = parseInt(mergeCountOut.trim(), 10);
+          if (Number.isFinite(mergeCount) && mergeCount > 0) {
+            core.warning(
+              `push_to_pull_request_branch: detected ${mergeCount} merge commit(s) in range ${squashBase}..HEAD. ` +
+                `Merge commits cannot be pushed as signed commits. Squashing the range into a single regular commit to preserve content. ` +
+                `To avoid this, use 'git rebase' instead of 'git merge' when updating the PR branch.`
+            );
+            // Prefer the message from the first non-merge commit in the range — it carries
+            // the most meaningful description of the actual work.  Fall back to the last
+            // commit's message (which may be the merge commit itself) if no regular commit
+            // exists, and finally to a generic label.
+            const { stdout: firstNonMergeOut } = await exec.getExecOutput("git", ["log", "--no-merges", "--max-count=1", "--format=%B", "--reverse", `${squashBase}..HEAD`], baseGitOpts);
+            let squashMessage = firstNonMergeOut.trim();
+            if (!squashMessage) {
+              const { stdout: lastMsgOut } = await exec.getExecOutput("git", ["log", "-1", "--format=%B"], baseGitOpts);
+              squashMessage = lastMsgOut.trim() || "Merge changes";
+            }
+            await linearizeRangeAsCommit(squashBase, squashMessage, exec, { gitOpts: baseGitOpts, commitFlags: ["--allow-empty", "--no-verify"] });
+            core.info(`push_to_pull_request_branch: merge commits linearized into single regular commit for signed-commit push`);
+          }
+        } catch (squashErr) {
+          core.warning(`push_to_pull_request_branch: failed to linearize merge commits: ${getErrorMessage(squashErr)}; push may fail`);
+        }
+      }
+
       // Push the applied commits to the branch using signed GraphQL commits (outside patch try/catch so push failures are not misattributed)
       try {
         const pushedSha = await pushSignedCommits({
@@ -886,9 +1119,13 @@ async function main(config = {}) {
           owner: repoParts.owner,
           repo: repoParts.repo,
           branch: branchName,
-          baseRef: remoteHeadBeforePatch || `origin/${branchName}`,
+          baseRef: rangeBaseRef,
           cwd: repoCwd || process.cwd(),
           gitAuthEnv,
+          signedCommits,
+          resolvedTemporaryIds,
+          currentRepo: itemRepo,
+          validationConfig: config,
         });
         if (pushedSha) {
           pushedCommitSha = pushedSha;
@@ -1028,10 +1265,32 @@ async function main(config = {}) {
     // Update the activation comment with commit link (if a comment was created and changes were pushed)
     // Pass pullNumber so a new comment is created on the PR when no activation comment exists (e.g., schedule triggers)
     //
-    // NOTE: we pass 'github' (global octokit) instead of githubClient (repo-scoped octokit) because the issue is created
-    // in the same repo as the activation, so the global client has the correct context for updating the comment.
+    // NOTE: we pass 'github' (global octokit) for updating the activation comment (same repo as workflow).
+    // For the fallback path (no activation comment), we pass githubClient and targetRepo so the comment
+    // is created in the correct target repository with the right authentication.
+    //
+    // Skip the activation comment for empty commits (0 file changes, e.g. CI trigger commits).
+    // These are noise — they don't represent meaningful work and would clutter PRs on every scheduled run.
     if (hasChanges) {
-      await updateActivationCommentWithCommit(github, context, core, commitSha, commitUrl, { targetIssueNumber: pullNumber });
+      let isEmptyCommit = false;
+      if (rangeBaseRef) {
+        try {
+          const { stdout: diffStat } = await exec.getExecOutput("git", ["diff", "--stat", rangeBaseRef, "HEAD"], baseGitOpts);
+          isEmptyCommit = !diffStat.trim();
+          if (isEmptyCommit) {
+            core.info("Skipping activation comment: pushed commit has no file changes (empty commit)");
+          }
+        } catch {
+          // Non-fatal — proceed with the comment if we can't determine
+        }
+      }
+      if (!isEmptyCommit) {
+        await updateActivationCommentWithCommit(github, context, core, commitSha, commitUrl, {
+          targetIssueNumber: pullNumber,
+          targetRepo: `${repoParts.owner}/${repoParts.repo}`,
+          targetGithubClient: githubClient,
+        });
+      }
     }
 
     // Write summary to GitHub Actions summary
@@ -1068,13 +1327,20 @@ async function main(config = {}) {
       }
     }
 
-    return {
-      success: true,
-      branch_name: branchName,
-      commit_sha: commitSha,
-      commit_url: commitUrl,
-    };
+    return attachExecutionState(
+      {
+        success: true,
+        number: pullNumber,
+        repo: itemRepo,
+        url: `${repoUrl}/pull/${pullNumber}`,
+        branch_name: branchName,
+        commit_sha: commitSha,
+        commit_url: commitUrl,
+      },
+      branchStateBefore || (remoteHeadBeforePatch ? { head_sha: remoteHeadBeforePatch } : null),
+      commitSha ? { head_sha: commitSha } : null
+    );
   };
 }
 
-module.exports = { main, HANDLER_TYPE };
+module.exports = { main, HANDLER_TYPE, getBundlePreApplyFiles };

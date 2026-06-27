@@ -119,6 +119,40 @@ func TestValidateRunsOn(t *testing.T) {
 			errorInMsg:  "containers",
 			description: "Error should explain containers requirement",
 		},
+		{
+			name:        "macos in runs-on-slim array",
+			frontmatter: map[string]any{"runs-on-slim": []any{"self-hosted", "macos-14"}},
+			wantErr:     true,
+			errorInMsg:  "runs-on-slim",
+			description: "runs-on-slim array containing macos runner should be rejected",
+		},
+		{
+			name: "macos in safe-outputs.runs-on array",
+			frontmatter: map[string]any{
+				"safe-outputs": map[string]any{
+					"runs-on": []any{"self-hosted", "macos-latest"},
+				},
+			},
+			wantErr:     true,
+			errorInMsg:  "safe-outputs.runs-on",
+			description: "safe-outputs.runs-on array containing macos runner should be rejected",
+		},
+		{
+			name: "macos in safe-outputs.threat-detection.runs-on labels",
+			frontmatter: map[string]any{
+				"safe-outputs": map[string]any{
+					"threat-detection": map[string]any{
+						"runs-on": map[string]any{
+							"group":  "runner-group",
+							"labels": []any{"linux", "macos-latest"},
+						},
+					},
+				},
+			},
+			wantErr:     true,
+			errorInMsg:  "safe-outputs.threat-detection.runs-on",
+			description: "threat-detection runs-on labels containing macos runner should be rejected",
+		},
 	}
 
 	for _, tt := range tests {
@@ -184,6 +218,66 @@ func TestExtractRunnerLabels(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			result := extractRunnerLabels(tt.runsOn)
 			assert.Equal(t, tt.expected, result)
+		})
+	}
+}
+
+func TestValidateRunsOnValue(t *testing.T) {
+	tests := []struct {
+		name       string
+		value      any
+		wantErr    bool
+		errContain string
+	}{
+		{
+			name:    "string is valid",
+			value:   "ubuntu-latest",
+			wantErr: false,
+		},
+		{
+			name:    "array of strings is valid",
+			value:   []any{"self-hosted", "linux"},
+			wantErr: false,
+		},
+		{
+			name: "object with group and labels is valid",
+			value: map[string]any{
+				"group":  "my-group",
+				"labels": []any{"linux", "x64"},
+			},
+			wantErr: false,
+		},
+		{
+			name:       "array with non-string entry is invalid",
+			value:      []any{"linux", 42},
+			wantErr:    true,
+			errContain: "array entry type int",
+		},
+		{
+			name: "object with invalid key is invalid",
+			value: map[string]any{
+				"runner": "ubuntu-latest",
+			},
+			wantErr:    true,
+			errContain: `invalid runs-on object key "runner"`,
+		},
+		{
+			name:       "unsupported type is invalid",
+			value:      123,
+			wantErr:    true,
+			errContain: "invalid runs-on type int",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := validateRunsOnValue(tt.value)
+			if tt.wantErr {
+				require.Error(t, err)
+				assert.Contains(t, err.Error(), tt.errContain)
+				return
+			}
+			assert.NoError(t, err)
 		})
 	}
 }

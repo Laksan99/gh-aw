@@ -134,6 +134,40 @@ async function getReviewSummary(githubClient, owner, repo, pullNumber) {
 }
 
 /**
+ * Returns the first open pull request where the given branch is the head (source) branch,
+ * or null if no such PR exists.
+ *
+ * Note: the `head` filter uses `owner:branch` format, which matches only PRs whose head branch
+ * lives in the base repository's owner account. Fork-sourced upstream PRs (e.g. an external
+ * contributor's fork tracking `release/1.0 → main`) are intentionally excluded; this gate
+ * enforces an intra-repository PR-chain model only.
+ *
+ * @param {any} githubClient
+ * @param {string} owner
+ * @param {string} repo
+ * @param {string} branch
+ * @returns {Promise<{number: number, html_url: string}|null>}
+ */
+async function getOpenPullRequestForBranch(githubClient, owner, repo, branch) {
+  core.info(`Looking up open pull request for head branch "${branch}" in ${owner}/${repo}`);
+  const { data: prs } = await withRetry(() =>
+    githubClient.rest.pulls.list({
+      owner,
+      repo,
+      state: "open",
+      head: `${owner}:${branch}`,
+      per_page: 1,
+    })
+  );
+  if (!Array.isArray(prs) || prs.length === 0) {
+    core.info(`No open pull request found for head branch "${branch}"`);
+    return null;
+  }
+  core.info(`Found open pull request #${prs[0].number} for head branch "${branch}"`);
+  return { number: prs[0].number, html_url: prs[0].html_url };
+}
+
+/**
  * @param {any} githubClient
  * @param {string} owner
  * @param {string} repo
@@ -282,11 +316,10 @@ function sanitizeBranchName(branchName, branchRole) {
 
 /**
  * @param {string[]} labels
- * @param {string[]} allowedLabels
  * @returns {string[]}
  */
-function findAllowedLabelMatches(labels, allowedLabels) {
-  return labels.filter(label => allowedLabels.includes(label));
+function findMissingRequiredLabels(labels, requiredLabels) {
+  return requiredLabels.filter(label => !labels.includes(label));
 }
 
 /**
@@ -326,11 +359,13 @@ async function main(config = {}) {
   const { defaultTargetRepo, allowedRepos } = resolveTargetRepoConfig(config);
   const maxCount = Number(config.max || 1);
   const requiredLabels = Array.isArray(config.required_labels) ? config.required_labels : [];
-  const allowedLabels = Array.isArray(config.allowed_labels) ? config.allowed_labels : [];
+  const requiredTitlePrefix = config.required_title_prefix || "";
   const allowedBranches = Array.isArray(config.allowed_branches) ? config.allowed_branches : [];
 
   const allowedBranchPatterns = compilePathGlobs(allowedBranches);
-  core.info(`merge_pull_request handler configured: max=${maxCount}, requiredLabels=${requiredLabels.length}, allowedLabels=${allowedLabels.length}, allowedBranches=${allowedBranches.length}, staged=${isStaged}`);
+  core.info(
+    `merge_pull_request handler configured: max=${maxCount}, requiredLabels=${requiredLabels.length}, requiredTitlePrefix=${requiredTitlePrefix ? JSON.stringify(requiredTitlePrefix) : "none"}, allowedBranches=${allowedBranches.length}, staged=${isStaged}`
+  );
 
   let processedCount = 0;
 
@@ -417,7 +452,7 @@ async function main(config = {}) {
 
       const labels = (pr.labels || []).map(l => l.name).filter(Boolean);
       core.info(`PR labels (${labels.length}): ${labels.join(", ") || "(none)"}`);
-      const missingRequiredLabels = requiredLabels.filter(label => !labels.includes(label));
+      const missingRequiredLabels = findMissingRequiredLabels(labels, requiredLabels);
       if (missingRequiredLabels.length > 0) {
         failureReasons.push({
           code: "missing_required_labels",
@@ -425,17 +460,12 @@ async function main(config = {}) {
           details: { missing: missingRequiredLabels, present: labels },
         });
       }
-
-      if (allowedLabels.length > 0) {
-        const matchedLabels = findAllowedLabelMatches(labels, allowedLabels);
-        core.info(`Allowed label match count: ${matchedLabels.length}`);
-        if (matchedLabels.length === 0) {
-          failureReasons.push({
-            code: "allowed_labels_no_match",
-            message: "No pull request label matches allowed-labels",
-            details: { present: labels, allowed_labels: allowedLabels },
-          });
-        }
+      if (requiredTitlePrefix && !pr.title?.startsWith(requiredTitlePrefix)) {
+        failureReasons.push({
+          code: "title_prefix_mismatch",
+          message: `PR title does not start with required prefix "${requiredTitlePrefix}"`,
+          details: { required_prefix: requiredTitlePrefix, actual_title: pr.title },
+        });
       }
 
       if (allowedBranchPatterns.length > 0 && sourceBranch && !allowedBranchPatterns.some(re => re.test(sourceBranch))) {
@@ -465,6 +495,15 @@ async function main(config = {}) {
             message: `Target branch "${baseBranch}" is the repository default branch`,
             details: { default_branch: branchPolicy.defaultBranch },
           });
+        }
+        if (!branchPolicy.isProtected && !branchPolicy.isDefault) {
+          const upstreamPR = await getOpenPullRequestForBranch(githubClient, owner, repo, baseBranch);
+          if (!upstreamPR) {
+            failureReasons.push({
+              code: "target_branch_has_no_open_pr",
+              message: `Target branch "${baseBranch}" is not the head branch of any open pull request`,
+            });
+          }
         }
       }
 
@@ -579,7 +618,8 @@ module.exports = {
     resolveContextPullNumber,
     sanitizeBranchName,
     getBranchPolicy,
-    findAllowedLabelMatches,
+    findMissingRequiredLabels,
     resolvePullRequestNumber,
+    getOpenPullRequestForBranch,
   },
 };

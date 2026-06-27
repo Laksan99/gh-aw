@@ -7,13 +7,16 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net/url"
 	"os"
 	"strings"
 
 	"github.com/cli/go-gh/v2/pkg/api"
 	"github.com/github/gh-aw/pkg/console"
+	"github.com/github/gh-aw/pkg/constants"
 	"github.com/github/gh-aw/pkg/logger"
 	"github.com/github/gh-aw/pkg/repoutil"
+	"github.com/github/gh-aw/pkg/stringutil"
 	"github.com/github/gh-aw/pkg/tty"
 	"github.com/spf13/cobra"
 	"golang.org/x/crypto/nacl/box"
@@ -48,10 +51,8 @@ func newSecretsSetSubcommand() *cobra.Command {
 The secret value can be provided in three ways:
   1. Via the --value flag
   2. Via the --value-from-env flag (reads from environment variable)
-  3. From stdin (if neither flag is provided)
-
-Examples:
-  # From stdin (uses current repository)
+  3. From stdin (if neither flag is provided)`,
+		Example: `  # From stdin (uses current repository)
   gh aw secrets set MY_SECRET
 
   # Specify target repository
@@ -90,11 +91,7 @@ Examples:
 			}
 
 			// Create GitHub REST client using go-gh
-			opts := api.ClientOptions{}
-			if flagAPIBase != "" {
-				opts.Host = strings.TrimPrefix(strings.TrimPrefix(flagAPIBase, "https://"), "http://")
-			}
-			client, err := api.NewRESTClient(opts)
+			client, err := api.NewRESTClient(secretSetClientOptions(flagAPIBase))
 			if err != nil {
 				return fmt.Errorf("cannot create GitHub client: %w", err)
 			}
@@ -123,6 +120,44 @@ Examples:
 	cmd.Flags().StringVar(&flagAPIBase, "api-url", "", "GitHub API base URL (default: https://api.github.com or $GITHUB_API_URL)")
 
 	return cmd
+}
+
+func secretSetClientOptions(apiBase string) api.ClientOptions {
+	opts := api.ClientOptions{
+		Timeout: constants.DefaultHTTPClientTimeout,
+	}
+	if apiBase != "" {
+		opts.Host = normalizeSecretSetAPIHost(apiBase)
+	}
+	return opts
+}
+
+func normalizeSecretSetAPIHost(apiBase string) string {
+	raw := strings.TrimSpace(apiBase)
+	if raw == "" {
+		return ""
+	}
+
+	candidates := []string{raw}
+	if !strings.Contains(raw, "://") {
+		candidates = append(candidates, "https://"+raw)
+	}
+	for _, candidate := range candidates {
+		parsed, err := url.Parse(candidate)
+		if err != nil || parsed.Hostname() == "" {
+			continue
+		}
+		if parsed.Hostname() == "api.github.com" {
+			return "github.com"
+		}
+		return parsed.Hostname()
+	}
+
+	legacy := stringutil.ExtractDomainFromURL(raw)
+	if legacy == "api.github.com" {
+		return "github.com"
+	}
+	return legacy
 }
 
 func resolveSecretValueForSet(fromEnv, fromFlag string) (string, error) {
@@ -224,10 +259,8 @@ func encryptWithPublicKey(publicKeyB64, plaintext string) (string, error) {
 		return "", fmt.Errorf("unexpected public key length: %d, expected %d", len(raw), publicKeySize)
 	}
 
-	var pk [publicKeySize]byte
-	copy(pk[:], raw)
-
-	ciphertext, err := box.SealAnonymous(nil, []byte(plaintext), &pk, rand.Reader)
+	pk := (*[publicKeySize]byte)(raw[:publicKeySize])
+	ciphertext, err := box.SealAnonymous(nil, []byte(plaintext), pk, rand.Reader)
 	if err != nil {
 		return "", fmt.Errorf("nacl encryption failed: %w", err)
 	}

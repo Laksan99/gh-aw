@@ -1,10 +1,14 @@
 package workflow
 
 import (
+	_ "embed"
 	"errors"
 	"fmt"
 	"strings"
 )
+
+//go:embed prompts/checkouts_no_credentials_warning.md
+var checkoutsNoCredentialsWarning string
 
 // ParseCheckoutConfigs converts a raw frontmatter value (single map or array of maps)
 // into a slice of CheckoutConfig entries.
@@ -64,6 +68,7 @@ func ParseCheckoutConfigs(raw any) ([]*CheckoutConfig, error) {
 		currentTargets[key] = struct{}{}
 	}
 	if len(currentTargets) > 1 {
+		checkoutManagerLog.Printf("Rejecting checkout config: %d distinct current targets, only one allowed", len(currentTargets))
 		return nil, fmt.Errorf("only one checkout target may have current: true, found %d", len(currentTargets))
 	}
 
@@ -134,6 +139,7 @@ func checkoutConfigFromMap(m map[string]any) (*CheckoutConfig, error) {
 
 	// Validate mutual exclusivity of github-token and github-app
 	if cfg.GitHubToken != "" && cfg.GitHubApp != nil {
+		checkoutManagerLog.Print("Rejecting checkout config: github-token and github-app are mutually exclusive")
 		return nil, errors.New("checkout: github-token and github-app are mutually exclusive; use one or the other")
 	}
 
@@ -159,6 +165,9 @@ func checkoutConfigFromMap(m map[string]any) (*CheckoutConfig, error) {
 			cfg.FetchDepth = &depth
 		default:
 			return nil, errors.New("checkout.fetch-depth must be an integer")
+		}
+		if cfg.FetchDepth != nil && *cfg.FetchDepth < 0 {
+			return nil, errors.New("checkout.fetch-depth must be >= 0")
 		}
 	}
 
@@ -235,6 +244,14 @@ func checkoutConfigFromMap(m map[string]any) (*CheckoutConfig, error) {
 		cfg.Wiki = b
 	}
 
+	if v, ok := m["force-clean-git-credentials"]; ok {
+		b, ok := v.(bool)
+		if !ok {
+			return nil, errors.New("checkout.force-clean-git-credentials must be a boolean")
+		}
+		cfg.CleanGitCredentials = b
+	}
+
 	return cfg, nil
 }
 
@@ -250,6 +267,7 @@ func checkoutConfigFromMap(m map[string]any) (*CheckoutConfig, error) {
 // so the placeholder substitution step can resolve them at runtime.
 func buildCheckoutsPromptContent(checkouts []*CheckoutConfig) string {
 	if len(checkouts) == 0 {
+		checkoutManagerLog.Print("buildCheckoutsPromptContent: no checkouts configured, returning empty content")
 		return ""
 	}
 	checkoutManagerLog.Printf("Building checkouts prompt content for %d checkout(s)", len(checkouts))
@@ -286,7 +304,7 @@ func buildCheckoutsPromptContent(checkouts []*CheckoutConfig) string {
 			}
 		}
 
-		line := fmt.Sprintf("  - `%s` → `%s`", absPath, repo)
+		line := fmt.Sprintf("  - repo `%s` → `%s`", repo, absPath)
 		if isRoot {
 			line += " (cwd)"
 		}
@@ -310,16 +328,22 @@ func buildCheckoutsPromptContent(checkouts []*CheckoutConfig) string {
 		if len(cfg.Fetch) > 0 {
 			line += fmt.Sprintf(" [additional refs fetched: %s]", strings.Join(cfg.Fetch, ", "))
 		}
+		if strings.TrimSpace(cfg.SparseCheckout) != "" {
+			line += " [sparse checkout enabled]"
+		}
 
 		sb.WriteString(line + "\n")
 	}
 
 	// General guidance about unavailable branches
 	sb.WriteString("  - **Note**: If a branch you need is not in the list above and is not listed as an additional fetched ref, " +
-		"it has NOT been checked out. For private repositories you cannot fetch it without proper authentication. " +
+		"it has NOT been checked out. For private repositories you cannot fetch it. " +
 		"If the branch is required and not available, exit with an error and ask the user to add it to the " +
 		"`fetch:` option of the `checkout:` configuration (e.g., `fetch: [\"refs/pulls/open/*\"]` for all open PR refs, " +
 		"or `fetch: [\"main\", \"feature/my-branch\"]` for specific branches).\n")
+
+	// Credential warning — always present for any checkout-enabled workflow.
+	sb.WriteString(checkoutsNoCredentialsWarning)
 
 	return sb.String()
 }

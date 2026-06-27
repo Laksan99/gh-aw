@@ -90,6 +90,18 @@ const mockCore = {
         expect(mockCore.setOutput).toHaveBeenCalledWith("command_position_ok", "true");
         expect(mockCore.setOutput).toHaveBeenCalledWith("matched_command", "test-bot");
       }),
+      it("should resolve wildcard command from workflow_dispatch aw_context", async () => {
+        process.env.GH_AW_COMMANDS = JSON.stringify(["smoke*"]);
+        mockContext.eventName = "workflow_dispatch";
+        mockContext.payload = {
+          inputs: {
+            aw_context: JSON.stringify({ command_name: "smoke-copilot-sdk" }),
+          },
+        };
+        await eval(`(async () => { ${checkCommandPositionScript}; await main(); })()`);
+        expect(mockCore.setOutput).toHaveBeenCalledWith("command_position_ok", "true");
+        expect(mockCore.setOutput).toHaveBeenCalledWith("matched_command", "smoke-copilot-sdk");
+      }),
       it("should handle pull_request event with command at start", async () => {
         ((process.env.GH_AW_COMMANDS = JSON.stringify(["review-bot"])),
           (mockContext.eventName = "pull_request"),
@@ -126,6 +138,22 @@ const mockCore = {
           (mockContext.payload = { comment: { body: "/discuss-bot analyze this" } }),
           await eval(`(async () => { ${checkCommandPositionScript}; await main(); })()`),
           expect(mockCore.setOutput).toHaveBeenCalledWith("command_position_ok", "true"));
+      }),
+      it("should match wildcard command at the start of text", async () => {
+        ((process.env.GH_AW_COMMANDS = JSON.stringify(["smoke*"])),
+          (mockContext.eventName = "issue_comment"),
+          (mockContext.payload = { comment: { body: "/smoke-copilot-sdk run tests" } }),
+          await eval(`(async () => { ${checkCommandPositionScript}; await main(); })()`),
+          expect(mockCore.setOutput).toHaveBeenCalledWith("command_position_ok", "true"),
+          expect(mockCore.setOutput).toHaveBeenCalledWith("matched_command", "smoke-copilot-sdk"));
+      }),
+      it("should reject command followed by punctuation", async () => {
+        ((process.env.GH_AW_COMMANDS = JSON.stringify(["review"])),
+          (mockContext.eventName = "issue_comment"),
+          (mockContext.payload = { comment: { body: "/review:" } }),
+          await eval(`(async () => { ${checkCommandPositionScript}; await main(); })()`),
+          expect(mockCore.setOutput).toHaveBeenCalledWith("command_position_ok", "false"),
+          expect(mockCore.setOutput).toHaveBeenCalledWith("matched_command", ""));
       }),
       it("should pass for bot comment with attribution metadata after newline", async () => {
         ((process.env.GH_AW_COMMANDS = JSON.stringify(["deploy"])),
@@ -169,5 +197,29 @@ const mockCore = {
         await eval(`(async () => { ${checkCommandPositionScript}; await main(); })()`);
         expect(mockCore.setOutput).toHaveBeenCalledWith("command_position_ok", "true");
         expect(mockCore.info).toHaveBeenCalledWith(expect.stringContaining("does not require command position check"));
+      }),
+      it("should pass pull_request ready_for_review for pull_request_reviewer workflows", async () => {
+        process.env.GH_AW_COMMANDS = JSON.stringify(["review"]);
+        mockContext.eventName = "pull_request";
+        mockContext.payload = { action: "ready_for_review", pull_request: { body: "PR body without slash command" } };
+        await eval(`(async () => { ${checkCommandPositionScript}; await main(); })()`);
+        expect(mockCore.setOutput).toHaveBeenCalledWith("command_position_ok", "true");
+        expect(mockCore.setOutput).toHaveBeenCalledWith("matched_command", "");
+      }),
+      it("should pass pull_request review_requested for pull_request_reviewer workflows", async () => {
+        process.env.GH_AW_COMMANDS = JSON.stringify(["review"]);
+        mockContext.eventName = "pull_request";
+        mockContext.payload = { action: "review_requested", pull_request: { body: "PR body without slash command" } };
+        await eval(`(async () => { ${checkCommandPositionScript}; await main(); })()`);
+        expect(mockCore.setOutput).toHaveBeenCalledWith("command_position_ok", "true");
+        expect(mockCore.setOutput).toHaveBeenCalledWith("matched_command", "");
+      }),
+      it("should pass pull_request_review submitted for pull_request_reviewer workflows", async () => {
+        process.env.GH_AW_COMMANDS = JSON.stringify(["review"]);
+        mockContext.eventName = "pull_request_review";
+        mockContext.payload = { action: "submitted", review: { body: "Looks good to me" } };
+        await eval(`(async () => { ${checkCommandPositionScript}; await main(); })()`);
+        expect(mockCore.setOutput).toHaveBeenCalledWith("command_position_ok", "true");
+        expect(mockCore.setOutput).toHaveBeenCalledWith("matched_command", "");
       }));
   }));

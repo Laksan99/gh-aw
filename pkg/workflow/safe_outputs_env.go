@@ -1,6 +1,7 @@
 package workflow
 
 import (
+	"encoding/json"
 	"fmt"
 	"strconv"
 	"strings"
@@ -10,6 +11,31 @@ import (
 )
 
 var safeOutputsEnvLog = logger.New("workflow:safe_outputs_env")
+
+// ========================================
+// Trace Context Environment Variables
+// ========================================
+
+// applyTraceContextEnvToMap injects the W3C trace context (TRACEPARENT) into an engine
+// execution step environment map. The value is derived at runtime from
+// GITHUB_AW_OTEL_TRACE_ID and GITHUB_AW_OTEL_PARENT_SPAN_ID, which are written to
+// GITHUB_ENV by the setup action.
+//
+// The TRACEPARENT variable is formatted as a W3C Trace Context traceparent header
+// (version 00, trace-flags 01 / sampled): 00-<trace-id>-<span-id>-01.
+// When either ID is absent (OTEL not configured) the variable resolves to an empty
+// string, which engines that implement W3C trace context (e.g. Claude Code) treat as
+// "no parent context" — a safe no-op.
+//
+// Propagating TRACEPARENT lets those engines nest their internal spans (interaction,
+// LLM request, tool call) under the gh-aw.agent.setup span, producing a complete
+// end-to-end distributed trace in the OTEL backend.
+func applyTraceContextEnvToMap(env map[string]string) {
+	// Format: 00-<trace-id>-<span-id>-01 (W3C traceparent, sampled flag = 01).
+	// Only set when both OTEL IDs are non-empty; the conditional || '' fallback
+	// ensures engines see an empty string rather than a malformed traceparent.
+	env["TRACEPARENT"] = "${{ env.GITHUB_AW_OTEL_TRACE_ID != '' && env.GITHUB_AW_OTEL_PARENT_SPAN_ID != '' && format('00-{0}-{1}-01', env.GITHUB_AW_OTEL_TRACE_ID, env.GITHUB_AW_OTEL_PARENT_SPAN_ID) || '' }}"
+}
 
 // ========================================
 // Safe Output Environment Variables
@@ -22,13 +48,17 @@ func applySafeOutputEnvToMap(env map[string]string, data *WorkflowData) {
 		return
 	}
 
-	safeOutputsEnvLog.Printf("Applying safe output env vars: trial_mode=%t, staged=%t", data.TrialMode, data.SafeOutputs.Staged)
+	safeOutputsEnvLog.Printf("Applying safe output env vars: trial_mode=%t, staged=%v", data.TrialMode, data.SafeOutputs.Staged)
 
 	env["GH_AW_SAFE_OUTPUTS"] = "${{ steps.set-runtime-paths.outputs.GH_AW_SAFE_OUTPUTS }}"
 
 	// Add staged flag if specified
-	if data.TrialMode || data.SafeOutputs.Staged {
-		env["GH_AW_SAFE_OUTPUTS_STAGED"] = "true"
+	if value := resolveSafeOutputsStagedValue(data.TrialMode, data.SafeOutputs.Staged); value != nil {
+		if isExpression(*value) {
+			env["GH_AW_SAFE_OUTPUTS_STAGED"] = *value
+		} else {
+			env["GH_AW_SAFE_OUTPUTS_STAGED"] = "true"
+		}
 	}
 	if data.TrialMode && data.TrialLogicalRepo != "" {
 		env["GH_AW_TARGET_REPO_SLUG"] = data.TrialLogicalRepo
@@ -45,7 +75,7 @@ func applySafeOutputEnvToMap(env map[string]string, data *WorkflowData) {
 
 // buildWorkflowMetadataEnvVars builds workflow name and source environment variables
 // This extracts the duplicated workflow metadata setup logic from safe-output job builders
-func buildWorkflowMetadataEnvVars(workflowName string, workflowSource string) []string {
+func buildWorkflowMetadataEnvVars(workflowName string, workflowSource string, localSourceURL string) []string {
 	var customEnvVars []string
 
 	// Add workflow name
@@ -58,14 +88,18 @@ func buildWorkflowMetadataEnvVars(workflowName string, workflowSource string) []
 		if sourceURL != "" {
 			customEnvVars = append(customEnvVars, fmt.Sprintf("          GH_AW_WORKFLOW_SOURCE_URL: %q\n", sourceURL))
 		}
+	} else if localSourceURL != "" {
+		// For local workflows (no external source), use the local file URL so that
+		// failure issue links point to the workflow source file rather than "#".
+		customEnvVars = append(customEnvVars, fmt.Sprintf("          GH_AW_WORKFLOW_SOURCE_URL: %q\n", localSourceURL))
 	}
 
 	return customEnvVars
 }
 
 // buildWorkflowMetadataEnvVarsWithTrackerID builds workflow metadata env vars including tracker-id
-func buildWorkflowMetadataEnvVarsWithTrackerID(workflowName string, workflowSource string, trackerID string) []string {
-	customEnvVars := buildWorkflowMetadataEnvVars(workflowName, workflowSource)
+func buildWorkflowMetadataEnvVarsWithTrackerID(workflowName string, workflowSource string, trackerID string, localSourceURL string) []string {
+	customEnvVars := buildWorkflowMetadataEnvVars(workflowName, workflowSource, localSourceURL)
 
 	// Add tracker-id if present
 	if trackerID != "" {
@@ -77,13 +111,13 @@ func buildWorkflowMetadataEnvVarsWithTrackerID(workflowName string, workflowSour
 
 // buildSafeOutputJobEnvVars builds environment variables for safe-output jobs with staged/target repo handling
 // This extracts the duplicated env setup logic in safe-output job builders (create_issue, add_comment, etc.)
-func buildSafeOutputJobEnvVars(trialMode bool, trialLogicalRepoSlug string, staged bool, targetRepoSlug string) []string {
+func buildSafeOutputJobEnvVars(trialMode bool, trialLogicalRepoSlug string, staged *TemplatableBool, targetRepoSlug string) []string {
 	var customEnvVars []string
 
 	// Pass the staged flag if it's set to true
-	if trialMode || staged {
-		safeOutputsEnvLog.Printf("Setting staged flag: trial_mode=%t, staged=%t", trialMode, staged)
-		customEnvVars = append(customEnvVars, "          GH_AW_SAFE_OUTPUTS_STAGED: \"true\"\n")
+	if value := resolveSafeOutputsStagedValue(trialMode, staged); value != nil {
+		safeOutputsEnvLog.Printf("Setting staged flag: trial_mode=%t, staged=%v", trialMode, staged)
+		customEnvVars = append(customEnvVars, buildTemplatableBoolEnvVar("GH_AW_SAFE_OUTPUTS_STAGED", value)...)
 	}
 
 	// Set GH_AW_TARGET_REPO_SLUG - prefer target-repo config over trial target repo
@@ -105,7 +139,7 @@ func (c *Compiler) buildStandardSafeOutputEnvVars(data *WorkflowData, targetRepo
 	var customEnvVars []string
 
 	// Add workflow metadata (name, source, and tracker-id)
-	customEnvVars = append(customEnvVars, buildWorkflowMetadataEnvVarsWithTrackerID(data.Name, data.Source, data.TrackerID)...)
+	customEnvVars = append(customEnvVars, buildWorkflowMetadataEnvVarsWithTrackerID(data.Name, data.Source, data.TrackerID, buildLocalWorkflowSourceURL(c.markdownPath))...)
 
 	// Add engine metadata (id, version, model) for XML comment marker
 	customEnvVars = append(customEnvVars, buildEngineMetadataEnvVars(data.EngineConfig)...)
@@ -177,54 +211,49 @@ func (c *Compiler) addCustomSafeOutputEnvVars(steps *[]string, data *WorkflowDat
 	}
 }
 
-// addSafeOutputGitHubTokenForConfig adds github-token to the with section, preferring per-config token over global
-// Uses precedence: config token > safe-outputs global github-token > GH_AW_GITHUB_TOKEN || GITHUB_TOKEN
-func (c *Compiler) addSafeOutputGitHubTokenForConfig(steps *[]string, data *WorkflowData, configToken string) {
+func (c *Compiler) addResolvedSafeOutputGitHubTokenForConfig(steps *[]string, data *WorkflowData, configToken string, resolver func(string) string, allowGitHubApp bool) {
 	var safeOutputsToken string
+	var githubApp *GitHubAppConfig
 	if data.SafeOutputs != nil {
 		safeOutputsToken = data.SafeOutputs.GitHubToken
+		githubApp = data.SafeOutputs.GitHubApp
 	}
 
-	// If app is configured, use app token
-	if data.SafeOutputs != nil && data.SafeOutputs.GitHubApp != nil {
-		*steps = append(*steps, "          github-token: ${{ steps.safe-outputs-app-token.outputs.token }}\n")
-		return
-	}
-
-	// Choose the first non-empty custom token for precedence
 	effectiveCustomToken := configToken
 	if effectiveCustomToken == "" {
 		effectiveCustomToken = safeOutputsToken
 	}
 
-	// Get effective token
-	effectiveToken := getEffectiveSafeOutputGitHubToken(effectiveCustomToken)
+	if allowGitHubApp && githubApp != nil {
+		if githubApp.shouldIgnoreMissingKey() {
+			fallbackToken := resolver(effectiveCustomToken)
+			*steps = append(*steps, fmt.Sprintf("          github-token: %s\n", combineTokenExpressions("${{ steps.safe-outputs-app-token.outputs.token }}", fallbackToken)))
+			return
+		}
+		*steps = append(*steps, "          github-token: ${{ steps.safe-outputs-app-token.outputs.token }}\n")
+		return
+	}
+
+	effectiveToken := resolver(effectiveCustomToken)
 	*steps = append(*steps, fmt.Sprintf("          github-token: %s\n", effectiveToken))
 }
 
+// addSafeOutputGitHubTokenForConfig adds github-token to the with section for standard safe-output operations.
+// Uses precedence:
+//   - when safe-outputs.github-app is configured, the app installation token is used
+//   - when safe-outputs.github-app ignores missing keys, the app token is primary and the resolved custom token is fallback
+//   - otherwise: config token > safe-outputs global github-token > GH_AW_GITHUB_TOKEN || GITHUB_TOKEN
+func (c *Compiler) addSafeOutputGitHubTokenForConfig(steps *[]string, data *WorkflowData, configToken string) {
+	c.addResolvedSafeOutputGitHubTokenForConfig(steps, data, configToken, getEffectiveSafeOutputGitHubToken, true)
+}
+
 // addSafeOutputCopilotGitHubTokenForConfig adds github-token to the with section for Copilot-related operations
-// Uses precedence: config token > safe-outputs global github-token > COPILOT_GITHUB_TOKEN
+// Uses precedence:
+//   - when safe-outputs.github-app is configured, the app installation token is used
+//   - when safe-outputs.github-app ignores missing keys, the app token is primary and the resolved custom token is fallback
+//   - otherwise: config token > safe-outputs global github-token > COPILOT_GITHUB_TOKEN
 func (c *Compiler) addSafeOutputCopilotGitHubTokenForConfig(steps *[]string, data *WorkflowData, configToken string) {
-	var safeOutputsToken string
-	if data.SafeOutputs != nil {
-		safeOutputsToken = data.SafeOutputs.GitHubToken
-	}
-
-	// If app is configured, use app token
-	if data.SafeOutputs != nil && data.SafeOutputs.GitHubApp != nil {
-		*steps = append(*steps, "          github-token: ${{ steps.safe-outputs-app-token.outputs.token }}\n")
-		return
-	}
-
-	// Choose the first non-empty custom token for precedence
-	effectiveCustomToken := configToken
-	if effectiveCustomToken == "" {
-		effectiveCustomToken = safeOutputsToken
-	}
-
-	// Get effective token
-	effectiveToken := getEffectiveCopilotRequestsToken(effectiveCustomToken)
-	*steps = append(*steps, fmt.Sprintf("          github-token: %s\n", effectiveToken))
+	c.addResolvedSafeOutputGitHubTokenForConfig(steps, data, configToken, getEffectiveCopilotRequestsToken, true)
 }
 
 // addSafeOutputAgentGitHubTokenForConfig adds github-token to the with section for agent assignment operations
@@ -235,21 +264,115 @@ func (c *Compiler) addSafeOutputCopilotGitHubTokenForConfig(steps *[]string, dat
 // The Copilot assignment API only accepts PATs (fine-grained or classic), not GitHub App
 // installation tokens. Callers must provide an explicit github-token or rely on GH_AW_AGENT_TOKEN.
 func (c *Compiler) addSafeOutputAgentGitHubTokenForConfig(steps *[]string, data *WorkflowData, configToken string) {
-	// Get safe-outputs level token
-	var safeOutputsToken string
-	if data.SafeOutputs != nil {
-		safeOutputsToken = data.SafeOutputs.GitHubToken
-	}
-
-	// Choose the first non-empty custom token for precedence
-	effectiveCustomToken := configToken
-	if effectiveCustomToken == "" {
-		effectiveCustomToken = safeOutputsToken
-	}
-
 	// Get effective token - falls back to ${{ secrets.GH_AW_AGENT_TOKEN || secrets.GH_AW_GITHUB_TOKEN || secrets.GITHUB_TOKEN }}
 	// when no explicit token is provided. GitHub App tokens are never used here because the
 	// Copilot assignment API rejects them.
-	effectiveToken := getEffectiveCopilotCodingAgentGitHubToken(effectiveCustomToken)
-	*steps = append(*steps, fmt.Sprintf("          github-token: %s\n", effectiveToken))
+	c.addResolvedSafeOutputGitHubTokenForConfig(steps, data, configToken, getEffectiveCopilotCodingAgentGitHubToken, false)
+}
+
+func (c *Compiler) addAllSafeOutputConfigEnvVars(steps *[]string, data *WorkflowData) {
+	safeOutputsEnvLog.Print("Adding safe output config environment variables")
+	if data.SafeOutputs == nil {
+		safeOutputsEnvLog.Print("No safe outputs configured, skipping env var addition")
+		return
+	}
+
+	// Add the global staged env var once when resolveSafeOutputsStagedValue determines
+	// staged mode should be enabled (including trial mode), and at least one handler is
+	// configured. Staged mode is independent of target-repo.
+	if hasAnySafeOutputEnabled(data.SafeOutputs) {
+		if value := resolveSafeOutputsStagedValue(c.trialMode, data.SafeOutputs.Staged); value != nil {
+			*steps = append(*steps, buildTemplatableBoolEnvVar("GH_AW_SAFE_OUTPUTS_STAGED", value)...)
+			safeOutputsEnvLog.Print("Added staged flag")
+		} else {
+			safeOutputsEnvLog.Print("Staged flag not set")
+		}
+	}
+
+	// Check if copilot is in create-issue or create-pull-request assignees - enables inline copilot assignment
+	if (data.SafeOutputs.CreateIssues != nil && hasCopilotAssignee(data.SafeOutputs.CreateIssues.Assignees)) ||
+		(data.SafeOutputs.CreatePullRequests != nil && hasCopilotAssignee(data.SafeOutputs.CreatePullRequests.Assignees)) {
+		*steps = append(*steps, "          GH_AW_ASSIGN_COPILOT: \"true\"\n")
+		safeOutputsEnvLog.Print("Copilot assignment requested - enabled for create-issue or create-pull-request fallback issues")
+	}
+
+	// Note: All handler configuration is read from the config.json file at runtime.
+}
+
+// systemSafeOutputJobNames contains job names that are built-in system jobs and should not be
+// treated as custom safe output job types in the GH_AW_SAFE_OUTPUT_JOBS mapping.
+// The safe output handler manager uses this mapping to determine which message types are
+// handled by custom job steps (and therefore should be silently skipped rather than flagged
+// as "no handler loaded").
+var systemSafeOutputJobNames = map[string]bool{
+	"safe_outputs":  true, // consolidated safe outputs job
+	"upload_assets": true, // upload assets job
+}
+
+// buildSafeOutputJobsEnvVars creates environment variables for safe output job URLs
+// Returns both a JSON mapping and the actual environment variable declarations.
+// The mapping includes:
+//   - Built-in jobs with known URL outputs (e.g., create_issue → issue_url)
+//   - Custom safe-output jobs (from safe-outputs.jobs) with an empty URL key, so the handler
+//     manager knows those message types are handled by a dedicated job step and should be
+//     skipped gracefully rather than reported as "No handler loaded".
+func buildSafeOutputJobsEnvVars(jobNames []string) (string, []string) {
+	// Map job names to their expected URL output keys
+	jobOutputMapping := make(map[string]string)
+	var envVars []string
+
+	for _, jobName := range jobNames {
+		var urlKey string
+		switch jobName {
+		case "create_issue":
+			urlKey = "issue_url"
+		case "add_comment":
+			urlKey = "comment_url"
+		case "create_pull_request":
+			urlKey = "pull_request_url"
+		case "create_discussion":
+			urlKey = "discussion_url"
+		case "create_pr_review_comment":
+			urlKey = "review_comment_url"
+		case "close_issue":
+			urlKey = "issue_url"
+		case "close_pull_request":
+			urlKey = "pull_request_url"
+		case "close_discussion":
+			urlKey = "discussion_url"
+		case "create_agent_session":
+			urlKey = "task_url"
+		case "push_to_pull_request_branch":
+			urlKey = "commit_url"
+		default:
+			if !systemSafeOutputJobNames[jobName] {
+				// Custom safe-output job: include in the mapping with an empty URL key so the
+				// handler manager can silently skip messages of this type.
+				jobOutputMapping[jobName] = ""
+			}
+			continue
+		}
+
+		jobOutputMapping[jobName] = urlKey
+
+		// Add environment variable for this job's URL output
+		envVarName := fmt.Sprintf("GH_AW_OUTPUT_%s_%s",
+			normalizeJobNameForEnvVar(jobName),
+			normalizeJobNameForEnvVar(urlKey))
+		envVars = append(envVars,
+			fmt.Sprintf("          %s: ${{ needs.%s.outputs.%s }}\n",
+				envVarName, jobName, urlKey))
+	}
+
+	if len(jobOutputMapping) == 0 {
+		return "", nil
+	}
+
+	jsonBytes, err := json.Marshal(jobOutputMapping)
+	if err != nil {
+		safeOutputsEnvLog.Printf("Warning: failed to marshal safe output jobs info: %v", err)
+		return "", nil
+	}
+
+	return string(jsonBytes), envVars
 }

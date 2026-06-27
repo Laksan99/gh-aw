@@ -1,9 +1,12 @@
 ---
+private: true
+emoji: "📊"
 description: Daily codebase quality report using sentrux — tracks architecture health, quality signal, and structural trends
 name: Daily Sentrux Report
 on:
   schedule: daily
   workflow_dispatch:
+timeout-minutes: 30
 permissions:
   contents: read
 imports:
@@ -12,7 +15,7 @@ imports:
       title-prefix: "[daily-sentrux] "
       expires: "3d"
   - shared/mcp/sentrux.md
-  - shared/observability-otlp.md
+  - shared/otlp.md
 network:
   allowed:
     - defaults
@@ -25,7 +28,9 @@ tools:
     description: "Historical sentrux quality signal and architecture metrics"
     file-glob: ["*.json", "*.jsonl"]
     max-file-size: 51200
-engine: copilot
+engine:
+  id: copilot
+  copilot-sdk: true
 
 ---
 
@@ -43,10 +48,10 @@ Run a full sentrux scan on the workspace using bash:
 cd ${{ github.workspace }}
 
 # Check rules and capture output (continues even if rules fail)
-sentrux check . 2>&1 | tee /tmp/sentrux-check.txt || true
+sentrux check . 2>&1 | tee /tmp/gh-aw/agent/sentrux-check.txt || true
 
 # Save a gate baseline for comparison in future runs
-sentrux gate --save . 2>&1 | tee /tmp/sentrux-gate.txt || true
+sentrux gate --save . 2>&1 | tee /tmp/gh-aw/agent/sentrux-gate.txt || true
 ```
 
 Parse the output to extract:

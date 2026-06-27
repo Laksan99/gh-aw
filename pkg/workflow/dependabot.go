@@ -12,13 +12,13 @@ import (
 	"path/filepath"
 	"reflect"
 	"slices"
-	"sort"
 	"strings"
 
-	"github.com/github/gh-aw/pkg/constants"
-
 	"github.com/github/gh-aw/pkg/console"
+	"github.com/github/gh-aw/pkg/constants"
 	"github.com/github/gh-aw/pkg/logger"
+	"github.com/github/gh-aw/pkg/setutil"
+	"github.com/github/gh-aw/pkg/sliceutil"
 	"github.com/goccy/go-yaml"
 )
 
@@ -75,12 +75,14 @@ func (c *Compiler) GenerateDependabotManifests(workflowDataList []*WorkflowData,
 	dependabotLog.Print("Starting Dependabot manifest generation")
 
 	// Track which ecosystems have dependencies
-	ecosystems := make(map[string]bool)
+	ecosystems := make(map[string]struct {
+	})
 
 	// Collect npm dependencies
 	npmDeps := c.collectNpmDependencies(workflowDataList)
 	if len(npmDeps) > 0 {
-		ecosystems["npm"] = true
+		ecosystems["npm"] = struct {
+		}{}
 		dependabotLog.Printf("Found %d unique npm dependencies", len(npmDeps))
 		if c.verbose {
 			fmt.Fprintln(os.Stderr, console.FormatInfoMessage(fmt.Sprintf("Found %d npm dependencies in workflows", len(npmDeps))))
@@ -109,7 +111,8 @@ func (c *Compiler) GenerateDependabotManifests(workflowDataList []*WorkflowData,
 	// Collect pip dependencies
 	pipDeps := c.collectPipDependencies(workflowDataList)
 	if len(pipDeps) > 0 {
-		ecosystems["pip"] = true
+		ecosystems["pip"] = struct {
+		}{}
 		dependabotLog.Printf("Found %d unique pip dependencies", len(pipDeps))
 		if c.verbose {
 			fmt.Fprintln(os.Stderr, console.FormatInfoMessage(fmt.Sprintf("Found %d pip dependencies in workflows", len(pipDeps))))
@@ -129,7 +132,8 @@ func (c *Compiler) GenerateDependabotManifests(workflowDataList []*WorkflowData,
 	// Collect go dependencies
 	goDeps := c.collectGoDependencies(workflowDataList)
 	if len(goDeps) > 0 {
-		ecosystems["gomod"] = true
+		ecosystems["gomod"] = struct {
+		}{}
 		dependabotLog.Printf("Found %d unique go dependencies", len(goDeps))
 		if c.verbose {
 			fmt.Fprintln(os.Stderr, console.FormatInfoMessage(fmt.Sprintf("Found %d go dependencies in workflows", len(goDeps))))
@@ -196,8 +200,15 @@ func (c *Compiler) collectNpmDependencies(workflowDataList []*WorkflowData) []Np
 	}
 
 	// Sort by name for deterministic output
-	sort.Slice(deps, func(i, j int) bool {
-		return deps[i].Name < deps[j].Name
+	slices.SortFunc(deps, func(a, b NpmDependency) int {
+		switch {
+		case a.Name < b.Name:
+			return -1
+		case a.Name > b.Name:
+			return 1
+		default:
+			return 0
+		}
 	})
 
 	dependabotLog.Printf("Collected %d unique dependencies", len(deps))
@@ -353,7 +364,8 @@ func (c *Compiler) generatePackageLock(workflowDir string) error {
 }
 
 // generateDependabotConfig creates or updates .github/dependabot.yml
-func (c *Compiler) generateDependabotConfig(path string, ecosystems map[string]bool, forceOverwrite bool) error {
+func (c *Compiler) generateDependabotConfig(path string, ecosystems map[string]struct {
+}, forceOverwrite bool) error {
 	dependabotLog.Printf("Generating dependabot.yml at %s", path)
 
 	var config DependabotConfig
@@ -448,7 +460,7 @@ func (c *Compiler) ReconcileManagedDependabotIgnores(path string) error {
 		return nil
 	}
 
-	managedPatterns := []string{c.effectiveActionsRepo() + "/**"}
+	managedPatterns := []string{c.effectiveActionsRepo()}
 	changed := false
 	originalStr := string(original)
 	managedPatternsWithComment := managedPatternsWithInlineComment(originalStr, managedPatterns)
@@ -476,7 +488,8 @@ func (c *Compiler) ReconcileManagedDependabotIgnores(path string) error {
 			continue
 		}
 
-		managedPresent := make(map[string]bool, len(managedPatterns))
+		managedPresent := make(map[string]struct {
+		}, len(managedPatterns))
 		for _, ignoreEntryAny := range ignoreEntries {
 			ignoreEntryMap, ok := dependabotToStringAnyMap(ignoreEntryAny)
 			if !ok {
@@ -489,8 +502,9 @@ func (c *Compiler) ReconcileManagedDependabotIgnores(path string) error {
 
 			for _, pattern := range managedPatterns {
 				if dependencyName == pattern {
-					managedPresent[pattern] = true
-					if !managedPatternsWithComment[pattern] {
+					managedPresent[pattern] = struct {
+					}{}
+					if !setutil.Contains(managedPatternsWithComment, pattern) {
 						changed = true
 					}
 				}
@@ -498,7 +512,7 @@ func (c *Compiler) ReconcileManagedDependabotIgnores(path string) error {
 		}
 
 		for _, pattern := range managedPatterns {
-			if managedPresent[pattern] {
+			if setutil.Contains(managedPresent, pattern) {
 				continue
 			}
 			ignoreEntries = append(ignoreEntries, map[string]any{"dependency-name": pattern})
@@ -610,15 +624,18 @@ func isYAMLNullOrEmptyScalar(value any) bool {
 	return trimmed == "" || strings.EqualFold(trimmed, "null") || trimmed == "~"
 }
 
-func managedPatternsWithInlineComment(content string, managedPatterns []string) map[string]bool {
-	result := make(map[string]bool, len(managedPatterns))
+func managedPatternsWithInlineComment(content string, managedPatterns []string) map[string]struct {
+} {
+	result := make(map[string]struct {
+	}, len(managedPatterns))
 	for line := range strings.SplitSeq(content, "\n") {
 		if !strings.Contains(line, "dependency-name:") || !strings.Contains(line, managedDependabotIgnoreComment) {
 			continue
 		}
 		for _, pattern := range managedPatterns {
 			if strings.Contains(line, pattern) {
-				result[pattern] = true
+				result[pattern] = struct {
+				}{}
 			}
 		}
 	}
@@ -695,8 +712,15 @@ func (c *Compiler) collectPipDependencies(workflowDataList []*WorkflowData) []Pi
 	}
 
 	// Sort by name for deterministic output
-	sort.Slice(deps, func(i, j int) bool {
-		return deps[i].Name < deps[j].Name
+	slices.SortFunc(deps, func(a, b PipDependency) int {
+		switch {
+		case a.Name < b.Name:
+			return -1
+		case a.Name > b.Name:
+			return 1
+		default:
+			return 0
+		}
 	})
 
 	dependabotLog.Printf("Collected %d unique pip dependencies", len(deps))
@@ -772,11 +796,7 @@ func (c *Compiler) generateRequirementsTxt(path string, deps []PipDependency, fo
 	}
 
 	// Sort dependencies by name
-	var sortedNames []string
-	for name := range reqMap {
-		sortedNames = append(sortedNames, name)
-	}
-	sort.Strings(sortedNames)
+	sortedNames := sliceutil.SortedKeys(reqMap)
 
 	// Build requirements.txt content
 	var lines []string
@@ -832,8 +852,15 @@ func (c *Compiler) collectGoDependencies(workflowDataList []*WorkflowData) []GoD
 	}
 
 	// Sort by path for deterministic output
-	sort.Slice(deps, func(i, j int) bool {
-		return deps[i].Path < deps[j].Path
+	slices.SortFunc(deps, func(a, b GoDependency) int {
+		switch {
+		case a.Path < b.Path:
+			return -1
+		case a.Path > b.Path:
+			return 1
+		default:
+			return 0
+		}
 	})
 
 	dependabotLog.Printf("Collected %d unique Go dependencies", len(deps))

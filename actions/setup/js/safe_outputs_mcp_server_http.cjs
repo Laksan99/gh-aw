@@ -41,11 +41,36 @@ const { createAppendFunction } = require("./safe_outputs_append.cjs");
 moduleLogger.debug("Loaded safe_outputs_append.cjs");
 const { createHandlers } = require("./safe_outputs_handlers.cjs");
 moduleLogger.debug("Loaded safe_outputs_handlers.cjs");
+const { normalizeTool } = require("./mcp_server_core.cjs");
 const { attachHandlers, registerPredefinedTools, registerDynamicTools } = require("./safe_outputs_tools_loader.cjs");
 moduleLogger.debug("Loaded safe_outputs_tools_loader.cjs");
 const { getErrorMessage } = require("./error_helpers.cjs");
 const { runHttpServer, logStartupError } = require("./mcp_http_server_runner.cjs");
+const { normalizeSafeOutputToolArguments, stripInternalSafeOutputSchemaMetadata } = require("./safe_outputs_mcp_arguments.cjs");
 moduleLogger.debug("All modules loaded successfully");
+
+/**
+ * Normalize a handler result into the MCP tool-call response shape, preserving
+ * the handler-provided `isError` flag (e.g. safe-output handlers return
+ * `isError: true` on error). Hardcoding `isError: false` here would mask
+ * application-level errors from clients such as the samples replay driver.
+ * @param {any} result - Raw result returned by a tool handler.
+ * @returns {{ content: any[], isError: boolean }}
+ */
+function normalizeMcpToolResult(result) {
+  const content = result && result.content ? result.content : [];
+  const isError = !!(result && result.isError);
+  return { content, isError };
+}
+
+/**
+ * Check whether workflow metadata name is a non-empty string after trimming.
+ * @param {any} workflowName
+ * @returns {boolean}
+ */
+function hasValidWorkflowMetadataName(workflowName) {
+  return typeof workflowName === "string" && workflowName.trim().length > 0;
+}
 
 /**
  * Create and configure the MCP server with tools
@@ -65,6 +90,7 @@ function createMCPServer(options = {}) {
   // Create server with configuration
   const serverName = "safeoutputs";
   const version = "1.0.0";
+  const normalizationSchemas = new Map();
 
   logger.debug(`Server name: ${serverName}`);
   logger.debug(`Server version: ${version}`);
@@ -81,6 +107,7 @@ function createMCPServer(options = {}) {
       capabilities: {
         tools: {},
       },
+      normalizeArguments: (toolName, args, tool) => normalizeSafeOutputToolArguments(toolName, args, logger, normalizationSchemas.get(normalizeTool(toolName)) || tool?.inputSchema),
     }
   );
 
@@ -92,7 +119,13 @@ function createMCPServer(options = {}) {
   const { defaultHandler } = handlers;
 
   // Attach handlers to tools
-  const toolsWithHandlers = attachHandlers(ALL_TOOLS, handlers);
+  const toolsWithHandlers = attachHandlers(ALL_TOOLS, handlers, logger);
+  for (const tool of toolsWithHandlers) {
+    if (tool?.name && tool?.inputSchema) {
+      normalizationSchemas.set(normalizeTool(tool.name), tool.inputSchema);
+      tool.inputSchema = stripInternalSafeOutputSchemaMetadata(tool.inputSchema);
+    }
+  }
 
   // Register predefined tools that are enabled in configuration
   logger.debug(`Registering predefined tools...`);
@@ -111,7 +144,7 @@ function createMCPServer(options = {}) {
     // Check if this is a dispatch_workflow tool (has _workflow_name metadata)
     // These tools are dynamically generated with workflow-specific names
     // The _workflow_name should be a non-empty string
-    const isDispatchWorkflowTool = tool._workflow_name && typeof tool._workflow_name === "string" && tool._workflow_name.length > 0;
+    const isDispatchWorkflowTool = hasValidWorkflowMetadataName(tool._workflow_name);
 
     // Check if this is a dispatch_repository tool (has _dispatch_repository_tool metadata)
     // These tools are dynamically generated with tool-specific names
@@ -120,7 +153,7 @@ function createMCPServer(options = {}) {
     // Check if this is a call_workflow tool (has _call_workflow_name metadata)
     // These tools are dynamically generated with workflow-specific names
     // The _call_workflow_name should be a non-empty string
-    const isCallWorkflowTool = tool._call_workflow_name && typeof tool._call_workflow_name === "string" && tool._call_workflow_name.length > 0;
+    const isCallWorkflowTool = hasValidWorkflowMetadataName(tool._call_workflow_name);
 
     if (isDispatchWorkflowTool) {
       logger.debug(`Found dispatch_workflow tool: ${tool.name} (_workflow_name: ${tool._workflow_name})`);
@@ -179,9 +212,8 @@ function createMCPServer(options = {}) {
       const result = await Promise.resolve(toolHandler(args));
       logger.debug(`Handler returned for tool: ${tool.name}`);
 
-      // Normalize result to MCP format
-      const content = result && result.content ? result.content : [];
-      return { content, isError: false };
+      // Normalize result to MCP format; preserve isError from the handler result
+      return normalizeMcpToolResult(result);
     });
 
     registeredCount++;
@@ -216,9 +248,8 @@ function createMCPServer(options = {}) {
         const result = await Promise.resolve(defaultHandler({ toolName, ...args }));
         logger.debug(`Handler returned for dynamic tool: ${toolName}`);
 
-        // Normalize result to MCP format
-        const content = result && result.content ? result.content : [];
-        return { content, isError: false };
+        // Normalize result to MCP format; preserve isError from the handler result
+        return normalizeMcpToolResult(result);
       });
 
       registeredCount++;
@@ -336,4 +367,5 @@ if (require.main === module) {
 module.exports = {
   startHttpServer,
   createMCPServer,
+  normalizeMcpToolResult,
 };

@@ -36,9 +36,8 @@ Displays a simplified table with workflow name, AI engine, and compilation statu
 Unlike 'status', this command does not check GitHub workflow state or time remaining.
 
 The optional pattern argument filters workflows by name (case-insensitive substring match).
-
-Examples:
-  ` + string(constants.CLIExtensionPrefix) + ` list                              # List all workflows in current repo
+It accepts workflow IDs (basename without .md) or full filenames.`,
+		Example: `  ` + string(constants.CLIExtensionPrefix) + ` list                              # List all workflows in current repo
   ` + string(constants.CLIExtensionPrefix) + ` list --repo github/gh-aw          # List workflows from github/gh-aw repo
   ` + string(constants.CLIExtensionPrefix) + ` list --repo org/repo --path workflows  # List from custom path
   ` + string(constants.CLIExtensionPrefix) + ` list --dir custom/workflows        # List from custom local directory
@@ -71,8 +70,8 @@ Examples:
 	addRepoFlag(cmd)
 	addJSONFlag(cmd)
 	cmd.Flags().String("label", "", "Filter workflows by label")
-	cmd.Flags().String("path", ".github/workflows", "Path to workflows directory in the remote repository (used with --repo)")
-	cmd.Flags().StringP("dir", "d", "", "Workflow directory (default: .github/workflows; ignored when --repo is set)")
+	cmd.Flags().String("path", constants.GetWorkflowDir(), "Path to workflows directory in the remote repository (used with --repo)")
+	cmd.Flags().StringP("dir", "d", "", "Workflow directory (default: $GH_AW_WORKFLOWS_DIR or .github/workflows; ignored when --repo is set)")
 
 	// Register completions for list command
 	cmd.ValidArgsFunction = CompleteWorkflowNames
@@ -119,7 +118,7 @@ func RunListWorkflows(repo, path, pattern string, verbose bool, jsonOutput bool,
 			// Output empty array for JSON
 			output := []WorkflowListItem{}
 			jsonBytes, _ := json.MarshalIndent(output, "", "  ")
-			fmt.Println(string(jsonBytes))
+			fmt.Fprintln(os.Stdout, string(jsonBytes))
 			return nil
 		}
 		fmt.Fprintln(os.Stderr, console.FormatInfoMessage("No workflow files found."))
@@ -219,7 +218,7 @@ func RunListWorkflows(repo, path, pattern string, verbose bool, jsonOutput bool,
 		if err != nil {
 			return fmt.Errorf("failed to marshal JSON: %w", err)
 		}
-		fmt.Println(string(jsonBytes))
+		fmt.Fprintln(os.Stdout, string(jsonBytes))
 		return nil
 	}
 

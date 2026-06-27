@@ -1,4 +1,6 @@
 ---
+private: true
+emoji: "🔒"
 name: The Great Escapi
 description: Security testing to find escape paths in the AWF (Agent Workflow Firewall)
 
@@ -16,9 +18,12 @@ permissions:
   pull-requests: read
   discussions: read
 
+  copilot-requests: write
 strict: true
 
-engine: copilot
+engine:
+  id: copilot
+  copilot-sdk: true
 
 timeout-minutes: 60
 
@@ -30,7 +35,9 @@ network:
     - node
 
 sandbox:
-  agent: awf  # Firewall enabled (migrated from network.firewall)
+  agent:
+    id: awf
+    sudo: false
 
 safe-outputs:
   create-discussion:
@@ -40,7 +47,7 @@ safe-outputs:
     max: 1
 
 imports:
-  - shared/observability-otlp.md
+  - shared/otlp.md
 tools:
   cli-proxy: true
   github:
@@ -66,7 +73,7 @@ jobs:
       issues: write
     steps:
       - name: Create issue on test failure
-        uses: actions/github-script@v9
+        uses: actions/github-script@v9.0.0
         with:
           script: |
             await github.rest.issues.create({
@@ -85,9 +92,6 @@ jobs:
             - File operations failed`,
               labels: ['bug', 'firewall', 'automated']
             });
-features:
-  copilot-requests: true
-
 ---
 
 # The Great Escapi
@@ -155,16 +159,16 @@ rm $HOME/.firewall-test-marker
 
 **Expected:** SUCCESS - File write and cleanup in home directory should work.
 
-## Test 7: File Write (/tmp)
+## Test 7: File Write (`/tmp/gh-aw/agent`)
 
 Run:
 ```bash
-echo "tmp-test-$(date +%s)" > /tmp/firewall-test-marker
-cat /tmp/firewall-test-marker
-rm /tmp/firewall-test-marker
+echo "tmp-test-$(date +%s)" > /tmp/gh-aw/agent/firewall-test-marker
+cat /tmp/gh-aw/agent/firewall-test-marker
+rm /tmp/gh-aw/agent/firewall-test-marker
 ```
 
-**Expected:** SUCCESS - File write and cleanup in /tmp should work.
+**Expected:** SUCCESS - File write and cleanup in `/tmp/gh-aw/agent` should work.
 
 ## Test 8: Localhost Connectivity
 

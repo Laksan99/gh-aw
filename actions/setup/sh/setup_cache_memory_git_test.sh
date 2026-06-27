@@ -195,6 +195,99 @@ assert "file with space and .json kept"    "[ -f '${D}/my data.json' ]"
 assert "file with space and .sh removed"   "[ ! -f '${D}/my script.sh' ]"
 echo ""
 
+# ── Test 12: Legacy nested artifact layout is flattened before git setup ─────
+echo "Test 12: Legacy nested cache directory is flattened"
+D="${WORKSPACE}/test12"
+mkdir -p "${D}/$(basename "${D}")"
+echo '{"totalRuns":15}' > "${D}/$(basename "${D}")/chaos-pr-bundle-fuzzer.json"
+set +e
+OUTPUT="$(
+  GH_AW_CACHE_DIR="${D}" \
+  GH_AW_MIN_INTEGRITY="none" \
+    bash "${SCRIPT}" 2>&1
+)"
+EXIT_CODE=$?
+set -e
+assert "legacy nested layout exits successfully" \
+  "[ '${EXIT_CODE}' -eq 0 ]"
+assert "legacy nested file moved to cache root" \
+  "[ -f '${D}/chaos-pr-bundle-fuzzer.json' ]"
+assert "legacy nested directory removed" \
+  "[ ! -d '${D}/$(basename "${D}")' ]"
+assert "flattening message logged" \
+  "printf '%s' \"${OUTPUT}\" | grep -q 'Flattening legacy nested cache directory'"
+echo ""
+
+# ── Test 13: Corrupted git metadata is healed automatically ───────────────────
+echo "Test 13: Corrupted git metadata is reinitialized"
+D="${WORKSPACE}/test13"
+make_cache_dir "${D}" "data.json"
+pushd "${D}" >/dev/null
+TREE_OBJ="$(git rev-parse HEAD^{tree})"
+TREE_OBJ_PATH=".git/objects/${TREE_OBJ:0:2}/${TREE_OBJ:2}"
+if [ ! -f "${TREE_OBJ_PATH}" ]; then
+  echo "  ✗ expected loose tree object to exist at ${TREE_OBJ_PATH}"
+  TESTS_FAILED=$((TESTS_FAILED + 1))
+else
+  rm -f "${TREE_OBJ_PATH}"
+fi
+popd >/dev/null
+
+set +e
+OUTPUT="$(run_script "${D}" none)"
+EXIT_CODE=$?
+set -e
+assert "corrupted repo exits successfully" \
+  "[ '${EXIT_CODE}' -eq 0 ]"
+assert "corruption warning logged" \
+  "printf '%s' \"${OUTPUT}\" | grep -qi 'Detected corrupted cache-memory git repository'"
+assert "git metadata recreated" \
+  "[ -d '${D}/.git' ]"
+assert "restored file preserved after recovery" \
+  "[ -f '${D}/data.json' ]"
+assert "integrity branch exists after recovery" \
+  "git -C '${D}' rev-parse --verify none >/dev/null 2>&1"
+echo ""
+
+# ── Test 14: Missing HEAD corruption is healed before hook config ─────────────
+echo "Test 14: Missing HEAD corruption is reinitialized"
+D="${WORKSPACE}/test14"
+make_cache_dir "${D}" "data.json"
+rm -f "${D}/.git/HEAD"
+set +e
+OUTPUT="$(run_script "${D}" none)"
+EXIT_CODE=$?
+set -e
+assert "missing HEAD exits successfully" \
+  "[ '${EXIT_CODE}' -eq 0 ]"
+assert "corruption warning logged for missing HEAD" \
+  "printf '%s' \"${OUTPUT}\" | grep -qi 'Detected corrupted cache-memory git repository'"
+assert "git metadata recreated after missing HEAD" \
+  "[ -d '${D}/.git' ]"
+assert "restored file preserved after missing HEAD recovery" \
+  "[ -f '${D}/data.json' ]"
+assert "integrity branch exists after missing HEAD recovery" \
+  "git -C '${D}' rev-parse --verify none >/dev/null 2>&1"
+echo ""
+
+# ── Test 15: Daily SPDD rotation directory preflight is created and writable ──
+echo "Test 15: Daily SPDD rotation cache directory is writable"
+D="${WORKSPACE}/test15"
+make_cache_dir "${D}" "data.json"
+set +e
+OUTPUT="$(run_script "${D}" none)"
+EXIT_CODE=$?
+set -e
+assert "preflight exits successfully" \
+  "[ '${EXIT_CODE}' -eq 0 ]"
+assert "spdd-daily directory created" \
+  "[ -d '${D}/spdd-daily' ]"
+assert "spdd-daily directory writable" \
+  "[ -w '${D}/spdd-daily' ]"
+assert "preflight success message logged" \
+  "printf '%s' \"${OUTPUT}\" | grep -q 'Cache memory preflight write checks passed'"
+echo ""
+
 # ── Summary ──────────────────────────────────────────────────────────────────
 echo "Tests passed: ${TESTS_PASSED}"
 echo "Tests failed: ${TESTS_FAILED}"

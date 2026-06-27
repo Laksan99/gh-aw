@@ -14,6 +14,8 @@
 package workflow
 
 import (
+	"slices"
+
 	"github.com/github/gh-aw/pkg/logger"
 )
 
@@ -26,6 +28,8 @@ const (
 	SandboxTypeAWF     SandboxType = "awf"     // Uses AWF (Agent Workflow Firewall)
 	SandboxTypeDefault SandboxType = "default" // Alias for AWF (backward compat)
 )
+
+const defaultAgentWorkspaceWritePath = "/tmp/gh-aw/agent"
 
 // SandboxConfig represents the top-level sandbox configuration from front matter
 // New format: { agent: "awf"|"srt"|{type, config}, mcp: {port, command, ...} }
@@ -42,16 +46,30 @@ type SandboxConfig struct {
 
 // AgentSandboxConfig represents the agent sandbox configuration
 type AgentSandboxConfig struct {
-	ID       string                `yaml:"id,omitempty"`      // Agent ID: "awf" or "srt" (replaces Type in new object format)
-	Type     SandboxType           `yaml:"type,omitempty"`    // Sandbox type: "awf" or "srt" (legacy, use ID instead)
-	Version  string                `yaml:"version,omitempty"` // AWF version override used to install and run the matching firewall version
-	Disabled bool                  `yaml:"-"`                 // True when agent is explicitly set to false (disables firewall). This is a runtime flag, not serialized to YAML.
-	Config   *SandboxRuntimeConfig `yaml:"config,omitempty"`  // Custom SRT config (optional)
-	Command  string                `yaml:"command,omitempty"` // Custom command to replace AWF or SRT installation
-	Args     []string              `yaml:"args,omitempty"`    // Additional arguments to append to the command
-	Env      map[string]string     `yaml:"env,omitempty"`     // Environment variables to set on the step
-	Mounts   []string              `yaml:"mounts,omitempty"`  // Container mounts to add for AWF (format: "source:dest:mode")
-	Memory   string                `yaml:"memory,omitempty"`  // Memory limit for the AWF container (e.g., "4g", "8g")
+	ID               string                                `yaml:"id,omitempty"`             // Agent ID: "awf" or "srt" (replaces Type in new object format)
+	Type             SandboxType                           `yaml:"type,omitempty"`           // Sandbox type: "awf" or "srt" (legacy, use ID instead)
+	Version          string                                `yaml:"version,omitempty"`        // AWF version override used to install and run the matching firewall version
+	Platform         string                                `yaml:"platform,omitempty"`       // AWF platform.type override (github.com, ghes, ghec, ghec-self-hosted)
+	NetworkIsolation bool                                  `yaml:"sudo,omitempty"`           // Internal: true = isolation mode (AWF --network-isolation). Frontmatter sudo: false maps to NetworkIsolation=true; sudo: true or omitted maps to NetworkIsolation=false.
+	Disabled         bool                                  `yaml:"-"`                        // True when agent is explicitly set to false (disables firewall). This is a runtime flag, not serialized to YAML.
+	DisableReason    string                                `yaml:"-"`                        // Operator-authored justification from dangerously-disable-sandbox-agent feature; available for diagnostics and audit logging.
+	Config           *SandboxRuntimeConfig                 `yaml:"config,omitempty"`         // Custom SRT config (optional)
+	Command          string                                `yaml:"command,omitempty"`        // Custom command to replace AWF or SRT installation
+	Args             []string                              `yaml:"args,omitempty"`           // Additional arguments to append to the command
+	Env              map[string]string                     `yaml:"env,omitempty"`            // Environment variables to set on the step
+	Mounts           []string                              `yaml:"mounts,omitempty"`         // Container mounts to add for AWF (format: "source:dest:mode")
+	Memory           string                                `yaml:"memory,omitempty"`         // Memory limit for the AWF container (e.g., "4g", "8g")
+	ModelFallback    *TemplatableBool                      `yaml:"model-fallback,omitempty"` // AWF API proxy model fallback enable/disable flag (optional)
+	Targets          map[string]*AgentAPIProxyTargetConfig `yaml:"targets,omitempty"`        // Per-provider API proxy target overrides keyed by provider name (e.g. "openai", "anthropic")
+}
+
+// AgentAPIProxyTargetConfig configures a single LLM provider's API proxy target.
+type AgentAPIProxyTargetConfig struct {
+	// AuthHeader is the custom authentication header name sent with API requests.
+	// When set, the raw API key is sent as "<authHeader>: <key>" instead of the
+	// provider default ("Authorization" for OpenAI, "x-api-key" for Anthropic).
+	// Example: "api-key" for Azure OpenAI gateways.
+	AuthHeader string `yaml:"authHeader,omitempty"`
 }
 
 // SandboxRuntimeConfig represents the Anthropic Sandbox Runtime configuration
@@ -149,17 +167,20 @@ func applySandboxDefaults(sandboxConfig *SandboxConfig, engineConfig *EngineConf
 	// If no sandbox config exists, create one with awf as default
 	if sandboxConfig == nil {
 		sandboxLog.Print("No sandbox config found, creating default with agent: awf")
-		return &SandboxConfig{
+		sandboxConfig = &SandboxConfig{
 			Agent: &AgentSandboxConfig{
 				Type: SandboxTypeAWF,
 			},
 		}
+		ensureDefaultAgentWritePath(sandboxConfig)
+		return sandboxConfig
 	}
 
 	// If sandbox config exists with legacy Type field set, don't override with awf default
 	// The legacy Type field indicates explicit sandbox configuration
 	if sandboxConfig.Type != "" {
 		sandboxLog.Printf("Sandbox config uses legacy Type field: %s, preserving it", sandboxConfig.Type)
+		ensureDefaultAgentWritePath(sandboxConfig)
 		return sandboxConfig
 	}
 
@@ -169,6 +190,7 @@ func applySandboxDefaults(sandboxConfig *SandboxConfig, engineConfig *EngineConf
 		sandboxConfig.Agent = &AgentSandboxConfig{
 			Type: SandboxTypeAWF,
 		}
+		ensureDefaultAgentWritePath(sandboxConfig)
 		return sandboxConfig
 	}
 
@@ -183,5 +205,59 @@ func applySandboxDefaults(sandboxConfig *SandboxConfig, engineConfig *EngineConf
 		sandboxConfig.Agent.Type = SandboxTypeAWF
 	}
 
+	ensureDefaultAgentWritePath(sandboxConfig)
 	return sandboxConfig
+}
+
+func ensureDefaultAgentWritePath(sandboxConfig *SandboxConfig) {
+	if sandboxConfig == nil || sandboxConfig.Agent == nil {
+		return
+	}
+	if sandboxConfig.Agent.Config == nil {
+		sandboxConfig.Agent.Config = &SandboxRuntimeConfig{}
+	}
+	if sandboxConfig.Agent.Config.Filesystem == nil {
+		sandboxConfig.Agent.Config.Filesystem = &SRTFilesystemConfig{}
+	}
+	if slices.Contains(sandboxConfig.Agent.Config.Filesystem.AllowWrite, defaultAgentWorkspaceWritePath) {
+		return
+	}
+	sandboxConfig.Agent.Config.Filesystem.AllowWrite = append(
+		sandboxConfig.Agent.Config.Filesystem.AllowWrite,
+		defaultAgentWorkspaceWritePath,
+	)
+}
+
+// isSandboxEnabled checks if the sandbox is enabled (either explicitly or auto-enabled)
+// Returns true when:
+// - sandbox.agent is explicitly set to awf
+// - Firewall is auto-enabled (networkPermissions.Firewall is set and enabled)
+// Returns false when:
+// - sandbox.agent is false (explicitly disabled)
+// - No sandbox configuration and no auto-enabled firewall
+func isSandboxEnabled(sandboxConfig *SandboxConfig, networkPermissions *NetworkPermissions) bool {
+	// Check if sandbox.agent is explicitly disabled
+	if sandboxConfig != nil && sandboxConfig.Agent != nil && sandboxConfig.Agent.Disabled {
+		return false
+	}
+
+	// Check if sandbox.agent is explicitly configured with a type
+	if sandboxConfig != nil && sandboxConfig.Agent != nil {
+		agentType := getAgentType(sandboxConfig.Agent)
+		if isSupportedSandboxType(agentType) {
+			return true
+		}
+	}
+
+	// Check legacy top-level Type field (deprecated but still supported)
+	if sandboxConfig != nil && isSupportedSandboxType(sandboxConfig.Type) {
+		return true
+	}
+
+	// Check if firewall is auto-enabled (AWF)
+	if networkPermissions != nil && networkPermissions.Firewall != nil && networkPermissions.Firewall.Enabled {
+		return true
+	}
+
+	return false
 }

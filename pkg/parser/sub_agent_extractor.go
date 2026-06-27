@@ -18,14 +18,10 @@
 // Both the agent marker and any subsequent H2 section heading render as visible
 // section headings in any Markdown preview (GitHub, VS Code, etc.).
 //
-// # Supported Frontmatter Fields
+// # Sub-Agent Frontmatter
 //
-// Only the following fields are valid in a sub-agent frontmatter block.
-// Any other field is stripped at runtime with a warning.
-//
-//   - description: Human-readable description of the sub-agent's role.
-//   - model: AI model to use.  Default is "inherited" (uses the parent
-//     workflow's model when not set).
+// Sub-agent frontmatter keys and their order are preserved without filtering;
+// boundary whitespace is trimmed.
 //
 // # Example
 //
@@ -69,21 +65,12 @@ package parser
 import (
 	"fmt"
 	"regexp"
-	"sort"
 	"strings"
 
 	"github.com/github/gh-aw/pkg/logger"
 )
 
 var subAgentLog = logger.New("parser:sub_agent_extractor")
-
-// validSubAgentFrontmatterFields is the set of permitted keys in a sub-agent
-// frontmatter block. Any key not in this set will produce a warning when
-// ValidateInlineSubAgentsFrontmatter is called.
-var validSubAgentFrontmatterFields = map[string]bool{
-	"description": true,
-	"model":       true,
-}
 
 // ValidateInlineSubAgentsFrontmatter performs best-effort frontmatter validation
 // on every inline sub-agent section found in markdown.
@@ -93,9 +80,8 @@ var validSubAgentFrontmatterFields = map[string]bool{
 // before scanning for ## agent: `name` markers so that the file-level
 // frontmatter is not mistaken for sub-agent content.
 //
-// For each detected sub-agent the function:
-//  1. Attempts to parse its embedded frontmatter block (--- … ---).
-//  2. Reports unknown fields (anything other than "description" or "model").
+// For each detected sub-agent the function attempts to parse its embedded
+// frontmatter block (--- … ---).
 //
 // All issues are returned as human-readable warning strings. Callers must not
 // fail compilation based on these messages — they are advisory only (best effort).
@@ -133,59 +119,18 @@ func ValidateInlineSubAgentsInBody(body string) []string {
 
 	var warnings []string
 	for _, agent := range subAgents {
-		warnings = append(warnings, validateSubAgentFrontmatterFields(agent)...)
+		warnings = append(warnings, validateSubAgentFrontmatterSyntax(agent)...)
 	}
 	return warnings
 }
 
-// validateSubAgentFrontmatterFields parses the frontmatter block embedded in a
-// single InlineSubAgent.Content and returns warning messages for any unknown fields.
-func validateSubAgentFrontmatterFields(agent InlineSubAgent) []string {
-	parsed, err := ExtractFrontmatterFromContent(agent.Content)
-	if err != nil {
+// validateSubAgentFrontmatterSyntax parses the frontmatter block embedded in a
+// single InlineSubAgent.Content and returns warning messages for parse errors only.
+func validateSubAgentFrontmatterSyntax(agent InlineSubAgent) []string {
+	if _, err := ExtractFrontmatterFromContent(agent.Content); err != nil {
 		return []string{fmt.Sprintf("sub-agent %q: could not parse frontmatter: %v", agent.Name, err)}
 	}
-	if len(parsed.Frontmatter) == 0 {
-		return nil
-	}
-
-	var unknown []string
-	for key := range parsed.Frontmatter {
-		if !validSubAgentFrontmatterFields[key] {
-			unknown = append(unknown, key)
-		}
-	}
-	if len(unknown) == 0 {
-		return nil
-	}
-
-	sort.Strings(unknown) // deterministic order
-	return []string{fmt.Sprintf(
-		"sub-agent %q: unknown frontmatter field(s): %s (valid fields: description, model)",
-		agent.Name, strings.Join(unknown, ", "),
-	)}
-}
-
-// GetEngineSubAgentDir returns the relative directory (from repo root / tmp base) used
-// to store inline sub-agent files for a given engine.
-//
-// Each engine has a dedicated config directory:
-//
-//	claude   → .claude/agents
-//	codex    → .codex/agents
-//	gemini   → .gemini/agents
-//	others   → .github/agents  (Copilot default)
-func GetEngineSubAgentDir(engineID string) string {
-	switch strings.ToLower(engineID) {
-	case "claude":
-		return ".claude/agents"
-	case "codex":
-		return ".codex/agents"
-	case "gemini":
-		return ".gemini/agents"
-	default:
-		return ".github/agents"
-	}
+	return nil
 }
 
 // GetEngineSubAgentExt returns the file extension used for inline sub-agent files
@@ -231,10 +176,6 @@ type InlineSubAgent struct {
 //   - Optional trailing whitespace
 var subAgentSeparatorRegex = regexp.MustCompile("(?m)^##[ \t]+agent:[ \t]+`([a-z][a-z0-9_-]*)`[ \t]*$")
 
-// h2HeadingRegex matches the start of any level-2 Markdown heading (## space/tab).
-// An agent block extends from its start marker to the next H2 heading or EOF.
-var h2HeadingRegex = regexp.MustCompile(`(?m)^##[ \t]`)
-
 // ExtractInlineSubAgents splits markdown into the main workflow section and any
 // inline sub-agent definitions.
 //
@@ -247,66 +188,28 @@ var h2HeadingRegex = regexp.MustCompile(`(?m)^##[ \t]`)
 // agents is nil.
 func ExtractInlineSubAgents(markdown string) (mainMarkdown string, agents []InlineSubAgent, err error) {
 	subAgentLog.Printf("Extracting inline sub-agents from markdown (length: %d)", len(markdown))
-	// Find all start markers (returned in document order by FindAllStringSubmatchIndex).
 	allStarts := subAgentSeparatorRegex.FindAllStringSubmatchIndex(markdown, -1)
 	if len(allStarts) == 0 {
-		// No start markers — return unchanged.
 		subAgentLog.Print("No inline sub-agent markers found")
 		return markdown, nil, nil
 	}
 
 	subAgentLog.Printf("Found %d inline sub-agent marker(s)", len(allStarts))
-
-	// Validate that all agent names are unique.
-	seen := make(map[string]struct{})
-	for _, m := range allStarts {
-		name := markdown[m[2]:m[3]]
-		if _, exists := seen[name]; exists {
-			subAgentLog.Printf("Duplicate sub-agent name: %q", name)
-			return "", nil, fmt.Errorf("duplicate inline sub-agent name %q", name)
-		}
-		seen[name] = struct{}{}
+	if err := validateUniqueSubAgentNames(markdown, allStarts); err != nil {
+		return "", nil, err
 	}
 
-	// Main markdown is everything before the first start marker.
-	mainMarkdown = strings.TrimRight(markdown[:allStarts[0][0]], "\n")
-
-	// Collect the byte offset of every H2 heading in the document.
-	// These positions are used to find the boundary where each agent block ends.
-	var h2Positions []int
-	for _, m := range h2HeadingRegex.FindAllStringIndex(markdown, -1) {
-		h2Positions = append(h2Positions, m[0])
-	}
-
-	// nextH2After returns the byte offset of the first H2 heading at or after
-	// 'offset', or len(markdown) when none exists.
-	nextH2After := func(offset int) int {
-		for _, pos := range h2Positions {
-			if pos >= offset {
-				return pos
-			}
-		}
-		return len(markdown)
-	}
-
-	// Extract each agent block.
-	for _, m := range allStarts {
-		name := markdown[m[2]:m[3]]
-
-		// Content starts on the line after the start marker.
-		lineEnd := m[1]
-		if lineEnd < len(markdown) && markdown[lineEnd] == '\n' {
-			lineEnd++
-		}
-
-		// Content ends at the next H2 heading after the start marker line, or EOF.
-		contentEnd := nextH2After(lineEnd)
-
-		content := strings.TrimSpace(markdown[lineEnd:contentEnd])
+	mainMarkdown, agents = extractInlineSections(markdown, allStarts, func(name, content string) InlineSubAgent {
 		subAgentLog.Printf("Extracted sub-agent %q (content length: %d)", name, len(content))
-		agents = append(agents, InlineSubAgent{Name: name, Content: content})
-	}
-
+		return InlineSubAgent{Name: name, Content: content}
+	})
 	subAgentLog.Printf("Extraction complete: %d sub-agent(s), main markdown length: %d", len(agents), len(mainMarkdown))
 	return mainMarkdown, agents, nil
+}
+
+func validateUniqueSubAgentNames(markdown string, allStarts [][]int) error {
+	return validateUniqueInlineSectionNames(markdown, allStarts, func(name string) error {
+		subAgentLog.Printf("Duplicate sub-agent name: %q", name)
+		return fmt.Errorf("duplicate inline sub-agent name %q", name)
+	})
 }

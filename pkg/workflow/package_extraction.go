@@ -100,6 +100,7 @@ import (
 	"strings"
 
 	"github.com/github/gh-aw/pkg/logger"
+	"github.com/github/gh-aw/pkg/setutil"
 )
 
 var pkgLog = logger.New("workflow:package_extraction")
@@ -351,15 +352,17 @@ func collectPackagesFromWorkflow(
 ) []string {
 	pkgLog.Printf("Collecting packages from workflow: toolCommand=%s", toolCommand)
 	var packages []string
-	seen := make(map[string]bool)
+	seen := make(map[string]struct {
+	})
 
 	// Extract from custom steps
 	if workflowData.CustomSteps != "" {
 		pkgs := extractor(workflowData.CustomSteps)
 		for _, pkg := range pkgs {
-			if !seen[pkg] {
+			if !setutil.Contains(seen, pkg) {
 				packages = append(packages, pkg)
-				seen[pkg] = true
+				seen[pkg] = struct {
+				}{}
 			}
 		}
 	}
@@ -377,9 +380,10 @@ func collectPackagesFromWorkflow(
 								for _, arg := range argsSlice {
 									if pkgStr, ok := arg.(string); ok {
 										// Skip flags (arguments starting with - or --)
-										if !strings.HasPrefix(pkgStr, "-") && !seen[pkgStr] {
+										if !strings.HasPrefix(pkgStr, "-") && !setutil.Contains(seen, pkgStr) {
 											packages = append(packages, pkgStr)
-											seen[pkgStr] = true
+											seen[pkgStr] = struct {
+											}{}
 											break // Only take the first non-flag argument
 										}
 									}
@@ -393,9 +397,10 @@ func collectPackagesFromWorkflow(
 				// Use the extractor function to parse the command string
 				pkgs := extractor(cmdStr)
 				for _, pkg := range pkgs {
-					if !seen[pkg] {
+					if !setutil.Contains(seen, pkg) {
 						packages = append(packages, pkg)
-						seen[pkg] = true
+						seen[pkg] = struct {
+						}{}
 					}
 				}
 			}

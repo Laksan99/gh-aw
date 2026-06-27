@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/exec"
 	"strings"
+	"sync"
 
 	"github.com/github/gh-aw/pkg/console"
 	"github.com/github/gh-aw/pkg/logger"
@@ -16,21 +17,37 @@ import (
 )
 
 var githubCLILog = logger.New("workflow:github_cli")
+var defaultGHHost struct {
+	mu   sync.RWMutex
+	host string
+}
+
+// SetDefaultGHHost sets the default host used by gh CLI helper commands when GH_HOST
+// is not set in the process environment.
+func SetDefaultGHHost(host string) {
+	defaultGHHost.mu.Lock()
+	defer defaultGHHost.mu.Unlock()
+	defaultGHHost.host = host
+}
+
+func getDefaultGHHost() string {
+	defaultGHHost.mu.RLock()
+	defer defaultGHHost.mu.RUnlock()
+	return defaultGHHost.host
+}
 
 // setupGHCommand creates an exec.Cmd for gh CLI with proper token configuration.
 // This is the core implementation shared by ExecGH and ExecGHContext.
-// When ctx is nil, it uses exec.Command; when ctx is provided, it uses exec.CommandContext.
+// When ctx is nil, it falls back to context.TODO().
 func setupGHCommand(ctx context.Context, args ...string) *exec.Cmd {
 	// Check if GH_TOKEN or GITHUB_TOKEN is available
 	ghToken := os.Getenv("GH_TOKEN")
 	githubToken := os.Getenv("GITHUB_TOKEN")
 
-	var cmd *exec.Cmd
-	if ctx != nil {
-		cmd = exec.CommandContext(ctx, "gh", args...)
-	} else {
-		cmd = exec.Command("gh", args...)
+	if ctx == nil {
+		ctx = context.TODO()
 	}
+	cmd := exec.CommandContext(ctx, "gh", args...)
 
 	if ghToken != "" || githubToken != "" {
 		githubCLILog.Printf("Token detected, using gh CLI for command: gh %v", args)
@@ -43,6 +60,9 @@ func setupGHCommand(ctx context.Context, args ...string) *exec.Cmd {
 	if ghToken == "" && githubToken != "" {
 		githubCLILog.Printf("GH_TOKEN not set, using GITHUB_TOKEN for gh CLI")
 		cmd.Env = append(os.Environ(), "GH_TOKEN="+githubToken)
+	}
+	if os.Getenv("GH_HOST") == "" {
+		SetGHHostEnv(cmd, getDefaultGHHost())
 	}
 
 	return cmd
@@ -189,6 +209,25 @@ func RunGHWithHost(spinnerMessage string, host string, args ...string) ([]byte, 
 	return output, enrichGHError(err)
 }
 
+// RunGHContextWithHost executes a gh CLI command with context support, a spinner,
+// and an explicit GitHub host.
+func RunGHContextWithHost(ctx context.Context, spinnerMessage string, host string, args ...string) ([]byte, error) {
+	cmd := ExecGHContext(ctx, args...)
+	SetGHHostEnv(cmd, host)
+
+	if tty.IsStderrTerminal() {
+		spinner := console.NewSpinner(spinnerMessage)
+		spinner.Start()
+		output, err := cmd.Output()
+		err = enrichGHError(err)
+		spinner.Stop()
+		return output, err
+	}
+
+	output, err := cmd.Output()
+	return output, enrichGHError(err)
+}
+
 // SetGHHostEnv sets the GH_HOST environment variable on the command for non-github.com hosts.
 // This is needed for GitHub Enterprise Server (GHES) and Proxima (data residency) instances
 // because commands like `gh repo view`, `gh pr create`, and `gh run view` do not accept a
@@ -202,4 +241,25 @@ func SetGHHostEnv(cmd *exec.Cmd, host string) {
 	} else {
 		cmd.Env = append(cmd.Env, "GH_HOST="+host)
 	}
+}
+
+// ForceGHHostEnv forces GH_HOST=<host> on the command's environment, overriding
+// any GH_HOST already present in the process environment or cmd.Env.
+// Unlike SetGHHostEnv, this always sets GH_HOST — including for "github.com" —
+// so that a GHE host in the process environment cannot be inherited by the subprocess.
+func ForceGHHostEnv(cmd *exec.Cmd, host string) {
+	if host == "" {
+		return
+	}
+	base := cmd.Env
+	if base == nil {
+		base = os.Environ()
+	}
+	filtered := make([]string, 0, len(base)+1)
+	for _, e := range base {
+		if !strings.HasPrefix(e, "GH_HOST=") {
+			filtered = append(filtered, e)
+		}
+	}
+	cmd.Env = append(filtered, "GH_HOST="+host)
 }

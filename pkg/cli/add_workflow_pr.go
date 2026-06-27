@@ -1,6 +1,7 @@
 package cli
 
 import (
+	"context"
 	"fmt"
 	"math/rand"
 	"os"
@@ -14,6 +15,12 @@ import (
 
 var addWorkflowPRLog = logger.New("cli:add_workflow_pr")
 
+// invalidBranchCharsPattern matches characters not allowed in git branch names
+var invalidBranchCharsPattern = regexp.MustCompile(`[^a-zA-Z0-9_-]+`)
+
+// consecutiveHyphensPattern matches two or more consecutive hyphens
+var consecutiveHyphensPattern = regexp.MustCompile(`-{2,}`)
+
 // sanitizeBranchName sanitizes a string for use in a git branch name.
 // Git branch names cannot contain:
 // - spaces, ~, ^, :, \, ?, *, [, @{
@@ -26,12 +33,10 @@ func sanitizeBranchName(name string) string {
 
 	// Replace problematic characters with hyphens
 	// This regex matches any character that's not alphanumeric, hyphen, or underscore
-	invalidChars := regexp.MustCompile(`[^a-zA-Z0-9_-]+`)
-	name = invalidChars.ReplaceAllString(name, "-")
+	name = invalidBranchCharsPattern.ReplaceAllString(name, "-")
 
 	// Remove consecutive hyphens
-	consecutiveHyphens := regexp.MustCompile(`-{2,}`)
-	name = consecutiveHyphens.ReplaceAllString(name, "-")
+	name = consecutiveHyphensPattern.ReplaceAllString(name, "-")
 
 	// Trim leading/trailing hyphens
 	name = strings.Trim(name, "-")
@@ -45,7 +50,7 @@ func sanitizeBranchName(name string) string {
 }
 
 // addWorkflowsWithPR handles workflow addition with PR creation using pre-resolved workflows.
-func addWorkflowsWithPR(workflows []*ResolvedWorkflow, opts AddOptions) (int, string, error) {
+func addWorkflowsWithPR(ctx context.Context, workflows []*ResolvedWorkflow, opts AddOptions) (int, string, error) {
 	addWorkflowPRLog.Printf("Adding %d workflow(s) with PR creation (resolved)", len(workflows))
 
 	// Get current branch for restoration later
@@ -83,7 +88,7 @@ func addWorkflowsWithPR(workflows []*ResolvedWorkflow, opts AddOptions) (int, st
 	addWorkflowPRLog.Print("Adding workflows to repository")
 	prOpts := opts
 	prOpts.DisableSecurityScanner = false
-	if err := addWorkflowsWithTracking(workflows, tracker, prOpts); err != nil {
+	if err := addWorkflowsWithTracking(ctx, workflows, tracker, prOpts); err != nil {
 		addWorkflowPRLog.Printf("Failed to add workflows: %v", err)
 		// Rollback on error
 		if rollbackErr := tracker.RollbackAllFiles(opts.Verbose); rollbackErr != nil && opts.Verbose {

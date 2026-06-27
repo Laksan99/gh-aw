@@ -1,18 +1,18 @@
 // @ts-check
 
-import { describe, it, expect, beforeEach, afterEach } from "vitest";
+import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import fs from "fs";
 import path from "path";
 import os from "os";
 
 const { validateMemoryFiles } = require("./validate_memory_files.cjs");
 
-// Mock core globally
+// Mock core globally with vi.fn() so we can assert on calls
 global.core = {
-  info: () => {},
-  error: () => {},
-  warning: () => {},
-  debug: () => {},
+  info: vi.fn(),
+  error: vi.fn(),
+  warning: vi.fn(),
+  debug: vi.fn(),
 };
 
 describe("validateMemoryFiles", () => {
@@ -21,6 +21,7 @@ describe("validateMemoryFiles", () => {
   beforeEach(() => {
     // Create a temporary directory for testing
     tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "validate-memory-test-"));
+    vi.resetAllMocks();
   });
 
   afterEach(() => {
@@ -28,6 +29,7 @@ describe("validateMemoryFiles", () => {
     if (tempDir && fs.existsSync(tempDir)) {
       fs.rmSync(tempDir, { recursive: true, force: true });
     }
+    vi.restoreAllMocks();
   });
 
   it("returns valid for empty directory", () => {
@@ -205,5 +207,88 @@ describe("validateMemoryFiles", () => {
     const result = validateMemoryFiles(tempDir, "cache");
     expect(result.valid).toBe(true); // undefined means allow all
     expect(result.invalidFiles).toEqual([]);
+  });
+
+  it("skips .git directory during scan", () => {
+    const gitDir = path.join(tempDir, ".git");
+    fs.mkdirSync(gitDir);
+    // These would fail validation (no extension) but should be skipped
+    fs.writeFileSync(path.join(gitDir, "HEAD"), "ref: refs/heads/main");
+    fs.writeFileSync(path.join(gitDir, "packed-refs"), "");
+    fs.writeFileSync(path.join(tempDir, "valid.json"), "{}");
+    const result = validateMemoryFiles(tempDir, "cache", [".json"]);
+    expect(result.valid).toBe(true);
+    expect(result.invalidFiles).toEqual([]);
+  });
+
+  it("rejects invalid files in subdirectories with custom extensions", () => {
+    const subdir = path.join(tempDir, "subdir");
+    fs.mkdirSync(subdir);
+    fs.writeFileSync(path.join(subdir, "valid.json"), "{}");
+    fs.writeFileSync(path.join(subdir, "invalid.log"), "log");
+    const result = validateMemoryFiles(tempDir, "cache", [".json"]);
+    expect(result.valid).toBe(false);
+    expect(result.invalidFiles).toContain(path.join("subdir", "invalid.log"));
+  });
+
+  it("validates files with no extension against custom extensions", () => {
+    fs.writeFileSync(path.join(tempDir, "noext"), "content");
+    const result = validateMemoryFiles(tempDir, "cache", [".json"]);
+    expect(result.valid).toBe(false);
+    expect(result.invalidFiles).toEqual(["noext"]);
+  });
+
+  it("trims and normalizes extension casing in custom allowed list", () => {
+    fs.writeFileSync(path.join(tempDir, "data.JSON"), "{}");
+    const result = validateMemoryFiles(tempDir, "cache", [" .json "]);
+    expect(result.valid).toBe(true);
+    expect(result.invalidFiles).toEqual([]);
+  });
+
+  it("uses 'cache' as the default memoryType", () => {
+    const result = validateMemoryFiles(tempDir);
+    expect(result.valid).toBe(true);
+    expect(global.core.info).toHaveBeenCalledWith(expect.stringContaining("cache-memory"));
+  });
+
+  it("calls core.error with details when files fail custom extension validation", () => {
+    fs.writeFileSync(path.join(tempDir, "bad.log"), "log");
+    const result = validateMemoryFiles(tempDir, "repo", [".json"]);
+    expect(result.valid).toBe(false);
+    expect(result.invalidFiles).toContain("bad.log");
+    expect(global.core.error).toHaveBeenCalledWith(expect.stringContaining("Found 1 file(s) with invalid extensions in repo-memory:"));
+    expect(global.core.error).toHaveBeenCalledWith(expect.stringContaining("bad.log (extension: .log)"));
+    expect(global.core.error).toHaveBeenCalledWith(expect.stringContaining("Allowed extensions: .json"));
+  });
+
+  it("reports files with no extension as '(no extension)' in error output", () => {
+    fs.writeFileSync(path.join(tempDir, "noext"), "content");
+    const result = validateMemoryFiles(tempDir, "cache", [".json"]);
+    expect(result.valid).toBe(false);
+    expect(result.invalidFiles).toContain("noext");
+    expect(global.core.error).toHaveBeenCalledWith(expect.stringContaining("noext (extension: (no extension))"));
+  });
+
+  it("detects invalid files in deeply nested directories with custom extensions", () => {
+    const level1 = path.join(tempDir, "level1");
+    const level2 = path.join(level1, "level2");
+    fs.mkdirSync(level1);
+    fs.mkdirSync(level2);
+    fs.writeFileSync(path.join(level2, "valid.json"), "{}");
+    fs.writeFileSync(path.join(level2, "invalid.bin"), "binary");
+    const result = validateMemoryFiles(tempDir, "cache", [".json"]);
+    expect(result.valid).toBe(false);
+    expect(result.invalidFiles).toContain(path.join("level1", "level2", "invalid.bin"));
+    expect(result.invalidFiles).not.toContain(path.join("level1", "level2", "valid.json"));
+  });
+
+  it("returns valid=false and empty invalidFiles when directory scan throws", () => {
+    vi.spyOn(fs, "readdirSync").mockImplementationOnce(() => {
+      throw new Error("Permission denied");
+    });
+    const result = validateMemoryFiles(tempDir, "cache", [".json"]);
+    expect(result.valid).toBe(false);
+    expect(result.invalidFiles).toEqual([]);
+    expect(global.core.error).toHaveBeenCalledWith(expect.stringContaining("Failed to scan cache-memory directory: Permission denied"));
   });
 });

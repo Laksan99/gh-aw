@@ -179,6 +179,137 @@ func TestGenerateDefaultCheckoutStep(t *testing.T) {
 		assert.Contains(t, combined, "sparse-checkout: |", "should include sparse-checkout header")
 		assert.Contains(t, combined, ".github/", "should include first pattern")
 		assert.Contains(t, combined, "src/", "should include second pattern")
+		assert.Contains(t, combined, "filter: 'blob:limit=1073741824'", "sparse-checkout should emit blob:limit filter to ensure blobs are fetched")
+		assert.Contains(t, combined, "Clear partial clone markers after sparse checkout", "sparse-checkout should repair partial clone state after checkout")
+		assert.Contains(t, combined, "git config --local --unset-all remote.origin.promisor || true", "default checkout repair should target workspace root")
+		assert.Contains(t, combined, "git config --local --unset-all remote.origin.partialclonefilter || true", "default checkout repair should clear partial clone filter")
+	})
+
+	t.Run("sparse-checkout without fetch refs still ensures blobs present", func(t *testing.T) {
+		cm := NewCheckoutManager([]*CheckoutConfig{
+			{SparseCheckout: ".github/\nsrc/"},
+		})
+		lines := cm.GenerateDefaultCheckoutStep(false, "", getPin)
+		combined := strings.Join(lines, "")
+		// blob:limit filter ensures all blobs are fetched during checkout even without additional refs
+		assert.Contains(t, combined, "filter: 'blob:limit=1073741824'", "sparse-checkout should use blob:limit to fetch all blobs")
+		assert.Contains(t, combined, "Clear partial clone markers after sparse checkout", "repair step should run even without fetch refs")
+		assert.NotContains(t, combined, "Fetch additional refs", "should not emit fetch step when no refs configured")
+	})
+
+	t.Run("no filter emitted without sparse-checkout", func(t *testing.T) {
+		cm := NewCheckoutManager([]*CheckoutConfig{
+			{Ref: "develop"},
+		})
+		lines := cm.GenerateDefaultCheckoutStep(false, "", getPin)
+		combined := strings.Join(lines, "")
+		assert.NotContains(t, combined, "filter:", "should not emit filter when no sparse-checkout")
+	})
+
+	t.Run("sparse-checkout repair runs before additional ref fetch", func(t *testing.T) {
+		cm := NewCheckoutManager([]*CheckoutConfig{
+			{SparseCheckout: ".github/\nsrc/", Fetch: []string{"main"}},
+		})
+		lines := cm.GenerateDefaultCheckoutStep(false, "", getPin)
+		combined := strings.Join(lines, "")
+		repairIndex := strings.Index(combined, "Clear partial clone markers after sparse checkout")
+		fetchIndex := strings.Index(combined, "Fetch additional refs")
+		require.NotEqual(t, -1, repairIndex, "should emit sparse-checkout repair step")
+		require.NotEqual(t, -1, fetchIndex, "should emit fetch step")
+		assert.Less(t, repairIndex, fetchIndex, "repair step should run before additional fetches")
+	})
+
+	t.Run("force-clean-git-credentials enables persist true and cleanup step", func(t *testing.T) {
+		cm := NewCheckoutManager([]*CheckoutConfig{
+			{CleanGitCredentials: true},
+		})
+		lines := cm.GenerateDefaultCheckoutStep(false, "", getPin)
+		combined := strings.Join(lines, "")
+		assert.Contains(t, combined, "persist-credentials: true", "force-clean-git-credentials should switch persist-credentials to true")
+		assert.Contains(t, combined, "Clean git credentials after checkout", "should inject post-checkout clean step")
+		assert.Contains(t, combined, "${RUNNER_TEMP}/gh-aw/actions/clean_git_credentials_checkout.sh", "cleanup should call orchestrator helper")
+		assert.NotContains(t, combined, "${GITHUB_WORKSPACE}/actions/setup/sh/clean_git_credentials_pre_setup.sh", "cleanup must not execute helper from workspace")
+		assert.NotContains(t, combined, "WARNING: Checkout cleanup helper missing. Running inline fallback.", "cleanup should not include inline fallback path")
+		assert.NotContains(t, combined, "cleaned_configs=0", "cleanup should not include inline fallback logic")
+	})
+}
+
+// TestCheckoutPushTokenFallback verifies the safe_outputs push-token fallback that
+// persists the resolved PR push token into the checkout when keepCredentialsForPush is
+// enabled and no explicit checkout token (or app auth) already governs the checkout.
+func TestCheckoutPushTokenFallback(t *testing.T) {
+	getPin := func(action string) string { return action + "@v4" }
+	const pushToken = "${{ secrets.PUSH_TOKEN }}"
+
+	t.Run("default checkout with no explicit token emits pushToken once", func(t *testing.T) {
+		cm := NewCheckoutManager(nil)
+		cm.SetKeepCredentialsForPush(true)
+		cm.SetPushToken(pushToken)
+		lines := cm.GenerateDefaultCheckoutStep(false, "", getPin)
+		combined := strings.Join(lines, "")
+		assert.Contains(t, combined, "persist-credentials: true", "keepCredentialsForPush should retain credentials")
+		assert.Contains(t, combined, "token: "+pushToken, "should persist the push token")
+		assert.Equal(t, 1, strings.Count(combined, "token: "), "token must be emitted exactly once")
+	})
+
+	t.Run("default checkout with explicit token does not override with pushToken", func(t *testing.T) {
+		cm := NewCheckoutManager([]*CheckoutConfig{
+			{GitHubToken: "${{ secrets.MY_TOKEN }}"},
+		})
+		cm.SetKeepCredentialsForPush(true)
+		cm.SetPushToken(pushToken)
+		lines := cm.GenerateDefaultCheckoutStep(false, "", getPin)
+		combined := strings.Join(lines, "")
+		assert.Contains(t, combined, "token: ${{ secrets.MY_TOKEN }}", "explicit checkout token should win")
+		assert.NotContains(t, combined, pushToken, "pushToken must not override an explicit checkout token")
+		assert.Equal(t, 1, strings.Count(combined, "token: "), "token must be emitted exactly once")
+	})
+
+	t.Run("default checkout with app auth does not override with pushToken", func(t *testing.T) {
+		cm := NewCheckoutManager([]*CheckoutConfig{
+			{GitHubApp: &GitHubAppConfig{AppID: "${{ vars.APP_ID }}", PrivateKey: "${{ secrets.APP_KEY }}"}},
+		})
+		cm.SetKeepCredentialsForPush(true)
+		cm.SetPushToken(pushToken)
+		lines := cm.GenerateDefaultCheckoutStep(false, "", getPin)
+		combined := strings.Join(lines, "")
+		assert.Contains(t, combined, "checkout-app-token-0.outputs.token", "app-minted token should govern the checkout")
+		assert.NotContains(t, combined, pushToken, "pushToken must not override an app-minted token")
+	})
+
+	t.Run("default checkout does not emit pushToken when keepCredentialsForPush is false", func(t *testing.T) {
+		cm := NewCheckoutManager(nil)
+		cm.SetPushToken(pushToken)
+		lines := cm.GenerateDefaultCheckoutStep(false, "", getPin)
+		combined := strings.Join(lines, "")
+		assert.Contains(t, combined, "persist-credentials: false", "agent-style checkout strips credentials")
+		assert.NotContains(t, combined, pushToken, "pushToken must not be persisted when credentials are not retained")
+	})
+
+	t.Run("additional checkout with no token uses pushToken", func(t *testing.T) {
+		cm := NewCheckoutManager([]*CheckoutConfig{
+			{Repository: "owner/libs", Path: "./libs"},
+		})
+		cm.SetKeepCredentialsForPush(true)
+		cm.SetPushToken(pushToken)
+		lines := cm.GenerateAdditionalCheckoutSteps(getPin)
+		combined := strings.Join(lines, "")
+		assert.Contains(t, combined, "persist-credentials: true", "keepCredentialsForPush should retain credentials")
+		assert.Contains(t, combined, "token: "+pushToken, "additional checkout should fall back to the push token")
+		assert.Equal(t, 1, strings.Count(combined, "token: "), "token must be emitted exactly once")
+	})
+
+	t.Run("additional checkout with explicit token does not override with pushToken", func(t *testing.T) {
+		cm := NewCheckoutManager([]*CheckoutConfig{
+			{Repository: "owner/libs", Path: "./libs", GitHubToken: "${{ secrets.MY_TOKEN }}"},
+		})
+		cm.SetKeepCredentialsForPush(true)
+		cm.SetPushToken(pushToken)
+		lines := cm.GenerateAdditionalCheckoutSteps(getPin)
+		combined := strings.Join(lines, "")
+		assert.Contains(t, combined, "token: ${{ secrets.MY_TOKEN }}", "explicit checkout token should win")
+		assert.NotContains(t, combined, pushToken, "pushToken must not override an explicit checkout token")
+		assert.Equal(t, 1, strings.Count(combined, "token: "), "token must be emitted exactly once")
 	})
 }
 
@@ -234,6 +365,38 @@ func TestGenerateAdditionalCheckoutSteps(t *testing.T) {
 		assert.Contains(t, combined, "token: ${{ secrets.MY_TOKEN }}", "actions/checkout input must be 'token' even when frontmatter uses 'github-token'")
 		assert.NotContains(t, combined, "github-token:", "must not emit 'github-token' as actions/checkout input")
 	})
+
+	t.Run("additional checkout supports force-clean-git-credentials", func(t *testing.T) {
+		cm := NewCheckoutManager([]*CheckoutConfig{
+			{Path: "./libs", Repository: "owner/libs", CleanGitCredentials: true},
+		})
+		lines := cm.GenerateAdditionalCheckoutSteps(getPin)
+		combined := strings.Join(lines, "")
+		assert.Contains(t, combined, "persist-credentials: true", "force-clean-git-credentials should switch persist-credentials to true")
+		assert.Contains(t, combined, "Clean git credentials after checkout", "should inject post-checkout clean step")
+	})
+
+	t.Run("additional checkout with sparse-checkout emits filter empty", func(t *testing.T) {
+		cm := NewCheckoutManager([]*CheckoutConfig{
+			{Path: "./libs", Repository: "owner/libs", SparseCheckout: "src/\nlib/"},
+		})
+		lines := cm.GenerateAdditionalCheckoutSteps(getPin)
+		combined := strings.Join(lines, "")
+		assert.Contains(t, combined, "sparse-checkout: |", "should include sparse-checkout header")
+		assert.Contains(t, combined, "filter: 'blob:limit=1073741824'", "sparse-checkout should emit blob:limit filter to ensure blobs are fetched")
+		assert.Contains(t, combined, "Clear partial clone markers after sparse checkout", "sparse-checkout should repair partial clone state after checkout")
+		assert.Contains(t, combined, `git -C "${{ github.workspace }}/./libs" config --local --unset-all remote.origin.promisor || true`, "additional checkout repair should target checkout path")
+		assert.Contains(t, combined, `git -C "${{ github.workspace }}/./libs" config --local --unset-all remote.origin.partialclonefilter || true`, "additional checkout repair should clear partial clone filter")
+	})
+
+	t.Run("additional checkout without sparse-checkout does not emit filter", func(t *testing.T) {
+		cm := NewCheckoutManager([]*CheckoutConfig{
+			{Path: "./libs", Repository: "owner/libs"},
+		})
+		lines := cm.GenerateAdditionalCheckoutSteps(getPin)
+		combined := strings.Join(lines, "")
+		assert.NotContains(t, combined, "filter:", "should not emit filter when no sparse-checkout")
+	})
 }
 
 // TestParseCheckoutConfigs verifies parsing of raw frontmatter values.
@@ -255,6 +418,17 @@ func TestParseCheckoutConfigs(t *testing.T) {
 		assert.Equal(t, "${{ secrets.MY_TOKEN }}", configs[0].GitHubToken, "github-token should be set")
 		require.NotNil(t, configs[0].FetchDepth, "fetch-depth should be set")
 		assert.Equal(t, 0, *configs[0].FetchDepth, "fetch-depth should be 0")
+	})
+
+	t.Run("negative fetch-depth returns error", func(t *testing.T) {
+		for _, depth := range []float64{-1, -999999} {
+			raw := map[string]any{
+				"fetch-depth": depth,
+			}
+			_, err := ParseCheckoutConfigs(raw)
+			require.Error(t, err)
+			assert.Contains(t, err.Error(), "checkout.fetch-depth must be >= 0")
+		}
 	})
 
 	t.Run("backward compat: token key still works", func(t *testing.T) {
@@ -536,6 +710,7 @@ func TestBuildCheckoutsPromptContent(t *testing.T) {
 		content := buildCheckoutsPromptContent([]*CheckoutConfig{
 			{Repository: "owner/target", Path: "./target"},
 		})
+		assert.Contains(t, content, "repo `owner/target` → `$GITHUB_WORKSPACE/target`", "should present checkout as repo-to-directory mapping")
 		assert.Contains(t, content, "$GITHUB_WORKSPACE/target", "should show full workspace path")
 		assert.Contains(t, content, "owner/target", "should show the configured repo")
 		assert.NotContains(t, content, "github.repository", "should not include github.repository expression for explicit repo")
@@ -604,12 +779,36 @@ func TestBuildCheckoutsPromptContent(t *testing.T) {
 		assert.Contains(t, content, "main", "should list the main branch")
 	})
 
+	t.Run("sparse checkout is annotated in prompt notes", func(t *testing.T) {
+		content := buildCheckoutsPromptContent([]*CheckoutConfig{
+			{Repository: "owner/repo", SparseCheckout: ".github/\nsrc/"},
+		})
+		assert.Contains(t, content, "sparse checkout enabled", "should indicate sparse checkout when configured")
+	})
+
 	t.Run("unavailable branch note is always present", func(t *testing.T) {
 		content := buildCheckoutsPromptContent([]*CheckoutConfig{
 			{Repository: "owner/repo"},
 		})
 		assert.Contains(t, content, "has NOT been checked out", "should mention branches that are not checked out")
 		assert.Contains(t, content, "fetch:", "should mention the fetch option for resolution")
+	})
+
+	t.Run("no credentials warning is always present", func(t *testing.T) {
+		content := buildCheckoutsPromptContent([]*CheckoutConfig{
+			{Repository: "owner/repo"},
+		})
+		assert.Contains(t, content, "No git credentials are available", "should warn that git credentials are absent")
+		assert.Contains(t, content, "git fetch", "should mention that git fetch will fail")
+		assert.Contains(t, content, "authentication will not succeed", "should explain that authentication attempts will fail")
+	})
+
+	t.Run("no credentials warning present for sparse checkout", func(t *testing.T) {
+		content := buildCheckoutsPromptContent([]*CheckoutConfig{
+			{Repository: "owner/repo", SparseCheckout: ".github/\nsrc/"},
+		})
+		assert.Contains(t, content, "No git credentials are available", "should warn about credentials even for sparse checkouts")
+		assert.Contains(t, content, "partial/blobless clones", "should mention partial clone risk for sparse checkouts")
 	})
 }
 
@@ -784,6 +983,45 @@ func TestGenerateFetchStep(t *testing.T) {
 		got := generateFetchStepLines(entry, 0)
 		assert.Contains(t, got, "+refs/heads/*:refs/remotes/origin/*", "should include branches refspec")
 		assert.Contains(t, got, "+refs/pull/*/head:refs/remotes/origin/pull/*/head", "should include PR refspec")
+	})
+
+	t.Run("default depth adds --depth=1 to prevent full-history fetch", func(t *testing.T) {
+		// nil fetchDepth = default shallow clone (depth 1); fetch must not expand history
+		entry := &resolvedCheckout{
+			fetchRefs: []string{"main"},
+		}
+		got := generateFetchStepLines(entry, 0)
+		assert.Contains(t, got, "--depth=1", "default shallow checkout should pass --depth=1 to git fetch")
+	})
+
+	t.Run("explicit depth=1 adds --depth=1", func(t *testing.T) {
+		depth := 1
+		entry := &resolvedCheckout{
+			fetchRefs:  []string{"main"},
+			fetchDepth: &depth,
+		}
+		got := generateFetchStepLines(entry, 0)
+		assert.Contains(t, got, "--depth=1", "explicit fetch-depth: 1 should pass --depth=1 to git fetch")
+	})
+
+	t.Run("explicit depth=0 (full history) omits --depth flag", func(t *testing.T) {
+		depth := 0
+		entry := &resolvedCheckout{
+			fetchRefs:  []string{"main"},
+			fetchDepth: &depth,
+		}
+		got := generateFetchStepLines(entry, 0)
+		assert.NotContains(t, got, "--depth", "fetch-depth: 0 (full history) should not add --depth flag to git fetch")
+	})
+
+	t.Run("explicit depth=N adds --depth=N", func(t *testing.T) {
+		depth := 10
+		entry := &resolvedCheckout{
+			fetchRefs:  []string{"main"},
+			fetchDepth: &depth,
+		}
+		got := generateFetchStepLines(entry, 0)
+		assert.Contains(t, got, "--depth=10", "fetch-depth: 10 should pass --depth=10 to git fetch")
 	})
 }
 
@@ -1056,6 +1294,29 @@ func TestHasExternalRootCheckout(t *testing.T) {
 	})
 }
 
+func TestGetCurrentCheckoutPath(t *testing.T) {
+	t.Run("returns empty when no current checkout is configured", func(t *testing.T) {
+		cm := NewCheckoutManager([]*CheckoutConfig{
+			{Repository: "owner/repo", Path: "repo"},
+		})
+		assert.Empty(t, cm.GetCurrentCheckoutPath())
+	})
+
+	t.Run("returns empty when current checkout is workspace root", func(t *testing.T) {
+		cm := NewCheckoutManager([]*CheckoutConfig{
+			{Current: true, Path: "."},
+		})
+		assert.Empty(t, cm.GetCurrentCheckoutPath())
+	})
+
+	t.Run("returns normalized subdirectory when current checkout is non-root", func(t *testing.T) {
+		cm := NewCheckoutManager([]*CheckoutConfig{
+			{Repository: "caido/proxy-frontend", Current: true, Path: "./proxy-frontend"},
+		})
+		assert.Equal(t, "proxy-frontend", cm.GetCurrentCheckoutPath())
+	})
+}
+
 // TestWikiCheckout verifies wiki: true support across parsing, deduplication, and step generation.
 func TestWikiCheckout(t *testing.T) {
 	getPin := func(action string) string { return action + "@v4" }
@@ -1089,6 +1350,25 @@ func TestWikiCheckout(t *testing.T) {
 		_, err := ParseCheckoutConfigs(raw)
 		require.Error(t, err, "non-boolean wiki should return error")
 		assert.Contains(t, err.Error(), "checkout.wiki must be a boolean", "error message should mention wiki")
+	})
+
+	t.Run("parse force-clean-git-credentials true", func(t *testing.T) {
+		raw := map[string]any{
+			"force-clean-git-credentials": true,
+		}
+		configs, err := ParseCheckoutConfigs(raw)
+		require.NoError(t, err, "should parse force-clean-git-credentials: true without error")
+		require.Len(t, configs, 1, "should produce one config")
+		assert.True(t, configs[0].CleanGitCredentials, "force-clean-git-credentials should be true")
+	})
+
+	t.Run("force-clean-git-credentials must be boolean", func(t *testing.T) {
+		raw := map[string]any{
+			"force-clean-git-credentials": "true",
+		}
+		_, err := ParseCheckoutConfigs(raw)
+		require.Error(t, err, "non-boolean force-clean-git-credentials should return error")
+		assert.Contains(t, err.Error(), "checkout.force-clean-git-credentials must be a boolean", "error message should mention force-clean-git-credentials")
 	})
 
 	t.Run("wiki and non-wiki checkouts of same repo and path are not merged", func(t *testing.T) {
@@ -1168,5 +1448,222 @@ func TestWikiCheckout(t *testing.T) {
 		})
 		assert.Contains(t, content, "owner/docs.wiki", "prompt must show .wiki suffix for wiki checkout")
 		assert.Contains(t, content, "(wiki)", "prompt must annotate wiki checkout")
+	})
+}
+
+// TestGenerateCheckoutManifestStep verifies the cross-repo manifest emitter.
+// The manifest step is consumed by the safe-outputs MCP server to resolve a
+// per-repo default branch without making any network calls at request time.
+func TestGenerateCheckoutManifestStep(t *testing.T) {
+	getActionPin := func(action string) string {
+		return action + "@pin"
+	}
+
+	t.Run("no configs emits nothing", func(t *testing.T) {
+		cm := NewCheckoutManager(nil)
+		assert.Empty(t, cm.GenerateCheckoutManifestStep(getActionPin), "empty manager should not emit a manifest step")
+	})
+
+	t.Run("default-only checkout emits nothing", func(t *testing.T) {
+		cm := NewCheckoutManager([]*CheckoutConfig{
+			{Path: "."},
+		})
+		assert.Empty(t, cm.GenerateCheckoutManifestStep(getActionPin), "manifest is for cross-repo entries only; default checkout should not produce one")
+	})
+
+	t.Run("path-only additional checkout (no repository) emits nothing", func(t *testing.T) {
+		cm := NewCheckoutManager([]*CheckoutConfig{
+			{Path: "./workspace"},
+		})
+		assert.Empty(t, cm.GenerateCheckoutManifestStep(getActionPin), "additional checkout without repository should not be in manifest")
+	})
+
+	t.Run("wiki cross-repo checkout is excluded", func(t *testing.T) {
+		cm := NewCheckoutManager([]*CheckoutConfig{
+			{Repository: "owner/docs", Path: "./wiki", Wiki: true},
+		})
+		assert.Empty(t, cm.GenerateCheckoutManifestStep(getActionPin), "wiki checkouts must be excluded from manifest")
+	})
+
+	t.Run("cross-repo additional checkout emits entry", func(t *testing.T) {
+		cm := NewCheckoutManager([]*CheckoutConfig{
+			{Repository: "owner/other", Path: "./other", GitHubToken: "${{ secrets.CROSS_REPO_PAT }}"},
+		})
+		steps := cm.GenerateCheckoutManifestStep(getActionPin)
+		require.Len(t, steps, 1, "should emit one manifest step")
+		out := steps[0]
+		assert.Contains(t, out, "name: Build checkout manifest for safe-outputs handlers")
+		assert.Contains(t, out, "uses: actions/github-script@pin")
+		assert.Contains(t, out, "GH_TOKEN: ${{ secrets.GH_AW_GITHUB_TOKEN || secrets.GITHUB_TOKEN }}")
+		assert.Contains(t, out, `GH_AW_CHECKOUT_MANIFEST_COUNT: "1"`)
+		assert.Contains(t, out, `GH_AW_CHECKOUT_REPO_0: "owner/other"`)
+		assert.Contains(t, out, `GH_AW_CHECKOUT_PATH_0: "./other"`)
+		assert.Contains(t, out, "GH_AW_CHECKOUT_TOKEN_0: ${{ secrets.CROSS_REPO_PAT }}")
+		assert.Contains(t, out, "build_checkout_manifest.cjs")
+		assert.NotContains(t, out, "run: |", "manifest step should use github-script instead of shell run block")
+	})
+
+	t.Run("cross-repo root checkout (empty path) is included", func(t *testing.T) {
+		cm := NewCheckoutManager([]*CheckoutConfig{
+			{Repository: "owner/other"},
+		})
+		steps := cm.GenerateCheckoutManifestStep(getActionPin)
+		require.Len(t, steps, 1, "cross-repo root checkout must be in manifest")
+		out := steps[0]
+		assert.Contains(t, out, `GH_AW_CHECKOUT_REPO_0: "owner/other"`)
+		assert.Contains(t, out, `GH_AW_CHECKOUT_PATH_0: ""`, "empty path should still be emitted (manifest consumer expects the key)")
+	})
+
+	t.Run("multiple cross-repo entries each get a jq update", func(t *testing.T) {
+		cm := NewCheckoutManager([]*CheckoutConfig{
+			{Repository: "owner/a", Path: "./a"},
+			{Repository: "owner/b", Path: "./b"},
+			{Path: "./local-only"},               // no repo → skipped
+			{Repository: "owner/c", Path: "./c"}, // included
+		})
+		steps := cm.GenerateCheckoutManifestStep(getActionPin)
+		require.Len(t, steps, 1)
+		out := steps[0]
+		assert.Contains(t, out, `GH_AW_CHECKOUT_MANIFEST_COUNT: "3"`)
+		assert.Contains(t, out, `GH_AW_CHECKOUT_REPO_0: "owner/a"`)
+		assert.Contains(t, out, `GH_AW_CHECKOUT_REPO_1: "owner/b"`)
+		assert.Contains(t, out, `GH_AW_CHECKOUT_REPO_2: "owner/c"`)
+		assert.NotContains(t, out, "./local-only", "path-only entries must not be in the manifest step")
+	})
+
+	t.Run("repository names containing single quotes are yaml-escaped", func(t *testing.T) {
+		cm := NewCheckoutManager([]*CheckoutConfig{
+			{Repository: "weird'owner/repo", Path: "./x"},
+		})
+		steps := cm.GenerateCheckoutManifestStep(getActionPin)
+		require.Len(t, steps, 1)
+		assert.Contains(t, steps[0], `GH_AW_CHECKOUT_REPO_0: "weird'owner/repo"`)
+	})
+
+	t.Run("dynamic repository expressions are emitted as raw env expressions", func(t *testing.T) {
+		cm := NewCheckoutManager([]*CheckoutConfig{
+			{Repository: "${{ github.event.inputs.trigger_ref }}", Path: "./target"},
+		})
+		steps := cm.GenerateCheckoutManifestStep(getActionPin)
+		require.Len(t, steps, 1)
+		assert.Contains(t, steps[0], "GH_AW_CHECKOUT_REPO_0: ${{ github.event.inputs.trigger_ref }}")
+	})
+
+	t.Run("github-app token expression preserves checkout index in manifest env", func(t *testing.T) {
+		cm := NewCheckoutManager([]*CheckoutConfig{
+			{Path: "./local"},
+			{
+				Repository: "owner/private",
+				Path:       "./private",
+				GitHubApp: &GitHubAppConfig{
+					AppID:      "${{ vars.APP_ID }}",
+					PrivateKey: "${{ secrets.APP_PRIVATE_KEY }}",
+				},
+			},
+		})
+		steps := cm.GenerateCheckoutManifestStep(getActionPin)
+		require.Len(t, steps, 1)
+		assert.Contains(t, steps[0], "GH_AW_CHECKOUT_TOKEN_0: ${{ steps.checkout-app-token-1.outputs.token }}")
+	})
+}
+
+// TestGenerateConfigureGitCredentialsSteps verifies that the "Configure Git credentials"
+// step never inlines GitHub Actions expressions directly into the shell run: block.
+// Regression test for: compiler inlines workflow_dispatch input into generated step,
+// tripping the template-injection scanner for target-repo workflows.
+func TestGenerateConfigureGitCredentialsSteps(t *testing.T) {
+	alwaysTrue := BuildBooleanLiteral(true)
+	token := "${{ steps.safe-outputs-app-token.outputs.token }}"
+
+	t.Run("single root repo emits simple script call (no multi-repo env vars)", func(t *testing.T) {
+		cm := NewCheckoutManager(nil)
+		steps := cm.GenerateConfigureGitCredentialsSteps(token, alwaysTrue)
+		combined := strings.Join(steps, "")
+
+		assert.Contains(t, combined, "name: Configure Git credentials")
+		assert.Contains(t, combined, "GITHUB_REPOSITORY: ${{ github.repository }}")
+		assert.Contains(t, combined, "GIT_TOKEN: "+token)
+		assert.Contains(t, combined, `run: bash "${RUNNER_TEMP}/gh-aw/actions/configure_git_credentials.sh"`)
+		assert.NotContains(t, combined, "GH_AW_SUBREPO_", "single-repo case must not emit subrepo env vars")
+	})
+
+	t.Run("multi-repo with literal repo name places it in env var", func(t *testing.T) {
+		cm := NewCheckoutManager([]*CheckoutConfig{
+			{Repository: "org/other-repo", Path: "./target-repo"},
+		})
+		steps := cm.GenerateConfigureGitCredentialsSteps(token, alwaysTrue)
+		combined := strings.Join(steps, "")
+
+		assert.Contains(t, combined, `GH_AW_SUBREPO_0: "org/other-repo"`, "literal repo must be in env var (quoted)")
+		assert.Contains(t, combined, "${GH_AW_SUBREPO_0}.git", "shell command must reference the env var")
+		assert.NotContains(t, combined, "org/other-repo.git", "literal repo must not be inlined in shell command")
+		assert.Contains(t, combined, "GITHUB_REPOSITORY:", "root repo env var must be present")
+		assert.Contains(t, combined, "GIT_TOKEN: "+token, "token env var must be present")
+	})
+
+	t.Run("multi-repo with expression-based repo does not inline expression in shell command (regression)", func(t *testing.T) {
+		// Regression: v0.80.6 inlined the expression directly into the git remote set-url
+		// command, which the template-injection scanner correctly rejected.
+		cm := NewCheckoutManager([]*CheckoutConfig{
+			{Repository: "github/${{ github.event.inputs.target_repo }}", Path: "./target-repo"},
+		})
+		steps := cm.GenerateConfigureGitCredentialsSteps(token, alwaysTrue)
+		combined := strings.Join(steps, "")
+
+		// Expression must be in the env: block, not inlined in the shell command.
+		assert.Contains(t, combined, "GH_AW_SUBREPO_0: github/${{ github.event.inputs.target_repo }}",
+			"expression-based repo must be assigned to an env var")
+		assert.Contains(t, combined, "${GH_AW_SUBREPO_0}.git",
+			"shell command must reference env var, not the raw expression")
+		assert.NotContains(t, combined, "github/${{ github.event.inputs.target_repo }}.git",
+			"expression must not be inlined in the git remote set-url command (template injection risk)")
+		// The bash comment must use the path, not the expression-based repo name.
+		assert.Contains(t, combined, "# Re-authenticate git for ./target-repo",
+			"comment must reference checkout path, never the raw expression")
+		assert.NotContains(t, combined, "# Re-authenticate git for github/${{",
+			"expression must not appear in bash comment (template injection risk)")
+		assert.Contains(t, combined, "GITHUB_REPOSITORY:", "root repo env var must be present")
+		assert.Contains(t, combined, "GIT_TOKEN: "+token, "token env var must be present")
+		// No raw Actions expression may appear in the run: block.
+		runIdx := strings.Index(combined, "run: |")
+		if runIdx >= 0 {
+			assert.NotContains(t, combined[runIdx:], "${{",
+				"run: block must not contain any raw GitHub Actions expression")
+		}
+	})
+
+	t.Run("multi-repo with expression-based path routes path through env var", func(t *testing.T) {
+		cm := NewCheckoutManager([]*CheckoutConfig{
+			{Repository: "org/other-repo", Path: "${{ github.event.inputs.target_path }}"},
+		})
+		steps := cm.GenerateConfigureGitCredentialsSteps(token, alwaysTrue)
+		combined := strings.Join(steps, "")
+
+		assert.Contains(t, combined, "GH_AW_SUBREPO_PATH_0: ${{ github.event.inputs.target_path }}",
+			"expression-based path must be assigned to an env var")
+		assert.Contains(t, combined, "${GH_AW_SUBREPO_PATH_0}",
+			"git -C argument must reference the path env var, not the raw expression")
+		assert.NotContains(t, combined, `git -C "${{ github.event.inputs.target_path }}"`,
+			"expression path must not be inlined in git -C argument (template injection risk)")
+		// No raw Actions expression may appear in the run: block.
+		runIdx := strings.Index(combined, "run: |")
+		if runIdx >= 0 {
+			assert.NotContains(t, combined[runIdx:], "${{",
+				"run: block must not contain any raw GitHub Actions expression")
+		}
+	})
+
+	t.Run("multiple sub-repos each get a unique env var", func(t *testing.T) {
+		cm := NewCheckoutManager([]*CheckoutConfig{
+			{Repository: "org/repo-a", Path: "./repo-a"},
+			{Repository: "org/repo-b", Path: "./repo-b"},
+		})
+		steps := cm.GenerateConfigureGitCredentialsSteps(token, alwaysTrue)
+		combined := strings.Join(steps, "")
+
+		assert.Contains(t, combined, `GH_AW_SUBREPO_0: "org/repo-a"`)
+		assert.Contains(t, combined, `GH_AW_SUBREPO_1: "org/repo-b"`)
+		assert.Contains(t, combined, `${GH_AW_SUBREPO_0}.git`)
+		assert.Contains(t, combined, `${GH_AW_SUBREPO_1}.git`)
 	})
 }

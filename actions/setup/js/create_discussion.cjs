@@ -17,7 +17,7 @@ const { removeDuplicateTitleFromDescription } = require("./remove_duplicate_titl
 const { getErrorMessage } = require("./error_helpers.cjs");
 const { ERR_VALIDATION } = require("./error_codes.cjs");
 const { createExpirationLine, generateFooterWithExpiration, addExpirationToFooter } = require("./ephemerals.cjs");
-const { generateFooterWithMessages, getDetectionCautionAlert } = require("./messages_footer.cjs");
+const { assembleMarkdownBodyParts } = require("./markdown_body_helpers.cjs");
 const { getBodyHeader } = require("./messages_header.cjs");
 const { generateWorkflowIdMarker, generateWorkflowCallIdMarker, generateCloseKeyMarker, normalizeCloseOlderKey } = require("./generate_footer.cjs");
 const { sanitizeContent } = require("./sanitize_content.cjs");
@@ -31,6 +31,7 @@ const { buildWorkflowRunUrl } = require("./workflow_metadata_helpers.cjs");
 const { generateHistoryLink, generateHistoryUrl } = require("./generate_history_link.cjs");
 const { MAX_LABELS } = require("./constants.cjs");
 const { fetchAllRepoLabels } = require("./github_api_helpers.cjs");
+const { resolveAllowedMentionsFromPayload } = require("./resolve_mentions_from_payload.cjs");
 
 /**
  * Fetch repository ID and discussion categories for a repository
@@ -311,6 +312,12 @@ async function main(config = {}) {
   // Create an authenticated GitHub client. Uses config["github-token"] when set
   // (for cross-repository operations), otherwise falls back to the step-level github.
   const githubClient = await createAuthenticatedGitHubClient(config);
+  let allowedMentionAliases = [];
+  if (Array.isArray(config.allowedMentionAliases)) {
+    allowedMentionAliases = config.allowedMentionAliases;
+  } else if (config.mentions != null) {
+    allowedMentionAliases = await resolveAllowedMentionsFromPayload(context, githubClient, core, config.mentions);
+  }
 
   // Check if we're in staged mode
   const isStaged = isStagedMode(config);
@@ -494,7 +501,7 @@ async function main(config = {}) {
     const preSanitizeBodyLength = processedBody.trim().length;
 
     // Sanitize body content to neutralize @mentions, URLs, and other security risks
-    processedBody = sanitizeContent(processedBody);
+    processedBody = sanitizeContent(processedBody, { allowedAliases: allowedMentionAliases });
     if (minBodyLength > 0 && preSanitizeBodyLength < minBodyLength) {
       const error = `Discussion body length ${preSanitizeBodyLength} is below configured minimum ${minBodyLength}`;
       core.error(error);
@@ -538,34 +545,41 @@ async function main(config = {}) {
       bodyLines.unshift(...bodyHeader.split("\n"), "");
     }
 
+    const triggeringIssueNumber = context.payload?.issue?.number && !context.payload?.issue?.pull_request ? context.payload.issue.number : undefined;
+    const triggeringPRNumber = context.payload?.pull_request?.number || (context.payload?.issue?.pull_request ? context.payload.issue.number : undefined);
+    const triggeringDiscussionNumber = context.payload?.discussion?.number;
+    const historyUrl = includeFooter
+      ? (generateHistoryUrl({
+          owner: repoParts.owner,
+          repo: repoParts.repo,
+          itemType: "discussion",
+          workflowCallId: callerWorkflowId,
+          workflowId,
+          serverUrl: context.serverUrl,
+        }) ?? undefined)
+      : undefined;
+    const markdownParts = assembleMarkdownBodyParts({
+      includeFooter,
+      workflowName,
+      runUrl,
+      workflowSource: process.env.GH_AW_WORKFLOW_SOURCE ?? "",
+      workflowSourceURL: process.env.GH_AW_WORKFLOW_SOURCE_URL ?? "",
+      triggeringIssueNumber,
+      triggeringPRNumber,
+      triggeringDiscussionNumber,
+      historyUrl,
+    });
+
     // Inject CAUTION at top of body if threat detection warning was raised
     // (unshifted after header so it appears first in the final output)
-    const detectionCaution = getDetectionCautionAlert(workflowName, runUrl);
+    const detectionCaution = markdownParts.detectionCaution;
     if (detectionCaution) {
       bodyLines.unshift(...detectionCaution.split("\n"), "");
     }
 
     // Generate footer with expiration using helper
-    // When footer is disabled, only add XML markers (no visible footer content)
     if (includeFooter) {
-      const historyUrl = generateHistoryUrl({
-        owner: repoParts.owner,
-        repo: repoParts.repo,
-        itemType: "discussion",
-        workflowCallId: callerWorkflowId,
-        workflowId,
-        serverUrl: context.serverUrl,
-      });
-      const workflowSource = process.env.GH_AW_WORKFLOW_SOURCE ?? "";
-      const workflowSourceURL = process.env.GH_AW_WORKFLOW_SOURCE_URL ?? "";
-      const triggeringIssueNumber = context.payload?.issue?.number && !context.payload?.issue?.pull_request ? context.payload.issue.number : undefined;
-      const triggeringPRNumber = context.payload?.pull_request?.number || (context.payload?.issue?.pull_request ? context.payload.issue.number : undefined);
-      const triggeringDiscussionNumber = context.payload?.discussion?.number;
-      const footer = addExpirationToFooter(
-        generateFooterWithMessages(workflowName, runUrl, workflowSource, workflowSourceURL, triggeringIssueNumber, triggeringPRNumber, triggeringDiscussionNumber, historyUrl, { skipDetectionCaution: true }).trimEnd(),
-        expiresHours,
-        "Discussion"
-      );
+      const footer = addExpirationToFooter(markdownParts.footer, expiresHours, "Discussion");
       bodyLines.push(``, ``, footer);
     }
 

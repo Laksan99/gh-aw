@@ -3,26 +3,33 @@ package workflow
 import (
 	"errors"
 	"fmt"
-	"sort"
 	"strings"
 
 	"github.com/github/gh-aw/pkg/parser"
+	"github.com/github/gh-aw/pkg/setutil"
+	"github.com/github/gh-aw/pkg/sliceutil"
 	"github.com/github/gh-aw/pkg/stringutil"
 )
 
 func validateGitHubToolsAgainstToolsetsCore(allowedTools []string, enabledToolsets []string) error {
 	githubToolToToolsetLog.Printf("Validating GitHub tools against toolsets: allowed_tools=%d, enabled_toolsets=%d", len(allowedTools), len(enabledToolsets))
-
 	if len(allowedTools) == 0 {
 		githubToolToToolsetLog.Print("No tools to validate, skipping")
 		// No specific tools restricted, validation not needed
 		return nil
 	}
 
+	toolToToolsetMap, err := getGitHubToolToToolsetMap()
+	if err != nil {
+		return fmt.Errorf("failed to load GitHub tool-to-toolset mapping: %w", err)
+	}
+
 	// Create a set of enabled toolsets for fast lookup
-	enabledSet := make(map[string]bool)
+	enabledSet := make(map[string]struct {
+	})
 	for _, toolset := range enabledToolsets {
-		enabledSet[toolset] = true
+		enabledSet[toolset] = struct {
+		}{}
 	}
 	githubToolToToolsetLog.Printf("Enabled toolsets: %v", enabledToolsets)
 
@@ -39,16 +46,12 @@ func validateGitHubToolsAgainstToolsetsCore(allowedTools []string, enabledToolse
 			continue
 		}
 
-		requiredToolset, exists := GitHubToolToToolsetMap[tool]
+		requiredToolset, exists := toolToToolsetMap[tool]
 		if !exists {
 			githubToolToToolsetLog.Printf("Tool %s not found in mapping, checking for typo", tool)
 
 			// Get all valid tool names for suggestion
-			validTools := make([]string, 0, len(GitHubToolToToolsetMap))
-			for validTool := range GitHubToolToToolsetMap {
-				validTools = append(validTools, validTool)
-			}
-			sort.Strings(validTools)
+			validTools := sliceutil.SortedKeys(toolToToolsetMap)
 
 			// Try to find close matches
 			matches := parser.FindClosestMatches(tool, validTools, 1)
@@ -65,7 +68,7 @@ func validateGitHubToolsAgainstToolsetsCore(allowedTools []string, enabledToolse
 			continue
 		}
 
-		if !enabledSet[requiredToolset] {
+		if !setutil.Contains(enabledSet, requiredToolset) {
 			githubToolToToolsetLog.Printf("Tool %s requires missing toolset: %s", tool, requiredToolset)
 			missingToolsets[requiredToolset] = append(missingToolsets[requiredToolset], tool)
 		}
@@ -75,25 +78,21 @@ func validateGitHubToolsAgainstToolsetsCore(allowedTools []string, enabledToolse
 	if len(unknownTools) > 0 {
 		githubToolToToolsetLog.Printf("Found %d unknown tools", len(unknownTools))
 		var errMsg strings.Builder
-		errMsg.WriteString(fmt.Sprintf("Unknown GitHub tool(s): %s\n\n", stringutil.FormatList(unknownTools)))
+		fmt.Fprintf(&errMsg, "Unknown GitHub tool(s): %s\n\n", stringutil.FormatList(unknownTools))
 
 		if len(suggestions) > 0 {
 			errMsg.WriteString("Did you mean:\n")
 			for _, s := range suggestions {
-				errMsg.WriteString(fmt.Sprintf("  %s\n", s))
+				fmt.Fprintf(&errMsg, "  %s\n", s)
 			}
 			errMsg.WriteString("\n")
 		}
 
 		// Show a few examples of valid tools
-		validTools := make([]string, 0, len(GitHubToolToToolsetMap))
-		for tool := range GitHubToolToToolsetMap {
-			validTools = append(validTools, tool)
-		}
-		sort.Strings(validTools)
+		validTools := sliceutil.SortedKeys(toolToToolsetMap)
 
 		exampleCount := min(10, len(validTools))
-		errMsg.WriteString(fmt.Sprintf("Valid GitHub tools include: %s\n\n", stringutil.FormatList(validTools[:exampleCount])))
+		fmt.Fprintf(&errMsg, "Valid GitHub tools include: %s\n\n", stringutil.FormatList(validTools[:exampleCount]))
 		errMsg.WriteString("See all tools: https://github.com/github/gh-aw/blob/main/pkg/workflow/data/github_tool_to_toolset.json")
 
 		return errors.New(errMsg.String())

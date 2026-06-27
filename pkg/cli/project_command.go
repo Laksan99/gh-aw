@@ -11,6 +11,7 @@ import (
 	"strings"
 
 	"github.com/github/gh-aw/pkg/console"
+	"github.com/github/gh-aw/pkg/errorutil"
 	"github.com/github/gh-aw/pkg/logger"
 	"github.com/github/gh-aw/pkg/workflow"
 	"github.com/spf13/cobra"
@@ -43,10 +44,8 @@ This command allows you to create new projects owned by users or organizations
 and optionally link them to specific repositories.
 
 Available subcommands:
-  - new - Create a new GitHub Project V2 board
-
-Examples:
-  gh aw project new "My Project" --owner @me                      # Create user project
+  - new - Create a new GitHub Project V2 board`,
+		Example: `  gh aw project new "My Project" --owner @me                      # Create user project
   gh aw project new "Team Board" --owner myorg                    # Create org project
   gh aw project new "Bugs" --owner myorg --link myorg/myrepo     # Create and link to repo`,
 	}
@@ -68,16 +67,14 @@ The project can optionally be linked to a specific repository.
 
 Authentication Requirements:
   The default GITHUB_TOKEN cannot create projects. You must use additional authentication.
-  See https://github.github.io/gh-aw/reference/auth-projects/.
+  See https://github.github.com/gh-aw/reference/auth-projects/.
 
 Project Setup:
   Use --with-project-setup to automatically create:
   - Standard views (Progress Board, Task Tracker, Roadmap)
   - Custom fields (Tracker Id, Worker Workflow, Target Repo, Priority, Size, dates)
-  - Enhanced Status field with "Review Required" option
-
-Examples:
-  gh aw project new "My Project" --owner @me                           # Create user project
+  - Enhanced Status field with "Review Required" option`,
+		Example: `  gh aw project new "My Project" --owner @me                           # Create user project
   gh aw project new "Team Board" --owner myorg                         # Create org project  
   gh aw project new "Bugs" --owner myorg --link myorg/myrepo           # Create and link to repo
   gh aw project new "Project Q1" --owner myorg --with-project-setup     # With project setup`,
@@ -152,10 +149,15 @@ func RunProjectNew(ctx context.Context, config ProjectConfig) error {
 		return fmt.Errorf("failed to create project: %w", err)
 	}
 
+	projectID, ok := project["id"].(string)
+	if !ok || projectID == "" {
+		return errors.New("failed to get project ID from response")
+	}
+
 	// Link to repository if specified
 	if config.Repo != "" {
 		fmt.Fprintln(os.Stderr, console.FormatInfoMessage(fmt.Sprintf("Linking project to repository %s...", config.Repo)))
-		if err := linkProjectToRepo(ctx, project["id"].(string), config.Repo, config.Verbose); err != nil {
+		if err := linkProjectToRepo(ctx, projectID, config.Repo, config.Verbose); err != nil {
 			fmt.Fprintln(os.Stderr, console.FormatWarningMessage(fmt.Sprintf("Warning: Failed to link project to repository: %v", err)))
 		} else {
 			fmt.Fprintln(os.Stderr, console.FormatSuccessMessage("✓ Project linked to repository"))
@@ -249,7 +251,7 @@ func validateOwner(ctx context.Context, ownerType, owner string, verbose bool) e
 
 // capitalizeFirst capitalizes the first letter of a string
 func capitalizeFirst(s string) string {
-	if len(s) == 0 {
+	if s == "" {
 		return s
 	}
 	return strings.ToUpper(s[:1]) + s[1:]
@@ -289,8 +291,8 @@ func createProject(ctx context.Context, ownerId, title string, verbose bool) (ma
 	projectLog.Printf("Creating project: ownerId=%s, title=%s", ownerId, title)
 	console.LogVerbose(verbose, "Creating project with owner ID: "+ownerId)
 
-	mutation := fmt.Sprintf(`mutation {
-		createProjectV2(input: { ownerId: "%s", title: "%s" }) {
+	mutation := `mutation($ownerId: ID!, $title: String!) {
+		createProjectV2(input: { ownerId: $ownerId, title: $title }) {
 			projectV2 {
 				id
 				number
@@ -298,12 +300,17 @@ func createProject(ctx context.Context, ownerId, title string, verbose bool) (ma
 				url
 			}
 		}
-	}`, ownerId, escapeGraphQLString(title))
+	}`
 
-	output, err := workflow.RunGH("Creating project...", "api", "graphql", "-f", "query="+mutation)
+	output, err := workflow.RunGH("Creating project...", "api", "graphql",
+		"-f", "query="+mutation,
+		"-f", "ownerId="+ownerId,
+		"-f", "title="+title,
+	)
 	if err != nil {
 		// Check for permission errors
-		if strings.Contains(err.Error(), "INSUFFICIENT_SCOPES") || strings.Contains(err.Error(), "NOT_FOUND") {
+		//nolint:errstringmatch // gh CLI GraphQL surfaces missing Projects scope as INSUFFICIENT_SCOPES text.
+		if strings.Contains(err.Error(), "INSUFFICIENT_SCOPES") || errorutil.IsNotFoundError(err) {
 			return nil, errors.New("insufficient permissions. You need a PAT with Projects access (classic: 'project' scope, fine-grained: Organization → Projects: Read & Write). Set GH_AW_PROJECT_GITHUB_TOKEN or configure gh CLI with a suitable token")
 		}
 		return nil, fmt.Errorf("GraphQL mutation failed: %w", err)
@@ -349,8 +356,13 @@ func linkProjectToRepo(ctx context.Context, projectId, repoSlug string, verbose 
 	repoName := parts[1]
 
 	// Get repository ID
-	query := fmt.Sprintf(`query { repository(owner: "%s", name: "%s") { id } }`, escapeGraphQLString(repoOwner), escapeGraphQLString(repoName))
-	output, err := workflow.RunGH("Getting repository ID...", "api", "graphql", "-f", "query="+query, "--jq", ".data.repository.id")
+	repoIdQuery := `query($owner: String!, $name: String!) { repository(owner: $owner, name: $name) { id } }`
+	output, err := workflow.RunGH("Getting repository ID...", "api", "graphql",
+		"-f", "query="+repoIdQuery,
+		"-f", "owner="+repoOwner,
+		"-f", "name="+repoName,
+		"--jq", ".data.repository.id",
+	)
 	if err != nil {
 		return fmt.Errorf("repository '%s' not found: %w", repoSlug, err)
 	}
@@ -361,15 +373,19 @@ func linkProjectToRepo(ctx context.Context, projectId, repoSlug string, verbose 
 	}
 
 	// Link project to repository
-	mutation := fmt.Sprintf(`mutation {
-		linkProjectV2ToRepository(input: { projectId: "%s", repositoryId: "%s" }) {
+	mutation := `mutation($projectId: ID!, $repositoryId: ID!) {
+		linkProjectV2ToRepository(input: { projectId: $projectId, repositoryId: $repositoryId }) {
 			repository {
 				id
 			}
 		}
-	}`, projectId, repoId)
+	}`
 
-	_, err = workflow.RunGH("Linking project to repository...", "api", "graphql", "-f", "query="+mutation)
+	_, err = workflow.RunGH("Linking project to repository...", "api", "graphql",
+		"-f", "query="+mutation,
+		"-f", "projectId="+projectId,
+		"-f", "repositoryId="+repoId,
+	)
 	if err != nil {
 		return fmt.Errorf("failed to link project to repository: %w", err)
 	}

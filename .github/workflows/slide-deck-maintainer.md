@@ -1,4 +1,5 @@
 ---
+emoji: "📊"
 name: Slide Deck Maintainer
 description: Maintains the gh-aw slide deck by scanning repository content and detecting layout issues using Playwright
 on:
@@ -27,7 +28,7 @@ imports:
     with:
       title-prefix: "[slides] "
       expires: "1d"
-  - shared/observability-otlp.md
+  - shared/otlp.md
 timeout-minutes: 45
 tools:
   cli-proxy: true
@@ -97,7 +98,7 @@ The slides use Marp syntax. Build them to HTML for testing:
 
 ```bash
 cd ${{ github.workspace }}/docs
-npx @marp-team/marp-cli slides/index.md --html --allow-local-files -o /tmp/slides-preview.html
+npx @marp-team/marp-cli slides/index.md --html --allow-local-files -o /tmp/gh-aw/agent/slides-preview.html
 ```
 
 ## Step 2: Serve Slides Locally
@@ -105,9 +106,9 @@ npx @marp-team/marp-cli slides/index.md --html --allow-local-files -o /tmp/slide
 Start a simple HTTP server to view the slides:
 
 ```bash
-cd /tmp
-npx http-server -p 8080 > /tmp/server.log 2>&1 &
-echo $! > /tmp/server.pid
+cd /tmp/gh-aw/agent
+npx http-server -p 8080 > /tmp/gh-aw/agent/server.log 2>&1 &
+echo $! > /tmp/gh-aw/agent/server.pid
 
 # Wait for server to be ready
 for i in {1..20}; do
@@ -157,13 +158,13 @@ Focus on:
 
 ### 4a: Load Round-Robin State from Cache
 
-The state file is at **`/tmp/gh-aw/cache-memory/slide-deck-maintainer/state.json`**.
+The state file is at **`/tmp/gh-aw/cache-memory/slide-deck-maintainer-state.json`**.
 
 Check whether the file exists, then read it:
 
 ```bash
-if [ -f /tmp/gh-aw/cache-memory/slide-deck-maintainer/state.json ]; then
-  cat /tmp/gh-aw/cache-memory/slide-deck-maintainer/state.json
+if [ -f /tmp/gh-aw/cache-memory/slide-deck-maintainer-state.json ]; then
+  cat /tmp/gh-aw/cache-memory/slide-deck-maintainer-state.json
 else
   echo "NOT_FOUND"
 fi
@@ -211,13 +212,9 @@ Based on the selected category, scan the corresponding sources:
 
 ### 4c: Save Round-Robin State to Cache
 
-After scanning, **always write the updated state file** regardless of whether changes were made:
+After scanning, **always write the updated state file** regardless of whether changes were made. Write directly to `/tmp/gh-aw/cache-memory/slide-deck-maintainer-state.json` (no subdirectory needed — the cache-memory root is already writable):
 
-```bash
-mkdir -p /tmp/gh-aw/cache-memory/slide-deck-maintainer
-```
-
-Write `/tmp/gh-aw/cache-memory/slide-deck-maintainer/state.json` with:
+Write `/tmp/gh-aw/cache-memory/slide-deck-maintainer-state.json` with:
 - `last_category`: the category you just scanned
 - `last_run`: today's date in `YYYY-MM-DD` format (filesystem-safe — no colons or special characters)
 - `run_history`: append this run's entry (keep at most the last 10 entries)
@@ -275,7 +272,7 @@ After editing, rebuild and retest:
 
 ```bash
 cd ${{ github.workspace }}/docs
-npx @marp-team/marp-cli slides/index.md --html --allow-local-files -o /tmp/slides-preview-updated.html
+npx @marp-team/marp-cli slides/index.md --html --allow-local-files -o /tmp/gh-aw/agent/slides-preview-updated.html
 ```
 
 Run Playwright checks again to ensure no new overflow issues were introduced.
@@ -285,8 +282,8 @@ Run Playwright checks again to ensure no new overflow issues were introduced.
 Stop the server:
 
 ```bash
-kill $(cat /tmp/server.pid) 2>/dev/null || true
-rm -f /tmp/server.pid /tmp/slides-preview.html /tmp/slides-preview-updated.html /tmp/server.log
+kill $(cat /tmp/gh-aw/agent/server.pid) 2>/dev/null || true
+rm -f /tmp/gh-aw/agent/server.pid /tmp/gh-aw/agent/slides-preview.html /tmp/gh-aw/agent/slides-preview-updated.html /tmp/gh-aw/agent/server.log
 ```
 
 ## Step 9: Report Your Actions (REQUIRED)

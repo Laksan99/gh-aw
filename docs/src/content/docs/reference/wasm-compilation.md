@@ -1,7 +1,13 @@
 ---
 title: WebAssembly Compilation
 description: How to compile the gh-aw workflow compiler to WebAssembly and use it in the browser or other JavaScript environments.
+sidebar:
+  order: 1400
 ---
+
+:::caution[Experimental]
+WASM compilation of the GH-AW toolchain is an experimental feature.
+:::
 
 The gh-aw compiler can be built as a WebAssembly (Wasm) module, letting you compile agentic workflows directly in the browser without a server-side Go installation.
 

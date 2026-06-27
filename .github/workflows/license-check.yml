@@ -5,13 +5,19 @@ on:
     paths:
       - 'go.mod'
       - 'go.sum'
+      - '.github/workflows/license-check.yml'
   push:
     branches: [main]
+    paths:
+      - 'go.mod'
+      - 'go.sum'
+      - '.github/workflows/license-check.yml'
   workflow_dispatch:
 
 jobs:
   license-check:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     permissions:
       contents: read
     steps:

@@ -201,8 +201,6 @@ Test workflow content with bot and default roles.`
 
 // TestMergeBots tests the mergeBots helper function
 func TestMergeBots(t *testing.T) {
-	compiler := NewCompiler()
-
 	tests := []struct {
 		name     string
 		top      []string
@@ -243,7 +241,7 @@ func TestMergeBots(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			result := compiler.mergeBots(tt.top, tt.imported)
+			result := mergeBots(tt.top, tt.imported)
 			assert.Equal(t, tt.expected, result, "mergeBots result mismatch")
 		})
 	}
@@ -292,6 +290,39 @@ Test workflow content.`
 	if strings.Contains(compiledStr, "check_membership") {
 		t.Errorf("Expected no check_membership job when roles: all is set")
 	}
+}
+
+// TestCopilotBotAliasExpansion tests that "copilot" in the bots list is expanded to all
+// known GitHub Copilot bot identifiers in the compiled output.
+func TestCopilotBotAliasExpansion(t *testing.T) {
+	tmpDir := testutil.TempDir(t, "workflow-copilot-bot-alias-test")
+
+	compiler := NewCompiler()
+
+	frontmatter := `---
+on:
+  pull_request:
+    types: [opened]
+  bots: ["copilot"]
+---
+
+# Test Workflow with Copilot Alias
+Test workflow content.`
+
+	workflowPath := filepath.Join(tmpDir, "workflow-copilot-bot.md")
+	err := os.WriteFile(workflowPath, []byte(frontmatter), 0644)
+	require.NoError(t, err, "Failed to write workflow file")
+
+	err = compiler.CompileWorkflow(workflowPath)
+	require.NoError(t, err, "Compilation failed")
+
+	lockContent, err := os.ReadFile(stringutil.MarkdownToLockFile(workflowPath))
+	require.NoError(t, err, "Failed to read lock file")
+	lockStr := string(lockContent)
+
+	// The "copilot" alias must be expanded to all Copilot bot identities
+	assert.Contains(t, lockStr, `GH_AW_ALLOWED_BOTS: "copilot-swe-agent,Copilot,copilot,@app/copilot-swe-agent"`,
+		`Expected compiled workflow to expand "copilot" alias to all Copilot bot identifiers`)
 }
 
 // TestBotsImportMerge tests that bots from imported workflows are merged with top-level bots

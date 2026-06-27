@@ -1,4 +1,6 @@
 ---
+private: true
+emoji: "🔍"
 description: Analyzes workflow examples to identify patterns, best practices, and potential improvements
 on:
   schedule: weekly on monday around 09:00
@@ -9,7 +11,7 @@ permissions:
   pull-requests: read
   actions: read
 engine: claude
-timeout-minutes: 10
+timeout-minutes: 30
 imports:
   - uses: shared/meta-analysis-base.md
     with:
@@ -20,7 +22,10 @@ imports:
       expires: 1d
 
 
-  - shared/observability-otlp.md
+  - shared/otlp.md
+sandbox:
+  agent:
+    sudo: false
 ---
 # Weekly Workflow Analysis
 

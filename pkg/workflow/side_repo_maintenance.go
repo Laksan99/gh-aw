@@ -1,6 +1,7 @@
 package workflow
 
 import (
+	"context"
 	_ "embed"
 	"fmt"
 	"os"
@@ -9,6 +10,7 @@ import (
 	"strings"
 
 	"github.com/github/gh-aw/pkg/constants"
+	"github.com/github/gh-aw/pkg/setutil"
 
 	"github.com/github/gh-aw/pkg/stringutil"
 )
@@ -37,12 +39,16 @@ type SideRepoTarget struct {
 // preferred over an empty one so that the generated workflow uses the custom
 // token rather than falling back to GH_AW_GITHUB_TOKEN.
 func collectSideRepoTargets(workflowDataList []*WorkflowData) []SideRepoTarget {
+	maintenanceLog.Printf("Scanning %d workflows for side-repo targets", len(workflowDataList))
 	// Use a map to accumulate the best token seen for each slug.
 	// Order slice preserves first-seen repository discovery order for stable output;
 	// tokens may be upgraded to non-empty values from later occurrences.
 	tokenByRepo := make(map[string]string)
 	var order []string
 	for _, wd := range workflowDataList {
+		if wd == nil {
+			continue
+		}
 		for _, checkout := range wd.CheckoutConfigs {
 			if !checkout.Current {
 				continue
@@ -83,33 +89,61 @@ func effectiveSideRepoToken(checkout SideRepoTarget) string {
 	return "${{ secrets.GH_AW_GITHUB_TOKEN }}"
 }
 
+// generateAllSideRepoMaintenanceWorkflowsOptions configures side-repo maintenance workflow generation.
+type generateAllSideRepoMaintenanceWorkflowsOptions struct {
+	workflowDataList []*WorkflowData
+	workflowDir      string
+	version          string
+	actionMode       ActionMode
+	actionTag        string
+	runsOnValue      string
+	resolver         SHAResolver
+	hasExpires       bool
+	minExpiresDays   int
+}
+
 // generateAllSideRepoMaintenanceWorkflows detects SideRepoOps targets and
 // generates a per-target maintenance workflow for each unique static repository.
 func generateAllSideRepoMaintenanceWorkflows(
-	workflowDataList []*WorkflowData,
-	workflowDir string,
-	version string,
-	actionMode ActionMode,
-	actionTag string,
-	runsOnValue string,
-	resolver ActionSHAResolver,
-	hasExpires bool,
-	minExpiresDays int,
+	ctx context.Context,
+	opts generateAllSideRepoMaintenanceWorkflowsOptions,
 ) error {
+	workflowDataList := opts.workflowDataList
+	workflowDir := opts.workflowDir
+	version := opts.version
+	actionMode := opts.actionMode
+	actionTag := opts.actionTag
+	runsOnValue := opts.runsOnValue
+	resolver := opts.resolver
+	hasExpires := opts.hasExpires
+	minExpiresDays := opts.minExpiresDays
 	targets := collectSideRepoTargets(workflowDataList)
+	maintenanceLog.Printf("Generating maintenance workflows for %d side-repo target(s): hasExpires=%t, minExpiresDays=%d", len(targets), hasExpires, minExpiresDays)
 
 	// Track which side-repo maintenance files we (re-)generate so we can identify
 	// and remove stale files from previous runs when target repos are renamed or removed.
-	generatedFiles := make(map[string]bool)
+	generatedFiles := make(map[string]struct {
+	})
 
 	for _, target := range targets {
 		slug := stringutil.SanitizeForFilename(target.Repository)
 		filename := "agentics-maintenance-" + slug + ".yml"
-		generatedFiles[filename] = true
+		generatedFiles[filename] = struct {
+		}{}
 		outPath := filepath.Join(workflowDir, filename)
 
 		maintenanceLog.Printf("Generating side-repo maintenance workflow: %s → %s", target.Repository, filename)
-		if err := generateSideRepoMaintenanceWorkflow(target, outPath, version, actionMode, actionTag, runsOnValue, resolver, hasExpires, minExpiresDays); err != nil {
+		if err := generateSideRepoMaintenanceWorkflow(ctx, generateSideRepoMaintenanceWorkflowOptions{
+			target:         target,
+			outPath:        outPath,
+			version:        version,
+			actionMode:     actionMode,
+			actionTag:      actionTag,
+			runsOnValue:    runsOnValue,
+			resolver:       resolver,
+			hasExpires:     hasExpires,
+			minExpiresDays: minExpiresDays,
+		}); err != nil {
 			return fmt.Errorf("failed to generate side-repo maintenance workflow for %s: %w", target.Repository, err)
 		}
 		fmt.Fprintf(os.Stderr, "  Generated side-repo maintenance workflow: %s\n", filename)
@@ -128,7 +162,7 @@ func generateAllSideRepoMaintenanceWorkflows(
 		if !strings.HasPrefix(name, "agentics-maintenance-") || !strings.HasSuffix(name, ".yml") {
 			continue
 		}
-		if generatedFiles[name] {
+		if setutil.Contains(generatedFiles, name) {
 			continue
 		}
 		stalePath := filepath.Join(workflowDir, name)
@@ -142,24 +176,41 @@ func generateAllSideRepoMaintenanceWorkflows(
 	return nil
 }
 
+// generateSideRepoMaintenanceWorkflowOptions configures generation of a single side-repo
+// maintenance workflow.
+type generateSideRepoMaintenanceWorkflowOptions struct {
+	target         SideRepoTarget
+	outPath        string
+	version        string
+	actionMode     ActionMode
+	actionTag      string
+	runsOnValue    string
+	resolver       SHAResolver
+	hasExpires     bool
+	minExpiresDays int
+}
+
 // generateSideRepoMaintenanceWorkflow generates a workflow_call-based maintenance
 // workflow that targets an external repository detected via the SideRepoOps pattern.
 // The generated workflow mirrors agentics-maintenance.yml but authenticates against
 // the target repository using the token from the checkout config and sets
 // GH_AW_TARGET_REPO_SLUG for all cross-repo operations.
 func generateSideRepoMaintenanceWorkflow(
-	target SideRepoTarget,
-	outPath string,
-	version string,
-	actionMode ActionMode,
-	actionTag string,
-	runsOnValue string,
-	resolver ActionSHAResolver,
-	hasExpires bool,
-	minExpiresDays int,
+	ctx context.Context,
+	opts generateSideRepoMaintenanceWorkflowOptions,
 ) error {
+	target := opts.target
+	outPath := opts.outPath
+	version := opts.version
+	actionMode := opts.actionMode
+	actionTag := opts.actionTag
+	runsOnValue := opts.runsOnValue
+	resolver := opts.resolver
+	hasExpires := opts.hasExpires
+	minExpiresDays := opts.minExpiresDays
 	token := effectiveSideRepoToken(target)
 	repoSlug := target.Repository
+	maintenanceLog.Printf("Building side-repo workflow content: repo=%s, actionMode=%s, hasExpires=%t", repoSlug, actionMode, hasExpires)
 
 	var yaml strings.Builder
 
@@ -236,10 +287,11 @@ jobs:
 `
 	yaml.WriteString(onSection)
 
-	setupActionRef := ResolveSetupActionReference(actionMode, version, actionTag, resolver)
+	setupActionRef := ResolveSetupActionReference(ctx, actionMode, version, actionTag, resolver)
 
 	// Add close-expired-entities job only when any workflow uses expires.
 	if hasExpires {
+		maintenanceLog.Printf("Including close-expired-entities job for %s (cron=%s)", repoSlug, cronSchedule)
 		closeExpiredCondition := buildNotForkAndScheduled()
 		yaml.WriteString(`  close-expired-entities:
     if: ${{ ` + RenderCondition(closeExpiredCondition) + ` }}
@@ -360,7 +412,9 @@ jobs:
 
       - name: Record outputs
         id: record
-        run: echo "run_url=${{ inputs.run_url }}" >> "$GITHUB_OUTPUT"
+        env:
+          GH_AW_RUN_URL: ${{ inputs.run_url }}
+        run: echo "run_url=$GH_AW_RUN_URL" >> "$GITHUB_OUTPUT"
 `)
 
 	// Add create_labels job for workflow_dispatch/workflow_call with operation == 'create_labels'
@@ -394,7 +448,7 @@ jobs:
 
 `)
 
-	yaml.WriteString(generateInstallCLISteps(actionMode, version, actionTag, resolver))
+	yaml.WriteString(generateInstallCLISteps(ctx, actionMode, version, actionTag, resolver))
 	yaml.WriteString(`      - name: Create missing labels in target repository
         uses: ` + getCachedActionPinFromResolver("actions/github-script", resolver) + `
         env:
@@ -442,7 +496,7 @@ jobs:
 
 `)
 
-	yaml.WriteString(generateInstallCLISteps(actionMode, version, actionTag, resolver))
+	yaml.WriteString(generateInstallCLISteps(ctx, actionMode, version, actionTag, resolver))
 	yaml.WriteString(`      - name: Restore activity report logs cache
         id: activity_report_logs_cache
         uses: ` + getActionPin("actions/cache/restore") + `
@@ -464,10 +518,10 @@ jobs:
           ${GH_AW_CMD_PREFIX} logs \
             --repo "${GH_AW_TARGET_REPO_SLUG}" \
             --start-date -1w \
-            --count 100 \
+            --count 500 \
             --output ./.cache/gh-aw/activity-report-logs \
             --format markdown \
-            > ./.cache/gh-aw/activity-report-logs/report.md
+            --report-file ./.cache/gh-aw/activity-report-logs/report.md
 
       - name: Save activity report logs cache
         if: ${{ always() }}
@@ -523,11 +577,11 @@ jobs:
 `)
 
 	// Add validate_workflows job for workflow_dispatch/workflow_call with operation == 'validate'
-	validateRunsOnValue := FormatRunsOn(nil, "ubuntu-latest")
+	formattedRunsOn := FormatRunsOn(nil, "ubuntu-latest")
 	yaml.WriteString(`
   validate_workflows:
     if: ${{ ` + RenderCondition(buildDispatchOperationCondition("validate")) + ` }}
-    runs-on: ` + validateRunsOnValue + `
+    runs-on: ` + formattedRunsOn + `
     permissions:
       contents: read
       issues: write
@@ -554,7 +608,7 @@ jobs:
 
 `)
 
-	yaml.WriteString(generateInstallCLISteps(actionMode, version, actionTag, resolver))
+	yaml.WriteString(generateInstallCLISteps(ctx, actionMode, version, actionTag, resolver))
 	yaml.WriteString(`      - name: Validate workflows and file issue on findings
         uses: ` + getCachedActionPinFromResolver("actions/github-script", resolver) + `
         env:

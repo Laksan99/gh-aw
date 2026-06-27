@@ -539,6 +539,58 @@ describe("runtime_import", () => {
             expect(result).not.toContain("title: Test"),
             expect(core.debug).toHaveBeenCalledWith(`File workflows/${filepath} contains front matter which will be ignored in runtime import`));
         }),
+        it("should preserve front matter for .github/agents imports", async () => {
+          const agentsDir = path.join(tempDir, ".github", "agents");
+          fs.mkdirSync(agentsDir, { recursive: true });
+          const filepath = ".github/agents/planner.md";
+          const content = "---\nmodel: gpt-5-mini\ndescription: Planner\n---\n\n# Planner\n\nPrompt body.";
+          fs.writeFileSync(path.join(agentsDir, "planner.md"), content);
+
+          const result = await processRuntimeImport(filepath, !1, tempDir);
+
+          expect(result).toContain("model: gpt-5-mini");
+          expect(result).toContain("# Planner");
+          expect(core.debug).toHaveBeenCalledWith("File agents/planner.md contains front matter which will be preserved for agent runtime import");
+        }),
+        it("should preserve front matter for .agents/agents imports", async () => {
+          const subAgentsDir = path.join(tempDir, ".agents", "agents");
+          fs.mkdirSync(subAgentsDir, { recursive: true });
+          const filepath = ".agents/agents/router.md";
+          const content = "---\nmodel: gpt-5-mini\n---\n\nRouter body.";
+          fs.writeFileSync(path.join(subAgentsDir, "router.md"), content);
+
+          const result = await processRuntimeImport(filepath, !1, tempDir);
+
+          expect(result).toContain("model: gpt-5-mini");
+          expect(result).toContain("Router body.");
+          expect(core.debug).toHaveBeenCalledWith("File .agents/agents/router.md contains front matter which will be preserved for agent runtime import");
+        }),
+        it("should preserve front matter for .github/skills imports", async () => {
+          const skillsDir = path.join(tempDir, ".github", "skills", "planner-skill");
+          fs.mkdirSync(skillsDir, { recursive: true });
+          const filepath = ".github/skills/planner-skill/SKILL.md";
+          const content = "---\nmodel: gpt-5-mini\ndescription: Planner skill\n---\n\nSkill body.";
+          fs.writeFileSync(path.join(skillsDir, "SKILL.md"), content);
+
+          const result = await processRuntimeImport(filepath, !1, tempDir);
+
+          expect(result).toContain("model: gpt-5-mini");
+          expect(result).toContain("Skill body.");
+          expect(core.debug).toHaveBeenCalledWith("File skills/planner-skill/SKILL.md contains front matter which will be preserved for agent runtime import");
+        }),
+        it("should preserve front matter for .agents/skills imports", async () => {
+          const skillsDir = path.join(tempDir, ".agents", "skills", "router-skill");
+          fs.mkdirSync(skillsDir, { recursive: true });
+          const filepath = ".agents/skills/router-skill/instructions.md";
+          const content = "---\nmodel: gpt-5-mini\n---\n\nRouter skill body.";
+          fs.writeFileSync(path.join(skillsDir, "instructions.md"), content);
+
+          const result = await processRuntimeImport(filepath, !1, tempDir);
+
+          expect(result).toContain("model: gpt-5-mini");
+          expect(result).toContain("Router skill body.");
+          expect(core.debug).toHaveBeenCalledWith("File .agents/skills/router-skill/instructions.md contains front matter which will be preserved for agent runtime import");
+        }),
         it("should remove XML comments", async () => {
           fs.writeFileSync(path.join(workflowsDir, "with-comments.md"), "# Title\n\n\x3c!-- This is a comment --\x3e\n\nContent here.");
           const result = await processRuntimeImport("with-comments.md", !1, tempDir);
@@ -1083,6 +1135,7 @@ describe("runtime_import", () => {
           expect(isSafeExpression("github.event.inputs.branch")).toBe(true);
           expect(isSafeExpression("inputs.version")).toBe(true);
           expect(isSafeExpression("env.NODE_VERSION")).toBe(true);
+          expect(isSafeExpression("experiments.prompt_style")).toBe(true);
         });
 
         it("should reject unsafe expressions", () => {
@@ -1205,6 +1258,69 @@ describe("runtime_import", () => {
           const result = evaluateExpression("github.event.nonexistent.property");
           expect(result).toContain("github.event.nonexistent.property");
         });
+
+        describe("compound || expressions with deterministic env vars (compiler fix)", () => {
+          // These tests verify the runtime side of the compiler/runtime naming fix.
+          // The compiler now emits GH_AW_STEPS_* / GH_AW_INPUTS_* env vars for each
+          // needs.*/steps.*/inputs.* terminal sub-expression of a compound || expression,
+          // so that the recursive evaluator can resolve each operand by its deterministic name.
+
+          it("should resolve compound || when left env var (steps.*) is set", () => {
+            process.env.GH_AW_STEPS_SANITIZED_OUTPUTS_TEXT = "/repo-assist some instruction";
+            try {
+              const result = evaluateExpression("steps.sanitized.outputs.text || inputs.command");
+              expect(result).toBe("/repo-assist some instruction");
+            } finally {
+              delete process.env.GH_AW_STEPS_SANITIZED_OUTPUTS_TEXT;
+            }
+          });
+
+          it("should resolve compound || when only right env var (inputs.*) is set", () => {
+            process.env.GH_AW_INPUTS_COMMAND = "manual dispatch command";
+            try {
+              const result = evaluateExpression("steps.sanitized.outputs.text || inputs.command");
+              expect(result).toBe("manual dispatch command");
+            } finally {
+              delete process.env.GH_AW_INPUTS_COMMAND;
+            }
+          });
+
+          it("should prefer left side when both env vars are set (left-biased || semantics)", () => {
+            process.env.GH_AW_STEPS_SANITIZED_OUTPUTS_TEXT = "slash-command text";
+            process.env.GH_AW_INPUTS_COMMAND = "manual dispatch command";
+            try {
+              const result = evaluateExpression("steps.sanitized.outputs.text || inputs.command");
+              expect(result).toBe("slash-command text");
+            } finally {
+              delete process.env.GH_AW_STEPS_SANITIZED_OUTPUTS_TEXT;
+              delete process.env.GH_AW_INPUTS_COMMAND;
+            }
+          });
+
+          it("should return right-side wrapped expression when neither env var is set", () => {
+            // Both operands are unresolvable. The || evaluator tries left first: left
+            // is unresolved → try right, which is also unresolved → returns ${{ right }}.
+            // This is the pre-fix behaviour for the "neither set" case and is unchanged.
+            const result = evaluateExpression("steps.sanitized.outputs.text || inputs.command");
+            expect(result).toBe("${{ inputs.command }}");
+          });
+
+          it("should resolve compound || with needs.* left and inputs.* right", () => {
+            process.env.GH_AW_NEEDS_BUILD_OUTPUTS_VERSION = "v1.2.3";
+            try {
+              const result = evaluateExpression("needs.build.outputs.version || inputs.version_override");
+              expect(result).toBe("v1.2.3");
+            } finally {
+              delete process.env.GH_AW_NEEDS_BUILD_OUTPUTS_VERSION;
+            }
+          });
+
+          it("should fall back to literal right side when left env var is unset", () => {
+            // inputs.command is not set; right side is a string literal
+            const result = evaluateExpression("inputs.command || 'default-value'");
+            expect(result).toBe("default-value");
+          });
+        });
       });
 
       describe("processExpressions", () => {
@@ -1239,6 +1355,12 @@ describe("runtime_import", () => {
         it("should throw error for unsafe expressions", () => {
           const content = "Token: ${{ secrets.GITHUB_TOKEN }}";
           expect(() => processExpressions(content, "test.md")).toThrow("unauthorized GitHub Actions expressions");
+        });
+
+        it("should preserve experiments expressions for downstream interpolation", () => {
+          const content = "Model: ${{ experiments.subagent_model }}";
+          const result = processExpressions(content, "test.md");
+          expect(result).toBe("Model: ${{ experiments.subagent_model }}");
         });
 
         it("should throw error for multiline expressions", () => {
@@ -1383,6 +1505,51 @@ describe("runtime_import", () => {
 
           const result = await processRuntimeImports("{{#runtime-import outer.md}}", tempDir);
           expect(result).toBe("Outer \nInner  text");
+        });
+
+        it("should deduplicate imports already resolved before recursive workflow self-import", async () => {
+          const sharedDir = path.join(workflowsDir, "shared", "agent");
+          fs.mkdirSync(sharedDir, { recursive: true });
+          fs.writeFileSync(path.join(sharedDir, "foo.md"), "<wiki-context>Shared block</wiki-context>");
+          fs.writeFileSync(path.join(workflowsDir, "my-workflow.md"), "# Workflow\n\n{{#runtime-import shared/agent/foo.md}}\n\nDone.");
+
+          const result = await processRuntimeImports("{{#runtime-import .github/workflows/shared/agent/foo.md}}\n{{#runtime-import .github/workflows/my-workflow.md}}", tempDir);
+
+          expect(result).toBe("<wiki-context>Shared block</wiki-context>\n# Workflow\n\n\n\nDone.");
+          expect(core.info).toHaveBeenCalledWith("Skipping already resolved import for shared/agent/foo.md");
+        });
+
+        it("should fuzz dedup across equivalent recursive self-import path spellings", async () => {
+          const sharedDir = path.join(workflowsDir, "shared", "agent");
+          fs.mkdirSync(sharedDir, { recursive: true });
+          fs.writeFileSync(path.join(sharedDir, "foo.md"), "<wiki-context>Shared block</wiki-context>");
+
+          // Include leading "/" and "//" forms to fuzz root-absolute import normalization.
+          const sharedPathVariants = ["shared/agent/foo.md", "./shared/agent/foo.md", ".github/workflows/shared/agent/foo.md", "/.github/workflows/shared/agent/foo.md", "//.github/workflows/shared/agent/foo.md"];
+          const workflowPathVariants = ["my-workflow.md", ".github/workflows/my-workflow.md", "/.github/workflows/my-workflow.md"];
+
+          // Deterministic pseudo-random generator to keep this test stable and reproducible.
+          let seed = 123456789;
+          const nextRandomIndex = max => {
+            seed = (seed * 1664525 + 1013904223) >>> 0;
+            return seed % max;
+          };
+
+          for (let i = 0; i < 50; i++) {
+            vi.clearAllMocks();
+            const topLevelPath = sharedPathVariants[nextRandomIndex(sharedPathVariants.length)];
+            const nestedPath = sharedPathVariants[nextRandomIndex(sharedPathVariants.length)];
+            const workflowPath = workflowPathVariants[nextRandomIndex(workflowPathVariants.length)];
+
+            fs.writeFileSync(path.join(workflowsDir, "my-workflow.md"), `# Workflow\n\n{{#runtime-import ${nestedPath}}}\n\nDone.`);
+
+            const result = await processRuntimeImports(`{{#runtime-import ${topLevelPath}}}\n{{#runtime-import ${workflowPath}}}`, tempDir);
+
+            expect(result.match(/<wiki-context>Shared block<\/wiki-context>/g)?.length ?? 0).toBe(1);
+            expect(result).toContain("# Workflow");
+            expect(result).toContain("Done.");
+            expect(core.info.mock.calls.some(([msg]) => String(msg).startsWith("Skipping already resolved import for "))).toBe(true);
+          }
         });
 
         it("should handle deep nesting of imports", async () => {

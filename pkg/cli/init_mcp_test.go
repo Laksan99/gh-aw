@@ -3,6 +3,7 @@
 package cli
 
 import (
+	"context"
 	"encoding/json"
 	"os"
 	"os/exec"
@@ -43,7 +44,7 @@ func TestInitRepository_WithMCP(t *testing.T) {
 	}
 
 	// Call the function with MCP flag (no campaign agent)
-	err = InitRepository(InitOptions{Verbose: false, MCP: true, CodespaceRepos: []string{}, CodespaceEnabled: false, Completions: false, CreatePR: false, RootCmd: nil})
+	err = InitRepository(InitOptions{Verbose: false, Skill: true, Agent: true, MCP: true, CodespaceRepos: []string{}, CodespaceEnabled: false, Completions: false, CreatePR: false, RootCmd: nil})
 	if err != nil {
 		t.Fatalf("InitRepository(, false, false, false, nil) with MCP returned error: %v", err)
 	}
@@ -98,11 +99,18 @@ func TestInitRepository_WithMCP(t *testing.T) {
 		}
 
 		server := config.MCPServers["github-agentic-workflows"]
+		if server.Type != "local" {
+			t.Errorf("Expected type to be 'local', got %s", server.Type)
+		}
 		if server.Command != "gh" {
 			t.Errorf("Expected command to be 'gh', got %s", server.Command)
 		}
 		if len(server.Args) != 2 || server.Args[0] != "aw" || server.Args[1] != "mcp-server" {
 			t.Errorf("Expected args to be ['aw', 'mcp-server'], got %v", server.Args)
+		}
+		expectedTools := []string{"compile", "audit", "logs", "inspect", "status", "audit-diff"}
+		if len(server.Tools) != len(expectedTools) {
+			t.Errorf("Expected %d tools, got %d (%v)", len(expectedTools), len(server.Tools), server.Tools)
 		}
 	}
 }
@@ -136,13 +144,13 @@ func TestInitRepository_MCP_Idempotent(t *testing.T) {
 	}
 
 	// Call the function first time with MCP
-	err = InitRepository(InitOptions{Verbose: false, MCP: true, CodespaceRepos: []string{}, CodespaceEnabled: false, Completions: false, CreatePR: false, RootCmd: nil})
+	err = InitRepository(InitOptions{Verbose: false, Skill: true, Agent: true, MCP: true, CodespaceRepos: []string{}, CodespaceEnabled: false, Completions: false, CreatePR: false, RootCmd: nil})
 	if err != nil {
 		t.Fatalf("InitRepository(, false, false, false, nil) with MCP returned error on first call: %v", err)
 	}
 
 	// Call the function second time with MCP
-	err = InitRepository(InitOptions{Verbose: false, MCP: true, CodespaceRepos: []string{}, CodespaceEnabled: false, Completions: false, CreatePR: false, RootCmd: nil})
+	err = InitRepository(InitOptions{Verbose: false, Skill: true, Agent: true, MCP: true, CodespaceRepos: []string{}, CodespaceEnabled: false, Completions: false, CreatePR: false, RootCmd: nil})
 	if err != nil {
 		t.Fatalf("InitRepository(, false, false, false, nil) with MCP returned error on second call: %v", err)
 	}
@@ -159,7 +167,7 @@ func TestInitRepository_MCP_Idempotent(t *testing.T) {
 	}
 }
 
-func TestEnsureMCPConfig_RendersInstructions(t *testing.T) {
+func TestEnsureMCPConfig_UpdatesExistingFile(t *testing.T) {
 	// Create a temporary directory for testing
 	tempDir := testutil.TempDir(t, "test-*")
 
@@ -199,7 +207,7 @@ func TestEnsureMCPConfig_RendersInstructions(t *testing.T) {
 		t.Fatalf("ensureMCPConfig() returned error: %v", err)
 	}
 
-	// Verify the config was NOT modified (file should remain unchanged)
+	// Verify the config was updated in place
 	content, err := os.ReadFile(mcpConfigPath)
 	if err != nil {
 		t.Fatalf("Failed to read .github/mcp.json: %v", err)
@@ -215,9 +223,15 @@ func TestEnsureMCPConfig_RendersInstructions(t *testing.T) {
 		t.Errorf("Expected existing 'other-server' to be preserved")
 	}
 
-	// Check that github-agentic-workflows was NOT added (file should not be modified)
-	if _, exists := config.MCPServers["github-agentic-workflows"]; exists {
-		t.Errorf("Expected 'github-agentic-workflows' server to NOT be added (should render instructions instead)")
+	server, exists := config.MCPServers["github-agentic-workflows"]
+	if !exists {
+		t.Fatalf("Expected 'github-agentic-workflows' server to be added")
+	}
+	if server.Type != "local" {
+		t.Errorf("Expected type 'local', got %q", server.Type)
+	}
+	if server.Command != "gh" {
+		t.Errorf("Expected command 'gh', got %q", server.Command)
 	}
 }
 
@@ -263,8 +277,8 @@ jobs:
 	}
 
 	// Call ensureCopilotSetupSteps
-	if err := ensureCopilotSetupSteps(false, workflow.ActionModeDev, "dev"); err != nil {
-		t.Fatalf("ensureCopilotSetupSteps() returned error: %v", err)
+	if err := ensureCopilotSetupSteps(context.Background(), false, workflow.ActionModeDev, "dev"); err != nil {
+		t.Fatalf("ensureCopilotSetupSteps(context.Background()) returned error: %v", err)
 	}
 
 	// Verify the file was NOT modified (should render instructions instead)
@@ -332,8 +346,8 @@ jobs:
 	}
 
 	// Call ensureCopilotSetupSteps
-	if err := ensureCopilotSetupSteps(false, workflow.ActionModeDev, "dev"); err != nil {
-		t.Fatalf("ensureCopilotSetupSteps() returned error: %v", err)
+	if err := ensureCopilotSetupSteps(context.Background(), false, workflow.ActionModeDev, "dev"); err != nil {
+		t.Fatalf("ensureCopilotSetupSteps(context.Background()) returned error: %v", err)
 	}
 
 	// Verify the file was not modified (content should be the same)

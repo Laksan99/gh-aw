@@ -4,6 +4,7 @@ package cli
 
 import (
 	"encoding/json"
+	"strconv"
 	"testing"
 	"time"
 
@@ -14,7 +15,7 @@ import (
 // TestRateLimitResponseUnmarshal verifies that the rateLimitResponse struct correctly
 // unmarshals the JSON returned by `gh api rate_limit`.
 func TestRateLimitResponseUnmarshal(t *testing.T) {
-	now := time.Now().Add(30 * time.Second).Unix()
+	now := time.Now().Add(time.Second * 30).Unix()
 	raw := []byte(`{
 		"resources": {
 			"core": {
@@ -80,6 +81,5 @@ func TestRateLimitResourceIsBelowThreshold(t *testing.T) {
 
 // jsonInt is a helper that converts an int64 to its JSON number representation.
 func jsonInt(n int64) string {
-	b, _ := json.Marshal(n)
-	return string(b)
+	return strconv.FormatInt(n, 10)
 }

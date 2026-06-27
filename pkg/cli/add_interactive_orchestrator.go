@@ -5,12 +5,14 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"strings"
 
 	"charm.land/huh/v2"
 	"github.com/github/gh-aw/pkg/console"
 	"github.com/github/gh-aw/pkg/constants"
 	"github.com/github/gh-aw/pkg/logger"
 	"github.com/github/gh-aw/pkg/styles"
+	"github.com/github/gh-aw/pkg/workflow"
 )
 
 var addInteractiveLog = logger.New("cli:add_interactive")
@@ -29,6 +31,17 @@ type AddInteractiveConfig struct {
 	SkipSecret      bool   // Skip the API secret prompt (useful when secret is set at org level)
 	RepoOverride    string // owner/repo format, if user provides it
 
+	// UseCopilotRequests indicates the user chose org-billing (copilot-requests) auth
+	// instead of a PAT when setting up the Copilot engine during the wizard.
+	// When true, COPILOT_GITHUB_TOKEN secret setup is skipped and
+	// permissions.copilot-requests: write is injected into the workflow.
+	UseCopilotRequests bool
+
+	// copilotCLIBillingStatus is the detected org Copilot CLI billing status.
+	// "enabled" — confirmed available; "disabled" — confirmed unavailable; "" — inconclusive.
+	// Populated by selectCopilotAuthMethod() via probeCopilotBillingForOrg().
+	copilotCLIBillingStatus string
+
 	// isPublicRepo tracks whether the target repository is public
 	// This is populated by checkGitRepository() when determining the repo
 	isPublicRepo bool
@@ -39,7 +52,7 @@ type AddInteractiveConfig struct {
 
 	// existingSecrets tracks which secrets already exist in the repository
 	// This is populated by checkExistingSecrets() before engine selection
-	existingSecrets map[string]bool
+	existingSecrets map[string]struct{}
 
 	// addResult holds the result from AddWorkflows, including HasWorkflowDispatch
 	addResult *AddWorkflowsResult
@@ -50,8 +63,10 @@ type AddInteractiveConfig struct {
 }
 
 // RunAddInteractive runs the interactive add workflow
-// This walks the user through adding an agentic workflow to their repository
-func RunAddInteractive(ctx context.Context, workflowSpecs []string, verbose bool, engineOverride string, noGitattributes bool, workflowDir string, noStopAfter bool, stopAfter string, skipSecret bool) error {
+// This walks the user through adding an agentic workflow to their repository.
+// ctx is applied to config.Ctx; callers should not rely on config.Ctx after this call
+// as it will be overwritten by the provided ctx.
+func RunAddInteractive(ctx context.Context, config *AddInteractiveConfig) error {
 	addInteractiveLog.Print("Starting interactive add workflow")
 
 	// Assert this function is not running in automated unit tests or CI
@@ -59,28 +74,19 @@ func RunAddInteractive(ctx context.Context, workflowSpecs []string, verbose bool
 		return errors.New("interactive add cannot be used in automated tests or CI environments")
 	}
 
+	// Set context on the config
+	config.Ctx = ctx
+
 	// Auto-detect GHES host from git remote if not already set
 	if os.Getenv("GH_HOST") == "" {
 		detectedHost := getHostFromOriginRemote()
 		if detectedHost != "github.com" {
 			addInteractiveLog.Printf("Auto-detected GHES host from git remote: %s", detectedHost)
-			os.Setenv("GH_HOST", detectedHost)
-			if verbose {
+			workflow.SetDefaultGHHost(detectedHost)
+			if config.Verbose {
 				fmt.Fprintln(os.Stderr, console.FormatInfoMessage("Auto-detected GitHub Enterprise host: "+detectedHost))
 			}
 		}
-	}
-
-	config := &AddInteractiveConfig{
-		Ctx:             ctx,
-		WorkflowSpecs:   workflowSpecs,
-		Verbose:         verbose,
-		EngineOverride:  engineOverride,
-		NoGitattributes: noGitattributes,
-		WorkflowDir:     workflowDir,
-		NoStopAfter:     noStopAfter,
-		StopAfter:       stopAfter,
-		SkipSecret:      skipSecret,
 	}
 
 	// Step 1: Welcome message
@@ -137,7 +143,7 @@ func RunAddInteractive(ctx context.Context, workflowSpecs []string, verbose bool
 
 	// Step 8: Confirm with user
 	var secretName, secretValue string
-	if config.hasWriteAccess && !config.SkipSecret {
+	if config.hasWriteAccess && !config.SkipSecret && !config.UseCopilotRequests {
 		secretName, secretValue, err = config.resolveEngineApiKeyCredential()
 		if err != nil {
 			return err
@@ -178,6 +184,10 @@ func (c *AddInteractiveConfig) resolveWorkflows() error {
 
 // showWorkflowDescriptions displays the descriptions of resolved workflows
 func (c *AddInteractiveConfig) showWorkflowDescriptions() {
+	if !c.Verbose {
+		return
+	}
+
 	if c.resolvedWorkflows == nil || len(c.resolvedWorkflows.Workflows) == 0 {
 		return
 	}
@@ -195,14 +205,40 @@ func (c *AddInteractiveConfig) showWorkflowDescriptions() {
 func (c *AddInteractiveConfig) determineFilesToAdd() (workflowFiles []string, initFiles []string, err error) {
 	addInteractiveLog.Print("Determining files to add")
 
-	// Parse the workflow specs to get the files that will be added
-	for _, spec := range c.WorkflowSpecs {
-		parsed, parseErr := parseWorkflowSpec(spec)
-		if parseErr != nil {
-			return nil, nil, fmt.Errorf("invalid workflow specification '%s': %w", spec, parseErr)
+	// Prefer the pre-resolved workflows (populated by resolveWorkflows). Fall back
+	// to parsing the raw WorkflowSpecs when no workflows were resolved.
+	if c.resolvedWorkflows != nil && len(c.resolvedWorkflows.Workflows) > 0 {
+		workflowSpecsForError := strings.Join(c.WorkflowSpecs, ", ")
+		for i, rw := range c.resolvedWorkflows.Workflows {
+			if rw == nil {
+				return nil, nil, fmt.Errorf("resolved workflow at position %d from %q is nil", i+1, workflowSpecsForError)
+			}
+			if rw.Spec == nil {
+				return nil, nil, fmt.Errorf("resolved workflow at position %d from %q is missing its specification", i+1, workflowSpecsForError)
+			}
+			workflowName := strings.TrimSpace(rw.Spec.WorkflowName)
+			if workflowName == "" {
+				return nil, nil, fmt.Errorf("resolved workflow at position %d from %q is missing its workflow name", i+1, workflowSpecsForError)
+			}
+			if rw.IsActionWorkflow {
+				// Raw GitHub Actions YAML files are installed as-is; no .lock.yml is produced.
+				workflowFiles = append(workflowFiles, workflowName+".yml")
+			} else {
+				workflowFiles = append(workflowFiles, workflowName+".md")
+				workflowFiles = append(workflowFiles, workflowName+".lock.yml")
+			}
 		}
-		workflowFiles = append(workflowFiles, parsed.WorkflowName+".md")
-		workflowFiles = append(workflowFiles, parsed.WorkflowName+".lock.yml")
+	} else {
+		// Fallback: derive file names from unresolved spec strings. All are assumed to be
+		// agentic workflow .md files since we have no resolution metadata here.
+		workflowNames, nameErr := c.workflowNamesForInteractiveAdd()
+		if nameErr != nil {
+			return nil, nil, nameErr
+		}
+		for _, workflowName := range workflowNames {
+			workflowFiles = append(workflowFiles, workflowName+".md")
+			workflowFiles = append(workflowFiles, workflowName+".lock.yml")
+		}
 	}
 
 	fmt.Fprintln(os.Stderr, "")
@@ -212,6 +248,45 @@ func (c *AddInteractiveConfig) determineFilesToAdd() (workflowFiles []string, in
 	}
 
 	return workflowFiles, initFiles, nil
+}
+
+func (c *AddInteractiveConfig) workflowNamesForInteractiveAdd() ([]string, error) {
+	workflowSpecsForError := strings.Join(c.WorkflowSpecs, ", ")
+	if c.resolvedWorkflows != nil && len(c.resolvedWorkflows.Workflows) > 0 {
+		workflowNames := make([]string, 0, len(c.resolvedWorkflows.Workflows))
+		for i, resolvedWorkflow := range c.resolvedWorkflows.Workflows {
+			if resolvedWorkflow == nil {
+				return nil, fmt.Errorf("resolved manifest workflow at position %d from %q is nil", i+1, workflowSpecsForError)
+			}
+			if resolvedWorkflow.Spec == nil {
+				return nil, fmt.Errorf("resolved manifest workflow at position %d from %q is missing its specification", i+1, workflowSpecsForError)
+			}
+			workflowName := strings.TrimSpace(resolvedWorkflow.Spec.WorkflowName)
+			if workflowName == "" {
+				return nil, fmt.Errorf("resolved manifest workflow at position %d from %q is missing its workflow name", i+1, workflowSpecsForError)
+			}
+			workflowNames = append(workflowNames, workflowName)
+		}
+		return workflowNames, nil
+	}
+
+	workflowNames := make([]string, 0, len(c.WorkflowSpecs))
+	for _, spec := range c.WorkflowSpecs {
+		parsed, parseErr := parseWorkflowSpec(spec)
+		if parseErr != nil {
+			return nil, fmt.Errorf("invalid workflow specification '%s': %w", spec, parseErr)
+		}
+		workflowNames = append(workflowNames, parsed.WorkflowName)
+	}
+	return workflowNames, nil
+}
+
+func (c *AddInteractiveConfig) primaryWorkflowName() string {
+	workflowNames, err := c.workflowNamesForInteractiveAdd()
+	if err != nil || len(workflowNames) == 0 {
+		return ""
+	}
+	return workflowNames[0]
 }
 
 // confirmChanges asks the user to confirm the changes

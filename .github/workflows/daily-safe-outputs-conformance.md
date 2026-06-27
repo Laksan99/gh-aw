@@ -1,4 +1,6 @@
 ---
+private: true
+emoji: "✅"
 description: Daily automated conformance check for Safe Outputs specification implementation, analyzing critical/high/medium/low issues and creating agentic tasks for Copilot
 on:
   schedule: daily
@@ -30,7 +32,10 @@ imports:
       expires: 1d
 
 
-  - shared/observability-otlp.md
+  - shared/otlp.md
+sandbox:
+  agent:
+    sudo: false
 ---
 
 # Daily Safe Outputs Conformance Checker
@@ -63,7 +68,7 @@ Execute the conformance checker script and capture its output:
 
 ```bash
 cd /home/runner/work/gh-aw/gh-aw
-bash scripts/check-safe-outputs-conformance.sh 2>&1 | tee /tmp/conformance-results.txt
+bash scripts/check-safe-outputs-conformance.sh 2>&1 | tee /tmp/gh-aw/agent/conformance-results.txt
 exit_code=${PIPESTATUS[0]}
 echo "Exit code: $exit_code"
 ```
@@ -75,13 +80,13 @@ echo "Exit code: $exit_code"
 
 ## Phase 2: Parse and Analyze Results
 
-Analyze the output from `/tmp/conformance-results.txt`:
+Analyze the output from `/tmp/gh-aw/agent/conformance-results.txt`:
 
 1. **Extract failure counts** from the summary section:
-   - Critical Failures: `grep "Critical Failures:" /tmp/conformance-results.txt`
-   - High Failures: `grep "High Failures:" /tmp/conformance-results.txt`
-   - Medium Failures: `grep "Medium Failures:" /tmp/conformance-results.txt`
-   - Low Failures: `grep "Low Failures:" /tmp/conformance-results.txt`
+   - Critical Failures: `grep "Critical Failures:" /tmp/gh-aw/agent/conformance-results.txt`
+   - High Failures: `grep "High Failures:" /tmp/gh-aw/agent/conformance-results.txt`
+   - Medium Failures: `grep "Medium Failures:" /tmp/gh-aw/agent/conformance-results.txt`
+   - Low Failures: `grep "Low Failures:" /tmp/gh-aw/agent/conformance-results.txt`
 
 2. **Extract specific check failures** by parsing lines that start with:
    - `[CRITICAL]` - Security violations requiring immediate attention
@@ -157,7 +162,7 @@ The check [CHECK_ID] should pass without errors.
 
 ### References
 
-- Safe Outputs Specification: docs/src/content/docs/reference/safe-outputs-specification.md
+- Safe Outputs Specification: docs/src/content/docs/specs/safe-outputs-specification.md
 - Conformance Checker: scripts/check-safe-outputs-conformance.sh
 - Run ID: ${{ github.run_id }}
 - Date: $(date +%Y-%m-%d)

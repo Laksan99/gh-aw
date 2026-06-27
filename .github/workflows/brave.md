@@ -1,37 +1,42 @@
 ---
+private: true
+emoji: "🦁"
 description: Performs web searches using Brave search engine when invoked with /brave command in issues or PRs
 on:
   slash_command:
     strategy: centralized
     name: brave
     events: [issue_comment]
+max-daily-ai-credits: 10000
 permissions:
   contents: read
   issues: read
   pull-requests: read
-engine: copilot
+  copilot-requests: write
+engine:
+  id: copilot
+  copilot-sdk: true
 strict: true
 imports:
   - shared/mcp/brave.md
-  - shared/observability-otlp.md
+  - shared/otlp.md
 safe-outputs:
   add-comment:
     max: 1
   messages:
-    footer: "> 🦁 *Search results brought to you by [{workflow_name}]({run_url})*{effective_tokens_suffix}{history_link}"
+    footer: "> 🦁 *Search results brought to you by [{workflow_name}]({run_url})*{ai_credits_suffix}{history_link}"
     footer-workflow-recompile: "> 🔄 *Maintenance report by [{workflow_name}]({run_url}) for {repository}*"
     run-started: "🔍 [{workflow_name}]({run_url}) is searching the web on this {event_type}."
     run-success: "✅ Research complete. [{workflow_name}]({run_url}) has returned with results."
     run-failure: "❌ Search failed. [{workflow_name}]({run_url}) {status}. Unable to retrieve web sources."
 timeout-minutes: 10
-features:
-  copilot-requests: true
-firewall:
-  effective-token-steering: true
-
+sandbox:
+  agent:
+    sudo: false
 tools:
   cli-proxy: true
-
+features:
+  gh-aw-detection: true
 ---
 
 # Brave Web Search Agent

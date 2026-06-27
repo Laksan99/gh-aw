@@ -45,10 +45,8 @@ Shows health metrics for workflows including:
 When called without a workflow name, displays summary for all workflows.
 When called with a specific workflow name, displays detailed metrics for that workflow.
 
-` + WorkflowIDExplanation + `
-
-Examples:
-  ` + string(constants.CLIExtensionPrefix) + ` health                       # Summary of all workflows (last 7 days)
+` + WorkflowIDExplanation,
+		Example: `  ` + string(constants.CLIExtensionPrefix) + ` health                       # Summary of all workflows (last 7 days)
   ` + string(constants.CLIExtensionPrefix) + ` health issue-monster         # Detailed metrics for specific workflow
   ` + string(constants.CLIExtensionPrefix) + ` health --days 30             # Summary for last 30 days
   ` + string(constants.CLIExtensionPrefix) + ` health --threshold 90        # Warn if below 90% success rate
@@ -272,7 +270,7 @@ func displayDetailedHealth(runs []WorkflowRun, config HealthConfig) error {
 		if err != nil {
 			return fmt.Errorf("failed to marshal JSON: %w", err)
 		}
-		fmt.Println(string(jsonBytes))
+		fmt.Fprintln(os.Stdout, string(jsonBytes))
 		return nil
 	}
 
@@ -294,8 +292,6 @@ func displayDetailedHealth(runs []WorkflowRun, config HealthConfig) error {
 		{"Trend", health.Trend},
 		{"Avg Duration", health.DisplayDur},
 		{"Avg Tokens", health.DisplayTokens},
-		{"Avg Cost", "$" + health.DisplayCost},
-		{"Total Cost", fmt.Sprintf("$%.3f", health.TotalCost)},
 	}
 
 	fmt.Fprint(os.Stderr, console.RenderStruct(details))
@@ -317,7 +313,7 @@ func outputHealthJSON(summary HealthSummary) error {
 	if err != nil {
 		return fmt.Errorf("failed to marshal JSON: %w", err)
 	}
-	fmt.Println(string(jsonBytes))
+	fmt.Fprintln(os.Stdout, string(jsonBytes))
 	return nil
 }
 

@@ -1,16 +1,22 @@
 ---
+private: true
+emoji: "🤖"
 description: Investigates suspicious repository activity and maintains a single triage issue
 on:
   schedule:
     - cron: "every 6h"  # Every ~6 hours (scattered to avoid thundering herd)
   workflow_dispatch:
+max-daily-ai-credits: 10000
 permissions:
   contents: read
   pull-requests: read
   issues: read
   actions: read
 imports:
-  - shared/observability-otlp.md
+  - shared/otlp.md
+sandbox:
+  agent:
+    sudo: false
 tools:
   cli-proxy: true
   github:
@@ -34,7 +40,7 @@ jobs:
     steps:
       - name: Precompute deterministic findings
         id: precompute
-        uses: actions/github-script@v9
+        uses: actions/github-script@v9.0.0
         with:
           github-token: ${{ secrets.GITHUB_TOKEN }}
           script: |
@@ -829,12 +835,12 @@ safe-outputs:
 timeout-minutes: 10
 strict: true
 
-
 ---
 
 # Bot Detection
 
 You are a repository security triage agent whose job is to detect and summarize **suspicious activity** in ${{ github.repository }} over the last **6 hours**.
+Use the inline skill `bot-detection-risk-scoring` for deterministic risk scoring details.
 
 ## What to Investigate
 
@@ -900,7 +906,10 @@ This workflow enforces determinism via a **precompute job**.
 
 - Do not modify the precomputed markdown body.
 
-## Risk Scoring (rules-based)
+## skill: `bot-detection-risk-scoring`
+---
+description: Documents deterministic bot-detection risk scoring rules and thresholds.
+---
 
 `risk_score` is computed in the precompute job (cap 100) from deterministic signals:
 

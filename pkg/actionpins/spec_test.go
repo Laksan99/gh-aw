@@ -4,6 +4,7 @@ package actionpins_test
 
 import (
 	"context"
+	"errors"
 	"strings"
 	"testing"
 
@@ -93,6 +94,11 @@ func TestSpec_PublicAPI_ExtractRepo(t *testing.T) {
 			uses:     "actions/setup-go@cdabf2d4679a00bef48b5a7c69a9b8d0b4f6e3c9",
 			expected: "actions/setup-go",
 		},
+		{
+			name:     "no @ separator returns full string",
+			uses:     "actions/checkout",
+			expected: "actions/checkout",
+		},
 	}
 
 	for _, tt := range tests {
@@ -119,6 +125,11 @@ func TestSpec_PublicAPI_ExtractVersion(t *testing.T) {
 			name:     "extracts sha version",
 			uses:     "actions/setup-go@abc123def456",
 			expected: "abc123def456",
+		},
+		{
+			name:     "no @ separator returns empty string",
+			uses:     "actions/checkout",
+			expected: "",
 		},
 	}
 
@@ -155,7 +166,7 @@ func TestSpec_PublicAPI_GetLatestActionPinByRepo(t *testing.T) {
 	t.Run("returns a pin for a known repository", func(t *testing.T) {
 		known := "actions/checkout"
 		pin, ok := actionpins.GetLatestActionPinByRepo(known)
-		assert.True(t, ok, "should return true for a known repo")
+		require.True(t, ok, "should return true for a known repo")
 		assert.Equal(t, known, pin.Repo, "returned pin should belong to the queried repo")
 	})
 }
@@ -173,6 +184,49 @@ func TestSpec_PublicAPI_ResolveActionPin(t *testing.T) {
 	})
 }
 
+// TestSpec_PublicAPI_ResolveActionPin_NilContext validates nil context fallback to embedded pins.
+func TestSpec_PublicAPI_ResolveActionPin_NilContext(t *testing.T) {
+	latestPin, ok := actionpins.GetLatestActionPinByRepo("actions/checkout")
+	require.True(t, ok, "expected embedded pins for actions/checkout")
+
+	result, err := actionpins.ResolveActionPin("actions/checkout", latestPin.Version, nil)
+	require.NoError(t, err, "nil ctx should still resolve from embedded pins")
+	assert.Equal(t,
+		actionpins.FormatPinnedActionReference("actions/checkout", latestPin.SHA, latestPin.Version),
+		result,
+		"nil ctx should resolve from embedded pins with correct SHA and format")
+}
+
+// TestSpec_PublicAPI_ResolveActionPin_EnforcePinned validates unresolved pin handling in enforce mode.
+func TestSpec_PublicAPI_ResolveActionPin_EnforcePinned(t *testing.T) {
+	t.Run("returns error when EnforcePinned=true and pin is unresolved", func(t *testing.T) {
+		var failures []actionpins.ResolutionFailure
+		ctx := &actionpins.PinContext{
+			EnforcePinned: true,
+			Warnings:      make(map[string]bool),
+			RecordResolutionFailure: func(f actionpins.ResolutionFailure) {
+				failures = append(failures, f)
+			},
+		}
+		_, err := actionpins.ResolveActionPin("does-not-exist/x", "v1", ctx)
+		require.Error(t, err, "enforce mode should return an error when pin is unresolved")
+		assert.Contains(t, err.Error(), "unable to pin action",
+			"enforce mode error should mention unable to pin action")
+		require.Len(t, failures, 1, "failure should be audited when enforce mode errors")
+		assert.Equal(t, actionpins.ResolutionErrorTypePinNotFound, failures[0].ErrorType,
+			"unresolved pin in enforce mode should audit pin_not_found")
+	})
+
+	t.Run("AllowActionRefs downgrades to warning with no error", func(t *testing.T) {
+		ctx := &actionpins.PinContext{EnforcePinned: true, AllowActionRefs: true, Warnings: make(map[string]bool)}
+		result, err := actionpins.ResolveActionPin("does-not-exist/x", "v1", ctx)
+		require.NoError(t, err, "AllowActionRefs should downgrade unresolved pin enforcement to warning")
+		assert.Empty(t, result, "AllowActionRefs downgrade should keep unresolved result empty")
+		assert.True(t, ctx.Warnings[actionpins.FormatCacheKey("does-not-exist/x", "v1")],
+			"AllowActionRefs should record warning dedup key")
+	})
+}
+
 // TestSpec_PublicAPI_ResolveLatestActionPin validates latest-version resolution behavior.
 func TestSpec_PublicAPI_ResolveLatestActionPin(t *testing.T) {
 	t.Run("returns latest pinned reference for known repository", func(t *testing.T) {
@@ -184,19 +238,33 @@ func TestSpec_PublicAPI_ResolveLatestActionPin(t *testing.T) {
 		expected := actionpins.FormatPinnedActionReference(known, latestPin.SHA, latestPin.Version)
 		assert.Equal(t, expected, result, "should resolve latest pinned reference")
 	})
+
+	t.Run("returns empty string for unknown repository", func(t *testing.T) {
+		result := actionpins.ResolveLatestActionPin("does-not-exist/x", nil)
+		assert.Empty(t, result, "unknown repo should return empty pin")
+	})
 }
 
 // TestSpec_Types_PinContext validates the documented PinContext type fields.
 func TestSpec_Types_PinContext(t *testing.T) {
-	t.Run("can construct PinContext with StrictMode enabled", func(t *testing.T) {
-		ctx := &actionpins.PinContext{StrictMode: true}
-		assert.NotNil(t, ctx)
+	t.Run("strict mode disables non-exact fallback", func(t *testing.T) {
+		ctx := &actionpins.PinContext{StrictMode: true, Warnings: make(map[string]bool)}
+		result, err := actionpins.ResolveActionPin("actions/checkout", "v999", ctx)
+		require.NoError(t, err)
+		assert.Empty(t, result, "strict mode must not fall back to a non-exact version")
 	})
 
-	t.Run("can construct PinContext without resolver for embedded-only lookup", func(t *testing.T) {
-		ctx := &actionpins.PinContext{}
-		assert.NotNil(t, ctx)
-		assert.Nil(t, ctx.Resolver, "nil Resolver enables embedded-only lookup")
+	t.Run("nil resolver enables embedded-only lookup", func(t *testing.T) {
+		latestPin, ok := actionpins.GetLatestActionPinByRepo("actions/checkout")
+		require.True(t, ok, "expected embedded pins for actions/checkout")
+
+		ctx := &actionpins.PinContext{Warnings: make(map[string]bool)}
+		result, err := actionpins.ResolveActionPin("actions/checkout", latestPin.Version, ctx)
+		require.NoError(t, err)
+		assert.Equal(t,
+			actionpins.FormatPinnedActionReference("actions/checkout", latestPin.SHA, latestPin.Version),
+			result,
+			"nil Resolver should use embedded pins")
 	})
 }
 
@@ -210,8 +278,8 @@ func TestSpec_DesignDecision_FormatConsistency(t *testing.T) {
 	cacheKey := actionpins.FormatCacheKey(repo, version)
 	reference := actionpins.FormatPinnedActionReference(repo, sha, version)
 
-	assert.True(t, strings.HasPrefix(cacheKey, repo+"@"), "cache key should be repo@version")
-	assert.True(t, strings.HasPrefix(reference, repo+"@"), "reference should start with repo@sha")
+	assert.Truef(t, strings.HasPrefix(cacheKey, repo+"@"), "cache key should be repo@version, got %q", cacheKey)
+	assert.Truef(t, strings.HasPrefix(reference, repo+"@"), "reference should start with repo@sha, got %q", reference)
 	assert.Contains(t, cacheKey, version, "cache key should contain version")
 	assert.Contains(t, reference, sha, "reference should contain sha")
 	assert.Contains(t, reference, version, "reference should contain version comment")
@@ -251,10 +319,18 @@ func TestSpec_Types_ActionPinsData(t *testing.T) {
 		Entries: map[string]actionpins.ActionPin{
 			"actions/checkout@v5": {Repo: "actions/checkout", Version: "v5", SHA: "abc123"},
 		},
+		Containers: map[string]actionpins.ContainerPin{
+			"ghcr.io/example/image:latest": {
+				Image:       "ghcr.io/example/image:latest",
+				Digest:      "sha256:def456",
+				PinnedImage: "ghcr.io/example/image@sha256:def456",
+			},
+		},
 	}
 	assert.Len(t, data.Entries, 1, "ActionPinsData.Entries should hold pin entries")
 	entry := data.Entries["actions/checkout@v5"]
 	assert.Equal(t, "actions/checkout", entry.Repo, "entry Repo should match")
+	assert.Len(t, data.Containers, 1, "ActionPinsData.Containers should hold container pins")
 }
 
 // TestSpec_PublicAPI_ResolveActionPin_EmbeddedMatch validates embedded-only pin resolution returns
@@ -326,22 +402,22 @@ func TestSpec_DynamicResolution_VersionCommentConsistency(t *testing.T) {
 	})
 }
 
-// TestSpec_PublicAPI_GetActionPins_SPEC_MISMATCH documents a spec-implementation gap.
-// SPEC_MISMATCH: The README specifies GetActionPins() []ActionPin ("Returns all loaded pins")
-// but this function is not implemented. Only GetActionPinsByRepo(repo string) is available.
-// Proxy validation: verify embedded data is non-empty via the available API.
-func TestSpec_PublicAPI_GetActionPins_SPEC_MISMATCH(t *testing.T) {
-	// SPEC_MISMATCH: GetActionPins() documented in README does not exist in the implementation.
-	pins := actionpins.GetActionPinsByRepo("actions/checkout")
-	assert.NotEmpty(t, pins, "embedded pin data should be non-empty (proxy for missing GetActionPins)")
-}
-
 // TestSpec_PublicAPI_GetContainerPin validates the documented GetContainerPin function.
 // Spec: "Returns a pinned container image by its original image reference"
 func TestSpec_PublicAPI_GetContainerPin(t *testing.T) {
 	t.Run("returns false for unknown container image", func(t *testing.T) {
 		_, ok := actionpins.GetContainerPin("does-not-exist/unknown-image:latest")
 		assert.False(t, ok, "should return false for unknown container image")
+	})
+
+	t.Run("returns pinned container for known image", func(t *testing.T) {
+		// "alpine:latest" is present in the embedded action_pins.json containers map.
+		pin, ok := actionpins.GetContainerPin("alpine:latest")
+		require.True(t, ok, "should return true for a known container image")
+		assert.Equal(t, "alpine:latest", pin.Image, "ContainerPin.Image should match the queried image")
+		assert.NotEmpty(t, pin.Digest, "ContainerPin.Digest should be non-empty for a known image")
+		assert.NotEmpty(t, pin.PinnedImage, "ContainerPin.PinnedImage should be non-empty for a known image")
+		assert.Contains(t, pin.PinnedImage, pin.Digest, "PinnedImage should contain the digest")
 	})
 }
 
@@ -356,6 +432,73 @@ func TestSpec_Types_ContainerPin(t *testing.T) {
 	assert.Equal(t, "ghcr.io/some/image:v1", pin.Image, "ContainerPin.Image field")
 	assert.Equal(t, "sha256:abc123", pin.Digest, "ContainerPin.Digest field")
 	assert.Equal(t, "ghcr.io/some/image@sha256:abc123", pin.PinnedImage, "ContainerPin.PinnedImage field")
+}
+
+// TestSpec_Constants_ResolutionErrorType validates the documented ResolutionErrorType constant values.
+// Spec table: ResolutionErrorTypeDynamicResolutionFailed="dynamic_resolution_failed",
+// ResolutionErrorTypePinNotFound="pin_not_found".
+func TestSpec_Constants_ResolutionErrorType(t *testing.T) {
+	assert.Equal(t, "dynamic_resolution_failed", string(actionpins.ResolutionErrorTypeDynamicResolutionFailed),
+		"ResolutionErrorTypeDynamicResolutionFailed should equal the documented value")
+	assert.Equal(t, "pin_not_found", string(actionpins.ResolutionErrorTypePinNotFound),
+		"ResolutionErrorTypePinNotFound should equal the documented value")
+}
+
+// TestSpec_Types_ResolutionFailure validates the documented ResolutionFailure type structure.
+// Spec: "Captures an unresolved action-ref pinning event (repo, ref, error type)".
+func TestSpec_Types_ResolutionFailure(t *testing.T) {
+	failure := actionpins.ResolutionFailure{
+		Repo:      "unknown/action",
+		Ref:       "v1",
+		ErrorType: actionpins.ResolutionErrorTypePinNotFound,
+	}
+	assert.Equal(t, "unknown/action", failure.Repo, "ResolutionFailure.Repo field")
+	assert.Equal(t, "v1", failure.Ref, "ResolutionFailure.Ref field")
+	assert.Equal(t, actionpins.ResolutionErrorTypePinNotFound, failure.ErrorType, "ResolutionFailure.ErrorType field")
+}
+
+// TestSpec_PublicAPI_RecordResolutionFailure validates the documented auditing behavior:
+// PinContext.RecordResolutionFailure collects ResolutionFailure events for unresolved pins,
+// classified with ResolutionErrorTypePinNotFound when no usable pin is found.
+// Spec section "Auditing Resolution Failures".
+func TestSpec_PublicAPI_RecordResolutionFailure(t *testing.T) {
+	var failures []actionpins.ResolutionFailure
+	ctx := &actionpins.PinContext{
+		Warnings: make(map[string]bool),
+		RecordResolutionFailure: func(f actionpins.ResolutionFailure) {
+			failures = append(failures, f)
+		},
+	}
+
+	_, err := actionpins.ResolveActionPin("does-not-exist/unknown-action-xyzzy", "v1", ctx)
+	require.NoError(t, err, "ResolveActionPin should not error even when the pin is unresolved")
+
+	require.Len(t, failures, 1, "RecordResolutionFailure should be invoked once for an unresolved pin")
+	assert.Equal(t, actionpins.ResolutionErrorTypePinNotFound, failures[0].ErrorType,
+		"unresolved pin with no resolver should be classified as pin_not_found")
+	assert.Equal(t, "does-not-exist/unknown-action-xyzzy", failures[0].Repo,
+		"recorded failure should carry the queried repo")
+	assert.Equal(t, "v1", failures[0].Ref, "recorded failure should carry the queried ref")
+}
+
+// TestSpec_PublicAPI_RecordResolutionFailure_DynamicFailed validates dynamic-resolution failure auditing.
+func TestSpec_PublicAPI_RecordResolutionFailure_DynamicFailed(t *testing.T) {
+	var failures []actionpins.ResolutionFailure
+	ctx := &actionpins.PinContext{
+		Resolver: &testSHAResolver{err: errors.New("network error")},
+		Warnings: make(map[string]bool),
+		RecordResolutionFailure: func(f actionpins.ResolutionFailure) {
+			failures = append(failures, f)
+		},
+	}
+
+	_, err := actionpins.ResolveActionPin("does-not-exist/x", "v1", ctx)
+	require.NoError(t, err, "dynamic resolver failures should be audited and downgraded to unresolved pin")
+	require.Len(t, failures, 1, "expected one resolution failure to be recorded")
+	assert.Equal(t, actionpins.ResolutionErrorTypeDynamicResolutionFailed, failures[0].ErrorType,
+		"resolver error should classify as dynamic_resolution_failed")
+	assert.Equal(t, "does-not-exist/x", failures[0].Repo, "recorded failure should carry the queried repo")
+	assert.Equal(t, "v1", failures[0].Ref, "recorded failure should carry the queried ref")
 }
 
 // TestSpec_ThreadSafety_ConcurrentGetActionPinsByRepo validates that concurrent calls to GetActionPinsByRepo
@@ -377,10 +520,114 @@ func TestSpec_ThreadSafety_ConcurrentGetActionPinsByRepo(t *testing.T) {
 		<-done
 	}
 
+	require.NotEmpty(t, results[0], "baseline goroutine 0 should return pins")
 	for i := 1; i < goroutines; i++ {
 		assert.NotEmpty(t, results[i], "concurrent GetActionPinsByRepo should return pins for known repo")
-		assert.Len(t, results[i], len(results[0]),
+		assert.Lenf(t, results[i], len(results[0]),
 			"concurrent GetActionPinsByRepo should return same number of pins (goroutine %d vs 0)", i)
 	}
-	assert.NotEmpty(t, results[0], "concurrent GetActionPinsByRepo should return pins for known repo")
+}
+
+// TestSpec_PublicAPI_ResolveActionPin_DynamicHappyPath validates that a dynamic resolver that
+// successfully returns a SHA produces a correctly formatted pinned reference.
+func TestSpec_PublicAPI_ResolveActionPin_DynamicHappyPath(t *testing.T) {
+	known := "actions/checkout"
+	latestPin, ok := actionpins.GetLatestActionPinByRepo(known)
+	require.True(t, ok, "prerequisite: known repo must be in embedded data")
+
+	// Resolver returns the SHA of the latest embedded pin so that the resolved
+	// version comment can be verified end-to-end.
+	ctx := &actionpins.PinContext{
+		Resolver: &testSHAResolver{sha: latestPin.SHA},
+		Warnings: make(map[string]bool),
+	}
+	result, err := actionpins.ResolveActionPin(known, "v4", ctx)
+	require.NoError(t, err, "dynamic resolver success should not return an error")
+	assert.NotEmpty(t, result, "should return a non-empty pinned reference when resolver succeeds")
+	assert.Contains(t, result, latestPin.SHA, "result should contain the SHA returned by the resolver")
+	assert.True(t, strings.HasPrefix(result, known+"@"),
+		"result should start with repo@sha in the documented format")
+}
+
+// TestSpec_PublicAPI_ResolveLatestActionPin_NonNilContext validates that a non-nil PinContext
+// is forwarded correctly to the embedded pin resolution path.
+func TestSpec_PublicAPI_ResolveLatestActionPin_NonNilContext(t *testing.T) {
+	known := "actions/checkout"
+	latestPin, ok := actionpins.GetLatestActionPinByRepo(known)
+	require.True(t, ok, "prerequisite: known repo must be in embedded data")
+
+	ctx := &actionpins.PinContext{Warnings: make(map[string]bool)}
+	result := actionpins.ResolveLatestActionPin(known, ctx)
+	expected := actionpins.FormatPinnedActionReference(known, latestPin.SHA, latestPin.Version)
+	assert.Equal(t, expected, result,
+		"non-nil ctx without a resolver should resolve the same reference as the nil-ctx path")
+}
+
+// TestSpec_PublicAPI_RecordResolutionFailure_WarningDedup validates that repeated resolution
+// failures for the same repo@version emit the warning only once (Warnings map deduplication).
+func TestSpec_PublicAPI_RecordResolutionFailure_WarningDedup(t *testing.T) {
+	var failures []actionpins.ResolutionFailure
+	ctx := &actionpins.PinContext{
+		Warnings: make(map[string]bool),
+		RecordResolutionFailure: func(f actionpins.ResolutionFailure) {
+			failures = append(failures, f)
+		},
+	}
+
+	repo, version := "does-not-exist/x", "v1"
+	cacheKey := actionpins.FormatCacheKey(repo, version)
+
+	// First call: failure is recorded and warning key is set.
+	_, err := actionpins.ResolveActionPin(repo, version, ctx)
+	require.NoError(t, err)
+	require.Len(t, failures, 1, "first call should record one resolution failure")
+	assert.True(t, ctx.Warnings[cacheKey], "warning key should be set after first call")
+
+	// Second call with the same args: failure is recorded again (auditing is not
+	// deduplicated), but the warning is suppressed by the Warnings map.
+	_, err = actionpins.ResolveActionPin(repo, version, ctx)
+	require.NoError(t, err)
+	assert.Len(t, failures, 2, "second call should append another resolution failure")
+	assert.True(t, ctx.Warnings[cacheKey], "warning dedup key should remain set after second call")
+}
+
+// TestSpec_PublicAPI_ResolveActionPin_AppliesMapping validates that ctx.Mappings redirects
+// action resolution to the mapped repository and version.
+func TestSpec_PublicAPI_ResolveActionPin_AppliesMapping(t *testing.T) {
+	// actions/checkout is in the embedded pins; acme-corp/checkout is not.
+	// After mapping, resolution should succeed using the mapped repo's pins.
+	checkoutPins := actionpins.GetActionPinsByRepo("actions/checkout")
+	require.NotEmpty(t, checkoutPins, "prerequisite: embedded pins for actions/checkout must exist")
+
+	t.Run("mapping redirects to a known pinned repo", func(t *testing.T) {
+		ctx := &actionpins.PinContext{
+			Warnings: make(map[string]bool),
+			Mappings: map[string]string{
+				"actions/setup-node@v4": "actions/checkout@v4",
+			},
+		}
+		// Request setup-node@v4 which is mapped to checkout@v4 — both exist in embedded pins.
+		result, err := actionpins.ResolveActionPin("actions/setup-node", "v4", ctx)
+		require.NoError(t, err)
+		assert.Contains(t, result, "actions/checkout@", "result should reference the mapped repo")
+	})
+
+	t.Run("mapping notification key is recorded in warnings", func(t *testing.T) {
+		ctx := &actionpins.PinContext{
+			Warnings: make(map[string]bool),
+			Mappings: map[string]string{
+				"actions/setup-node@v4": "actions/checkout@v4",
+			},
+		}
+		_, _ = actionpins.ResolveActionPin("actions/setup-node", "v4", ctx)
+		assert.True(t, ctx.Warnings["map:actions/setup-node@v4"], "mapping notification key should be set in warnings")
+	})
+
+	t.Run("no mapping leaves resolution unchanged", func(t *testing.T) {
+		ctx := &actionpins.PinContext{Warnings: make(map[string]bool)}
+
+		result, err := actionpins.ResolveActionPin("actions/checkout", "v4", ctx)
+		require.NoError(t, err)
+		assert.Contains(t, result, "actions/checkout@", "result should reference the original repo when no mapping exists")
+	})
 }

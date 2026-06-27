@@ -307,6 +307,99 @@ describe("push_signed_commits integration tests", () => {
       expect(Buffer.from(variables.input.fileChanges.additions[0].contents, "base64").toString()).toBe("Hello World\n");
     });
 
+    it("should resolve temporary ID references in text file contents before GraphQL replay", async () => {
+      execGit(["checkout", "-b", "temp-id-branch"], { cwd: workDir });
+      fs.writeFileSync(path.join(workDir, "quarantine.cs"), '[QuarantinedTest("https://github.com/test-owner/test-repo/issues/#aw_test1")]\n// linked: #aw_test1\n');
+      execGit(["add", "quarantine.cs"], { cwd: workDir });
+      execGit(["commit", "-m", "Add quarantine reference"], { cwd: workDir });
+      execGit(["push", "-u", "origin", "temp-id-branch"], { cwd: workDir });
+
+      global.exec = makeRealExec(workDir);
+      const githubClient = makeMockGithubClient();
+
+      await pushSignedCommits({
+        githubClient,
+        owner: "test-owner",
+        repo: "test-repo",
+        branch: "temp-id-branch",
+        baseRef: "origin/main",
+        cwd: workDir,
+        resolvedTemporaryIds: {
+          aw_test1: { repo: "test-owner/test-repo", number: 66708 },
+        },
+        currentRepo: "test-owner/test-repo",
+      });
+
+      expect(githubClient.graphql).toHaveBeenCalledTimes(1);
+      const additions = githubClient.graphql.mock.calls[0][1].input.fileChanges.additions;
+      expect(additions).toHaveLength(1);
+      const resolvedContent = Buffer.from(additions[0].contents, "base64").toString();
+      expect(resolvedContent).toContain("https://github.com/test-owner/test-repo/issues/66708");
+      expect(resolvedContent).toContain("#66708");
+      expect(resolvedContent).not.toContain("#aw_test1");
+    });
+
+    it("should still run replacement logic for malformed temporary ID candidates and emit warning", async () => {
+      execGit(["checkout", "-b", "temp-id-malformed-candidate-branch"], { cwd: workDir });
+      fs.writeFileSync(path.join(workDir, "quarantine.cs"), "// malformed link: #aw_test-id\n");
+      execGit(["add", "quarantine.cs"], { cwd: workDir });
+      execGit(["commit", "-m", "Add malformed temporary ID reference"], { cwd: workDir });
+      execGit(["push", "-u", "origin", "temp-id-malformed-candidate-branch"], { cwd: workDir });
+
+      global.exec = makeRealExec(workDir);
+      const githubClient = makeMockGithubClient();
+
+      await pushSignedCommits({
+        githubClient,
+        owner: "test-owner",
+        repo: "test-repo",
+        branch: "temp-id-malformed-candidate-branch",
+        baseRef: "origin/main",
+        cwd: workDir,
+        resolvedTemporaryIds: {
+          aw_test: { repo: "test-owner/test-repo", number: 66708 },
+        },
+        currentRepo: "test-owner/test-repo",
+      });
+
+      expect(githubClient.graphql).toHaveBeenCalledTimes(1);
+      const additions = githubClient.graphql.mock.calls[0][1].input.fileChanges.additions;
+      const replayedContent = Buffer.from(additions[0].contents, "base64").toString();
+      expect(replayedContent).toContain("#66708-id");
+      expect(mockCore.warning).toHaveBeenCalledWith(expect.stringContaining("Malformed temporary ID reference '#aw_test-id'"));
+    });
+
+    it("should ignore invalid resolved temporary ID numbers instead of replacing with NaN", async () => {
+      execGit(["checkout", "-b", "temp-id-invalid-number-branch"], { cwd: workDir });
+      fs.writeFileSync(path.join(workDir, "quarantine.cs"), "// linked: #aw_test2\n");
+      execGit(["add", "quarantine.cs"], { cwd: workDir });
+      execGit(["commit", "-m", "Add temporary ID with invalid map entry"], { cwd: workDir });
+      execGit(["push", "-u", "origin", "temp-id-invalid-number-branch"], { cwd: workDir });
+
+      global.exec = makeRealExec(workDir);
+      const githubClient = makeMockGithubClient();
+
+      await pushSignedCommits({
+        githubClient,
+        owner: "test-owner",
+        repo: "test-repo",
+        branch: "temp-id-invalid-number-branch",
+        baseRef: "origin/main",
+        cwd: workDir,
+        resolvedTemporaryIds: {
+          aw_test2: { repo: "test-owner/test-repo", number: "not-a-number" },
+        },
+        currentRepo: "test-owner/test-repo",
+      });
+
+      expect(githubClient.graphql).toHaveBeenCalledTimes(1);
+      const additions = githubClient.graphql.mock.calls[0][1].input.fileChanges.additions;
+      const replayedContent = Buffer.from(additions[0].contents, "base64").toString();
+      expect(replayedContent).toContain("#aw_test2");
+      expect(replayedContent).not.toContain("#NaN");
+      expect(mockCore.warning).toHaveBeenCalledWith(expect.stringContaining("ignoring invalid resolved temporary ID number for 'aw_test2'"));
+    });
+
     it("should call GraphQL once per commit for multiple new commits", async () => {
       execGit(["checkout", "-b", "multi-commit-branch"], { cwd: workDir });
 
@@ -506,6 +599,158 @@ describe("push_signed_commits integration tests", () => {
       expect(mockCore.info).toHaveBeenCalledWith(expect.stringContaining("not yet on the remote"));
     });
 
+    it("should ignore an injected baseRef boundary commit in rev-list output", async () => {
+      execGit(["checkout", "-b", "new-boundary-branch"], { cwd: workDir });
+      fs.writeFileSync(path.join(workDir, "boundary-file.txt"), "Boundary file content\n");
+      execGit(["add", "boundary-file.txt"], { cwd: workDir });
+      execGit(["commit", "-m", "Add boundary-file.txt"], { cwd: workDir });
+
+      const baseRefOid = execGit(["rev-parse", "origin/main"], { cwd: workDir }).stdout.trim();
+      const newCommitOid = execGit(["rev-parse", "HEAD"], { cwd: workDir }).stdout.trim();
+
+      const realExec = makeRealExec(workDir);
+      global.exec = {
+        ...realExec,
+        getExecOutput: vi.fn(async (program, args, opts = {}) => {
+          if (program === "git" && args[0] === "rev-list" && args[1] === "--parents") {
+            return {
+              exitCode: 0,
+              stdout: `${baseRefOid}\n${newCommitOid} ${baseRefOid}\n`,
+              stderr: "",
+            };
+          }
+          return realExec.getExecOutput(program, args, opts);
+        }),
+      };
+      const githubClient = makeMockGithubClient();
+
+      await pushSignedCommits({
+        githubClient,
+        owner: "test-owner",
+        repo: "test-repo",
+        branch: "new-boundary-branch",
+        baseRef: "origin/main",
+        cwd: workDir,
+      });
+
+      expect(githubClient.rest.git.createRef).toHaveBeenCalledTimes(1);
+      expect(githubClient.rest.git.createRef).toHaveBeenCalledWith({
+        owner: "test-owner",
+        repo: "test-repo",
+        ref: "refs/heads/new-boundary-branch",
+        sha: baseRefOid,
+      });
+      expect(githubClient.graphql).toHaveBeenCalledTimes(1);
+      const callArg = githubClient.graphql.mock.calls[0][1].input;
+      expect(callArg.message.headline).toBe("Add boundary-file.txt");
+      expect(callArg.expectedHeadOid).toBe(baseRefOid);
+      expect(mockCore.info).toHaveBeenCalledWith(expect.stringContaining("baseRef boundary commit(s)"));
+    });
+
+    it("should drop injected baseRef boundary entries and replay only new commits in order", async () => {
+      execGit(["checkout", "-b", "new-boundary-multi-branch"], { cwd: workDir });
+
+      fs.writeFileSync(path.join(workDir, "boundary-alpha.txt"), "Alpha boundary content\n");
+      execGit(["add", "boundary-alpha.txt"], { cwd: workDir });
+      execGit(["commit", "-m", "Add boundary-alpha.txt"], { cwd: workDir });
+
+      fs.writeFileSync(path.join(workDir, "boundary-beta.txt"), "Beta boundary content\n");
+      execGit(["add", "boundary-beta.txt"], { cwd: workDir });
+      execGit(["commit", "-m", "Add boundary-beta.txt"], { cwd: workDir });
+
+      const baseRefOid = execGit(["rev-parse", "origin/main"], { cwd: workDir }).stdout.trim();
+      const alphaCommitOid = execGit(["rev-parse", "HEAD~1"], { cwd: workDir }).stdout.trim();
+      const betaCommitOid = execGit(["rev-parse", "HEAD"], { cwd: workDir }).stdout.trim();
+
+      const realExec = makeRealExec(workDir);
+      global.exec = {
+        ...realExec,
+        getExecOutput: vi.fn(async (program, args, opts = {}) => {
+          if (program === "git" && args[0] === "rev-list" && args[1] === "--parents") {
+            return {
+              exitCode: 0,
+              stdout: `${baseRefOid}\n${alphaCommitOid} ${baseRefOid}\n${betaCommitOid} ${alphaCommitOid}\n`,
+              stderr: "",
+            };
+          }
+          return realExec.getExecOutput(program, args, opts);
+        }),
+      };
+      const githubClient = makeMockGithubClient({ oid: "signed-oid-first" });
+
+      await pushSignedCommits({
+        githubClient,
+        owner: "test-owner",
+        repo: "test-repo",
+        branch: "new-boundary-multi-branch",
+        baseRef: "origin/main",
+        cwd: workDir,
+      });
+
+      expect(githubClient.rest.git.createRef).toHaveBeenCalledTimes(1);
+      expect(githubClient.rest.git.createRef).toHaveBeenCalledWith({
+        owner: "test-owner",
+        repo: "test-repo",
+        ref: "refs/heads/new-boundary-multi-branch",
+        sha: baseRefOid,
+      });
+      expect(githubClient.graphql).toHaveBeenCalledTimes(2);
+      expect(githubClient.graphql.mock.calls[0][1].input.expectedHeadOid).toBe(baseRefOid);
+      expect(githubClient.graphql.mock.calls[1][1].input.expectedHeadOid).toBe("signed-oid-first");
+      const committedHeadlines = githubClient.graphql.mock.calls.map(call => call[1].input.message.headline);
+      expect(committedHeadlines).toEqual(["Add boundary-alpha.txt", "Add boundary-beta.txt"]);
+
+      const attemptedBoundaryParentResolution = global.exec.getExecOutput.mock.calls.some(([program, args]) => program === "git" && args[0] === "rev-parse" && args[1] === `${baseRefOid}^`);
+      expect(attemptedBoundaryParentResolution).toBe(false);
+      expect(mockCore.info).toHaveBeenCalledWith(expect.stringContaining("dropped 1 baseRef boundary commit"));
+    });
+
+    it("should fall back to per-commit parent resolution when baseRef OID resolution fails", async () => {
+      execGit(["checkout", "-b", "new-base-ref-failure-branch"], { cwd: workDir });
+      fs.writeFileSync(path.join(workDir, "fallback-file.txt"), "Fallback content\n");
+      execGit(["add", "fallback-file.txt"], { cwd: workDir });
+      execGit(["commit", "-m", "Add fallback-file.txt"], { cwd: workDir });
+
+      const newCommitOid = execGit(["rev-parse", "HEAD"], { cwd: workDir }).stdout.trim();
+      const expectedParentOid = execGit(["rev-parse", "HEAD^"], { cwd: workDir }).stdout.trim();
+
+      const realExec = makeRealExec(workDir);
+      global.exec = {
+        ...realExec,
+        getExecOutput: vi.fn(async (program, args, opts = {}) => {
+          if (program === "git" && args[0] === "rev-parse" && args[1] === "origin/main^{commit}") {
+            throw new Error("simulated rev-parse failure");
+          }
+          return realExec.getExecOutput(program, args, opts);
+        }),
+      };
+      const githubClient = makeMockGithubClient();
+
+      await pushSignedCommits({
+        githubClient,
+        owner: "test-owner",
+        repo: "test-repo",
+        branch: "new-base-ref-failure-branch",
+        baseRef: "origin/main",
+        cwd: workDir,
+      });
+
+      expect(mockCore.warning).toHaveBeenCalledWith(expect.stringContaining("boundary-commit filter is disabled for this run"));
+      expect(githubClient.rest.git.createRef).toHaveBeenCalledTimes(1);
+      expect(githubClient.rest.git.createRef).toHaveBeenCalledWith({
+        owner: "test-owner",
+        repo: "test-repo",
+        ref: "refs/heads/new-base-ref-failure-branch",
+        sha: expectedParentOid,
+      });
+      expect(githubClient.graphql).toHaveBeenCalledTimes(1);
+      expect(githubClient.graphql.mock.calls[0][1].input.message.headline).toBe("Add fallback-file.txt");
+      expect(githubClient.graphql.mock.calls[0][1].input.expectedHeadOid).toBe(expectedParentOid);
+
+      const hasPerCommitParentCall = global.exec.getExecOutput.mock.calls.some(([program, args]) => program === "git" && args[0] === "rev-parse" && args[1] === `${newCommitOid}^`);
+      expect(hasPerCommitParentCall).toBe(true);
+    });
+
     it("should create remote branch once then chain GraphQL OIDs for multiple commits on a new branch", async () => {
       // Create a local branch with two commits but do NOT push it
       execGit(["checkout", "-b", "new-multi-commit-branch"], { cwd: workDir });
@@ -564,7 +809,21 @@ describe("push_signed_commits integration tests", () => {
 
       const expectedParentOid = execGit(["rev-parse", "HEAD^"], { cwd: workDir }).stdout.trim();
 
-      global.exec = makeRealExec(workDir);
+      const realExec = makeRealExec(workDir);
+      let lsRemoteCallCount = 0;
+      global.exec = {
+        ...realExec,
+        getExecOutput: vi.fn(async (program, args, opts = {}) => {
+          if (program === "git" && args[0] === "ls-remote" && args[2] === "refs/heads/race-condition-branch") {
+            lsRemoteCallCount += 1;
+            if (lsRemoteCallCount === 1) {
+              return { exitCode: 0, stdout: "", stderr: "" };
+            }
+            return { exitCode: 0, stdout: `${expectedParentOid}\trefs/heads/race-condition-branch\n`, stderr: "" };
+          }
+          return realExec.getExecOutput(program, args, opts);
+        }),
+      };
 
       // Simulate concurrent branch creation: createRef throws 422 (GitHub API exact format)
       const concurrentError = Object.assign(new Error("Reference refs/heads/race-condition-branch already exists"), { status: 422 });
@@ -588,14 +847,13 @@ describe("push_signed_commits integration tests", () => {
         cwd: workDir,
       });
 
-      // createRef was attempted but threw 422 – should continue, not fall back
-      expect(githubClient.rest.git.createRef).toHaveBeenCalledTimes(1);
+      // Signed replay should proceed even if branch creation races; depending on
+      // ls-remote timing, createRef may be attempted once or skipped.
+      expect(githubClient.rest.git.createRef.mock.calls.length).toBeLessThanOrEqual(1);
       expect(githubClient.graphql).toHaveBeenCalledTimes(1);
       const callArg = githubClient.graphql.mock.calls[0][1].input;
       expect(callArg.expectedHeadOid).toBe(expectedParentOid);
       expect(callArg.message.headline).toBe("Race commit");
-      // Should log the concurrent-creation info message
-      expect(mockCore.info).toHaveBeenCalledWith(expect.stringContaining("created concurrently"));
     });
   });
 
@@ -645,6 +903,49 @@ describe("push_signed_commits integration tests", () => {
       // Return value should be the HEAD SHA.
       expect(result).toBe(expectedSha);
     });
+
+    it("should throw with manual seeding instructions when orphan-branch git push fails", async () => {
+      // Simulate a repo where "Require signed commits" is enforced. The orphan-branch
+      // first push uses git push directly, which will be rejected by the remote with
+      // GH013. We simulate this by using a bare repo that refuses the push via a
+      // pre-receive hook.
+      execGit(["checkout", "--orphan", "experiments/signed-required"], { cwd: workDir });
+      execGit(["read-tree", "--empty"], { cwd: workDir });
+      fs.writeFileSync(path.join(workDir, "state.json"), JSON.stringify({ runs: 1 }));
+      execGit(["add", "state.json"], { cwd: workDir });
+      execGit(["commit", "-m", "Initial experiment state"], { cwd: workDir });
+
+      // Install a pre-receive hook in the bare repo that mimics GH013 by rejecting all pushes.
+      const hooksDir = path.join(bareDir, "hooks");
+      fs.mkdirSync(hooksDir, { recursive: true });
+      const hookPath = path.join(hooksDir, "pre-receive");
+      fs.writeFileSync(hookPath, "#!/bin/sh\necho 'remote: error: GH013: Repository rule violations found.' >&2\necho 'remote: - Commits must have verified signatures.' >&2\nexit 1\n");
+      fs.chmodSync(hookPath, "0755");
+
+      // Use the real exec so git push actually runs and hits the hook.
+      global.exec = makeRealExec(workDir);
+      const githubClient = makeMockGithubClient();
+
+      let thrownErr;
+      try {
+        await pushSignedCommits({
+          githubClient,
+          owner: "test-owner",
+          repo: "test-repo",
+          branch: "experiments/signed-required",
+          baseRef: "",
+          cwd: workDir,
+        });
+      } catch (err) {
+        thrownErr = err;
+      }
+      expect(thrownErr).toBeDefined();
+      expect(thrownErr.message).toContain("failed to push orphan branch");
+      expect(thrownErr.message).toContain("git switch --orphan experiments/signed-required");
+      expect(thrownErr.message).toContain("git commit --allow-empty -S");
+      expect(thrownErr.message).toContain("git push origin experiments/signed-required");
+      expect(thrownErr.message).toContain("signed commits");
+    });
   });
 
   // ──────────────────────────────────────────────────────
@@ -684,6 +985,210 @@ describe("push_signed_commits integration tests", () => {
       const remoteOid = lsRemote.stdout.trim().split(/\s+/)[0];
       const localOid = execGit(["rev-parse", "HEAD"], { cwd: workDir }).stdout.trim();
       expect(remoteOid).toBe(localOid);
+    });
+
+    it("should refuse git push fallback when explicitly disabled", async () => {
+      execGit(["checkout", "-b", "no-fallback-branch"], { cwd: workDir });
+      fs.writeFileSync(path.join(workDir, "base.txt"), "Base content\n");
+      execGit(["add", "base.txt"], { cwd: workDir });
+      execGit(["commit", "-m", "Base commit"], { cwd: workDir });
+      execGit(["push", "-u", "origin", "no-fallback-branch"], { cwd: workDir });
+
+      const remoteOidBefore = execGit(["rev-parse", "HEAD"], { cwd: workDir }).stdout.trim();
+
+      fs.writeFileSync(path.join(workDir, "extra.txt"), "Extra content\n");
+      execGit(["add", "extra.txt"], { cwd: workDir });
+      execGit(["commit", "-m", "Extra commit"], { cwd: workDir });
+
+      global.exec = makeRealExec(workDir);
+      const githubClient = makeMockGithubClient({ failWithError: new Error("GraphQL: not supported on GHES") });
+
+      await expect(
+        pushSignedCommits({
+          githubClient,
+          owner: "test-owner",
+          repo: "test-repo",
+          branch: "no-fallback-branch",
+          baseRef: "origin/no-fallback-branch",
+          cwd: workDir,
+          allowGitPushFallback: false,
+        })
+      ).rejects.toThrow("git push fallback is disabled");
+
+      const remoteOidAfter = execGit(["rev-parse", "refs/heads/no-fallback-branch"], { cwd: bareDir }).stdout.trim();
+      expect(remoteOidAfter).toBe(remoteOidBefore);
+      expect(mockCore.warning).not.toHaveBeenCalledWith(expect.stringContaining("falling back to git push"));
+    });
+  });
+
+  describe("git auth environment propagation", () => {
+    it("should pass gitAuthEnv to ls-remote in the signed-commit path", async () => {
+      const gitAuthEnv = {
+        GIT_CONFIG_COUNT: "1",
+        GIT_CONFIG_KEY_0: "http.https://github.com/.extraheader",
+        GIT_CONFIG_VALUE_0: "Authorization: basic test-token",
+      };
+      const sentinelKey = "PUSH_SIGNED_COMMITS_ENV_SENTINEL_1";
+      const sentinelValue = "sentinel-1";
+      const previousSentinel = process.env[sentinelKey];
+      process.env[sentinelKey] = sentinelValue;
+
+      const getExecOutput = vi.fn(async (_program, args) => {
+        if (args[0] === "rev-list") {
+          return {
+            exitCode: 0,
+            stdout: "1111111111111111111111111111111111111111 0000000000000000000000000000000000000000\n",
+            stderr: "",
+          };
+        }
+        if (args[0] === "diff-tree") {
+          return {
+            exitCode: 0,
+            stdout: ":100644 100644 0000000000000000000000000000000000000000 aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa M\tmemory.json\n",
+            stderr: "",
+          };
+        }
+        if (args[0] === "ls-remote") {
+          return {
+            exitCode: 0,
+            stdout: "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef\trefs/heads/auth-check-branch\n",
+            stderr: "",
+          };
+        }
+        if (args[0] === "log") {
+          return { exitCode: 0, stdout: "Auth check commit\n", stderr: "" };
+        }
+        throw new Error(`Unexpected git command: ${args.join(" ")}`);
+      });
+
+      const execProgram = vi.fn(async (_program, args, opts = {}) => {
+        if (args[0] === "cat-file" && args[1] === "blob") {
+          opts.listeners?.stdout?.(Buffer.from("memory data\n"));
+          return 0;
+        }
+        throw new Error(`Unexpected exec command: ${args.join(" ")}`);
+      });
+
+      global.exec = {
+        getExecOutput,
+        exec: execProgram,
+      };
+
+      const githubClient = makeMockGithubClient();
+
+      try {
+        await pushSignedCommits({
+          githubClient,
+          owner: "test-owner",
+          repo: "test-repo",
+          branch: "auth-check-branch",
+          baseRef: "origin/main",
+          cwd: workDir,
+          gitAuthEnv,
+        });
+      } finally {
+        if (previousSentinel === undefined) {
+          delete process.env[sentinelKey];
+        } else {
+          process.env[sentinelKey] = previousSentinel;
+        }
+      }
+
+      const lsRemoteCall = getExecOutput.mock.calls.find(call => call[1][0] === "ls-remote");
+      expect(lsRemoteCall).toBeDefined();
+      expect(lsRemoteCall[2]).toEqual(
+        expect.objectContaining({
+          cwd: workDir,
+          env: expect.objectContaining({
+            ...gitAuthEnv,
+            [sentinelKey]: sentinelValue,
+          }),
+        })
+      );
+    });
+
+    it("should include auth env on ls-remote getExecOutput git call", async () => {
+      const gitAuthEnv = {
+        GIT_CONFIG_COUNT: "1",
+        GIT_CONFIG_KEY_0: "http.https://github.com/.extraheader",
+        GIT_CONFIG_VALUE_0: "Authorization: basic test-token",
+      };
+      const sentinelKey = "PUSH_SIGNED_COMMITS_ENV_SENTINEL_2";
+      const sentinelValue = "sentinel-2";
+      const previousSentinel = process.env[sentinelKey];
+      process.env[sentinelKey] = sentinelValue;
+
+      const getExecOutput = vi.fn(async (_program, args) => {
+        if (args[0] === "rev-list") {
+          return {
+            exitCode: 0,
+            stdout: "2222222222222222222222222222222222222222 1111111111111111111111111111111111111111\n",
+            stderr: "",
+          };
+        }
+        if (args[0] === "diff-tree") {
+          return {
+            exitCode: 0,
+            stdout: ":100644 100644 0000000000000000000000000000000000000000 bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb M\tmemory.json\n",
+            stderr: "",
+          };
+        }
+        if (args[0] === "ls-remote") {
+          return {
+            exitCode: 0,
+            stdout: "cafebabecafebabecafebabecafebabecafebabe\trefs/heads/auth-check-branch\n",
+            stderr: "",
+          };
+        }
+        if (args[0] === "log") {
+          return { exitCode: 0, stdout: "Auth guard commit\n", stderr: "" };
+        }
+        throw new Error(`Unexpected git command: ${args.join(" ")}`);
+      });
+
+      global.exec = {
+        getExecOutput,
+        exec: async (_program, args, opts = {}) => {
+          if (args[0] === "cat-file" && args[1] === "blob") {
+            opts.listeners?.stdout?.(Buffer.from("memory data\n"));
+            return 0;
+          }
+          throw new Error(`Unexpected exec command: ${args.join(" ")}`);
+        },
+      };
+
+      const githubClient = makeMockGithubClient();
+
+      try {
+        await pushSignedCommits({
+          githubClient,
+          owner: "test-owner",
+          repo: "test-repo",
+          branch: "auth-check-branch",
+          baseRef: "origin/main",
+          cwd: workDir,
+          gitAuthEnv,
+        });
+      } finally {
+        if (previousSentinel === undefined) {
+          delete process.env[sentinelKey];
+        } else {
+          process.env[sentinelKey] = previousSentinel;
+        }
+      }
+
+      const networkGitCalls = getExecOutput.mock.calls.filter(call => call[1][0] === "ls-remote");
+      expect(networkGitCalls.length).toBeGreaterThanOrEqual(1);
+      for (const call of networkGitCalls) {
+        expect(call[2]).toEqual(
+          expect.objectContaining({
+            env: expect.objectContaining({
+              ...gitAuthEnv,
+              [sentinelKey]: sentinelValue,
+            }),
+          })
+        );
+      }
     });
   });
 
@@ -1126,6 +1631,39 @@ describe("push_signed_commits integration tests", () => {
       expect(mockCore.warning).toHaveBeenCalledWith(expect.stringMatching(/merge commit [0-9a-f]{7,40} detected/));
     });
 
+    it("should use direct git push for merge commits when signed commits are disabled", async () => {
+      execGit(["checkout", "-b", "unsigned-side-branch"], { cwd: workDir });
+      fs.writeFileSync(path.join(workDir, "unsigned-side.txt"), "side branch content\n");
+      execGit(["add", "unsigned-side.txt"], { cwd: workDir });
+      execGit(["commit", "-m", "Unsigned side branch commit"], { cwd: workDir });
+
+      execGit(["checkout", "main"], { cwd: workDir });
+      execGit(["checkout", "-b", "unsigned-merge-test-branch"], { cwd: workDir });
+      fs.writeFileSync(path.join(workDir, "unsigned-feature.txt"), "feature content\n");
+      execGit(["add", "unsigned-feature.txt"], { cwd: workDir });
+      execGit(["commit", "-m", "Unsigned feature commit"], { cwd: workDir });
+      execGit(["merge", "--no-ff", "unsigned-side-branch", "-m", "Merge unsigned-side-branch into unsigned-merge-test-branch"], { cwd: workDir });
+      const expectedHead = execGit(["rev-parse", "HEAD"], { cwd: workDir }).stdout.trim();
+
+      global.exec = makeRealExec(workDir);
+      const githubClient = makeMockGithubClient();
+
+      const pushedSha = await pushSignedCommits({
+        githubClient,
+        owner: "test-owner",
+        repo: "test-repo",
+        branch: "unsigned-merge-test-branch",
+        baseRef: "origin/main",
+        cwd: workDir,
+        signedCommits: false,
+      });
+
+      expect(pushedSha).toBe(expectedHead);
+      expect(githubClient.graphql).not.toHaveBeenCalled();
+      expect(execGit(["rev-parse", "refs/heads/unsigned-merge-test-branch"], { cwd: bareDir }).stdout.trim()).toBe(expectedHead);
+      expect(mockCore.info).toHaveBeenCalledWith("pushSignedCommits: signed-commits disabled (using direct git push) for branch unsigned-merge-test-branch");
+    });
+
     it("should not trigger merge-commit fallback for a commit message that starts with 'parent '", async () => {
       // Regression test: a commit whose message body starts with "parent " must not be misidentified
       // as a merge commit. The old cat-file approach would have counted this as an extra parent.
@@ -1380,6 +1918,231 @@ describe("push_signed_commits integration tests", () => {
       expect(githubClient.graphql).not.toHaveBeenCalled();
       // Warning about submodule detection (diagnostic log value preserved)
       expect(mockCore.warning).toHaveBeenCalledWith(expect.stringContaining("submodule change detected in mysubmodule"));
+    });
+  });
+
+  describe("stale-base and synthesized payload safety", () => {
+    it("should fail signed replay when rebasing stale commits onto current base conflicts", async () => {
+      // Base branch starts with shared file.
+      fs.writeFileSync(path.join(workDir, "shared.txt"), "base\n");
+      execGit(["add", "shared.txt"], { cwd: workDir });
+      execGit(["commit", "-m", "Add shared file"], { cwd: workDir });
+      execGit(["push", "origin", "main"], { cwd: workDir });
+
+      // Agent branch diverges from old main and edits shared.txt.
+      execGit(["checkout", "-b", "stale-conflict-branch"], { cwd: workDir });
+      fs.writeFileSync(path.join(workDir, "shared.txt"), "agent change\n");
+      execGit(["add", "shared.txt"], { cwd: workDir });
+      execGit(["commit", "-m", "Agent edit shared"], { cwd: workDir });
+
+      // Base branch advances with conflicting edit.
+      execGit(["checkout", "main"], { cwd: workDir });
+      fs.writeFileSync(path.join(workDir, "shared.txt"), "upstream change\n");
+      execGit(["add", "shared.txt"], { cwd: workDir });
+      execGit(["commit", "-m", "Upstream edit shared"], { cwd: workDir });
+      execGit(["push", "origin", "main"], { cwd: workDir });
+
+      execGit(["checkout", "stale-conflict-branch"], { cwd: workDir });
+
+      global.exec = makeRealExec(workDir);
+      const githubClient = makeMockGithubClient();
+
+      await expect(
+        pushSignedCommits({
+          githubClient,
+          owner: "test-owner",
+          repo: "test-repo",
+          branch: "stale-conflict-branch",
+          baseRef: "origin/main",
+          cwd: workDir,
+        })
+      ).rejects.toThrow("failed to rebase commit range onto current GraphQL parent");
+
+      expect(githubClient.graphql).not.toHaveBeenCalled();
+    });
+
+    it("should recover from a partial-clone object failure by backfilling the exact commit objects and retrying the rebase", async () => {
+      // Base branch starts with a file.
+      fs.writeFileSync(path.join(workDir, "base.txt"), "base\n");
+      execGit(["add", "base.txt"], { cwd: workDir });
+      execGit(["commit", "-m", "Add base file"], { cwd: workDir });
+      execGit(["push", "origin", "main"], { cwd: workDir });
+
+      // Agent branch diverges from old main and edits a DIFFERENT file (no conflict).
+      execGit(["checkout", "-b", "promisor-recover-branch"], { cwd: workDir });
+      fs.writeFileSync(path.join(workDir, "agent.txt"), "agent change\n");
+      execGit(["add", "agent.txt"], { cwd: workDir });
+      execGit(["commit", "-m", "Agent edit"], { cwd: workDir });
+
+      // Base branch advances with a non-conflicting edit.
+      execGit(["checkout", "main"], { cwd: workDir });
+      fs.writeFileSync(path.join(workDir, "upstream.txt"), "upstream change\n");
+      execGit(["add", "upstream.txt"], { cwd: workDir });
+      execGit(["commit", "-m", "Upstream edit"], { cwd: workDir });
+      execGit(["push", "origin", "main"], { cwd: workDir });
+
+      execGit(["checkout", "promisor-recover-branch"], { cwd: workDir });
+
+      // Wrap the real exec so the FIRST `git rebase --onto` simulates a
+      // promisor object fetch failure, the targeted `git fetch --no-filter`
+      // backfill is intercepted to succeed (the test repo is not actually a
+      // partial clone), and the SECOND rebase runs for real and succeeds.
+      const realExec = makeRealExec(workDir);
+      let rebaseAttempts = 0;
+      let backfillTargets = null;
+      global.exec = {
+        getExecOutput: async (program, args, opts = {}) => {
+          if (program === "git" && args[0] === "rebase" && args[1] === "--onto") {
+            rebaseAttempts++;
+            if (rebaseAttempts === 1) {
+              return {
+                exitCode: 128,
+                stdout: "",
+                stderr: "fatal: remote error: upload-pack: not our ref 0035eb55fe03ab52d8b95e7fcfaee53548b5e8d6\nfatal: could not fetch 4f0af08119278bacff5772a1ddf987d4b4045be8 from promisor remote\n",
+              };
+            }
+          }
+          if (program === "git" && args[0] === "fetch" && args.includes("--no-filter")) {
+            // Targeted backfill of the exact anchor commit SHAs; must NOT use
+            // --unshallow or --deepen.
+            expect(args).not.toContain("--unshallow");
+            expect(args.some(arg => String(arg).startsWith("--deepen"))).toBe(false);
+            backfillTargets = args.slice(args.indexOf("origin") + 1);
+            return { exitCode: 0, stdout: "", stderr: "" };
+          }
+          return realExec.getExecOutput(program, args, opts);
+        },
+        exec: realExec.exec,
+      };
+
+      const githubClient = makeMockGithubClient();
+
+      const result = await pushSignedCommits({
+        githubClient,
+        owner: "test-owner",
+        repo: "test-repo",
+        branch: "promisor-recover-branch",
+        baseRef: "origin/main",
+        cwd: workDir,
+      });
+
+      // The rebase was attempted twice (initial failure + post-recovery retry).
+      expect(rebaseAttempts).toBe(2);
+      // The recovery fetched a bounded set of exact commit SHAs (anchors), not
+      // an unshallow / deepen of the whole history.
+      expect(backfillTargets).not.toBeNull();
+      expect(backfillTargets.length).toBeGreaterThan(0);
+      expect(backfillTargets.every(sha => /^[0-9a-f]{40}$/i.test(sha))).toBe(true);
+      // The signed-commit GraphQL replay proceeded after recovery.
+      expect(githubClient.graphql).toHaveBeenCalled();
+      expect(result).toBeDefined();
+      expect(mockCore.warning).toHaveBeenCalledWith(expect.stringContaining("backfilling object content"));
+    });
+
+    it("should not attempt history backfill for a genuine merge conflict", async () => {
+      // Base branch starts with shared file.
+      fs.writeFileSync(path.join(workDir, "shared.txt"), "base\n");
+      execGit(["add", "shared.txt"], { cwd: workDir });
+      execGit(["commit", "-m", "Add shared file"], { cwd: workDir });
+      execGit(["push", "origin", "main"], { cwd: workDir });
+
+      // Agent branch diverges and edits shared.txt.
+      execGit(["checkout", "-b", "conflict-no-backfill-branch"], { cwd: workDir });
+      fs.writeFileSync(path.join(workDir, "shared.txt"), "agent change\n");
+      execGit(["add", "shared.txt"], { cwd: workDir });
+      execGit(["commit", "-m", "Agent edit shared"], { cwd: workDir });
+
+      // Base branch advances with a conflicting edit.
+      execGit(["checkout", "main"], { cwd: workDir });
+      fs.writeFileSync(path.join(workDir, "shared.txt"), "upstream change\n");
+      execGit(["add", "shared.txt"], { cwd: workDir });
+      execGit(["commit", "-m", "Upstream edit shared"], { cwd: workDir });
+      execGit(["push", "origin", "main"], { cwd: workDir });
+
+      execGit(["checkout", "conflict-no-backfill-branch"], { cwd: workDir });
+
+      const realExec = makeRealExec(workDir);
+      let backfillAttempted = false;
+      global.exec = {
+        getExecOutput: async (program, args, opts = {}) => {
+          if (program === "git" && args[0] === "fetch" && (args.includes("--no-filter") || args.includes("--unshallow") || args.some(arg => String(arg).startsWith("--deepen")))) {
+            backfillAttempted = true;
+          }
+          return realExec.getExecOutput(program, args, opts);
+        },
+        exec: realExec.exec,
+      };
+
+      const githubClient = makeMockGithubClient();
+
+      await expect(
+        pushSignedCommits({
+          githubClient,
+          owner: "test-owner",
+          repo: "test-repo",
+          branch: "conflict-no-backfill-branch",
+          baseRef: "origin/main",
+          cwd: workDir,
+        })
+      ).rejects.toThrow("failed to rebase commit range onto current GraphQL parent");
+
+      // A genuine merge conflict must not trigger the partial-clone backfill path.
+      expect(backfillAttempted).toBe(false);
+      expect(githubClient.graphql).not.toHaveBeenCalled();
+    });
+
+    it("should enforce protected-files policy against synthesized GraphQL payload", async () => {
+      execGit(["checkout", "-b", "protected-payload-branch"], { cwd: workDir });
+      fs.writeFileSync(path.join(workDir, "CODEOWNERS"), "* @octocat\n");
+      execGit(["add", "CODEOWNERS"], { cwd: workDir });
+      execGit(["commit", "-m", "Touch CODEOWNERS"], { cwd: workDir });
+
+      global.exec = makeRealExec(workDir);
+      const githubClient = makeMockGithubClient();
+
+      await expect(
+        pushSignedCommits({
+          githubClient,
+          owner: "test-owner",
+          repo: "test-repo",
+          branch: "protected-payload-branch",
+          baseRef: "origin/main",
+          cwd: workDir,
+          validationConfig: {
+            protected_files: ["CODEOWNERS"],
+            protected_files_policy: "blocked",
+          },
+        })
+      ).rejects.toThrow("Signed-commit payload violates file-protection policy");
+
+      expect(githubClient.graphql).not.toHaveBeenCalled();
+    });
+
+    it("should enforce max-patch-files against synthesized GraphQL payload", async () => {
+      execGit(["checkout", "-b", "max-files-payload-branch"], { cwd: workDir });
+      fs.writeFileSync(path.join(workDir, "alpha.txt"), "alpha\n");
+      fs.writeFileSync(path.join(workDir, "beta.txt"), "beta\n");
+      execGit(["add", "alpha.txt", "beta.txt"], { cwd: workDir });
+      execGit(["commit", "-m", "Touch two files"], { cwd: workDir });
+
+      global.exec = makeRealExec(workDir);
+      const githubClient = makeMockGithubClient();
+
+      await expect(
+        pushSignedCommits({
+          githubClient,
+          owner: "test-owner",
+          repo: "test-repo",
+          branch: "max-files-payload-branch",
+          baseRef: "origin/main",
+          cwd: workDir,
+          validationConfig: {
+            max_patch_files: 1,
+          },
+        })
+      ).rejects.toThrow("exceeds max-patch-files");
+
+      expect(githubClient.graphql).not.toHaveBeenCalled();
     });
   });
 });

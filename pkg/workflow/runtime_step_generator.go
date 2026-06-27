@@ -3,21 +3,26 @@ package workflow
 import (
 	"fmt"
 	"maps"
-	"sort"
 
 	"github.com/github/gh-aw/pkg/logger"
+	"github.com/github/gh-aw/pkg/sliceutil"
 )
 
 var runtimeStepGeneratorLog = logger.New("workflow:runtime_step_generator")
 
-// GenerateRuntimeSetupSteps creates GitHub Actions steps for runtime setup
-func GenerateRuntimeSetupSteps(requirements []RuntimeRequirement) []GitHubActionStep {
+// GenerateRuntimeSetupSteps creates GitHub Actions steps for runtime setup.
+// data is the WorkflowData for the workflow being compiled; it is forwarded to
+// generateSetupStep so that the gh-aw setup-cli step can use the lock-file-aware
+// pin resolver (getActionPinWithData) rather than the static embedded-pins fallback.
+// Pass nil only when WorkflowData is unavailable or when tests specifically
+// target non-gh-aw runtime behavior.
+func GenerateRuntimeSetupSteps(requirements []RuntimeRequirement, data *WorkflowData) []GitHubActionStep {
 	runtimeStepGeneratorLog.Printf("Generating runtime setup steps: requirement_count=%d", len(requirements))
 	runtimeSetupLog.Printf("Generating runtime setup steps for %d requirements", len(requirements))
 	var steps []GitHubActionStep
 
 	for _, req := range requirements {
-		steps = append(steps, generateSetupStep(&req))
+		steps = append(steps, generateSetupStep(&req, data))
 
 		// Add environment variable capture steps after setup actions for AWF chroot mode.
 		// Most env vars are inherited via AWF_HOST_PATH, but Go is special.
@@ -50,28 +55,37 @@ func generateEnvCaptureStep(envVar string, captureCmd string) GitHubActionStep {
 }
 
 // generateSetupStep creates a setup step for a given runtime requirement
-func generateSetupStep(req *RuntimeRequirement) GitHubActionStep {
+func generateSetupStep(req *RuntimeRequirement, data *WorkflowData) GitHubActionStep {
 	runtime := req.Runtime
 	version := req.Version
 	runtimeStepGeneratorLog.Printf("Generating setup step for runtime: %s, version=%s, if=%s", runtime.ID, version, req.IfCondition)
 	runtimeSetupLog.Printf("Generating setup step for runtime: %s, version=%s, if=%s", runtime.ID, version, req.IfCondition)
 
-	// In dev mode, install gh-aw from the checked-out source tree instead of
-	// using setup-cli (which installs released tags).
-	if runtime.ID == "gh-aw" && !IsRelease() {
-		step := GitHubActionStep{"      - name: Build and install gh-aw CLI from source"}
-		if req.IfCondition != "" {
-			step = append(step, "        if: "+req.IfCondition)
+	if runtime.ID == "gh-aw" {
+		if version == "" {
+			version = getDefaultGhAWRuntimeVersion()
 		}
-		step = append(step,
-			"        run: |",
-			"          gh extension remove gh-aw || true",
-			"          make build",
-			"          gh extension install .",
-			"          gh aw version",
-			"        env:",
-			"          GH_TOKEN: ${{ github.token }}",
-		)
+
+		allExtraFields := make(map[string]string)
+		// runtime.ExtraWithFields are already YAML-formatted by runtime definitions.
+		maps.Copy(allExtraFields, runtime.ExtraWithFields)
+		// req.ExtraFields come from user input and need YAML formatting.
+		for k, v := range req.ExtraFields {
+			allExtraFields[k] = formatYAMLValue(v)
+		}
+
+		step, err := generateGhAwSetupStep(ghAwSetupStepConfig{
+			actionMode:           actionModeForRuntimeSetup(IsRelease()),
+			ifCondition:          req.IfCondition,
+			cliVersion:           version,
+			actionRepo:           runtime.ActionRepo,
+			fallbackActionRefTag: version,
+			workflowData:         data,
+			withFields:           allExtraFields,
+		})
+		if err != nil {
+			runtimeStepGeneratorLog.Printf("Failed to resolve pinned setup-cli action reference for %s@%s: %v", runtime.ActionRepo, version, err)
+		}
 		return step
 	}
 
@@ -117,11 +131,7 @@ func generateSetupStep(req *RuntimeRequirement) GitHubActionStep {
 		for k, v := range req.ExtraFields {
 			allGoModExtraFields[k] = formatYAMLValue(v)
 		}
-		var extraKeys []string
-		for key := range allGoModExtraFields {
-			extraKeys = append(extraKeys, key)
-		}
-		sort.Strings(extraKeys)
+		extraKeys := sliceutil.SortedKeys(allGoModExtraFields)
 		for _, key := range extraKeys {
 			step = append(step, fmt.Sprintf("          %s: %s", key, allGoModExtraFields[key]))
 		}
@@ -154,15 +164,18 @@ func generateSetupStep(req *RuntimeRequirement) GitHubActionStep {
 	}
 
 	// Output merged extra fields in sorted key order for stable output
-	var allKeys []string
-	for key := range allExtraFields {
-		allKeys = append(allKeys, key)
-	}
-	sort.Strings(allKeys)
+	allKeys := sliceutil.SortedKeys(allExtraFields)
 	for _, key := range allKeys {
 		step = append(step, fmt.Sprintf("          %s: %s", key, allExtraFields[key]))
-		log.Printf("  Added extra field to runtime setup: %s = %s", key, allExtraFields[key])
+		workflowLog.Printf("  Added extra field to runtime setup: %s = %s", key, allExtraFields[key])
 	}
 
 	return step
+}
+
+func actionModeForRuntimeSetup(isRelease bool) ActionMode {
+	if isRelease {
+		return ActionModeRelease
+	}
+	return ActionModeDev
 }

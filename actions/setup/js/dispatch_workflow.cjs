@@ -55,7 +55,9 @@ async function main(config = {}) {
   // repo_helpers.cjs for consistent slug validation and glob-pattern matching (e.g. "org/*").
   if (isCrossRepoDispatch) {
     if (allowedRepos.size === 0) {
-      throw new Error(`E004: Cross-repository dispatch to '${resolvedRepoSlug}' is not permitted. No allowlist is configured. Define 'allowed_repos' to enable cross-repository dispatch.`);
+      throw new Error(
+        `E004: Cross-repository dispatch to '${resolvedRepoSlug}' is not permitted. No allowlist is configured. Define 'allowed-repos' in the workflow's 'safe-outputs.dispatch-workflow' section to enable cross-repository dispatch.`
+      );
     }
     const repoValidation = validateTargetRepo(resolvedRepoSlug, contextRepoSlug, allowedRepos);
     if (!repoValidation.valid) {
@@ -142,7 +144,7 @@ async function main(config = {}) {
 
     processedCount++;
 
-    const workflowName = message.workflow_name;
+    const workflowName = typeof message.workflow_name === "string" ? message.workflow_name.trim() : "";
 
     if (!workflowName || workflowName.trim() === "") {
       core.warning("Workflow name is empty, skipping");

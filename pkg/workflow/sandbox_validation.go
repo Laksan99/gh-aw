@@ -11,55 +11,59 @@
 package workflow
 
 import (
+	"errors"
 	"fmt"
+	"regexp"
+	"strings"
 
 	"github.com/github/gh-aw/pkg/constants"
 )
 
 var sandboxValidationLog = newValidationLogger("sandbox")
 
+const minSandboxDisableJustificationLength = 20
+
+var githubActionsExpressionPattern = regexp.MustCompile(`\$\{\{[\s\S]*\}\}`)
+
 // validateMountsSyntax validates that mount strings follow the correct syntax
 // Expected format: "source:destination:mode" where mode is either "ro" or "rw"
 func validateMountsSyntax(mounts []string) error {
 	for i, mount := range mounts {
-		source, dest, mode, err := validateMountStringFormat(mount)
-		if err != nil {
-			// Distinguish format error (3-parts) from mode error
-			if source == "" && dest == "" && mode == "" {
-				return NewValidationError(
-					fmt.Sprintf("sandbox.mounts[%d]", i),
-					mount,
-					"mount syntax must follow 'source:destination:mode' format with exactly 3 colon-separated parts",
-					fmt.Sprintf("Use the format 'source:destination:mode'.\n\nExample:\nsandbox:\n  mounts:\n    - \"/host/path:/container/path:ro\"\n\nSee: %s", constants.DocsSandboxURL),
-				)
-			}
+		parts, kind := parseMountEntry(mount)
+		switch kind {
+		case mountValidationOK:
+			sandboxValidationLog.Printf("Validated mount %d: source=%s, dest=%s, mode=%s", i, parts.source, parts.dest, parts.mode)
+		case mountValidationFormatError:
+			return NewValidationError(
+				fmt.Sprintf("sandbox.mounts[%d]", i),
+				mount,
+				"mount syntax must follow 'source:destination:mode' format with exactly 3 colon-separated parts",
+				fmt.Sprintf("Use the format 'source:destination:mode'.\n\nExample:\nsandbox:\n  mounts:\n    - \"/host/path:/container/path:ro\"\n\nSee: %s", constants.DocsSandboxURL),
+			)
+		case mountValidationModeError:
 			return NewValidationError(
 				fmt.Sprintf("sandbox.mounts[%d].mode", i),
-				mode,
+				parts.mode,
 				"mount mode must be 'ro' (read-only) or 'rw' (read-write)",
 				fmt.Sprintf("Change the mount mode to either 'ro' or 'rw'.\n\nExample:\nsandbox:\n  mounts:\n    - \"/host/path:/container/path:ro\"  # read-only\n    - \"/host/path:/container/path:rw\"  # read-write\n\nSee: %s", constants.DocsSandboxURL),
 			)
-		}
-
-		// Validate that source and destination are not empty
-		if source == "" {
+		case mountValidationEmptySource:
 			return NewValidationError(
 				fmt.Sprintf("sandbox.mounts[%d].source", i),
 				mount,
 				"source path cannot be empty",
 				fmt.Sprintf("Provide a valid source path.\n\nExample:\nsandbox:\n  mounts:\n    - \"/host/path:/container/path:ro\"\n\nSee: %s", constants.DocsSandboxURL),
 			)
-		}
-		if dest == "" {
+		case mountValidationEmptyDestination:
 			return NewValidationError(
 				fmt.Sprintf("sandbox.mounts[%d].destination", i),
 				mount,
 				"destination path cannot be empty",
 				fmt.Sprintf("Provide a valid destination path.\n\nExample:\nsandbox:\n  mounts:\n    - \"/host/path:/container/path:ro\"\n\nSee: %s", constants.DocsSandboxURL),
 			)
+		default:
+			return fmt.Errorf("internal error: unsupported mount validation kind %d for sandbox mount %q", kind, mount)
 		}
-
-		sandboxValidationLog.Printf("Validated mount %d: source=%s, dest=%s, mode=%s", i, source, dest, mode)
 	}
 
 	return nil
@@ -79,12 +83,22 @@ func validateSandboxConfig(workflowData *WorkflowData) error {
 	sandboxConfig := workflowData.SandboxConfig
 
 	// Check if sandbox.agent: false was specified
-	// In non-strict mode, this is allowed (with a warning shown at compile time)
-	// The strict mode check happens in validateStrictFirewall()
+	// This requires the "dangerously-disable-sandbox-agent" feature to include a
+	// justification string. Without a valid justification, disabling the sandbox
+	// is a validation error.
 	if sandboxConfig.Agent != nil && sandboxConfig.Agent.Disabled {
-		// sandbox.agent: false is allowed in non-strict mode, so we don't error here
-		// The warning is emitted in compiler.go
-		sandboxValidationLog.Print("sandbox.agent: false detected, will be validated by strict mode check")
+		justification, err := getSandboxDisableJustification(workflowData)
+		if err != nil {
+			flag := string(constants.DangerouslyDisableSandboxAgentFeatureFlag)
+			return NewValidationError(
+				"sandbox.agent",
+				"false",
+				fmt.Sprintf("disabling the agent sandbox removes a trust boundary: '%s' must be a literal justification string (%d+ chars, no expressions): %v", flag, minSandboxDisableJustificationLength, err),
+				fmt.Sprintf("Add the feature value to your workflow frontmatter:\n\nfeatures:\n  %s: \"controlled environment with no internet access\"\nsandbox:\n  agent: false\n\nSee: %s", flag, constants.DocsSandboxURL),
+			)
+		}
+		sandboxConfig.Agent.DisableReason = justification
+		sandboxValidationLog.Printf("sandbox.agent: false permitted by %s justification: %q", constants.DangerouslyDisableSandboxAgentFeatureFlag, justification)
 	}
 
 	// Validate mounts syntax if specified in agent config
@@ -114,21 +128,12 @@ func validateSandboxConfig(workflowData *WorkflowData) error {
 		sandboxValidationLog.Printf("Validated MCP gateway port: %d", sandboxConfig.MCP.Port)
 	}
 
-	// Validate that if agent sandbox is enabled, MCP gateway is always enabled
-	// The MCP gateway is enabled when MCP servers are configured (tools that use MCP)
-	// Only validate this when sandbox is explicitly configured (not nil)
-	// If SandboxConfig is nil, defaults will be applied later and MCP check doesn't apply yet
-	//
+	// Validate that if agent sandbox is enabled, MCP gateway is always enabled.
+	// The MCP gateway is enabled when MCP servers are configured (tools that use MCP).
 	// Note: Even if agent sandbox is disabled (sandbox.agent: false), the MCP gateway
 	// must still be enabled. Agent sandbox and MCP gateway are now independent.
 	if sandboxConfig.Agent != nil && !sandboxConfig.Agent.Disabled {
-		// Agent sandbox is enabled - check if MCP gateway is enabled
-		// Only enforce this if sandbox was explicitly configured (has agent or type set)
-		// This prevents false positives for workflows where sandbox defaults haven't been applied yet
-		hasExplicitSandboxConfig := (sandboxConfig.Agent != nil && !sandboxConfig.Agent.Disabled) ||
-			sandboxConfig.Type != ""
-
-		if hasExplicitSandboxConfig && !HasMCPServers(workflowData) {
+		if !HasMCPServers(workflowData) {
 			return NewConfigurationError(
 				"sandbox",
 				"enabled without MCP servers",
@@ -136,10 +141,48 @@ func validateSandboxConfig(workflowData *WorkflowData) error {
 				"Add MCP tools to your workflow:\n\ntools:\n  github:\n    mode: remote\n  playwright: null\n\nOr disable the agent sandbox:\nsandbox:\n  agent: false",
 			)
 		}
-		if hasExplicitSandboxConfig {
-			sandboxValidationLog.Print("Agent sandbox enabled with MCP gateway - validation passed")
-		}
+		sandboxValidationLog.Print("Agent sandbox enabled with MCP gateway - validation passed")
 	}
 
 	return nil
+}
+
+func getSandboxDisableJustification(workflowData *WorkflowData) (string, error) {
+	if workflowData == nil || workflowData.Features == nil {
+		return "", errors.New("dangerously-disable-sandbox-agent feature is missing")
+	}
+
+	flagName := string(constants.DangerouslyDisableSandboxAgentFeatureFlag)
+	value, found := getFeatureValueCaseInsensitive(workflowData.Features, flagName)
+	if !found {
+		return "", errors.New("dangerously-disable-sandbox-agent feature is missing")
+	}
+
+	justification, ok := value.(string)
+	if !ok {
+		return "", fmt.Errorf("feature must be a string, got %T", value)
+	}
+
+	trimmed := strings.TrimSpace(justification)
+	if len(trimmed) < minSandboxDisableJustificationLength {
+		return "", fmt.Errorf("feature must be at least %d characters", minSandboxDisableJustificationLength)
+	}
+
+	if githubActionsExpressionPattern.MatchString(trimmed) {
+		return "", errors.New("feature cannot use GitHub Actions expressions")
+	}
+
+	return trimmed, nil
+}
+
+func getFeatureValueCaseInsensitive(features map[string]any, flagName string) (any, bool) {
+	if value, exists := features[flagName]; exists {
+		return value, true
+	}
+	for key, value := range features {
+		if strings.EqualFold(key, flagName) {
+			return value, true
+		}
+	}
+	return nil, false
 }

@@ -12,6 +12,7 @@ package cli
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"math"
 	"os"
@@ -22,17 +23,77 @@ import (
 	"github.com/github/gh-aw/pkg/console"
 	"github.com/github/gh-aw/pkg/constants"
 	"github.com/github/gh-aw/pkg/envutil"
+	"github.com/github/gh-aw/pkg/fileutil"
 	"github.com/github/gh-aw/pkg/logger"
 	"github.com/github/gh-aw/pkg/parser"
-	"github.com/github/gh-aw/pkg/workflow"
 )
 
 var logsOrchestratorLog = logger.New("cli:logs_orchestrator")
+
+// isDeadlineExceeded reports whether ctx.Err() is context.DeadlineExceeded,
+// returning false for any other error (including nil).  It is used to
+// distinguish our own timeout cancellation (graceful partial results) from a
+// user-initiated cancellation or other error.
+func isDeadlineExceeded(ctx context.Context) bool {
+	// errors.Is handles nil gracefully (returns false), so no nil check needed.
+	return errors.Is(ctx.Err(), context.DeadlineExceeded)
+}
+
+// noRunsMessage returns a human-readable explanation for why zero workflow runs
+// were returned.  It inspects the startDate filter and the timeoutReached flag
+// so callers receive actionable guidance instead of a silent empty result.
+//
+// Priority order (timeout is checked first because it is the most definitive
+// cause — the date filter may still be valid but no data was collected):
+//  1. Timeout – the download was cut short before any run was collected.
+//  2. Future start date – GitHub cannot have runs in the future.
+//  3. Start date older than GitHubActionsRetentionDays – beyond GitHub's default retention window.
+//  4. Generic fallback for any other combination of filters.
+func noRunsMessage(startDate string, timeoutReached bool) string {
+	if timeoutReached {
+		return "No runs found. Timeout reached before any runs could be downloaded."
+	}
+	if startDate != "" {
+		if t, err := parseFilterDate(startDate); err == nil {
+			now := time.Now()
+			if t.After(now) {
+				return fmt.Sprintf("No runs found. The start_date %q is in the future.", startDate)
+			}
+			// GitHub Actions retains logs for GitHubActionsRetentionDays by default.
+			if t.Before(now.AddDate(0, 0, -GitHubActionsRetentionDays)) {
+				return fmt.Sprintf("No runs found. Data may not be available beyond the %d-day retention period.", GitHubActionsRetentionDays)
+			}
+		}
+	}
+	return "No runs found matching the specified criteria."
+}
+
+// parseFilterDate tries to parse a date or datetime string in the formats used
+// by the logs command's --start-date / --end-date flags after date resolution.
+// Both plain dates ("2006-01-02") and RFC 3339 timestamps are accepted.
+func parseFilterDate(s string) (time.Time, error) {
+	for _, layout := range []string{time.RFC3339, "2006-01-02"} {
+		if t, err := time.Parse(layout, s); err == nil {
+			return t, nil
+		}
+	}
+	return time.Time{}, fmt.Errorf("unable to parse date %q", s)
+}
 
 // It reads from the GH_AW_MAX_CONCURRENT_DOWNLOADS environment variable if set,
 // validates the value is between 1 and 100, and falls back to the default if invalid.
 func getMaxConcurrentDownloads() int {
 	return envutil.GetIntFromEnv("GH_AW_MAX_CONCURRENT_DOWNLOADS", MaxConcurrentDownloads, 1, 100, logsOrchestratorLog)
+}
+
+// matchEngineFilter checks whether the run recorded in awInfo matches the
+// requested engine filter string.  It returns (matches, detectedEngineID).
+// detectedEngineID is "" when awInfo is unavailable or carries no engine_id.
+func matchEngineFilter(awInfo *AwInfo, awInfoErr error, filterEngine string) (bool, string) {
+	if awInfoErr != nil || awInfo == nil || awInfo.EngineID == "" {
+		return false, ""
+	}
+	return awInfo.EngineID == filterEngine, awInfo.EngineID
 }
 
 type LogsDownloadOptions struct {
@@ -61,6 +122,21 @@ type LogsDownloadOptions struct {
 	Format            string
 	ArtifactSets      []string
 	After             string
+	ReportFile        string
+}
+
+func shouldStopPagination(totalFetched, batchSize int) bool {
+	return totalFetched < batchSize
+}
+
+func selectPaginationCursorDate(filteredRuns []WorkflowRun, oldestFetchedCreatedAt time.Time) (string, bool) {
+	if !oldestFetchedCreatedAt.IsZero() {
+		return oldestFetchedCreatedAt.Format(time.RFC3339), true
+	}
+	if len(filteredRuns) == 0 {
+		return "", false
+	}
+	return filteredRuns[len(filteredRuns)-1].CreatedAt.Format(time.RFC3339), true
 }
 
 // DownloadWorkflowLogs downloads and analyzes workflow logs with metrics
@@ -150,11 +226,17 @@ func DownloadWorkflowLogs(ctx context.Context, opts LogsDownloadOptions) error {
 		fmt.Fprintln(os.Stderr, console.FormatInfoMessage("Fetching workflow runs from GitHub Actions..."))
 	}
 
-	// Start timeout timer if specified
+	// activeCtx is ctx extended with a deadline when timeoutMinutes > 0.
+	// Using a named variable avoids reassigning the ctx parameter and makes it
+	// explicit that a derived context governs all downstream downloads.
+	activeCtx := ctx
 	var startTime time.Time
 	var timeoutReached bool
 	if timeoutMinutes > 0 {
 		startTime = time.Now()
+		var timeoutCancel context.CancelFunc
+		activeCtx, timeoutCancel = context.WithTimeout(ctx, time.Duration(timeoutMinutes)*time.Minute)
+		defer timeoutCancel()
 		if verbose {
 			fmt.Fprintln(os.Stderr, console.FormatInfoMessage(fmt.Sprintf("Timeout set to %d minutes", timeoutMinutes)))
 		}
@@ -170,12 +252,24 @@ func DownloadWorkflowLogs(ctx context.Context, opts LogsDownloadOptions) error {
 	fetchAllInRange := startDate != "" || endDate != ""
 
 	// Iterative algorithm: keep fetching runs until we have enough or exhaust available runs
+outerLoop:
 	for iteration < MaxIterations {
-		// Check context cancellation
+		// Check context cancellation or timeout deadline
 		select {
-		case <-ctx.Done():
-			fmt.Fprintln(os.Stderr, console.FormatWarningMessage("Operation cancelled"))
-			return ctx.Err()
+		case <-activeCtx.Done():
+			if isDeadlineExceeded(activeCtx) {
+				// Our own timeout context expired — treat this as a graceful stop,
+				// not a hard error.  break outerLoop falls through to renderLogsOutput
+				// which outputs whatever processedRuns were collected before the deadline.
+				timeoutReached = true
+				if verbose {
+					fmt.Fprintln(os.Stderr, console.FormatWarningMessage("Timeout reached, stopping download"))
+				}
+			} else {
+				fmt.Fprintln(os.Stderr, console.FormatWarningMessage("Operation cancelled"))
+				return activeCtx.Err()
+			}
+			break outerLoop
 		default:
 		}
 
@@ -239,29 +333,47 @@ func DownloadWorkflowLogs(ctx context.Context, opts LogsDownloadOptions) error {
 			}
 		}
 
+		var oldestFetchedCreatedAt time.Time
 		runs, totalFetched, err := listWorkflowRunsWithPagination(ListWorkflowRunsOptions{
-			WorkflowName:   workflowName,
-			Limit:          batchSize,
-			StartDate:      startDate,
-			EndDate:        endDate,
-			BeforeDate:     beforeDate,
-			Ref:            ref,
-			BeforeRunID:    beforeRunID,
-			AfterRunID:     afterRunID,
-			RepoOverride:   repoOverride,
-			ProcessedCount: len(processedRuns),
-			TargetCount:    count,
-			Verbose:        verbose,
+			WorkflowName:           workflowName,
+			Limit:                  batchSize,
+			StartDate:              startDate,
+			EndDate:                endDate,
+			BeforeDate:             beforeDate,
+			Ref:                    ref,
+			BeforeRunID:            beforeRunID,
+			AfterRunID:             afterRunID,
+			RepoOverride:           repoOverride,
+			OldestFetchedCreatedAt: &oldestFetchedCreatedAt,
+			ProcessedCount:         len(processedRuns),
+			TargetCount:            count,
+			Verbose:                verbose,
 		})
 		if err != nil {
 			return err
 		}
 
 		if len(runs) == 0 {
-			if verbose {
-				fmt.Fprintln(os.Stderr, console.FormatInfoMessage("No more workflow runs found, stopping iteration"))
+			if shouldStopPagination(totalFetched, batchSize) {
+				if verbose {
+					fmt.Fprintln(os.Stderr, console.FormatInfoMessage("No more workflow runs found, stopping iteration"))
+				}
+				break
 			}
-			break
+
+			cursor, ok := selectPaginationCursorDate(nil, oldestFetchedCreatedAt)
+			if !ok {
+				if verbose {
+					fmt.Fprintln(os.Stderr, console.FormatWarningMessage("Workflow batch filtered to zero runs but no pagination cursor was found, stopping iteration"))
+				}
+				break
+			}
+
+			beforeDate = cursor
+			if verbose {
+				fmt.Fprintln(os.Stderr, console.FormatInfoMessage("Batch filtered to zero runs; advancing pagination cursor and continuing"))
+			}
+			continue
 		}
 
 		if verbose {
@@ -272,10 +384,22 @@ func DownloadWorkflowLogs(ctx context.Context, opts LogsDownloadOptions) error {
 		// forcing us to scan the entire batch.
 		batchProcessed := 0
 		runsRemaining := runs
+	innerLoop:
 		for len(runsRemaining) > 0 && len(processedRuns) < count {
 			remainingNeeded := count - len(processedRuns)
 			if remainingNeeded <= 0 {
 				break
+			}
+
+			// Check context/timeout before starting each new chunk so we stop
+			// promptly when the deadline fires between individual chunk downloads.
+			select {
+			case <-activeCtx.Done():
+				if isDeadlineExceeded(activeCtx) {
+					timeoutReached = true
+				}
+				break innerLoop
+			default:
 			}
 
 			// Process slightly more than we need to account for skips due to filters.
@@ -284,7 +408,7 @@ func DownloadWorkflowLogs(ctx context.Context, opts LogsDownloadOptions) error {
 			chunk := runsRemaining[:chunkSize]
 			runsRemaining = runsRemaining[chunkSize:]
 
-			downloadResults := downloadRunArtifactsConcurrent(ctx, chunk, outputDir, verbose, remainingNeeded, repoOverride, artifactFilter)
+			downloadResults := downloadRunArtifactsConcurrent(activeCtx, chunk, outputDir, verbose, remainingNeeded, repoOverride, artifactFilter)
 
 			for _, result := range downloadResults {
 				if result.Skipped {
@@ -313,36 +437,14 @@ func DownloadWorkflowLogs(ctx context.Context, opts LogsDownloadOptions) error {
 
 				// Apply engine filtering if specified
 				if engine != "" {
-					// Check if the run's engine matches the filter
-					detectedEngine := extractEngineFromAwInfo(awInfoPath, verbose)
-
-					var engineMatches bool
-					if detectedEngine != nil {
-						// Get the engine ID to compare with the filter
-						registry := workflow.GetGlobalEngineRegistry()
-						for _, supportedEngine := range constants.AgenticEngines {
-							if testEngine, err := registry.GetEngine(supportedEngine); err == nil && testEngine == detectedEngine {
-								engineMatches = (supportedEngine == engine)
-								break
-							}
-						}
-					}
-
+					engineMatches, detectedEngineID := matchEngineFilter(awInfo, awInfoErr, engine)
 					if !engineMatches {
-						logsOrchestratorLog.Printf("Skipping run %d: engine filter=%s, no match detected", result.Run.DatabaseID, engine)
+						if detectedEngineID == "" {
+							detectedEngineID = "unknown"
+						}
+						logsOrchestratorLog.Printf("Skipping run %d: engine filter=%s, detected=%s", result.Run.DatabaseID, engine, detectedEngineID)
 						if verbose {
-							engineName := "unknown"
-							if detectedEngine != nil {
-								// Try to get a readable name for the detected engine
-								registry := workflow.GetGlobalEngineRegistry()
-								for _, supportedEngine := range constants.AgenticEngines {
-									if testEngine, err := registry.GetEngine(supportedEngine); err == nil && testEngine == detectedEngine {
-										engineName = supportedEngine
-										break
-									}
-								}
-							}
-							fmt.Fprintln(os.Stderr, console.FormatInfoMessage(fmt.Sprintf("Skipping run %d: engine '%s' does not match filter '%s'", result.Run.DatabaseID, engineName, engine)))
+							fmt.Fprintln(os.Stderr, console.FormatInfoMessage(fmt.Sprintf("Skipping run %d: engine '%s' does not match filter '%s'", result.Run.DatabaseID, detectedEngineID, engine)))
 						}
 						continue
 					}
@@ -424,7 +526,6 @@ func DownloadWorkflowLogs(ctx context.Context, opts LogsDownloadOptions) error {
 				// Update run with metrics and path
 				run := result.Run
 				run.TokenUsage = result.Metrics.TokenUsage
-				run.EstimatedCost = result.Metrics.EstimatedCost
 				run.Turns = result.Metrics.Turns
 				run.AvgTimeBetweenTurns = result.Metrics.AvgTimeBetweenTurns
 				run.ErrorCount = 0
@@ -484,7 +585,7 @@ func DownloadWorkflowLogs(ctx context.Context, opts LogsDownloadOptions) error {
 					} else {
 						// Always show success message for parsing, not just in verbose mode
 						logMdPath := filepath.Join(result.LogsPath, "log.md")
-						if _, err := os.Stat(logMdPath); err == nil {
+						if fileutil.FileExists(logMdPath) {
 							fmt.Fprintln(os.Stderr, console.FormatSuccessMessage(fmt.Sprintf("✓ Parsed log for run %d → %s", run.DatabaseID, logMdPath)))
 						}
 					}
@@ -495,7 +596,7 @@ func DownloadWorkflowLogs(ctx context.Context, opts LogsDownloadOptions) error {
 					} else {
 						// Show success message if firewall.md was created
 						firewallMdPath := filepath.Join(result.LogsPath, "firewall.md")
-						if _, err := os.Stat(firewallMdPath); err == nil {
+						if fileutil.FileExists(firewallMdPath) {
 							fmt.Fprintln(os.Stderr, console.FormatSuccessMessage(fmt.Sprintf("✓ Parsed firewall logs for run %d → %s", run.DatabaseID, firewallMdPath)))
 						}
 					}
@@ -516,10 +617,12 @@ func DownloadWorkflowLogs(ctx context.Context, opts LogsDownloadOptions) error {
 			}
 		}
 
-		// Prepare for next iteration: set beforeDate to the oldest processed run from this batch
-		if len(runs) > 0 && len(runsRemaining) == 0 {
-			oldestRun := runs[len(runs)-1] // runs are typically ordered by creation date descending
-			beforeDate = oldestRun.CreatedAt.Format(time.RFC3339)
+		// Prepare for next iteration: set beforeDate to the oldest run from the raw API batch.
+		// This guarantees pagination moves forward even when filtered runs are sparse.
+		if len(runsRemaining) == 0 {
+			if cursor, ok := selectPaginationCursorDate(runs, oldestFetchedCreatedAt); ok {
+				beforeDate = cursor
+			}
 		}
 
 		// If we got fewer runs than requested in this batch, we've likely hit the end
@@ -529,7 +632,7 @@ func DownloadWorkflowLogs(ctx context.Context, opts LogsDownloadOptions) error {
 		// Example: API returns 250 total runs, but only 5 are agentic workflows after filtering.
 		//   Old buggy logic: len(runs)=5 < batchSize=250, stop iteration (WRONG - misses more agentic workflows!)
 		//   Fixed logic: totalFetched=250 < batchSize=250 is false, continue iteration (CORRECT)
-		if totalFetched < batchSize {
+		if shouldStopPagination(totalFetched, batchSize) {
 			if verbose {
 				fmt.Fprintln(os.Stderr, console.FormatInfoMessage("Received fewer runs than requested, likely reached end of available runs"))
 			}
@@ -556,7 +659,8 @@ func DownloadWorkflowLogs(ctx context.Context, opts LogsDownloadOptions) error {
 		// This prevents stderr messages from corrupting JSON when both streams are redirected together
 		if jsonOutput {
 			logsData := buildLogsData([]ProcessedRun{}, outputDir, nil)
-			if err := renderLogsJSON(logsData); err != nil {
+			logsData.Message = noRunsMessage(startDate, timeoutReached)
+			if err := renderLogsJSON(logsData, verbose); err != nil {
 				return fmt.Errorf("failed to render JSON output: %w", err)
 			}
 		}
@@ -597,13 +701,38 @@ func DownloadWorkflowLogs(ctx context.Context, opts LogsDownloadOptions) error {
 		}
 	}
 
-	return renderLogsOutput(processedRuns, outputDir, summaryFile, format, jsonOutput, toolGraph, train, continuation, verbose)
+	return renderLogsOutput(processedRuns, renderLogsOutputOptions{
+		outputDir:      outputDir,
+		summaryFile:    summaryFile,
+		format:         format,
+		reportFile:     opts.ReportFile,
+		jsonOutput:     jsonOutput,
+		toolGraph:      toolGraph,
+		train:          train,
+		continuation:   continuation,
+		verbose:        verbose,
+		artifactFilter: artifactFilter,
+	})
+}
+
+// renderLogsOutputOptions holds configuration for renderLogsOutput.
+type renderLogsOutputOptions struct {
+	outputDir      string
+	summaryFile    string
+	format         string
+	reportFile     string
+	jsonOutput     bool
+	toolGraph      bool
+	train          bool
+	continuation   *ContinuationData
+	verbose        bool
+	artifactFilter []string
 }
 
 // renderLogsOutput finalizes processedRuns and renders them in the appropriate output
 // format: JSON, console metrics table, or cross-run audit report (pretty/markdown).
 // continuation is optional and only set when a timeout was reached during a paginated download.
-func renderLogsOutput(processedRuns []ProcessedRun, outputDir, summaryFile, format string, jsonOutput, toolGraph, train bool, continuation *ContinuationData, verbose bool) error {
+func renderLogsOutput(processedRuns []ProcessedRun, opts renderLogsOutputOptions) error {
 	// Update MissingToolCount, MissingDataCount, and NoopCount in runs
 	for i := range processedRuns {
 		processedRuns[i].Run.MissingToolCount = len(processedRuns[i].MissingTools)
@@ -612,28 +741,42 @@ func renderLogsOutput(processedRuns []ProcessedRun, outputDir, summaryFile, form
 	}
 
 	// Build structured logs data
-	logsOrchestratorLog.Printf("Building logs data from %d processed runs (continuation=%t)", len(processedRuns), continuation != nil)
-	logsData := buildLogsData(processedRuns, outputDir, continuation)
+	logsOrchestratorLog.Printf("Building logs data from %d processed runs (continuation=%t)", len(processedRuns), opts.continuation != nil)
+	logsData := buildLogsData(processedRuns, opts.outputDir, opts.continuation)
+
+	// When only the usage artifact was downloaded, add a hint so consumers know how
+	// to fetch additional artifact sets (agent logs, firewall data, etc.).
+	if isUsageOnlyArtifactFilter(opts.artifactFilter) {
+		logsData.Message = usageOnlyArtifactHintMessage()
+	}
 
 	// Write summary file if requested (default behavior unless disabled with empty string)
-	if summaryFile != "" {
-		summaryPath := filepath.Join(outputDir, summaryFile)
-		if err := writeSummaryFile(summaryPath, logsData, verbose); err != nil {
+	if opts.summaryFile != "" {
+		summaryPath := filepath.Join(opts.outputDir, opts.summaryFile)
+		if err := writeSummaryFile(summaryPath, logsData, opts.verbose); err != nil {
 			return fmt.Errorf("failed to write summary file: %w", err)
 		}
 	}
 
 	// Train drain3 weights if requested.
-	if train {
-		if err := TrainDrain3Weights(processedRuns, outputDir, verbose); err != nil {
+	if opts.train {
+		if err := TrainDrain3Weights(processedRuns, opts.outputDir, opts.verbose); err != nil {
 			return fmt.Errorf("log pattern training: %w", err)
 		}
 	}
 
 	// Render output based on format preference.
-	// When --format markdown or --format pretty is specified, generate a cross-run audit report
-	// instead of the default metrics table.
-	if format == "markdown" || format == "pretty" {
+	switch opts.format {
+	case "tsv":
+		if opts.verbose {
+			renderLogsTSVVerbose(logsData)
+		} else {
+			renderLogsTSV(logsData)
+		}
+		renderLogsArtifactHint(os.Stderr, logsData.Message)
+		return nil
+
+	case "markdown", "pretty":
 		inputs := make([]crossRunInput, 0, len(processedRuns))
 		for _, pr := range processedRuns {
 			inputs = append(inputs, crossRunInput{
@@ -643,9 +786,8 @@ func renderLogsOutput(processedRuns []ProcessedRun, outputDir, summaryFile, form
 				Duration:         pr.Run.Duration,
 				FirewallAnalysis: pr.FirewallAnalysis,
 				Metrics: LogMetrics{
-					TokenUsage:    pr.Run.TokenUsage,
-					EstimatedCost: pr.Run.EstimatedCost,
-					Turns:         pr.Run.Turns,
+					TokenUsage: pr.Run.TokenUsage,
+					Turns:      pr.Run.Turns,
 				},
 				MCPToolUsage: pr.MCPToolUsage,
 				MCPFailures:  pr.MCPFailures,
@@ -653,56 +795,128 @@ func renderLogsOutput(processedRuns []ProcessedRun, outputDir, summaryFile, form
 			})
 		}
 		report := buildCrossRunAuditReport(inputs)
-		if jsonOutput {
+		if opts.jsonOutput {
 			return renderCrossRunReportJSON(report)
 		}
-		if format == "pretty" {
+		if opts.format == "pretty" {
 			renderCrossRunReportPretty(report)
+			renderLogsArtifactHint(os.Stderr, logsData.Message)
 			return nil
 		}
-		renderCrossRunReportMarkdown(report)
+		if opts.reportFile != "" {
+			if err := os.MkdirAll(filepath.Dir(opts.reportFile), constants.DirPermPublic); err != nil {
+				return fmt.Errorf("failed to create report file directory: %w", err)
+			}
+			f, err := os.Create(opts.reportFile)
+			if err != nil {
+				return fmt.Errorf("failed to create report file: %w", err)
+			}
+			if err := func() (retErr error) {
+				defer func() {
+					if cerr := f.Close(); cerr != nil && retErr == nil {
+						retErr = cerr
+					}
+				}()
+				oldStdout := os.Stdout
+				defer func() { os.Stdout = oldStdout }()
+				os.Stdout = f
+				renderCrossRunReportMarkdown(report)
+				return nil
+			}(); err != nil {
+				return fmt.Errorf("failed to write report file: %w", err)
+			}
+		} else {
+			renderCrossRunReportMarkdown(report)
+		}
+		renderLogsArtifactHint(os.Stderr, logsData.Message)
+		return nil
+
+	case "console":
+		// Explicit console format: decorated tables for human reading
+		if opts.jsonOutput {
+			if err := renderLogsJSON(logsData, opts.verbose); err != nil {
+				return fmt.Errorf("failed to render JSON output: %w", err)
+			}
+		} else {
+			renderLogsConsole(logsData)
+			displayAggregatedGatewayMetrics(processedRuns, opts.outputDir, opts.verbose)
+			displayUnifiedTimeline(processedRuns, opts.verbose)
+			if opts.toolGraph {
+				generateToolGraph(processedRuns, opts.verbose)
+			}
+			renderLogsArtifactHint(os.Stderr, logsData.Message)
+		}
 		return nil
 	}
 
-	if jsonOutput {
-		if err := renderLogsJSON(logsData); err != nil {
+	// Default: compact format optimized for agentic consumption
+	if opts.jsonOutput {
+		if err := renderLogsJSON(logsData, opts.verbose); err != nil {
 			return fmt.Errorf("failed to render JSON output: %w", err)
 		}
 	} else {
-		renderLogsConsole(logsData)
-
-		// Display aggregated gateway metrics if any runs have gateway.jsonl files
-		displayAggregatedGatewayMetrics(processedRuns, outputDir, verbose)
-
-		// Generate tool sequence graph if requested (console output only)
-		if toolGraph {
-			generateToolGraph(processedRuns, verbose)
+		if opts.verbose {
+			renderLogsCompactVerbose(logsData)
+		} else {
+			renderLogsCompact(logsData)
 		}
 	}
 
 	return nil
 }
 
+func renderLogsArtifactHint(w *os.File, message string) {
+	if message == "" {
+		return
+	}
+	fmt.Fprintf(w, "[hint] %s\n", message)
+}
+
+// StdinLogsOptions holds parameters for DownloadWorkflowLogsFromStdin.
+type StdinLogsOptions struct {
+	RunURLs           []string
+	OutputDir         string
+	Engine            string
+	RepoOverride      string
+	Verbose           bool
+	ToolGraph         bool
+	NoStaged          bool
+	FirewallOnly      bool
+	NoFirewall        bool
+	Parse             bool
+	JSONOutput        bool
+	Timeout           int
+	SummaryFile       string
+	SafeOutputType    string
+	FilteredIntegrity bool
+	Train             bool
+	Format            string
+	ReportFile        string
+	// ArtifactSets defaults to nil (download all artifacts) when this API is used
+	// programmatically. The CLI passes ["usage"] to match the logs command default.
+	ArtifactSets []string
+}
+
 // DownloadWorkflowLogsFromStdin fetches and processes workflow run logs for runs
 // provided as IDs or URLs, bypassing the GitHub API run-discovery step.
 // This is used when the --stdin flag is passed to the logs command.
-func DownloadWorkflowLogsFromStdin(ctx context.Context, runURLs []string, outputDir, engine, repoOverride string, verbose, toolGraph, noStaged, firewallOnly, noFirewall bool, parse, jsonOutput bool, timeout int, summaryFile, safeOutputType string, filteredIntegrity, train bool, format string, artifactSets []string) error {
-	logsOrchestratorLog.Printf("Starting stdin log download: runs=%d, outputDir=%s", len(runURLs), outputDir)
+func DownloadWorkflowLogsFromStdin(ctx context.Context, opts StdinLogsOptions) error {
+	logsOrchestratorLog.Printf("Starting stdin log download: runs=%d, outputDir=%s", len(opts.RunURLs), opts.OutputDir)
 
-	if err := ValidateArtifactSets(artifactSets); err != nil {
+	if err := ValidateArtifactSets(opts.ArtifactSets); err != nil {
 		return err
 	}
-	artifactFilter := ResolveArtifactFilter(artifactSets)
+	artifactFilter := ResolveArtifactFilter(opts.ArtifactSets)
 	if len(artifactFilter) > 0 {
 		logsOrchestratorLog.Printf("Artifact filter active: %v", artifactFilter)
-		if verbose {
+		if opts.Verbose {
 			fmt.Fprintln(os.Stderr, console.FormatInfoMessage("Artifact filter: downloading only "+strings.Join(artifactFilter, ", ")))
 		}
 	}
 
 	if err := ensureLogsGitignore(); err != nil {
 		logsOrchestratorLog.Printf("Failed to ensure logs .gitignore: %v", err)
-		if verbose {
+		if opts.Verbose {
 			fmt.Fprintln(os.Stderr, console.FormatWarningMessage(fmt.Sprintf("Failed to ensure .github/aw/logs/.gitignore: %v", err)))
 		}
 	}
@@ -714,7 +928,7 @@ func DownloadWorkflowLogsFromStdin(ctx context.Context, runURLs []string, output
 	default:
 	}
 
-	if len(runURLs) == 0 {
+	if len(opts.RunURLs) == 0 {
 		fmt.Fprintln(os.Stderr, console.FormatWarningMessage("No run IDs or URLs provided on stdin"))
 		return nil
 	}
@@ -722,40 +936,40 @@ func DownloadWorkflowLogsFromStdin(ctx context.Context, runURLs []string, output
 	// Parse owner/repo (and optional GHES host) from --repo override if provided.
 	// Accepted formats: "owner/repo" or "HOST/owner/repo".
 	var hostOverride, ownerOverride, repoNameOverride string
-	if repoOverride != "" {
-		parts := strings.SplitN(repoOverride, "/", 3)
+	if opts.RepoOverride != "" {
+		parts := strings.SplitN(opts.RepoOverride, "/", 3)
 		switch len(parts) {
 		case 3: // HOST/owner/repo
 			if parts[0] == "" || parts[1] == "" || parts[2] == "" {
-				return fmt.Errorf("invalid repository format '%s': expected '[HOST/]owner/repo'", repoOverride)
+				return fmt.Errorf("invalid repository format '%s': expected '[HOST/]owner/repo'", opts.RepoOverride)
 			}
 			hostOverride, ownerOverride, repoNameOverride = parts[0], parts[1], parts[2]
 		case 2: // owner/repo
 			if parts[0] == "" || parts[1] == "" {
-				return fmt.Errorf("invalid repository format '%s': expected '[HOST/]owner/repo'", repoOverride)
+				return fmt.Errorf("invalid repository format '%s': expected '[HOST/]owner/repo'", opts.RepoOverride)
 			}
 			ownerOverride, repoNameOverride = parts[0], parts[1]
 		default:
-			return fmt.Errorf("invalid repository format '%s': expected '[HOST/]owner/repo'", repoOverride)
+			return fmt.Errorf("invalid repository format '%s': expected '[HOST/]owner/repo'", opts.RepoOverride)
 		}
 	}
 
 	// Start timeout timer if specified
 	var startTime time.Time
-	if timeout > 0 {
+	if opts.Timeout > 0 {
 		startTime = time.Now()
-		if verbose {
-			fmt.Fprintln(os.Stderr, console.FormatInfoMessage(fmt.Sprintf("Timeout set to %d minutes", timeout)))
+		if opts.Verbose {
+			fmt.Fprintln(os.Stderr, console.FormatInfoMessage(fmt.Sprintf("Timeout set to %d minutes", opts.Timeout)))
 		}
 	}
 
-	if verbose {
-		fmt.Fprintln(os.Stderr, console.FormatInfoMessage(fmt.Sprintf("Fetching metadata for %d runs from stdin...", len(runURLs))))
+	if opts.Verbose {
+		fmt.Fprintln(os.Stderr, console.FormatInfoMessage(fmt.Sprintf("Fetching metadata for %d runs from stdin...", len(opts.RunURLs))))
 	}
 
 	// Build WorkflowRun objects by fetching metadata for each provided URL
 	var runs []WorkflowRun
-	for _, rawURL := range runURLs {
+	for _, rawURL := range opts.RunURLs {
 		select {
 		case <-ctx.Done():
 			fmt.Fprintln(os.Stderr, console.FormatWarningMessage("Operation cancelled"))
@@ -763,7 +977,7 @@ func DownloadWorkflowLogsFromStdin(ctx context.Context, runURLs []string, output
 		default:
 		}
 
-		if timeout > 0 && time.Since(startTime).Seconds() >= float64(timeout)*60 {
+		if opts.Timeout > 0 && time.Since(startTime).Seconds() >= float64(opts.Timeout)*60 {
 			fmt.Fprintln(os.Stderr, console.FormatWarningMessage("Timeout reached before all run metadata could be fetched"))
 			break
 		}
@@ -791,7 +1005,7 @@ func DownloadWorkflowLogsFromStdin(ctx context.Context, runURLs []string, output
 			return fmt.Errorf("run %q does not include repository information; pass --repo owner/repo or provide full run URLs", rawURL)
 		}
 
-		run, err := fetchWorkflowRunMetadata(ctx, components.Number, owner, repo, host, verbose)
+		run, err := fetchWorkflowRunMetadata(ctx, components.Number, owner, repo, host, opts.Verbose)
 		if err != nil {
 			fmt.Fprintln(os.Stderr, console.FormatWarningMessage(fmt.Sprintf("Skipping run %d: failed to fetch metadata: %v", components.Number, err)))
 			continue
@@ -800,9 +1014,10 @@ func DownloadWorkflowLogsFromStdin(ctx context.Context, runURLs []string, output
 	}
 
 	if len(runs) == 0 {
-		if jsonOutput {
-			logsData := buildLogsData([]ProcessedRun{}, outputDir, nil)
-			if err := renderLogsJSON(logsData); err != nil {
+		if opts.JSONOutput {
+			logsData := buildLogsData([]ProcessedRun{}, opts.OutputDir, nil)
+			logsData.Message = "No runs found. No valid runs could be loaded from the provided input."
+			if err := renderLogsJSON(logsData, opts.Verbose); err != nil {
 				return fmt.Errorf("failed to render JSON output: %w", err)
 			}
 		}
@@ -811,13 +1026,13 @@ func DownloadWorkflowLogsFromStdin(ctx context.Context, runURLs []string, output
 	}
 
 	// Download artifacts for all runs concurrently
-	downloadResults := downloadRunArtifactsConcurrent(ctx, runs, outputDir, verbose, len(runs), repoOverride, artifactFilter)
+	downloadResults := downloadRunArtifactsConcurrent(ctx, runs, opts.OutputDir, opts.Verbose, len(runs), opts.RepoOverride, artifactFilter)
 
 	// Process download results applying the same filters as DownloadWorkflowLogs
 	var processedRuns []ProcessedRun
 	for _, result := range downloadResults {
 		if result.Skipped {
-			if verbose && result.Error != nil {
+			if opts.Verbose && result.Error != nil {
 				fmt.Fprintln(os.Stderr, console.FormatWarningMessage(fmt.Sprintf("Skipping run %d: %v", result.Run.DatabaseID, result.Error)))
 			}
 			continue
@@ -831,88 +1046,81 @@ func DownloadWorkflowLogsFromStdin(ctx context.Context, runURLs []string, output
 		awInfoPath := filepath.Join(result.LogsPath, "aw_info.json")
 		var awInfo *AwInfo
 		var awInfoErr error
-		if engine != "" || noStaged || firewallOnly || noFirewall {
-			awInfo, awInfoErr = parseAwInfo(awInfoPath, verbose)
+		if opts.Engine != "" || opts.NoStaged || opts.FirewallOnly || opts.NoFirewall {
+			awInfo, awInfoErr = parseAwInfo(awInfoPath, opts.Verbose)
 		}
 
-		if engine != "" {
-			detectedEngine := extractEngineFromAwInfo(awInfoPath, verbose)
-			var engineMatches bool
-			if detectedEngine != nil {
-				registry := workflow.GetGlobalEngineRegistry()
-				for _, supportedEngine := range constants.AgenticEngines {
-					if testEngine, err := registry.GetEngine(supportedEngine); err == nil && testEngine == detectedEngine {
-						engineMatches = (supportedEngine == engine)
-						break
-					}
-				}
-			}
+		if opts.Engine != "" {
+			engineMatches, detectedEngineID := matchEngineFilter(awInfo, awInfoErr, opts.Engine)
 			if !engineMatches {
-				logsOrchestratorLog.Printf("Skipping run %d: engine filter=%s, no match detected", result.Run.DatabaseID, engine)
-				if verbose {
-					fmt.Fprintln(os.Stderr, console.FormatInfoMessage(fmt.Sprintf("Skipping run %d: engine does not match filter '%s'", result.Run.DatabaseID, engine)))
+				if detectedEngineID == "" {
+					detectedEngineID = "unknown"
+				}
+				logsOrchestratorLog.Printf("Skipping run %d: engine filter=%s, detected=%s", result.Run.DatabaseID, opts.Engine, detectedEngineID)
+				if opts.Verbose {
+					fmt.Fprintln(os.Stderr, console.FormatInfoMessage(fmt.Sprintf("Skipping run %d: engine '%s' does not match filter '%s'", result.Run.DatabaseID, detectedEngineID, opts.Engine)))
 				}
 				continue
 			}
 		}
 
-		if noStaged {
+		if opts.NoStaged {
 			var isStaged bool
 			if awInfoErr == nil && awInfo != nil {
 				isStaged = awInfo.Staged
 			}
 			if isStaged {
 				logsOrchestratorLog.Printf("Skipping run %d: staged workflow filtered by --no-staged", result.Run.DatabaseID)
-				if verbose {
+				if opts.Verbose {
 					fmt.Fprintln(os.Stderr, console.FormatInfoMessage(fmt.Sprintf("Skipping run %d: workflow is staged (filtered by --no-staged)", result.Run.DatabaseID)))
 				}
 				continue
 			}
 		}
 
-		if firewallOnly || noFirewall {
+		if opts.FirewallOnly || opts.NoFirewall {
 			var hasFirewall bool
 			if awInfoErr == nil && awInfo != nil {
 				hasFirewall = awInfo.Steps.Firewall != ""
 			}
-			if firewallOnly && !hasFirewall {
+			if opts.FirewallOnly && !hasFirewall {
 				logsOrchestratorLog.Printf("Skipping run %d: no firewall detected, filtered by --firewall", result.Run.DatabaseID)
-				if verbose {
+				if opts.Verbose {
 					fmt.Fprintln(os.Stderr, console.FormatInfoMessage(fmt.Sprintf("Skipping run %d: workflow does not use firewall (filtered by --firewall)", result.Run.DatabaseID)))
 				}
 				continue
 			}
-			if noFirewall && hasFirewall {
+			if opts.NoFirewall && hasFirewall {
 				logsOrchestratorLog.Printf("Skipping run %d: firewall detected, filtered by --no-firewall", result.Run.DatabaseID)
-				if verbose {
+				if opts.Verbose {
 					fmt.Fprintln(os.Stderr, console.FormatInfoMessage(fmt.Sprintf("Skipping run %d: workflow uses firewall (filtered by --no-firewall)", result.Run.DatabaseID)))
 				}
 				continue
 			}
 		}
 
-		if safeOutputType != "" {
-			hasSafeOutputType, checkErr := runContainsSafeOutputType(result.LogsPath, safeOutputType, verbose)
-			if checkErr != nil && verbose {
+		if opts.SafeOutputType != "" {
+			hasSafeOutputType, checkErr := runContainsSafeOutputType(result.LogsPath, opts.SafeOutputType, opts.Verbose)
+			if checkErr != nil && opts.Verbose {
 				fmt.Fprintln(os.Stderr, console.FormatWarningMessage(fmt.Sprintf("Failed to check safe output type for run %d: %v", result.Run.DatabaseID, checkErr)))
 			}
 			if !hasSafeOutputType {
-				if verbose {
-					fmt.Fprintln(os.Stderr, console.FormatInfoMessage(fmt.Sprintf("Skipping run %d: no '%s' safe output messages found", result.Run.DatabaseID, safeOutputType)))
+				if opts.Verbose {
+					fmt.Fprintln(os.Stderr, console.FormatInfoMessage(fmt.Sprintf("Skipping run %d: no '%s' safe output messages found", result.Run.DatabaseID, opts.SafeOutputType)))
 				}
 				continue
 			}
 		}
 
-		if filteredIntegrity {
-			hasFiltered, checkErr := runHasDifcFilteredItems(result.LogsPath, verbose)
+		if opts.FilteredIntegrity {
+			hasFiltered, checkErr := runHasDifcFilteredItems(result.LogsPath, opts.Verbose)
 			if checkErr != nil {
 				fmt.Fprintln(os.Stderr, console.FormatWarningMessage(fmt.Sprintf("Failed to check DIFC filtered items for run %d: %v", result.Run.DatabaseID, checkErr)))
 				continue
 			}
 			if !hasFiltered {
 				logsOrchestratorLog.Printf("Skipping run %d: no DIFC filtered items found", result.Run.DatabaseID)
-				if verbose {
+				if opts.Verbose {
 					fmt.Fprintln(os.Stderr, console.FormatInfoMessage(fmt.Sprintf("Skipping run %d: no DIFC integrity-filtered items found in gateway logs", result.Run.DatabaseID)))
 				}
 				continue
@@ -921,7 +1129,6 @@ func DownloadWorkflowLogsFromStdin(ctx context.Context, runURLs []string, output
 
 		run := result.Run
 		run.TokenUsage = result.Metrics.TokenUsage
-		run.EstimatedCost = result.Metrics.EstimatedCost
 		run.Turns = result.Metrics.Turns
 		run.AvgTimeBetweenTurns = result.Metrics.AvgTimeBetweenTurns
 		run.ErrorCount = 0
@@ -931,7 +1138,7 @@ func DownloadWorkflowLogsFromStdin(ctx context.Context, runURLs []string, output
 		if result.TokenUsage != nil && result.TokenUsage.TotalEffectiveTokens > 0 {
 			run.EffectiveTokens = result.TokenUsage.TotalEffectiveTokens
 		}
-		if failedJobCount, err := fetchJobStatuses(run.DatabaseID, verbose); err == nil {
+		if failedJobCount, err := fetchJobStatuses(run.DatabaseID, opts.Verbose); err == nil {
 			run.ErrorCount += failedJobCount
 		}
 		if !run.StartedAt.IsZero() && !run.UpdatedAt.IsZero() {
@@ -959,21 +1166,21 @@ func DownloadWorkflowLogsFromStdin(ctx context.Context, runURLs []string, output
 		}
 		processedRuns = append(processedRuns, processedRun)
 
-		if parse {
-			detectedEngine := extractEngineFromAwInfo(awInfoPath, verbose)
-			if err := parseAgentLog(result.LogsPath, detectedEngine, verbose); err != nil {
+		if opts.Parse {
+			detectedEngine := extractEngineFromAwInfo(awInfoPath, opts.Verbose)
+			if err := parseAgentLog(result.LogsPath, detectedEngine, opts.Verbose); err != nil {
 				fmt.Fprintln(os.Stderr, console.FormatWarningMessage(fmt.Sprintf("Failed to parse log for run %d: %v", run.DatabaseID, err)))
 			} else {
 				logMdPath := filepath.Join(result.LogsPath, "log.md")
-				if _, err := os.Stat(logMdPath); err == nil {
+				if fileutil.FileExists(logMdPath) {
 					fmt.Fprintln(os.Stderr, console.FormatSuccessMessage(fmt.Sprintf("✓ Parsed log for run %d → %s", run.DatabaseID, logMdPath)))
 				}
 			}
-			if err := parseFirewallLogs(result.LogsPath, verbose); err != nil {
+			if err := parseFirewallLogs(result.LogsPath, opts.Verbose); err != nil {
 				fmt.Fprintln(os.Stderr, console.FormatWarningMessage(fmt.Sprintf("Failed to parse firewall logs for run %d: %v", run.DatabaseID, err)))
 			} else {
 				firewallMdPath := filepath.Join(result.LogsPath, "firewall.md")
-				if _, err := os.Stat(firewallMdPath); err == nil {
+				if fileutil.FileExists(firewallMdPath) {
 					fmt.Fprintln(os.Stderr, console.FormatSuccessMessage(fmt.Sprintf("✓ Parsed firewall logs for run %d → %s", run.DatabaseID, firewallMdPath)))
 				}
 			}
@@ -981,9 +1188,10 @@ func DownloadWorkflowLogsFromStdin(ctx context.Context, runURLs []string, output
 	}
 
 	if len(processedRuns) == 0 {
-		if jsonOutput {
-			logsData := buildLogsData([]ProcessedRun{}, outputDir, nil)
-			if err := renderLogsJSON(logsData); err != nil {
+		if opts.JSONOutput {
+			logsData := buildLogsData([]ProcessedRun{}, opts.OutputDir, nil)
+			logsData.Message = "No runs found matching the specified criteria."
+			if err := renderLogsJSON(logsData, opts.Verbose); err != nil {
 				return fmt.Errorf("failed to render JSON output: %w", err)
 			}
 		}
@@ -991,5 +1199,15 @@ func DownloadWorkflowLogsFromStdin(ctx context.Context, runURLs []string, output
 		return nil
 	}
 
-	return renderLogsOutput(processedRuns, outputDir, summaryFile, format, jsonOutput, toolGraph, train, nil, verbose)
+	return renderLogsOutput(processedRuns, renderLogsOutputOptions{
+		outputDir:      opts.OutputDir,
+		summaryFile:    opts.SummaryFile,
+		format:         opts.Format,
+		reportFile:     opts.ReportFile,
+		jsonOutput:     opts.JSONOutput,
+		toolGraph:      opts.ToolGraph,
+		train:          opts.Train,
+		verbose:        opts.Verbose,
+		artifactFilter: artifactFilter,
+	})
 }

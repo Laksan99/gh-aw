@@ -6,6 +6,7 @@ import (
 	"context"
 	"testing"
 
+	"github.com/google/jsonschema-go/jsonschema"
 	"github.com/modelcontextprotocol/go-sdk/jsonrpc"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 	"github.com/stretchr/testify/assert"
@@ -70,6 +71,26 @@ func TestExtractUnknownParams(t *testing.T) {
 			assert.Equal(t, tt.expected, got, "extracted unknown params should match")
 		})
 	}
+}
+
+func TestExtractUnknownParamsFromSchemaError(t *testing.T) {
+	type sampleArgs struct {
+		Name string `json:"name" jsonschema:"Name field"`
+	}
+
+	schema, err := GenerateSchema[sampleArgs]()
+	require.NoError(t, err)
+
+	resolved, err := schema.Resolve(&jsonschema.ResolveOptions{})
+	require.NoError(t, err)
+
+	err = resolved.Validate(map[string]any{
+		"name":          "octocat",
+		"workflow-name": "typo",
+	})
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "unexpected additional properties")
+	assert.Equal(t, []string{"workflow-name"}, extractUnknownParams(err.Error()))
 }
 
 // TestFindSimilarParam verifies the fuzzy matching of parameter names.
@@ -351,6 +372,7 @@ func TestMCPToolParams(t *testing.T) {
 			case "audit":
 				// experiment and variant were previously missing from the hardcoded map;
 				// reflection must now include them automatically.
+				assert.Contains(t, toolParams, "run_id", "audit tool must include 'run_id' alias param")
 				assert.Contains(t, toolParams, "experiment", "audit tool must include 'experiment' param")
 				assert.Contains(t, toolParams, "variant", "audit tool must include 'variant' param")
 			}

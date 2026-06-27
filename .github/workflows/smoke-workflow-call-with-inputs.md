@@ -1,4 +1,6 @@
 ---
+private: true
+emoji: "🧪"
 name: Smoke Workflow Call with Inputs
 description: Reusable workflow with inputs - used to test that multiple callers don't clash on artifact names
 on:
@@ -26,7 +28,7 @@ network:
   allowed:
     - defaults
 imports:
-  - shared/observability-otlp.md
+  - shared/otlp.md
 tools:
   cli-proxy: true
   bash:
@@ -36,7 +38,8 @@ safe-outputs:
   allowed-domains: [default-safe-outputs]
   noop:
 timeout-minutes: 5
-
+features:
+  gh-aw-detection: false
 ---
 
 # Smoke Test: Workflow Call with Inputs

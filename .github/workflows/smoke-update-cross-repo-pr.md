@@ -1,8 +1,14 @@
 ---
+private: true
+emoji: "🧪"
 name: Smoke Update Cross-Repo PR
 description: Smoke test validating cross-repo pull request updates in github/gh-aw-side-repo by adding lines from Homer's Odyssey to the README
 
 on:
+  slash_command:
+    name: smoke-update-cross-repo-pr
+    strategy: centralized
+    events: [issues, issue_comment, pull_request, pull_request_comment]
   workflow_dispatch:
   pull_request:
     types: [labeled]
@@ -14,6 +20,7 @@ permissions:
   pull-requests: read
   issues: read
 
+  copilot-requests: write
 network:
   allowed:
     - defaults
@@ -49,16 +56,16 @@ safe-outputs:
     if-no-changes: "error"
     target: "1" # PR #1
   messages:
-    footer: "> 📜 *Cross-repo PR update smoke test by [{workflow_name}]({run_url})*{effective_tokens_suffix}{history_link}"
+    footer: "> 📜 *Cross-repo PR update smoke test by [{workflow_name}]({run_url})*{ai_credits_suffix}{history_link}"
     run-started: "📜 [{workflow_name}]({run_url}) is adding the next Odyssey line to github/gh-aw-side-repo PR #1..."
     run-success: "✅ [{workflow_name}]({run_url}) successfully updated the cross-repo PR with a new Odyssey line!"
     run-failure: "❌ [{workflow_name}]({run_url}) failed to update the cross-repo PR: {status}"
 
 timeout-minutes: 10
-features:
-  copilot-requests: true
 imports:
-  - shared/observability-otlp.md
+  - shared/otlp.md
+features:
+  gh-aw-detection: false
 ---
 
 # Smoke Test: Cross-Repo Pull Request Update

@@ -17,6 +17,7 @@ import (
 	"github.com/github/gh-aw/pkg/constants"
 	"github.com/github/gh-aw/pkg/logger"
 	"github.com/github/gh-aw/pkg/parser"
+	"github.com/github/gh-aw/pkg/setutil"
 	"github.com/github/gh-aw/pkg/sliceutil"
 	"github.com/github/gh-aw/pkg/stringutil"
 	"github.com/github/gh-aw/pkg/workflow"
@@ -34,7 +35,7 @@ var workflowTitleScannerBufferPool = sync.Pool{
 }
 
 func getWorkflowsDir() string {
-	return ".github/workflows"
+	return constants.GetWorkflowDir()
 }
 
 // readWorkflowFile reads a workflow file from either filesystem
@@ -138,15 +139,17 @@ func fetchGitHubWorkflows(repoOverride string, verbose bool) (map[string]*GitHub
 
 	// Count user workflows (those with .md files)
 	mdFiles, _ := getMarkdownWorkflowFiles("")
-	mdWorkflowNames := make(map[string]bool)
+	mdWorkflowNames := make(map[string]struct {
+	})
 	for _, file := range mdFiles {
 		name := extractWorkflowNameFromPath(file)
-		mdWorkflowNames[name] = true
+		mdWorkflowNames[name] = struct {
+		}{}
 	}
 
 	var userWorkflowCount int
 	for name := range workflowMap {
-		if mdWorkflowNames[name] {
+		if setutil.Contains(mdWorkflowNames, name) {
 			userWorkflowCount++
 		}
 	}
@@ -264,8 +267,7 @@ func suggestWorkflowNames(target string) []string {
 // isWorkflowFile returns true if the file should be treated as a workflow file.
 // README.md files are excluded as they are documentation, not workflows.
 func isWorkflowFile(filename string) bool {
-	base := strings.ToLower(filepath.Base(filename))
-	return base != "readme.md"
+	return !strings.EqualFold(filepath.Base(filename), "readme.md")
 }
 
 // filterWorkflowFiles filters out non-workflow files from a list of markdown files.
@@ -304,19 +306,26 @@ func getMarkdownWorkflowFiles(workflowDir string) ([]string, error) {
 func filterMarkdownFilesWithFrontmatter(mdFiles []string) ([]string, error) {
 	workflowFiles := make([]string, 0, len(mdFiles))
 	for _, file := range mdFiles {
-		fd, err := os.Open(file)
-		if err != nil {
-			return nil, fmt.Errorf("failed to read workflow file %s: %w", file, err)
-		}
+		firstLine, err := func() (firstLine string, err error) {
+			fd, err := os.Open(file)
+			if err != nil {
+				return "", fmt.Errorf("failed to read workflow file %s: %w", file, err)
+			}
+			defer func() {
+				if closeErr := fd.Close(); closeErr != nil {
+					err = fmt.Errorf("failed to close workflow file %s: %w", file, closeErr)
+				}
+			}()
 
-		reader := bufio.NewReader(fd)
-		firstLine, readErr := reader.ReadString('\n')
-		closeErr := fd.Close()
-		if closeErr != nil {
-			return nil, fmt.Errorf("failed to close workflow file %s: %w", file, closeErr)
-		}
-		if readErr != nil && !errors.Is(readErr, io.EOF) {
-			return nil, fmt.Errorf("failed to read workflow file %s: %w", file, readErr)
+			reader := bufio.NewReader(fd)
+			firstLine, err = reader.ReadString('\n')
+			if err != nil && !errors.Is(err, io.EOF) {
+				return "", fmt.Errorf("failed to read workflow file %s: %w", file, err)
+			}
+			return firstLine, nil
+		}()
+		if err != nil {
+			return nil, err
 		}
 
 		if firstLine == "" {
@@ -347,7 +356,12 @@ func fastParseTitleFromReader(r io.Reader) (string, error) {
 	scanner := bufio.NewScanner(r)
 	// Reuse the small initial scanner buffer across calls while still allowing
 	// growth up to 1 MB for large frontmatter values or long base64-encoded lines.
-	scannerBufferPtr := workflowTitleScannerBufferPool.Get().(*[]byte)
+	pooled := workflowTitleScannerBufferPool.Get()
+	scannerBufferPtr, ok := pooled.(*[]byte)
+	if !ok || scannerBufferPtr == nil {
+		fallback := make([]byte, workflowTitleScannerBufferSize)
+		scannerBufferPtr = &fallback
+	}
 	scannerBuffer := *scannerBufferPtr
 	if cap(scannerBuffer) != workflowTitleScannerBufferSize {
 		scannerBuffer = make([]byte, workflowTitleScannerBufferSize)
@@ -392,38 +406,39 @@ func fastParseTitleFromReader(r io.Reader) (string, error) {
 }
 
 // extractWorkflowNameFromFile extracts the workflow name from a file's H1 header
-func extractWorkflowNameFromFile(filePath string) (string, error) {
+func extractWorkflowNameFromFile(filePath string) (title string, err error) {
 	fd, err := os.Open(filePath)
 	if err != nil {
 		return "", err
 	}
+	defer func() {
+		if closeErr := fd.Close(); closeErr != nil && err == nil {
+			err = fmt.Errorf("failed to close workflow file %s: %w", filePath, closeErr)
+		}
+	}()
 
-	title, err := fastParseTitleFromReader(fd)
-	closeErr := fd.Close()
+	title, err = fastParseTitleFromReader(fd)
 	if err != nil {
 		return "", err
 	}
-	if closeErr != nil {
-		return "", fmt.Errorf("failed to close workflow file %s: %w", filePath, closeErr)
-	}
-	if title != "" {
-		return title, nil
-	}
 
-	// No H1 header found, generate default name from filename
-	baseName := filepath.Base(filePath)
-	baseName = strings.TrimSuffix(baseName, filepath.Ext(baseName))
-	baseName = strings.ReplaceAll(baseName, "-", " ")
+	if title == "" {
+		// No H1 header found, generate default name from filename
+		baseName := filepath.Base(filePath)
+		baseName = strings.TrimSuffix(baseName, filepath.Ext(baseName))
+		baseName = strings.ReplaceAll(baseName, "-", " ")
 
-	// Capitalize first letter of each word
-	words := strings.Fields(baseName)
-	for i, word := range words {
-		if len(word) > 0 {
-			words[i] = strings.ToUpper(word[:1]) + word[1:]
+		// Capitalize first letter of each word
+		words := strings.Fields(baseName)
+		for i, word := range words {
+			if len(word) > 0 {
+				words[i] = strings.ToUpper(word[:1]) + word[1:]
+			}
 		}
+		title = strings.Join(words, " ")
 	}
 
-	return strings.Join(words, " "), nil
+	return title, nil
 }
 
 // extractEngineIDFromFrontmatter extracts the engine ID from a parsed frontmatter map.

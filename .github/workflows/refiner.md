@@ -1,4 +1,6 @@
 ---
+private: true
+emoji: "✨"
 description: Aligns code style with repository conventions, detects security issues, and improves tests
 on: pull_request labeled refine
 strict: true
@@ -11,7 +13,7 @@ imports:
   - uses: shared/pr-review-base.md
     with:
       min-integrity: approved
-  - shared/observability-otlp.md
+  - shared/otlp.md
 tools:
   cli-proxy: true
   github:
@@ -35,6 +37,9 @@ concurrency:
   cancel-in-progress: true
 
 
+sandbox:
+  agent:
+    sudo: false
 ---
 
 # Code Refiner

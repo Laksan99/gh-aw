@@ -12,7 +12,8 @@ import (
 	"github.com/github/gh-aw/pkg/logger"
 )
 
-var log = logger.New("gitutil:gitutil")
+var gitutilLog = logger.New("gitutil:gitutil")
+var ErrNotGitRepository = errors.New("not in a git repository")
 
 var fullSHARegex = regexp.MustCompile(`^[0-9a-f]{40}$`)
 
@@ -29,7 +30,7 @@ func IsRateLimitError(errMsg string) bool {
 // IsAuthError checks if an error message indicates an authentication issue.
 // This is used to detect when GitHub API calls fail due to missing or invalid credentials.
 func IsAuthError(errMsg string) bool {
-	log.Printf("Checking if error is auth-related: %s", errMsg)
+	gitutilLog.Printf("Checking if error is auth-related: %s", errMsg)
 	lowerMsg := strings.ToLower(errMsg)
 	isAuth := strings.Contains(lowerMsg, "gh_token") ||
 		strings.Contains(lowerMsg, "github_token") ||
@@ -40,7 +41,7 @@ func IsAuthError(errMsg string) bool {
 		strings.Contains(lowerMsg, "permission denied") ||
 		strings.Contains(lowerMsg, "saml enforcement")
 	if isAuth {
-		log.Print("Detected authentication error")
+		gitutilLog.Print("Detected authentication error")
 	}
 	return isAuth
 }
@@ -48,7 +49,7 @@ func IsAuthError(errMsg string) bool {
 // IsHexString checks if a string contains only hexadecimal characters.
 // This is used to validate Git commit SHAs and other hexadecimal identifiers.
 func IsHexString(s string) bool {
-	if len(s) == 0 {
+	if s == "" {
 		return false
 	}
 	for _, c := range s {
@@ -82,21 +83,21 @@ func ExtractBaseRepo(repoPath string) string {
 // environments where git is not on PATH.
 // Returns an error if not in a git repository.
 func FindGitRoot() (string, error) {
-	log.Print("Finding git root directory")
+	gitutilLog.Print("Finding git root directory")
 
 	dir, err := os.Getwd()
 	if err != nil {
-		log.Printf("Failed to get current directory: %v", err)
+		gitutilLog.Printf("Failed to get current directory: %v", err)
 		return "", fmt.Errorf("failed to get current directory: %w", err)
 	}
 
 	root, err := FindGitRootFrom(dir)
 	if err != nil {
-		log.Printf("Failed to find git root: %v", err)
+		gitutilLog.Printf("Failed to find git root: %v", err)
 		return "", err
 	}
 
-	log.Printf("Found git root: %s", root)
+	gitutilLog.Printf("Found git root: %s", root)
 	return root, nil
 }
 
@@ -135,16 +136,18 @@ func FindGitRootFrom(startDir string) (string, error) {
 		}
 		parent := filepath.Dir(dir)
 		if parent == dir {
-			return "", errors.New("not in a git repository")
+			return "", ErrNotGitRepository
 		}
 		dir = parent
 	}
 }
 
-// ReadFileFromHEADWithRoot is like ReadFileFromHEAD but accepts a pre-computed git
-// repository root, avoiding the subprocess overhead of calling FindGitRoot().
+// ReadFileFromHEAD reads a file from git HEAD using a pre-computed repository root.
+// filePath is resolved with filepath.Abs, so relative paths are interpreted from the
+// current process working directory (not gitRoot). Prefer passing an absolute path
+// within gitRoot, such as filepath.Join(gitRoot, "path/to/file").
 // Use this when the caller already knows the git root (e.g. from a cached value).
-func ReadFileFromHEADWithRoot(filePath, gitRoot string) (string, error) {
+func ReadFileFromHEAD(filePath, gitRoot string) (string, error) {
 	if gitRoot == "" {
 		return "", fmt.Errorf("gitRoot must not be empty when reading %q from HEAD", filePath)
 	}
@@ -168,12 +171,12 @@ func ReadFileFromHEADWithRoot(filePath, gitRoot string) (string, error) {
 
 	relPath = filepath.ToSlash(relPath)
 
-	log.Printf("Reading %q from git HEAD (relative path: %s)", filePath, relPath)
+	gitutilLog.Printf("Reading %q from git HEAD (relative path: %s)", filePath, relPath)
 
 	cmd := exec.Command("git", "-C", gitRoot, "show", "HEAD:"+relPath)
 	output, err := cmd.Output()
 	if err != nil {
-		log.Printf("File %q not found in HEAD commit: %v", filePath, err)
+		gitutilLog.Printf("File %q not found in HEAD commit: %v", filePath, err)
 		return "", fmt.Errorf("file %q not found in HEAD commit: %w", filePath, err)
 	}
 	return string(output), nil

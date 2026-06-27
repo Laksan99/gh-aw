@@ -2,7 +2,6 @@ package workflow
 
 import (
 	"fmt"
-	"maps"
 	"os"
 	"slices"
 	"strings"
@@ -10,6 +9,7 @@ import (
 	"github.com/github/gh-aw/pkg/console"
 	"github.com/github/gh-aw/pkg/constants"
 	"github.com/github/gh-aw/pkg/logger"
+	"github.com/github/gh-aw/pkg/sliceutil"
 	"github.com/goccy/go-yaml"
 )
 
@@ -25,6 +25,7 @@ func ConvertStepToYAML(stepMap map[string]any) (string, error) {
 	// Wrap in array for step list format and marshal with proper options
 	yamlBytes, err := yaml.MarshalWithOptions([]yaml.MapSlice{orderedStep}, DefaultMarshalOptions...)
 	if err != nil {
+		stepConversionLog.Printf("Step YAML marshal failed: %v", err)
 		return "", fmt.Errorf("failed to marshal step to YAML: %w", err)
 	}
 
@@ -34,6 +35,7 @@ func ConvertStepToYAML(stepMap map[string]any) (string, error) {
 	// Post-process to move version comments outside of quoted uses values
 	// This handles cases like: uses: "slug@sha # v1"  ->  uses: slug@sha # v1
 	yamlStr = unquoteUsesWithComments(yamlStr)
+	yamlStr = quoteEnvValuesContainingColonSpace(yamlStr)
 
 	// Add 6 spaces to the beginning of each line to match GitHub Actions step indentation
 	lines := strings.Split(strings.TrimSpace(yamlStr), "\n")
@@ -108,6 +110,7 @@ func (c *Compiler) renderStepFromMap(out *strings.Builder, step map[string]any, 
 	// env: variables to prevent shell injection attacks.  A compiler warning is emitted
 	// for every expression that is moved so that authors know their script was changed.
 	if sanitized, warnings, changed := sanitizeRunStepExpressions(step); changed {
+		stepConversionLog.Printf("Sanitized run-step expressions: %d warning(s) emitted", len(warnings))
 		for _, w := range warnings {
 			fmt.Fprintln(os.Stderr, console.FormatWarningMessage(w))
 			c.IncrementWarningCount()
@@ -150,8 +153,12 @@ func (c *Compiler) renderStepFromMap(out *strings.Builder, step map[string]any, 
 			case map[string]any:
 				// For complex fields like "with" or "env" — sort keys for stable output.
 				fmt.Fprintf(out, "%s:\n", field)
-				for _, key := range slices.Sorted(maps.Keys(v)) {
-					fmt.Fprintf(out, "%s    %s: %v\n", indent, key, v[key])
+				for _, key := range sliceutil.SortedKeys(v) {
+					if field == "env" {
+						fmt.Fprintf(out, "%s    %s: %s\n", indent, key, formatStepEnvValueForYAML(v[key]))
+					} else {
+						fmt.Fprintf(out, "%s    %s: %v\n", indent, key, v[key])
+					}
 				}
 			default:
 				fmt.Fprintf(out, "%s: %v\n", field, v)
@@ -187,11 +194,23 @@ func (c *Compiler) renderStepFromMap(out *strings.Builder, step map[string]any, 
 		case map[string]any:
 			// Sort keys for stable output.
 			fmt.Fprintf(out, "%s:\n", field)
-			for _, key := range slices.Sorted(maps.Keys(v)) {
-				fmt.Fprintf(out, "%s    %s: %v\n", indent, key, v[key])
+			for _, key := range sliceutil.SortedKeys(v) {
+				if field == "env" {
+					fmt.Fprintf(out, "%s    %s: %s\n", indent, key, formatStepEnvValueForYAML(v[key]))
+				} else {
+					fmt.Fprintf(out, "%s    %s: %v\n", indent, key, v[key])
+				}
 			}
 		default:
 			fmt.Fprintf(out, "%s: %v\n", field, v)
 		}
 	}
+}
+
+func formatStepEnvValueForYAML(value any) string {
+	strValue, ok := value.(string)
+	if !ok {
+		return fmt.Sprint(value)
+	}
+	return yamlStringValue(strValue)
 }

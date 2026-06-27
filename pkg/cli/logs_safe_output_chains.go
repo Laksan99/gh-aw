@@ -8,6 +8,7 @@ import (
 
 	"github.com/github/gh-aw/pkg/constants"
 	"github.com/github/gh-aw/pkg/logger"
+	"github.com/github/gh-aw/pkg/setutil"
 )
 
 var safeOutputChainsLog = logger.New("cli:logs_safe_output_chains")
@@ -60,8 +61,10 @@ func buildSafeOutputChainMetrics(logsPath string) SafeOutputChainMetrics {
 	}
 
 	itemCounts := make(map[string]int)
-	delegatedTargets := make(map[string]bool)
-	closedTargets := make(map[string]bool)
+	delegatedTargets := make(map[string]struct {
+	})
+	closedTargets := make(map[string]struct {
+	})
 	for _, item := range items {
 		if item.Repo == "" || item.Number <= 0 {
 			continue
@@ -70,9 +73,11 @@ func buildSafeOutputChainMetrics(logsPath string) SafeOutputChainMetrics {
 		itemCounts[key]++
 		switch item.Type {
 		case "assign_to_agent", "create_agent_session":
-			delegatedTargets[key] = true
+			delegatedTargets[key] = struct {
+			}{}
 		case "close_issue", "close_pull_request", "close_discussion", "merge_pull_request":
-			closedTargets[key] = true
+			closedTargets[key] = struct {
+			}{}
 		}
 	}
 
@@ -83,10 +88,10 @@ func buildSafeOutputChainMetrics(logsPath string) SafeOutputChainMetrics {
 			metrics.ChainedTargetCount++
 			metrics.ChainedFollowupActionCount += count - 1
 		}
-		if delegatedTargets[key] {
+		if setutil.Contains(delegatedTargets, key) {
 			metrics.DelegatedTempTargetCount++
 		}
-		if closedTargets[key] {
+		if setutil.Contains(closedTargets, key) {
 			metrics.ClosedTempTargetCount++
 		}
 	}

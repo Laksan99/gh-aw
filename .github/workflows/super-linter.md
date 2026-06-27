@@ -1,4 +1,6 @@
 ---
+private: true
+emoji: "🔍"
 description: Runs Markdown quality checks using Super Linter and creates issues for violations
 on:
   workflow_dispatch:
@@ -19,7 +21,7 @@ name: Super Linter Report
 timeout-minutes: 15
 imports:
   - shared/reporting.md
-  - shared/observability-otlp.md
+  - shared/otlp.md
 jobs:
   super_linter:
     runs-on: ubuntu-latest
@@ -30,7 +32,7 @@ jobs:
       statuses: write
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v6.0.2
+        uses: actions/checkout@v7.0.0
         with:
           # super-linter needs the full git history to get the
           # list of files that changed across commits
@@ -45,11 +47,11 @@ jobs:
           CREATE_LOG_FILE: "true"
           LOG_FILE: super-linter.log
           DEFAULT_BRANCH: main
-          ENABLE_GITHUB_ACTIONS_STEP_SUMMARY: "true"
           # Only validate Markdown - other linters (Go, JS, YAML, Shell) run in CI
           VALIDATE_MARKDOWN: "true"
           # Disable all other linters to improve performance
           VALIDATE_ALL_CODEBASE: "false"
+          FILTER_REGEX_EXCLUDE: "(^|.*/)super-linter-output/.*"
       
       - name: Check for linting issues
         id: check-results
@@ -65,11 +67,17 @@ jobs:
             echo "needs-linting=false" >> "$GITHUB_OUTPUT"
           fi
 
-      - name: Fix super-linter log permissions
+      - name: Prepare super-linter log for upload
         if: always()
         run: |
           if [ -f "super-linter.log" ]; then
-            chmod 644 super-linter.log
+            if sudo cp super-linter.log /tmp/super-linter.log 2>/dev/null || cp super-linter.log /tmp/super-linter.log; then
+              if ! (sudo chmod 644 /tmp/super-linter.log 2>/dev/null || chmod 644 /tmp/super-linter.log); then
+                echo "::warning::Unable to set permissions on /tmp/super-linter.log"
+              fi
+            else
+              echo "::warning::Unable to copy super-linter.log to /tmp for artifact upload"
+            fi
           fi
       
       - name: Upload super-linter log
@@ -77,14 +85,15 @@ jobs:
         uses: actions/upload-artifact@v7.0.1
         with:
           name: super-linter-log
-          path: super-linter.log
+          path: /tmp/super-linter.log
+          if-no-files-found: ignore
           retention-days: 7
 steps:
   - name: Download super-linter log
     uses: actions/download-artifact@v8.0.1
     with:
       name: super-linter-log
-      path: /tmp/gh-aw/
+      path: /tmp/gh-aw/agent/
 tools:
   cli-proxy: true
   cache-memory: true
@@ -92,6 +101,9 @@ tools:
   bash:
     - "*"
 
+sandbox:
+  agent:
+    sudo: false
 ---
 
 # Super Linter Analysis Report
@@ -107,7 +119,7 @@ You are an expert code quality analyst for a Go-based GitHub CLI extension proje
 
 ## Your Task
 
-1. **Read the linter output** from `/tmp/gh-aw/super-linter.log` using the bash tool
+1. **Read the linter output** from `/tmp/gh-aw/agent/super-linter.log` using the bash tool
 2. **Analyze the findings**:
    - Categorize errors by severity (critical, high, medium, low)
    - Identify patterns in the errors

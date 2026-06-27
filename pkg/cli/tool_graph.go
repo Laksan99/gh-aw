@@ -3,11 +3,12 @@ package cli
 import (
 	"fmt"
 	"os"
-	"sort"
+	"slices"
 	"strings"
 
 	"github.com/github/gh-aw/pkg/console"
 	"github.com/github/gh-aw/pkg/logger"
+	"github.com/github/gh-aw/pkg/sliceutil"
 )
 
 var toolGraphLog = logger.New("cli:tool_graph")
@@ -73,11 +74,7 @@ func (g *ToolGraph) GenerateMermaidGraph() string {
 
 	// Add tool states with normalized names for Mermaid
 	toolToStateMap := make(map[string]string)
-	var tools []string
-	for tool := range g.Tools {
-		tools = append(tools, tool)
-	}
-	sort.Strings(tools)
+	tools := sliceutil.SortedKeys(g.Tools)
 
 	for i, tool := range tools {
 		stateId := fmt.Sprintf("tool%d", i)
@@ -132,14 +129,27 @@ func (g *ToolGraph) GenerateMermaidGraph() string {
 	}
 
 	// Sort transitions by count (descending) for better visualization
-	sort.Slice(transitions, func(i, j int) bool {
-		if transitions[i].Count != transitions[j].Count {
-			return transitions[i].Count > transitions[j].Count
+	slices.SortFunc(transitions, func(a, b ToolTransition) int {
+		if a.Count != b.Count {
+			if a.Count > b.Count {
+				return -1
+			}
+			return 1
 		}
-		if transitions[i].From != transitions[j].From {
-			return transitions[i].From < transitions[j].From
+		if a.From != b.From {
+			if a.From < b.From {
+				return -1
+			}
+			return 1
 		}
-		return transitions[i].To < transitions[j].To
+		switch {
+		case a.To < b.To:
+			return -1
+		case a.To > b.To:
+			return 1
+		default:
+			return 0
+		}
 	})
 
 	for _, transition := range transitions {
@@ -185,7 +195,7 @@ func generateToolGraph(processedRuns []ProcessedRun, verbose bool) {
 
 	// Generate and display Mermaid graph only
 	mermaidGraph := graph.GenerateMermaidGraph()
-	fmt.Println(mermaidGraph)
+	fmt.Fprintln(os.Stdout, mermaidGraph)
 }
 
 // extractToolSequencesFromRun extracts tool call sequences from a single run

@@ -6,11 +6,11 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"sort"
 	"strings"
 
 	"github.com/github/gh-aw/pkg/console"
 	"github.com/github/gh-aw/pkg/logger"
+	"github.com/github/gh-aw/pkg/sliceutil"
 )
 
 var redactedDomainsLog = logger.New("cli:redacted_domains")
@@ -44,7 +44,8 @@ func parseRedactedDomainsLog(logPath string, verbose bool) (*RedactedDomainsAnal
 	}
 	defer file.Close()
 
-	domainsSet := make(map[string]bool)
+	domainsSet := make(map[string]struct {
+	})
 
 	scanner := bufio.NewScanner(file)
 	for scanner.Scan() {
@@ -52,7 +53,8 @@ func parseRedactedDomainsLog(logPath string, verbose bool) (*RedactedDomainsAnal
 		if line == "" || strings.HasPrefix(line, "#") {
 			continue
 		}
-		domainsSet[line] = true
+		domainsSet[line] = struct {
+		}{}
 	}
 
 	if err := scanner.Err(); err != nil {
@@ -60,11 +62,7 @@ func parseRedactedDomainsLog(logPath string, verbose bool) (*RedactedDomainsAnal
 	}
 
 	// Convert set to sorted slice
-	var domains []string
-	for domain := range domainsSet {
-		domains = append(domains, domain)
-	}
-	sort.Strings(domains)
+	domains := sliceutil.SortedKeys(domainsSet)
 
 	analysis := &RedactedDomainsAnalysis{
 		TotalDomains: len(domains),

@@ -122,10 +122,10 @@ const GithubRateLimitsFilename = "github_rate_limits.jsonl"
 // Included in the agent artifact so spans are available without a live collector.
 const OtelJsonlFilename = "otel.jsonl"
 
-// CopilotOtelJsonlFilename is the filename of the Copilot CLI OpenTelemetry
-// file-exporter output written to /tmp/gh-aw/.
-// Each line is a JSON payload emitted by Copilot CLI.
-const CopilotOtelJsonlFilename = "copilot-otel.jsonl"
+// OtlpExportErrorsFilename is the filename of the OTLP per-endpoint export failure log
+// written to /tmp/gh-aw/ by send_otlp_span.cjs. Each line is a JSON object containing the
+// collector host, optional status, and sanitized failure reason for one terminal export failure.
+const OtlpExportErrorsFilename = "otlp-export-errors.jsonl"
 
 // ArtifactPrefixOutputName is the job output name that exposes the artifact name prefix.
 // In workflow_call context, the prefix is a stable hash derived from the workflow inputs,
@@ -141,6 +141,10 @@ const ActivationArtifactName = "activation"
 // ExperimentArtifactName is the artifact name for A/B experiment state
 // uploaded by the activation job when experiments are declared in the frontmatter.
 const ExperimentArtifactName = "experiment"
+
+// UsageArtifactName is the compact artifact produced by the conclusion job with
+// workflow-run metadata and token-usage files used by lightweight reporting paths.
+const UsageArtifactName = "usage"
 
 // SafeOutputItemsArtifactName is the artifact name for the safe output items manifest.
 // This artifact contains the JSONL manifest of all items created by safe output handlers
@@ -202,6 +206,12 @@ const PreActivationAppTokenStepID StepID = "pre-activation-app-token"
 // Its effective_tokens output is exposed as an agent job output so that the safe_outputs job
 // can pass the value as GH_AW_EFFECTIVE_TOKENS to the footer template renderer.
 const ParseMCPGatewayStepID StepID = "parse-mcp-gateway"
+
+// DetectAgentErrorsStepID is the step ID for the post-execution error detection step in the
+// agent job. It runs on the host runner (outside the AWF sandbox container) so that it can
+// write to GITHUB_OUTPUT, which is not accessible from inside the container. Any engine that
+// provides a detection script (via GetErrorDetectionScriptId) will emit this step.
+const DetectAgentErrorsStepID StepID = "detect-agent-errors"
 
 // Output names for pre-activation job steps
 const IsTeamMemberOutput = "is_team_member"

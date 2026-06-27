@@ -1,6 +1,12 @@
 ---
+private: true
+emoji: "🧪"
 description: Smoke test that validates assign-to-agent with the agentic-workflows custom agent
 on:
+  slash_command:
+    name: smoke-agent-public-approved
+    strategy: centralized
+    events: [issues, issue_comment, pull_request, pull_request_comment]
   workflow_dispatch:
   pull_request:
     types: [labeled]
@@ -15,7 +21,7 @@ engine: claude
 strict: true
 imports:
   - shared/github-guard-policy.md
-  - shared/observability-otlp.md
+  - shared/otlp.md
 tools:
   cli-proxy: true
   github:
@@ -37,11 +43,13 @@ safe-outputs:
     hide-older-comments: true
     max: 2
   messages:
-    footer: "> 🤖 *Smoke test by [{workflow_name}]({run_url})*{effective_tokens_suffix}{history_link}"
+    footer: "> 🤖 *Smoke test by [{workflow_name}]({run_url})*{ai_credits_suffix}{history_link}"
     run-started: "🤖 [{workflow_name}]({run_url}) is looking for a Smoke issue to assign..."
     run-success: "✅ [{workflow_name}]({run_url}) completed. Issue assigned to the agentic-workflows agent."
     run-failure: "❌ [{workflow_name}]({run_url}) {status}. Check the logs for details."
 timeout-minutes: 10
+features:
+  gh-aw-detection: false
 ---
 
 # Smoke Agent: assign-to-agent with agentic-workflows

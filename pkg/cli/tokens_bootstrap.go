@@ -24,10 +24,8 @@ func newSecretsBootstrapSubcommand() *cobra.Command {
 are required, check which ones are already configured, and interactively
 prompt for any missing required secrets.
 
-Only required secrets are prompted for. Optional secrets are not shown.
-
-Examples:
-  gh aw secrets bootstrap                        # Check and set up all required secrets
+Only required secrets are prompted for. Optional secrets are not shown.`,
+		Example: `  gh aw secrets bootstrap                        # Check and set up all required secrets
   gh aw secrets bootstrap --non-interactive      # Display missing secrets without prompting
   gh aw secrets bootstrap --engine copilot       # Check secrets for a specific engine`,
 		RunE: func(cmd *cobra.Command, args []string) error {
@@ -74,7 +72,8 @@ func runTokensBootstrap(engine, repo string, nonInteractive bool) error {
 		// If we can't check existing secrets (e.g., no gh auth), continue with empty map
 		tokensBootstrapLog.Printf("Could not check existing secrets: %v", err)
 		fmt.Fprintln(os.Stderr, console.FormatWarningMessage("Unable to check existing repository secrets. Will assume all secrets need to be configured."))
-		existingSecrets = make(map[string]bool)
+		existingSecrets = make(map[string]struct {
+		})
 	}
 
 	// Filter to only required secrets that are missing

@@ -3,11 +3,15 @@
 package cli
 
 import (
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 // getCodemodByID is a helper function to find a codemod by ID
@@ -19,6 +23,37 @@ func getCodemodByID(id string) *Codemod {
 		}
 	}
 	return nil
+}
+
+func TestProcessWorkflowFileWithInfo_WriteOutputUsesSingleCheckmark(t *testing.T) {
+	tmpDir := t.TempDir()
+	workflowFile := filepath.Join(tmpDir, "test-workflow.md")
+
+	content := `---
+timeout_minutes: 30
+---`
+	require.NoError(t, os.WriteFile(workflowFile, []byte(content), 0644))
+
+	timeoutCodemod := getCodemodByID("timeout-minutes-migration")
+	require.NotNil(t, timeoutCodemod)
+
+	originalStderr := os.Stderr
+	r, w, err := os.Pipe()
+	require.NoError(t, err)
+	os.Stderr = w
+	t.Cleanup(func() { os.Stderr = originalStderr })
+
+	fixed, _, err := processWorkflowFileWithInfo(workflowFile, []Codemod{*timeoutCodemod}, true, false)
+	require.NoError(t, err)
+	require.True(t, fixed)
+
+	require.NoError(t, w.Close())
+	outputBytes, err := io.ReadAll(r)
+	require.NoError(t, err)
+	output := string(outputBytes)
+
+	assert.Contains(t, output, "✓ test-workflow.md")
+	assert.NotContains(t, output, "✓ ✓ test-workflow.md")
 }
 
 func TestFixCommand_TimeoutMinutesMigration(t *testing.T) {
@@ -447,7 +482,6 @@ func TestGetAllCodemods(t *testing.T) {
 	if len(codemods) == 0 {
 		t.Fatal("Expected at least one codemod, got none")
 	}
-
 	// Check for required codemods
 	expectedIDs := []string{
 		"timeout-minutes-migration",
@@ -480,6 +514,41 @@ func TestGetAllCodemods(t *testing.T) {
 			t.Errorf("Expected codemod with ID %s not found", expectedID)
 		}
 	}
+}
+
+func TestNewFixCommand_HasDisableCodemodFlag(t *testing.T) {
+	cmd := NewFixCommand()
+	require.NotNil(t, cmd)
+
+	flag := cmd.Flags().Lookup("disable-codemod")
+	require.NotNil(t, flag, "fix command should register --disable-codemod")
+	assert.Equal(t, "stringSlice", flag.Value.Type())
+	assert.Contains(t, flag.Usage, "Disable specific codemod IDs")
+}
+
+func TestRunFix_DisabledCodemodSkipsMatchingFix(t *testing.T) {
+	tmpDir := t.TempDir()
+	workflowFile := filepath.Join(tmpDir, "test.md")
+
+	content := `---
+on: workflow_dispatch
+timeout_minutes: 30
+---
+# Test Workflow
+`
+	require.NoError(t, os.WriteFile(workflowFile, []byte(content), 0644))
+
+	err := RunFix(FixConfig{
+		Write:              true,
+		WorkflowDir:        tmpDir,
+		DisabledCodemodIDs: []string{"timeout-minutes-migration"},
+	})
+	require.NoError(t, err)
+
+	updatedContent, err := os.ReadFile(workflowFile)
+	require.NoError(t, err)
+	assert.Contains(t, string(updatedContent), "timeout_minutes: 30")
+	assert.NotContains(t, string(updatedContent), "timeout-minutes: 30")
 }
 
 func TestFixCommand_CommandToSlashCommandMigration(t *testing.T) {
@@ -623,31 +692,32 @@ This is a test workflow with mcp-scripts mode field.
 }
 
 func TestFixCommand_UpdatesPromptAndAgentFiles(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		// Skip when git isn't available in the test environment.
+		t.Skip("Git not available")
+	}
+
 	// Create a temporary directory for test files
 	tmpDir := t.TempDir()
 	workflowFile := filepath.Join(tmpDir, "test-workflow.md")
 
 	// Save and restore original directory
 	originalDir, err := os.Getwd()
-	if err != nil {
-		t.Fatalf("Failed to get current directory: %v", err)
-	}
-	defer func() {
-		_ = os.Chdir(originalDir)
-	}()
+	require.NoError(t, err, "Failed to get current directory")
+	t.Cleanup(func() {
+		if chdirErr := os.Chdir(originalDir); chdirErr != nil {
+			t.Errorf("Failed to restore current directory: %v", chdirErr)
+		}
+	})
 
-	if err := os.Chdir(tmpDir); err != nil {
-		t.Fatalf("Failed to change to temp directory: %v", err)
-	}
+	require.NoError(t, os.Chdir(tmpDir), "Failed to change to temp directory")
 
 	// Initialize git repo (required for ensure functions)
-	if err := exec.Command("git", "init").Run(); err != nil {
-		t.Skip("Git not available")
-	}
+	require.NoError(t, exec.Command("git", "init").Run(), "Failed to initialize git repo")
 
 	// Configure git
-	exec.Command("git", "config", "user.name", "Test User").Run()
-	exec.Command("git", "config", "user.email", "test@example.com").Run()
+	require.NoError(t, exec.Command("git", "config", "user.name", "Test User").Run(), "Failed to configure git user.name")
+	require.NoError(t, exec.Command("git", "config", "user.email", "test@example.com").Run(), "Failed to configure git user.email")
 
 	// Create a simple workflow file (no fixes needed)
 	content := `---
@@ -663,11 +733,9 @@ permissions:
 This is a test workflow.
 `
 
-	if err := os.WriteFile(workflowFile, []byte(content), 0644); err != nil {
-		t.Fatalf("Failed to create test file: %v", err)
-	}
+	require.NoError(t, os.WriteFile(workflowFile, []byte(content), 0644), "Failed to create test file")
 
-	// Run fix command (which checks prompt and agent files exist)
+	// Run fix command (which refreshes the generated skill and agent files)
 	config := FixConfig{
 		WorkflowIDs: []string{"test-workflow"},
 		Write:       false,
@@ -675,15 +743,15 @@ This is a test workflow.
 		WorkflowDir: tmpDir,
 	}
 
-	err = RunFix(config)
-	if err != nil {
-		t.Fatalf("RunFix failed: %v", err)
-	}
+	require.NoError(t, RunFix(config), "RunFix failed")
 
-	// Note: The ensure functions no longer create files from templates.
-	// They just check if files exist. Since we're in a temp directory,
-	// the files won't exist, but that's expected behavior.
-	// This test now just verifies that RunFix completes without error.
+	_, err = os.Stat(filepath.Join(tmpDir, ".github", "skills", "agentic-workflows", "SKILL.md"))
+	require.NoError(t, err, "Expected generated skill file to exist after RunFix")
+
+	agentContent, err := os.ReadFile(filepath.Join(tmpDir, ".github", "agents", "agentic-workflows.md"))
+	require.NoError(t, err, "Expected generated agent file to exist after RunFix")
+	assert.Contains(t, string(agentContent), ".github/aw/create-agentic-workflow.md")
+	assert.NotContains(t, string(agentContent), ".github/skills/agentic-workflows/SKILL.md")
 }
 
 func TestFixCommand_GrepToolRemoval(t *testing.T) {

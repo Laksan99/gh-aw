@@ -67,6 +67,7 @@ func TestNewMCPConfigRenderer(t *testing.T) {
 }
 
 func TestRenderSafeOutputsMCP_JSON_Copilot(t *testing.T) {
+	pinnedGhAwNodeImage := resolveMCPGatewayContainerImage(constants.DefaultGhAwNodeImage, nil)
 	renderer := NewMCPConfigRenderer(MCPRendererOptions{
 		IncludeCopilotFields: true,
 		InlineArgs:           true,
@@ -79,30 +80,41 @@ func TestRenderSafeOutputsMCP_JSON_Copilot(t *testing.T) {
 
 	output := yaml.String()
 
-	// Verify Safe Outputs now uses HTTP transport
-	if !strings.Contains(output, `"type": "http"`) {
-		t.Error("Expected 'type': 'http' field (safe outputs uses HTTP transport)")
+	// Verify Safe Outputs now uses containerized stdio transport
+	if !strings.Contains(output, `"type": "stdio"`) {
+		t.Error("Expected 'type': 'stdio' field for Copilot safe outputs server")
 	}
 	if !strings.Contains(output, `"safeoutputs": {`) {
 		t.Error("Expected safeoutputs server ID")
 	}
-	// Verify HTTP-based configuration
-	if !strings.Contains(output, `"url": "http://host.docker.internal:$GH_AW_SAFE_OUTPUTS_PORT"`) {
-		t.Error("Expected HTTP URL field")
+	if !strings.Contains(output, `"container": "`+pinnedGhAwNodeImage+`"`) {
+		t.Error("Expected gh-aw node container image")
 	}
-	if !strings.Contains(output, `"headers": {`) {
-		t.Error("Expected headers field")
+	if !strings.Contains(output, `"mounts": ["\${GITHUB_WORKSPACE}:\${GITHUB_WORKSPACE}:rw", "${RUNNER_TEMP}/gh-aw/safeoutputs:${RUNNER_TEMP}/gh-aw/safeoutputs:rw", "/tmp/gh-aw:/tmp/gh-aw:rw"]`) {
+		t.Error("Expected workspace, safe-outputs, log, and tmp mounts")
 	}
-	if !strings.Contains(output, `"Authorization":`) {
-		t.Error("Expected Authorization header")
+	if !strings.Contains(output, `"args": ["-w", "\${GITHUB_WORKSPACE}"]`) {
+		t.Error("Expected working directory args")
 	}
-	// Check for env var with backslash escaping (Copilot format)
-	if !strings.Contains(output, `\${`) {
-		t.Error("Expected backslash-escaped env vars for Copilot")
+	if !strings.Contains(output, `"entrypoint": "sh"`) {
+		t.Error("Expected entrypoint override to sh")
+	}
+	if !strings.Contains(output, `"entrypointArgs": ["-c", "sh ${RUNNER_TEMP}/gh-aw/safeoutputs/start_safe_outputs_mcp.sh"]`) {
+		t.Error("Expected entrypointArgs to run the stdio MCP server script")
+	}
+	if !strings.Contains(output, `"GH_AW_SAFE_OUTPUTS_CONFIG_PATH": "\${GH_AW_SAFE_OUTPUTS_CONFIG_PATH}"`) {
+		t.Error("Expected safe-outputs config path env var")
+	}
+	if strings.Contains(output, `"url": "http://`) {
+		t.Error("Did not expect HTTP URL field")
+	}
+	if strings.Contains(output, `"Authorization":`) {
+		t.Error("Did not expect Authorization header")
 	}
 }
 
 func TestRenderSafeOutputsMCP_JSON_Claude(t *testing.T) {
+	pinnedGhAwNodeImage := resolveMCPGatewayContainerImage(constants.DefaultGhAwNodeImage, nil)
 	renderer := NewMCPConfigRenderer(MCPRendererOptions{
 		IncludeCopilotFields: false,
 		InlineArgs:           false,
@@ -115,27 +127,37 @@ func TestRenderSafeOutputsMCP_JSON_Claude(t *testing.T) {
 
 	output := yaml.String()
 
-	// Verify HTTP transport is used (same as Copilot)
-	if !strings.Contains(output, `"type": "http"`) {
-		t.Error("Expected 'type': 'http' field for HTTP transport")
-	}
 	if !strings.Contains(output, `"safeoutputs": {`) {
 		t.Error("Expected safeoutputs server ID")
 	}
-	// Should not contain 'tools' field (HTTP servers don't have tools field)
+	if !strings.Contains(output, `"container": "`+pinnedGhAwNodeImage+`"`) {
+		t.Error("Expected gh-aw node container image")
+	}
+	if !strings.Contains(output, `"entrypoint": "sh"`) {
+		t.Error("Expected entrypoint override to sh")
+	}
+	if !strings.Contains(output, `"entrypointArgs": ["-c", "sh ${RUNNER_TEMP}/gh-aw/safeoutputs/start_safe_outputs_mcp.sh"]`) {
+		t.Error("Expected entrypointArgs to run the stdio MCP server script")
+	}
+	if !strings.Contains(output, `"GH_AW_SAFE_OUTPUTS": "\${GH_AW_SAFE_OUTPUTS}"`) {
+		t.Error("Expected backslash-escaped shell variable reference for safe outputs path")
+	}
+	if !strings.Contains(output, `"RUNNER_TEMP": "\${RUNNER_TEMP}"`) {
+		t.Error("Expected backslash-escaped shell variable reference for RUNNER_TEMP")
+	}
 	if strings.Contains(output, `"tools"`) {
-		t.Error("Should not contain 'tools' field for HTTP servers")
+		t.Error("Should not contain 'tools' field")
 	}
-	// Check for env var without backslash escaping (Claude format)
-	if strings.Contains(output, `\${`) {
-		t.Error("Should not have backslash-escaped env vars for Claude")
+	if strings.Contains(output, `"type"`) {
+		t.Error("Should not contain 'type' field for Claude stdio server config")
 	}
-	if !strings.Contains(output, `"$GH_AW_SAFE_OUTPUTS`) {
-		t.Error("Expected direct shell variable reference for Claude")
+	if strings.Contains(output, `"url": "http://`) {
+		t.Error("Did not expect HTTP URL field")
 	}
 }
 
 func TestRenderSafeOutputsMCP_TOML(t *testing.T) {
+	pinnedGhAwNodeImage := resolveMCPGatewayContainerImage(constants.DefaultGhAwNodeImage, nil)
 	renderer := NewMCPConfigRenderer(MCPRendererOptions{
 		IncludeCopilotFields: false,
 		InlineArgs:           false,
@@ -148,21 +170,33 @@ func TestRenderSafeOutputsMCP_TOML(t *testing.T) {
 
 	output := yaml.String()
 
-	// Verify TOML format with HTTP transport
+	// Verify TOML format with containerized stdio transport
 	if !strings.Contains(output, "[mcp_servers.safeoutputs]") {
 		t.Error("Expected TOML section header")
 	}
-	if !strings.Contains(output, `type = "http"`) {
-		t.Error("Expected TOML type field for HTTP transport")
+	if !strings.Contains(output, `container = "`+pinnedGhAwNodeImage+`"`) {
+		t.Error("Expected gh-aw node container image")
 	}
-	if !strings.Contains(output, `url = "http://host.docker.internal:$GH_AW_SAFE_OUTPUTS_PORT"`) {
-		t.Error("Expected TOML HTTP URL")
+	if !strings.Contains(output, `mounts = ["\${GITHUB_WORKSPACE}:\${GITHUB_WORKSPACE}:rw", "${RUNNER_TEMP}/gh-aw/safeoutputs:${RUNNER_TEMP}/gh-aw/safeoutputs:rw", "/tmp/gh-aw:/tmp/gh-aw:rw"]`) {
+		t.Error("Expected TOML mounts")
 	}
-	if !strings.Contains(output, "[mcp_servers.safeoutputs.headers]") {
-		t.Error("Expected TOML headers section")
+	if !strings.Contains(output, `args = ["-w", "$GITHUB_WORKSPACE"]`) {
+		t.Error("Expected TOML args")
 	}
-	if !strings.Contains(output, `Authorization = "$GH_AW_SAFE_OUTPUTS_API_KEY"`) {
-		t.Error("Expected TOML Authorization header")
+	if !strings.Contains(output, `entrypoint = "sh"`) {
+		t.Error("Expected TOML entrypoint override to sh")
+	}
+	if !strings.Contains(output, `entrypointArgs = ["-c", "sh ${RUNNER_TEMP}/gh-aw/safeoutputs/start_safe_outputs_mcp.sh"]`) {
+		t.Error("Expected TOML entrypointArgs to run the stdio MCP server script")
+	}
+	if !strings.Contains(output, `env_vars = ["DEBUG", "DEFAULT_BRANCH", "GH_AW_ASSETS_ALLOWED_EXTS", "GH_AW_ASSETS_BRANCH", "GH_AW_ASSETS_MAX_SIZE_KB", "GH_AW_MCP_LOG_DIR", "GH_AW_SAFE_OUTPUTS", "GH_AW_SAFE_OUTPUTS_CONFIG_PATH", "GH_AW_SAFE_OUTPUTS_TOOLS_PATH", "GH_AW_POLICY_ALLOW_CREATE_PULL_REQUEST", "GITHUB_REPOSITORY", "GITHUB_TOKEN", "GITHUB_WORKSPACE", "RUNNER_TEMP"]`) {
+		t.Error("Expected TOML env vars")
+	}
+	if strings.Contains(output, `type = "http"`) {
+		t.Error("Did not expect TOML HTTP type field")
+	}
+	if strings.Contains(output, `url = "http://`) {
+		t.Error("Did not expect TOML HTTP URL")
 	}
 }
 
@@ -515,28 +549,24 @@ func TestRenderJSONMCPConfig_OTLPGateway(t *testing.T) {
 		name         string
 		otlpEndpoint string
 		otlpHeaders  string
-		wantHeaders  bool
 		wantEndpoint bool
 	}{
 		{
 			name:         "OTLP endpoint only (no headers)",
 			otlpEndpoint: "https://otel.example.com:4318",
 			otlpHeaders:  "",
-			wantHeaders:  false,
 			wantEndpoint: true,
 		},
 		{
 			name:         "OTLP endpoint and headers",
 			otlpEndpoint: "https://otel.example.com:4318",
 			otlpHeaders:  "Authorization=Bearer token123",
-			wantHeaders:  true,
 			wantEndpoint: true,
 		},
 		{
 			name:         "no OTLP config",
 			otlpEndpoint: "",
 			otlpHeaders:  "",
-			wantHeaders:  false,
 			wantEndpoint: false,
 		},
 	}
@@ -582,10 +612,10 @@ func TestRenderJSONMCPConfig_OTLPGateway(t *testing.T) {
 				t.Error("output must not contain _GH_AW_OTLP_HEADERS_ESC preamble")
 			}
 
-			// Verify headers field (raw env var passthrough) is present iff configured
-			hasHeaders := strings.Contains(result, `"headers": "${OTEL_EXPORTER_OTLP_HEADERS}"`)
-			if hasHeaders != tt.wantHeaders {
-				t.Errorf("headers field presence = %v, want %v\noutput:\n%s", hasHeaders, tt.wantHeaders, result)
+			// Verify headers field is never emitted in JSON config; headers are now
+			// passed exclusively via the OTEL_EXPORTER_OTLP_HEADERS container env var.
+			if strings.Contains(result, `"headers"`) {
+				t.Errorf("headers field must not appear in gateway JSON config (use OTEL_EXPORTER_OTLP_HEADERS env var instead)\noutput:\n%s", result)
 			}
 
 			// Verify endpoint is present iff configured

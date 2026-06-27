@@ -20,6 +20,7 @@ GitHub Agentic Workflows upload several artifacts during workflow execution. Thi
 | `aw-info` | — | Single-file | Engine configuration (`aw_info.json`) |
 | `prompt` | — | Single-file | Generated prompt (`prompt.txt`) |
 | `experiment` | `constants.ExperimentArtifactName` | Multi-file | A/B experiment state (`state.json`) uploaded by the activation job when experiments are declared in the frontmatter |
+| `usage` | `constants.UsageArtifactName` | Multi-file | Compact conclusion-job artifact with workflow-run metadata and token-usage files used by lightweight reporting and forecasting paths |
 | `safe-outputs-items` | `constants.SafeOutputItemsArtifactName` | Single-file | Safe output items manifest |
 | `code-scanning-sarif` | `constants.SarifArtifactName` | Single-file | SARIF file for code scanning results |
 
@@ -36,6 +37,7 @@ The `gh aw logs` and `gh aw audit` commands support `--artifacts` to download on
 | `mcp` | `firewall-audit-logs` | MCP gateway traffic logs |
 | `detection` | `detection` | Threat detection output |
 | `experiment` | `experiment` | A/B experiment state (only present when experiments are declared) |
+| `usage` | `usage` | Compact conclusion-job artifact for lightweight reporting and forecasting |
 | `github-api` | `activation`, `agent` | GitHub API rate limit logs |
 
 ```bash
@@ -60,12 +62,15 @@ The `firewall-audit-logs` artifact is uploaded by **all firewall-enabled workflo
 ```
 firewall-audit-logs/
 ├── api-proxy-logs/
-│   └── token-usage.jsonl        ← Token usage data (input/output/cache tokens per API request)
+│   ├── token-usage.jsonl        ← Token usage data (input/output/cache tokens per API request)
+│   └── token-diag.log           ← Token diagnostics JSONL (only when AWF_DEBUG_TOKENS=1)
 ├── squid-logs/
 │   └── access.log               ← Network policy log (domain allow/deny decisions)
 ├── audit.jsonl                  ← Firewall audit trail (policy matches, rule evaluations)
 └── policy-manifest.json         ← Policy configuration snapshot
 ```
+
+`token-diag.log` is written by the AWF api-proxy `diag()` path (`containers/api-proxy/token-persistence.js`) to `$AWF_TOKEN_LOG_DIR/token-diag.log` (default `/var/log/api-proxy/token-diag.log`). It is only emitted when `AWF_DEBUG_TOKENS=1`, so set that environment variable on the workflow step that runs with AWF enabled when you need token diagnostics.
 
 ### Accessing Token Usage Data
 
@@ -136,6 +141,10 @@ The unified `agent` artifact contains all agent job outputs.
 - `otel.jsonl` — OTLP span mirror written by gh-aw's JavaScript span exporters (only present when `observability.otlp` is configured)
 - `copilot-otel.jsonl` — OTLP spans emitted by Copilot CLI (only present when `observability.otlp` is configured)
 
+For OTLP configuration, runtime environment variables, and
+span semantics, see the
+[OpenTelemetry guide](/gh-aw/guides/open-telemetry/).
+
 ## `activation`
 
 The `activation` artifact contains activation job outputs.
@@ -181,7 +190,21 @@ The `🧪 A/B Experiments` section of the audit report shows the variant chosen 
   • style = concise (cumulative: concise:5, detailed:4)
 ```
 
-See [A/B Experiments](/gh-aw/guides/experiments/) for how to declare experiments in workflow frontmatter.
+See [A/B Experiments](/gh-aw/experimental/experiments/) for how to declare experiments in workflow frontmatter.
+
+## `usage`
+
+The `usage` artifact is a compact artifact produced by the conclusion job. It carries workflow-run metadata and token-usage files used by lightweight reporting and forecasting paths, so downstream tools can read aggregated usage data without downloading the full `agent` artifact.
+
+### Accessing usage data
+
+```bash
+# Download only the usage artifact
+gh aw logs <run-id> --artifacts usage
+
+# Or with gh run download
+gh run download <run-id> -n usage
+```
 
 ## Naming Compatibility
 

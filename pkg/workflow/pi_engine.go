@@ -8,6 +8,7 @@ import (
 
 	"github.com/github/gh-aw/pkg/constants"
 	"github.com/github/gh-aw/pkg/logger"
+	"github.com/github/gh-aw/pkg/workflow/compilerenv"
 )
 
 var piLog = logger.New("workflow:pi_engine")
@@ -18,7 +19,7 @@ var piLog = logger.New("workflow:pi_engine")
 // provider/model format (e.g. "copilot/claude-sonnet-4-20250514"), Pi borrows the
 // matching engine's AWF configuration (secrets, gateway port, allowed domains) so the
 // firewall can route LLM traffic through the correct sidecar port.  Without a provider
-// prefix Pi defaults to the Copilot gateway.
+// prefix Pi defaults to the GitHub/Copilot gateway.
 //
 // Requirements:
 //   - tools.github.mode: gh-proxy must be enabled (pre-authenticated gh CLI).
@@ -39,7 +40,7 @@ func NewPiEngine() *PiEngine {
 			experimental: true,
 			capabilities: EngineCapabilities{
 				ToolsAllowlist:   true,
-				MaxTurns:         false,
+				MaxTurns:         true,
 				MaxContinuations: false,
 				WebSearch:        false,
 				NativeAgentFile:  false,
@@ -55,9 +56,15 @@ func (e *PiEngine) GetModelEnvVarName() string {
 	return constants.PiCLIModelEnvVar
 }
 
+// ResolveLLMProvider returns the effective provider for Pi inference.
+// Default is github, overridable via engine.model-provider.
+func (e *PiEngine) ResolveLLMProvider(workflowData *WorkflowData) string {
+	return resolveEngineLLMProvider(workflowData, LLMProviderGitHub)
+}
+
 // resolvePiBackend extracts the provider prefix from the engine model (if any) and maps
 // it to the matching UniversalLLMBackend.  A model without a slash (e.g. "claude-sonnet-4")
-// defaults to the Copilot backend for backward compatibility.
+// defaults to the GitHub (Copilot) backend for backward compatibility.
 //
 // "github-copilot/" is accepted as an alias for "copilot/" since that is the
 // provider name used by Pi CLI's built-in model registry.
@@ -141,6 +148,23 @@ func buildPiModelsJSON(gatewayPort int, secretEnvVarName, modelID string) string
 	return string(b)
 }
 
+func resolvePiGatewaySecretEnvVar(profile universalLLMBackendProfile, backend UniversalLLMBackend) string {
+	if len(profile.coreSecretNames) > 0 {
+		return profile.coreSecretNames[0]
+	}
+
+	switch backend {
+	case UniversalLLMBackendAnthropic:
+		return "ANTHROPIC_API_KEY"
+	case UniversalLLMBackendCodex:
+		return "CODEX_API_KEY"
+	default:
+		// copilot-requests: write intentionally leaves coreSecretNames empty and
+		// uses COPILOT_GITHUB_TOKEN=${{ github.token }} instead.
+		return "COPILOT_GITHUB_TOKEN"
+	}
+}
+
 // GetRequiredSecretNames returns the list of secrets required by the Pi engine.
 // When the model uses provider/model format the provider-specific secret is required
 // (e.g. ANTHROPIC_API_KEY for "anthropic/..."); otherwise Pi routes through the
@@ -148,17 +172,29 @@ func buildPiModelsJSON(gatewayPort int, secretEnvVarName, modelID string) string
 func (e *PiEngine) GetRequiredSecretNames(workflowData *WorkflowData) []string {
 	piLog.Print("Collecting required secrets for Pi engine")
 	backend := resolvePiBackend(workflowData)
-	profile := getUniversalLLMBackendProfile(backend, isFeatureEnabled(constants.CopilotRequestsFeatureFlag, workflowData))
+	profile := getUniversalLLMBackendProfile(backend, hasCopilotRequestsWritePermission(workflowData))
 	secrets := append([]string{}, profile.coreSecretNames...)
 	secrets = append(secrets, collectCommonMCPSecrets(workflowData)...)
 	return secrets
+}
+
+// GetSupportedEnvVarKeys returns the engine.env variable names that the Pi engine
+// supports as defined in the AWF specification. Pi is a multi-provider engine so all
+// provider API keys are valid engine.env overrides.
+func (e *PiEngine) GetSupportedEnvVarKeys() []string {
+	return []string{
+		constants.CopilotGitHubToken,
+		constants.AnthropicAPIKey,
+		constants.CodexAPIKey,
+		constants.OpenAIAPIKey,
+	}
 }
 
 // GetSecretValidationStep returns the secret validation step for the Pi engine.
 // The validated secret depends on the resolved provider backend.
 func (e *PiEngine) GetSecretValidationStep(workflowData *WorkflowData) GitHubActionStep {
 	backend := resolvePiBackend(workflowData)
-	profile := getUniversalLLMBackendProfile(backend, isFeatureEnabled(constants.CopilotRequestsFeatureFlag, workflowData))
+	profile := getUniversalLLMBackendProfile(backend, hasCopilotRequestsWritePermission(workflowData))
 	if len(profile.coreSecretNames) == 0 {
 		return GitHubActionStep{}
 	}
@@ -186,12 +222,14 @@ func (e *PiEngine) GetInstallationSteps(workflowData *WorkflowData) []GitHubActi
 		version = workflowData.EngineConfig.Version
 	}
 
-	npmSteps := BuildStandardNpmEngineInstallSteps(
-		"@mariozechner/pi-coding-agent",
+	npmSteps := GenerateNpmInstallSteps(
+		"@earendil-works/pi-coding-agent",
 		version,
 		"Install Pi CLI",
 		"pi",
-		workflowData,
+		true,  // Include Node.js setup
+		false, // Engine CLI installs must never run install scripts
+		false, // Pi installs should not apply the default npm release-age cooldown
 	)
 
 	steps := BuildNpmEngineInstallStepsWithAWF(npmSteps, workflowData)
@@ -262,8 +300,11 @@ func (e *PiEngine) GetExecutionSteps(workflowData *WorkflowData, logFile string)
 	// Resolve backend and profile early so we can use them when building piArgs.
 	modelConfigured := workflowData.EngineConfig != nil && workflowData.EngineConfig.Model != ""
 	backend := resolvePiBackend(workflowData)
-	profile := getUniversalLLMBackendProfile(backend, isFeatureEnabled(constants.CopilotRequestsFeatureFlag, workflowData))
+	profile := getUniversalLLMBackendProfile(backend, hasCopilotRequestsWritePermission(workflowData))
 	firewallEnabled := isFirewallEnabled(workflowData)
+
+	// When engine.driver is set, run the driver script directly instead of the pi CLI.
+	driverConfigured := workflowData.EngineConfig != nil && workflowData.EngineConfig.Driver != ""
 
 	// Build the pi command.  Pi v0.72+ uses flags-only syntax (no "run" subcommand).
 	// --print: non-interactive, process prompt from stdin and exit.
@@ -273,7 +314,7 @@ func (e *PiEngine) GetExecutionSteps(workflowData *WorkflowData, logFile string)
 
 	// Append any user-supplied extra args from engine.args
 	if workflowData.EngineConfig != nil {
-		piArgs = append(piArgs, workflowData.EngineConfig.Args...)
+		piArgs = append(piArgs, filterPiArgs(workflowData.EngineConfig.Args)...)
 	}
 
 	// Pi v0.72+ does not support a PI_MODEL env var for CLI model selection; the model must be passed as
@@ -284,7 +325,20 @@ func (e *PiEngine) GetExecutionSteps(workflowData *WorkflowData, logFile string)
 	var piModelsJSONSetup string // shell fragment prepended to piCommand when needed
 	if modelConfigured {
 		modelID := extractPiModelID(workflowData.EngineConfig.Model)
-		if firewallEnabled && len(profile.coreSecretNames) > 0 {
+
+		// Determine the env var name to use as the "apiKey" in the models.json gateway
+		// config. Pi's resolveConfigValue() reads process.env[apiKey] at runtime to
+		// obtain the actual token value.
+		gatewaySecretEnvVar := resolvePiGatewaySecretEnvVar(profile, backend)
+
+		if firewallEnabled {
+			// Pi + firewall must always route through aw-gateway/models.json. Native
+			// provider resolution bypasses the gateway and is incompatible with this mode.
+			if gatewaySecretEnvVar == "" {
+				piLog.Printf("Pi: no gateway apiKey env resolved for backend=%s; defaulting to COPILOT_GITHUB_TOKEN", backend)
+				gatewaySecretEnvVar = "COPILOT_GITHUB_TOKEN"
+			}
+
 			// Firewall case: write a models.json that redirects Pi's LLM calls to the
 			// AWF gateway sidecar port.  The "apiKey" field value is the name of the env
 			// var that holds the secret; Pi's resolveConfigValue() looks up
@@ -293,38 +347,49 @@ func (e *PiEngine) GetExecutionSteps(workflowData *WorkflowData, logFile string)
 			// printf '%s\n' '<json>' is safe here because JSON uses only double quotes
 			// (never single quotes), so single-quoting via shellEscapeArg requires no
 			// further escaping in practice.
-			modelsJSON := buildPiModelsJSON(profile.gatewayPort, profile.coreSecretNames[0], modelID)
+			modelsJSON := buildPiModelsJSON(profile.gatewayPort, gatewaySecretEnvVar, modelID)
 			piModelsJSONSetup = fmt.Sprintf(
 				`mkdir -p /tmp/gh-aw/pi-agent-dir && printf '%%s\n' %s > /tmp/gh-aw/pi-agent-dir/models.json && `,
 				shellEscapeArg(modelsJSON))
-			piArgs = append(piArgs, "--model", "aw-gateway/"+modelID)
+			if !driverConfigured {
+				piArgs = append(piArgs, "--model", "aw-gateway/"+modelID)
+			}
 			piLog.Printf("Pi: using models.json gateway routing for model %q via aw-gateway (port %d)", modelID, profile.gatewayPort)
 		} else {
-			// No firewall: use Pi's built-in provider so it can reach the real LLM API.
-			nativeProvider := piNativeProviderName(backend)
-			piArgs = append(piArgs, "--model", nativeProvider+"/"+modelID)
-			piLog.Printf("Pi: using native provider %q for model %q (no firewall)", nativeProvider, modelID)
+			if !driverConfigured {
+				// No firewall: use Pi's built-in provider so it can reach the real LLM API.
+				nativeProvider := piNativeProviderName(backend)
+				piArgs = append(piArgs, "--model", nativeProvider+"/"+modelID)
+				piLog.Printf("Pi: using native provider %q for model %q (no firewall)", nativeProvider, modelID)
+			}
 		}
 	}
 
-	// The prompt is piped from a file via stdin substitution.
-	// Two extensions are automatically loaded (in order):
-	//   1. pi_provider.cjs  — calls /reflect to discover the open LLM inference paths
-	//   2. pi_steering_extension.cjs — injects time-pressure steering messages
-	// Pi CLI supports multiple --extension flags; built-in extensions load after any
-	// user-specified extensions (via engine.args) so the built-in behaviour wins.
-	// ${RUNNER_TEMP} is a Linux shell variable expanded by bash at runtime; gh-aw
-	// container environments are Linux-only so this is safe across all runners.
-	// stdout (JSONL) and stderr are both piped through tee so that PiStreamingLogFile
-	// captures all structured events while agent-stdio.log captures the same output.
-	piCommand := fmt.Sprintf(
-		`cat /tmp/gh-aw/aw-prompts/prompt.txt | %s %s --extension "${RUNNER_TEMP}/gh-aw/actions/pi_provider.cjs" --extension "${RUNNER_TEMP}/gh-aw/actions/pi_steering_extension.cjs" 2>&1 | tee %s`,
-		commandName, shellJoinArgs(piArgs), PiStreamingLogFile)
+	var piCommand string
+	if driverConfigured {
+		piCommand = buildPiDriverCommand(workflowData.EngineConfig.Driver)
+		piLog.Printf("Pi: using driver mode with driver=%s", workflowData.EngineConfig.Driver)
+	} else {
+		// The prompt is piped from a file via stdin substitution.
+		// Two extensions are automatically loaded (in order):
+		//   1. pi_provider.cjs  — calls /reflect to discover the open LLM inference paths
+		//   2. pi_steering_extension.cjs — injects time-pressure steering messages
+		// Pi CLI supports multiple --extension flags; built-in extensions load after any
+		// user-specified extensions (via engine.args) so the built-in behaviour wins.
+		// ${RUNNER_TEMP} is a Linux shell variable expanded by bash at runtime; gh-aw
+		// container environments are Linux-only so this is safe across all runners.
+		// stdout (JSONL) and stderr are both piped through tee so that PiStreamingLogFile
+		// captures all structured events while agent-stdio.log captures the same output.
+		piCommand = fmt.Sprintf(
+			`cat /tmp/gh-aw/aw-prompts/prompt.txt | %s %s --extension "${RUNNER_TEMP}/gh-aw/actions/pi_provider.cjs" --extension "${RUNNER_TEMP}/gh-aw/actions/pi_steering_extension.cjs" 2>&1 | tee %s`,
+			commandName, shellJoinArgs(piArgs), PiStreamingLogFile)
+	}
 
 	// Prepend models.json generation when the gateway-routing approach is used.
 	if piModelsJSONSetup != "" {
 		piCommand = piModelsJSONSetup + piCommand
 	}
+	piCommand = getWorkspaceCommandPrefixFor(workflowData.EngineConfig) + piCommand
 
 	var command string
 	if firewallEnabled {
@@ -351,6 +416,9 @@ func (e *PiEngine) GetExecutionSteps(workflowData *WorkflowData, logFile string)
 		if mcpCLIPath := GetMCPCLIPathSetup(workflowData); mcpCLIPath != "" {
 			piCommandWithPath = fmt.Sprintf("%s && %s", mcpCLIPath, piCommandWithPath)
 		}
+		pathSetup := "touch " + AgentStepSummaryPath + "\n" +
+			"GH_AW_NODE_BIN=$(command -v node 2>/dev/null || true)\n" +
+			"export GH_AW_NODE_BIN"
 
 		command = BuildAWFCommand(AWFCommandConfig{
 			EngineName:         "pi",
@@ -359,7 +427,7 @@ func (e *PiEngine) GetExecutionSteps(workflowData *WorkflowData, logFile string)
 			WorkflowData:       workflowData,
 			UsesTTY:            false,
 			AllowedDomains:     allowedDomains,
-			PathSetup:          "touch " + AgentStepSummaryPath,
+			PathSetup:          pathSetup,
 			ExcludeEnvVarNames: ComputeAWFExcludeEnvVarNames(workflowData, profile.coreSecretNames),
 		})
 	} else {
@@ -376,11 +444,13 @@ touch %s
 	// vars; routing is instead handled through models.json (firewall case) or by Pi's
 	// native provider (no-firewall case).
 	env := map[string]string{
-		"GH_AW_PROMPT":        "/tmp/gh-aw/aw-prompts/prompt.txt",
+		"GH_AW_PROMPT":        constants.AwPromptsFile,
 		"GITHUB_AW":           "true",
 		"GITHUB_WORKSPACE":    "${{ github.workspace }}",
 		"GITHUB_STEP_SUMMARY": AgentStepSummaryPath,
+		"RUNNER_TEMP":         "${{ runner.temp }}",
 	}
+	injectWorkflowCallNetworkAllowedEnv(env, workflowData)
 	if modelConfigured {
 		env["GH_AW_PI_MODEL"] = workflowData.EngineConfig.Model
 	}
@@ -399,7 +469,7 @@ touch %s
 
 	// When the models.json gateway approach is used, tell Pi where to find it.
 	if piModelsJSONSetup != "" {
-		env["PI_CODING_AGENT_DIR"] = "/tmp/gh-aw/pi-agent-dir"
+		env["PI_CODING_AGENT_DIR"] = constants.TmpPiAgentDir
 		piLog.Printf("Pi: setting PI_CODING_AGENT_DIR for models.json gateway config")
 	}
 
@@ -415,15 +485,27 @@ touch %s
 	}
 
 	// When the AWF firewall is enabled, set git identity environment variables
-	// for commit authorship.
+	// for commit authorship and signal to the Pi extension that the AWF api-proxy
+	// sidecar is running so the /reflect preflight is not skipped.
 	if firewallEnabled {
 		maps.Copy(env, getGitIdentityEnvVars())
+		env["AWF_REFLECT_ENABLED"] = "1"
 	}
 
 	// Apply safe-outputs env
 	applySafeOutputEnvToMap(env, workflowData)
 
+	// Propagate W3C trace context so engine spans nest under the gh-aw.agent.setup span.
+	applyTraceContextEnvToMap(env)
+
+	if workflowData.EngineConfig != nil && workflowData.EngineConfig.MaxTurns != "" {
+		env["GH_AW_MAX_TURNS"] = workflowData.EngineConfig.MaxTurns
+	} else {
+		env["GH_AW_MAX_TURNS"] = compilerenv.BuildDefaultMaxTurnsExpression()
+	}
+
 	// Apply custom env overrides from engine.env
+	applyEngineCwdEnv(env, workflowData)
 	if workflowData.EngineConfig != nil && len(workflowData.EngineConfig.Env) > 0 {
 		maps.Copy(env, workflowData.EngineConfig.Env)
 	}
@@ -452,3 +534,41 @@ touch %s
 // All Pi tool calls, messages, and metrics are captured here for post-run analysis
 // and step summary rendering.
 const PiStreamingLogFile = "/tmp/gh-aw/pi-streaming.jsonl"
+
+// filterPiArgs removes redundant Pi CLI flags that gh-aw should not pass through.
+// Pi runs in yolo mode by default, so explicit --yolo flags are ignored while all
+// other engine args are preserved in order.
+func filterPiArgs(args []string) []string {
+	filtered := make([]string, 0, len(args))
+	for _, arg := range args {
+		if arg == "--yolo" || strings.HasPrefix(arg, "--yolo=") {
+			piLog.Printf("Pi: dropping redundant arg %q because Pi runs in yolo mode by default", arg)
+			continue
+		}
+		filtered = append(filtered, arg)
+	}
+
+	return filtered
+}
+
+// buildPiDriverCommand builds the shell command to run a pi engine driver script.
+//
+// When driverName contains a path separator ('/'), it is treated as a workspace-relative
+// custom driver: "${GITHUB_WORKSPACE}/<driverName>".  When it is a bare filename
+// (no '/'), it is resolved from the setup-action directory: "${RUNNER_TEMP}/gh-aw/actions/<driverName>".
+//
+// The driver reads GH_AW_PROMPT and GH_AW_PI_MODEL from the environment and emits
+// JSONL compatible with parse_pi_log.cjs to stdout; stderr and stdout are both
+// captured by tee to PiStreamingLogFile.
+func buildPiDriverCommand(driverName string) string {
+	var driverPath string
+	if strings.Contains(driverName, "/") {
+		// Workspace-relative custom driver: validation ensures no shell metacharacters or
+		// path traversal, so embedding directly in a double-quoted shell argument is safe.
+		driverPath = `"${GITHUB_WORKSPACE}/` + driverName + `"`
+	} else {
+		driverPath = fmt.Sprintf(`"%s/%s"`, SetupActionDestinationShell, driverName)
+	}
+
+	return fmt.Sprintf(`%s %s 2>&1 | tee %s`, nodeRuntimeResolutionCommand, driverPath, PiStreamingLogFile)
+}

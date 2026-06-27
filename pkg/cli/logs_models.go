@@ -43,7 +43,13 @@ const (
 	RateLimitThreshold = 10
 	// rateLimitResetBuffer is the extra duration added on top of the computed wait time
 	// after a rate-limit reset to avoid resuming right on the boundary.
-	rateLimitResetBuffer = 2 * time.Second
+
+	// GitHubActionsRetentionDays is GitHub's default log-retention window for
+	// GitHub Actions workflow runs.  Runs older than this threshold are unlikely
+	// to have artifacts available, so the logs tool uses it to produce a helpful
+	// "beyond retention period" message when no results are found.
+	GitHubActionsRetentionDays = 90
+	rateLimitResetBuffer       = 2 * time.Second
 )
 
 // WorkflowRun represents a GitHub Actions workflow run with metrics
@@ -65,7 +71,6 @@ type WorkflowRun struct {
 	Duration            time.Duration
 	ActionMinutes       float64 // Billable Actions minutes estimated from wall-clock time
 	TokenUsage          int
-	EstimatedCost       float64
 	Turns               int
 	ErrorCount          int
 	WarningCount        int
@@ -107,22 +112,25 @@ type ProcessedRun struct {
 	JobDetails              []JobInfoWithDuration
 }
 
+// ReportProvenance holds the shared provenance fields common to all report record types.
+type ReportProvenance struct {
+	Timestamp    string `json:"timestamp"`
+	WorkflowName string `json:"workflow_name,omitempty"` // Tracks which workflow reported this
+	RunID        int64  `json:"run_id,omitempty"`        // Tracks which run reported this
+}
+
 // MissingToolReport represents a missing tool reported by an agentic workflow
 type MissingToolReport struct {
 	Tool         string `json:"tool"`
 	Reason       string `json:"reason"`
 	Alternatives string `json:"alternatives,omitempty"`
-	Timestamp    string `json:"timestamp"`
-	WorkflowName string `json:"workflow_name,omitempty"` // Added for tracking which workflow reported this
-	RunID        int64  `json:"run_id,omitempty"`        // Added for tracking which run reported this
+	ReportProvenance
 }
 
 // NoopReport represents a noop message reported by an agentic workflow
 type NoopReport struct {
-	Message      string `json:"message"`
-	Timestamp    string `json:"timestamp,omitempty"`
-	WorkflowName string `json:"workflow_name,omitempty"` // Added for tracking which workflow reported this
-	RunID        int64  `json:"run_id,omitempty"`        // Added for tracking which run reported this
+	Message string `json:"message"`
+	ReportProvenance
 }
 
 // MissingDataReport represents missing data reported by an agentic workflow
@@ -131,18 +139,14 @@ type MissingDataReport struct {
 	Reason       string `json:"reason"`
 	Context      string `json:"context,omitempty"`
 	Alternatives string `json:"alternatives,omitempty"`
-	Timestamp    string `json:"timestamp"`
-	WorkflowName string `json:"workflow_name,omitempty"` // Added for tracking which workflow reported this
-	RunID        int64  `json:"run_id,omitempty"`        // Added for tracking which run reported this
+	ReportProvenance
 }
 
 // MCPFailureReport represents an MCP server failure detected in a workflow run
 type MCPFailureReport struct {
-	ServerName   string `json:"server_name"`
-	Status       string `json:"status"`
-	Timestamp    string `json:"timestamp,omitempty"`
-	WorkflowName string `json:"workflow_name,omitempty"`
-	RunID        int64  `json:"run_id,omitempty"`
+	ServerName string `json:"server_name"`
+	Status     string `json:"status"`
+	ReportProvenance
 }
 
 // MissingToolSummary aggregates missing tool reports across runs

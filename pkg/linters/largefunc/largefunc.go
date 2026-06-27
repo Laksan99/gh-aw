@@ -7,7 +7,10 @@ import (
 
 	"golang.org/x/tools/go/analysis"
 	"golang.org/x/tools/go/analysis/passes/inspect"
-	"golang.org/x/tools/go/ast/inspector"
+
+	"github.com/github/gh-aw/pkg/linters/internal/astutil"
+	"github.com/github/gh-aw/pkg/linters/internal/filecheck"
+	"github.com/github/gh-aw/pkg/linters/internal/nolint"
 )
 
 // DefaultMaxLines is the default maximum number of lines allowed in a function body.
@@ -31,7 +34,11 @@ func init() {
 }
 
 func run(pass *analysis.Pass) (any, error) {
-	insp := pass.ResultOf[inspect.Analyzer].(*inspector.Inspector)
+	insp, err := astutil.Inspector(pass)
+	if err != nil {
+		return nil, err
+	}
+	noLintLinesByFile := nolint.BuildLineIndex(pass, "largefunc")
 
 	nodeFilter := []ast.Node{
 		(*ast.FuncDecl)(nil),
@@ -41,17 +48,25 @@ func run(pass *analysis.Pass) (any, error) {
 	insp.Preorder(nodeFilter, func(n ast.Node) {
 		var body *ast.BlockStmt
 		var name string
+		var reportNode ast.Node
 
 		switch fn := n.(type) {
 		case *ast.FuncDecl:
 			body = fn.Body
 			name = fn.Name.Name
+			reportNode = fn.Name
 		case *ast.FuncLit:
 			body = fn.Body
 			name = "func literal"
+			reportNode = body
 		}
 
 		if body == nil {
+			return
+		}
+
+		position := pass.Fset.PositionFor(reportNode.Pos(), false)
+		if filecheck.IsTestFile(position.Filename) {
 			return
 		}
 
@@ -61,8 +76,11 @@ func run(pass *analysis.Pass) (any, error) {
 		lines := end.Line - start.Line - 1
 
 		if lines > maxLines {
-			pass.Reportf(
-				body.Lbrace,
+			if nolint.HasDirective(position, noLintLinesByFile) {
+				return
+			}
+			pass.ReportRangef(
+				reportNode,
 				"%s is %d lines long (limit: %d); consider breaking it up",
 				name, lines, maxLines,
 			)

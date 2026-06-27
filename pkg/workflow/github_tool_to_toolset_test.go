@@ -49,7 +49,7 @@ func TestValidateGitHubToolsAgainstToolsets(t *testing.T) {
 		},
 		{
 			name:            "All toolset enables everything",
-			allowedTools:    []string{"get_repository", "list_issues", "list_workflows", "create_gist"},
+			allowedTools:    []string{"get_repository", "list_issues", "actions_list", "create_gist"},
 			enabledToolsets: []string{"all"},
 			expectError:     false,
 		},
@@ -62,10 +62,10 @@ func TestValidateGitHubToolsAgainstToolsets(t *testing.T) {
 		},
 		{
 			name:            "Missing multiple toolsets",
-			allowedTools:    []string{"get_repository", "list_issues", "list_workflows"},
+			allowedTools:    []string{"get_repository", "list_issues", "actions_list"},
 			enabledToolsets: []string{"repos"}, // issues and actions missing
 			expectError:     true,
-			errorContains:   []string{"issues", "actions", "list_issues", "list_workflows"},
+			errorContains:   []string{"issues", "actions", "list_issues", "actions_list"},
 		},
 		{
 			name:            "Missing toolset for pull request tools",
@@ -90,16 +90,29 @@ func TestValidateGitHubToolsAgainstToolsets(t *testing.T) {
 		},
 		{
 			name:            "Actions toolset tools",
-			allowedTools:    []string{"list_workflows", "get_workflow_run", "download_workflow_run_artifact"},
+			allowedTools:    []string{"actions_list", "actions_get", "get_job_logs"},
+			enabledToolsets: []string{"actions"},
+			expectError:     false,
+		},
+		{
+			name:            "actions_run_trigger belongs to actions toolset",
+			allowedTools:    []string{"actions_run_trigger"},
 			enabledToolsets: []string{"actions"},
 			expectError:     false,
 		},
 		{
 			name:            "Actions toolset missing",
-			allowedTools:    []string{"list_workflows", "get_workflow_run"},
+			allowedTools:    []string{"actions_list", "actions_get"},
 			enabledToolsets: []string{"repos"},
 			expectError:     true,
-			errorContains:   []string{"actions", "list_workflows", "get_workflow_run"},
+			errorContains:   []string{"actions", "actions_list", "actions_get"},
+		},
+		{
+			name:            "actions_run_trigger fails without actions toolset",
+			allowedTools:    []string{"actions_run_trigger"},
+			enabledToolsets: []string{"repos"},
+			expectError:     true,
+			errorContains:   []string{"actions", "actions_run_trigger"},
 		},
 		{
 			name:            "Discussions and gists toolsets",
@@ -118,6 +131,32 @@ func TestValidateGitHubToolsAgainstToolsets(t *testing.T) {
 			allowedTools:    []string{"get_user", "get_me", "get_teams"},
 			enabledToolsets: []string{"users", "context"},
 			expectError:     false,
+		},
+		{
+			name:            "get_me belongs to context toolset",
+			allowedTools:    []string{"get_me"},
+			enabledToolsets: []string{"context"},
+			expectError:     false,
+		},
+		{
+			name:            "get_me fails without context toolset",
+			allowedTools:    []string{"get_me"},
+			enabledToolsets: []string{"users"},
+			expectError:     true,
+			errorContains:   []string{"context", "get_me"},
+		},
+		{
+			name:            "list_label belongs to labels toolset",
+			allowedTools:    []string{"list_label"},
+			enabledToolsets: []string{"labels"},
+			expectError:     false,
+		},
+		{
+			name:            "list_label fails without labels toolset",
+			allowedTools:    []string{"list_label"},
+			enabledToolsets: []string{"issues"},
+			expectError:     true,
+			errorContains:   []string{"labels", "list_label"},
 		},
 		{
 			name:            "Search toolset",
@@ -164,12 +203,12 @@ func TestGitHubToolsetValidationError_Error(t *testing.T) {
 		{
 			name: "Single missing toolset with single tool",
 			missingToolsets: map[string][]string{
-				"actions": {"list_workflows"},
+				"actions": {"actions_list"},
 			},
 			expectedParts: []string{
 				"ERROR",
 				"actions",
-				"list_workflows",
+				"actions_list",
 				"Suggested fix",
 			},
 		},
@@ -190,13 +229,13 @@ func TestGitHubToolsetValidationError_Error(t *testing.T) {
 			name: "Multiple missing toolsets",
 			missingToolsets: map[string][]string{
 				"issues":  {"list_issues", "create_issue"},
-				"actions": {"list_workflows"},
+				"actions": {"actions_list"},
 			},
 			expectedParts: []string{
 				"ERROR",
 				"actions",
 				"issues",
-				"list_workflows",
+				"actions_list",
 				"list_issues",
 				"create_issue",
 			},
@@ -231,21 +270,22 @@ func TestGitHubToolToToolsetMap_Completeness(t *testing.T) {
 	}
 
 	foundToolsets := make(map[string]bool)
-	for _, toolset := range GitHubToolToToolsetMap {
+	for _, toolset := range loadGitHubToolToToolsetMap(t) {
 		foundToolsets[toolset] = true
 	}
 
 	for _, expectedToolset := range expectedToolsets {
 		if !foundToolsets[expectedToolset] {
-			t.Errorf("Expected to find tools for toolset %q in GitHubToolToToolsetMap", expectedToolset)
+			t.Errorf("Expected to find tools for toolset %q in getGitHubToolToToolsetMap()", expectedToolset)
 		}
 	}
 }
 
 func TestGitHubToolToToolsetMap_IncludesDefaultGitHubTools(t *testing.T) {
+	toolToToolsetMap := loadGitHubToolToToolsetMap(t)
 	for _, tool := range constants.DefaultReadOnlyGitHubTools {
-		if _, exists := GitHubToolToToolsetMap[tool]; !exists {
-			t.Errorf("Expected tool %q from constants.DefaultReadOnlyGitHubTools to be in GitHubToolToToolsetMap", tool)
+		if _, exists := toolToToolsetMap[tool]; !exists {
+			t.Errorf("Expected tool %q from constants.DefaultReadOnlyGitHubTools to be in getGitHubToolToToolsetMap()", tool)
 		}
 	}
 }
@@ -253,19 +293,21 @@ func TestGitHubToolToToolsetMap_IncludesDefaultGitHubTools(t *testing.T) {
 func TestGitHubToolToToolsetMap_ConsistencyWithDocumentation(t *testing.T) {
 	// Sample of tools that should be in the map based on documentation
 	expectedMappings := map[string]string{
-		"get_me":                      "users",
+		"get_me":                      "context",
 		"get_repository":              "repos",
 		"get_file_contents":           "repos",
 		"list_issues":                 "issues",
 		"create_issue":                "issues",
 		"pull_request_read":           "pull_requests",
 		"search_pull_requests":        "pull_requests",
-		"list_workflows":              "actions",
-		"get_workflow_run":            "actions",
+		"actions_list":                "actions",
+		"actions_get":                 "actions",
+		"actions_run_trigger":         "actions",
 		"list_code_scanning_alerts":   "code_security",
 		"create_discussion":           "discussions",
 		"create_gist":                 "gists",
 		"get_label":                   "labels",
+		"list_label":                  "labels",
 		"list_notifications":          "notifications",
 		"get_organization":            "orgs",
 		"get_user":                    "users",
@@ -273,16 +315,27 @@ func TestGitHubToolToToolsetMap_ConsistencyWithDocumentation(t *testing.T) {
 		"list_secret_scanning_alerts": "secret_protection",
 	}
 
+	toolToToolsetMap := loadGitHubToolToToolsetMap(t)
 	for tool, expectedToolset := range expectedMappings {
-		actualToolset, exists := GitHubToolToToolsetMap[tool]
+		actualToolset, exists := toolToToolsetMap[tool]
 		if !exists {
-			t.Errorf("Expected tool %q to be in GitHubToolToToolsetMap", tool)
+			t.Errorf("Expected tool %q to be in getGitHubToolToToolsetMap()", tool)
 			continue
 		}
 		if actualToolset != expectedToolset {
 			t.Errorf("Tool %q: expected toolset %q, got %q", tool, expectedToolset, actualToolset)
 		}
 	}
+}
+
+func loadGitHubToolToToolsetMap(t *testing.T) map[string]string {
+	t.Helper()
+
+	toolToToolsetMap, err := getGitHubToolToToolsetMap()
+	if err != nil {
+		t.Fatalf("getGitHubToolToToolsetMap() error = %v", err)
+	}
+	return toolToToolsetMap
 }
 
 // expandToolsetsForTesting expands "default" and "all" toolsets for testing purposes
@@ -306,6 +359,7 @@ func expandToolsetsForTesting(toolsets []string) []string {
 			for _, ex := range GitHubToolsetsExcludedFromAll {
 				excludedMap[ex] = true
 			}
+			toolsetPermissionsMap := getToolsetPermissionsMap()
 			for t := range toolsetPermissionsMap {
 				if excludedMap[t] {
 					continue
@@ -354,9 +408,9 @@ func TestValidateGitHubToolsDidYouMean(t *testing.T) {
 			shouldHaveSuggestion: true,
 		},
 		{
-			name:                 "typo list_workflos suggests list_workflows",
-			invalidTool:          "list_workflos",
-			expectedSuggestion:   "list_workflows",
+			name:                 "typo actions_lst suggests actions_list",
+			invalidTool:          "actions_lst",
+			expectedSuggestion:   "actions_list",
 			shouldHaveSuggestion: true,
 		},
 		{

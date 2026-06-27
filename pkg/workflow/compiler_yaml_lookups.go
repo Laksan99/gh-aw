@@ -1,11 +1,13 @@
 package workflow
 
 import (
+	"encoding/json"
 	"regexp"
 	"strings"
 
 	"github.com/github/gh-aw/pkg/constants"
 	"github.com/github/gh-aw/pkg/logger"
+	"github.com/github/gh-aw/pkg/workflow/compilerenv"
 )
 
 var compilerYamlLookupsLog = logger.New("workflow:compiler_yaml_lookups")
@@ -31,21 +33,38 @@ func getVersionForSetup(data *WorkflowData) string {
 		engineID = data.AI
 	}
 	switch engineID {
-	case "copilot":
+	case string(constants.CopilotEngine):
 		return string(constants.DefaultCopilotVersion)
-	case "claude":
+	case string(constants.ClaudeEngine):
 		return string(constants.DefaultClaudeCodeVersion)
-	case "codex":
+	case string(constants.CodexEngine):
 		return string(constants.DefaultCodexVersion)
-	case "opencode":
+	case string(constants.OpenCodeEngine):
 		return string(constants.DefaultOpenCodeVersion)
-	case "crush":
+	case string(constants.CrushEngine):
 		return string(constants.DefaultCrushVersion)
-	case "pi":
+	case string(constants.PiEngine):
 		return string(constants.DefaultPiVersion)
 	default:
 		return ""
 	}
+}
+
+// getAWFVersionForSetup returns the AWF runtime version to inject as
+// GH_AW_INFO_AWF_VERSION in setup steps so all job-local OTel spans can
+// attribute telemetry to the firewall runtime that executed the job.
+func getAWFVersionForSetup(data *WorkflowData) string {
+	if data == nil {
+		return ""
+	}
+	firewallConfig := getFirewallConfig(data)
+	if firewallConfig == nil || !firewallConfig.Enabled {
+		return ""
+	}
+	if firewallConfig.Version != "" {
+		return firewallConfig.Version
+	}
+	return string(constants.DefaultFirewallVersion)
 }
 
 // getInstallationVersion returns the version that will be installed for the given engine.
@@ -62,17 +81,17 @@ func getInstallationVersion(data *WorkflowData, engine CodingAgentEngine) string
 
 	// Otherwise, use the default version for the engine
 	switch engineID {
-	case "copilot":
+	case string(constants.CopilotEngine):
 		return string(constants.DefaultCopilotVersion)
-	case "claude":
+	case string(constants.ClaudeEngine):
 		return string(constants.DefaultClaudeCodeVersion)
-	case "codex":
+	case string(constants.CodexEngine):
 		return string(constants.DefaultCodexVersion)
-	case "opencode":
+	case string(constants.OpenCodeEngine):
 		return string(constants.DefaultOpenCodeVersion)
-	case "crush":
+	case string(constants.CrushEngine):
 		return string(constants.DefaultCrushVersion)
-	case "pi":
+	case string(constants.PiEngine):
 		return string(constants.DefaultPiVersion)
 	default:
 		// Custom or unknown engines don't have a default version
@@ -84,14 +103,31 @@ func getInstallationVersion(data *WorkflowData, engine CodingAgentEngine) string
 // getDefaultAgentModel returns the model display value to use when no explicit model is configured.
 // For the copilot engine this matches the CopilotBYOKDefaultModel used in COPILOT_MODEL so that
 // GH_AW_INFO_MODEL and COPILOT_MODEL agree on the same fallback.
-// Returns "auto" for other known engines whose model is dynamically determined by the AI provider,
+// Returns "agent" for other known engines whose model is dynamically determined by the AI provider,
 // or empty string for custom/unknown engines.
 func getDefaultAgentModel(engineID string) string {
 	switch engineID {
-	case "copilot":
+	case string(constants.CopilotEngine):
 		return constants.CopilotBYOKDefaultModel
-	case "claude", "codex", "gemini", "opencode", "crush", "pi":
-		return "auto"
+	case string(constants.ClaudeEngine), string(constants.GeminiEngine), string(constants.OpenCodeEngine), string(constants.CrushEngine), string(constants.PiEngine):
+		return "agent"
+	case string(constants.CodexEngine):
+		return constants.CodexDefaultModel
+	default:
+		return ""
+	}
+}
+
+// getDefaultModelOverrideVar returns the enterprise override variable used for the engine's
+// default model fallback when the GH_AW_MODEL_AGENT/DETECTION_* variable is unset.
+func getDefaultModelOverrideVar(engineID string) string {
+	switch engineID {
+	case string(constants.CopilotEngine):
+		return compilerenv.DefaultModelCopilot
+	case string(constants.ClaudeEngine):
+		return compilerenv.DefaultModelClaude
+	case string(constants.CodexEngine):
+		return compilerenv.DefaultModelCodex
 	default:
 		return ""
 	}
@@ -123,4 +159,110 @@ func versionToGitRef(version string) string {
 	}
 	compilerYamlLookupsLog.Printf("Using version as git ref: %s -> %s", version, clean)
 	return clean
+}
+
+// collectEngineVersionsForMetadata returns engine version metadata for gh-aw lock files.
+// It includes only engines that are active in the current workflow, applies explicit version
+// overrides for those engines, and includes copilot-sdk only when enabled on an active copilot engine.
+func collectEngineVersionsForMetadata(data *WorkflowData) map[string]string {
+	if data == nil {
+		return map[string]string{}
+	}
+
+	versions := map[string]string{
+		string(constants.CopilotEngine):     string(constants.DefaultCopilotVersion),
+		string(constants.ClaudeEngine):      string(constants.DefaultClaudeCodeVersion),
+		string(constants.CodexEngine):       string(constants.DefaultCodexVersion),
+		string(constants.GeminiEngine):      string(constants.DefaultGeminiVersion),
+		string(constants.AntigravityEngine): string(constants.DefaultAntigravityVersion),
+		string(constants.OpenCodeEngine):    string(constants.DefaultOpenCodeVersion),
+		string(constants.CrushEngine):       string(constants.DefaultCrushVersion),
+		string(constants.PiEngine):          string(constants.DefaultPiVersion),
+	}
+
+	mainEngineID := strings.TrimSpace(ResolveEngineID(data))
+	if mainEngineID == "" {
+		mainEngineID = string(constants.DefaultEngine)
+	}
+	activeEngineIDs := map[string]struct{}{mainEngineID: {}}
+
+	applyMetadataEngineVersionOverrides(versions, data.EngineConfig, mainEngineID)
+	if IsDetectionJobEnabled(data.SafeOutputs) && data.SafeOutputs != nil && data.SafeOutputs.ThreatDetection != nil {
+		detectionConfig := data.SafeOutputs.ThreatDetection.EngineConfig
+		detectionEngineID := mainEngineID
+		if detectionConfig != nil && strings.TrimSpace(detectionConfig.ID) != "" {
+			detectionEngineID = strings.TrimSpace(detectionConfig.ID)
+		}
+		activeEngineIDs[detectionEngineID] = struct{}{}
+		applyMetadataEngineVersionOverrides(versions, detectionConfig, detectionEngineID)
+	}
+
+	filteredVersions := make(map[string]string, len(activeEngineIDs)+1)
+	for engineID := range activeEngineIDs {
+		if version := strings.TrimSpace(versions[engineID]); version != "" {
+			filteredVersions[engineID] = version
+		}
+	}
+
+	if isCopilotSDKEnabledForActiveEngine(data, mainEngineID) {
+		filteredVersions["copilot-sdk"] = string(constants.DefaultCopilotSDKVersion)
+	}
+
+	return filteredVersions
+}
+
+func applyMetadataEngineVersionOverrides(versions map[string]string, engineConfig *EngineConfig, fallbackEngineID string) {
+	if engineConfig == nil {
+		return
+	}
+
+	engineID := strings.TrimSpace(engineConfig.ID)
+	if engineID == "" {
+		engineID = strings.TrimSpace(fallbackEngineID)
+	}
+	if engineID != "" && strings.TrimSpace(engineConfig.Version) != "" {
+		versions[engineID] = strings.TrimSpace(engineConfig.Version)
+	}
+}
+
+func isCopilotSDKEnabledForActiveEngine(data *WorkflowData, mainEngineID string) bool {
+	if mainEngineID == string(constants.CopilotEngine) && data.EngineConfig != nil && data.EngineConfig.CopilotSDK {
+		return true
+	}
+
+	if !IsDetectionJobEnabled(data.SafeOutputs) || data.SafeOutputs == nil || data.SafeOutputs.ThreatDetection == nil {
+		return false
+	}
+
+	detectionConfig := data.SafeOutputs.ThreatDetection.EngineConfig
+	if detectionConfig == nil {
+		return false
+	}
+
+	detectionEngineID := strings.TrimSpace(detectionConfig.ID)
+	if detectionEngineID == "" {
+		detectionEngineID = mainEngineID
+	}
+	return detectionEngineID == string(constants.CopilotEngine) && detectionConfig.CopilotSDK
+}
+
+// resolveAgentImageRunnerIdentifier returns a stable identifier for the configured runs-on value.
+// For string values it returns the value directly; for array/object values it returns JSON.
+func resolveAgentImageRunnerIdentifier(frontmatter map[string]any) string {
+	if frontmatter == nil {
+		return ""
+	}
+	runsOn, exists := frontmatter["runs-on"]
+	if !exists || runsOn == nil {
+		return ""
+	}
+	if rawRunner, ok := runsOn.(string); ok {
+		return strings.TrimSpace(rawRunner)
+	}
+
+	serialized, err := json.Marshal(runsOn)
+	if err != nil {
+		return ""
+	}
+	return string(serialized)
 }

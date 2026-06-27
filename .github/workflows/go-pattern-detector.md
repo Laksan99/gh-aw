@@ -1,4 +1,6 @@
 ---
+private: true
+emoji: "🔍"
 name: Go Pattern Detector
 description: Detects common Go code patterns and anti-patterns to maintain code quality and consistency
 on:
@@ -17,7 +19,7 @@ jobs:
       found_patterns: ${{ steps.detect.outputs.found_patterns }}
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v6.0.2
+        uses: actions/checkout@v7.0.0
         with:
           persist-credentials: false
       - name: Install ast-grep
@@ -29,11 +31,11 @@ jobs:
         id: detect
         run: |
           # Run ast-grep to detect json:"-" pattern in Go files
-          if sg --pattern 'json:"-"' --lang go . > /tmp/ast-grep-results.txt 2>&1; then
-            if [ -s /tmp/ast-grep-results.txt ]; then
+          if sg --pattern 'json:"-"' --lang go . > /tmp/gh-aw/agent/ast-grep-results.txt 2>&1; then
+            if [ -s /tmp/gh-aw/agent/ast-grep-results.txt ]; then
               echo "found_patterns=true" >> "$GITHUB_OUTPUT"
               echo "::notice::Found Go patterns matching json:\"-\""
-              cat /tmp/ast-grep-results.txt
+              cat /tmp/gh-aw/agent/ast-grep-results.txt
             else
               echo "found_patterns=false" >> "$GITHUB_OUTPUT"
               echo "::notice::No Go patterns matching json:\"-\" found"
@@ -53,7 +55,7 @@ imports:
   - shared/mcp/ast-grep.md
   - shared/reporting.md
 
-  - shared/observability-otlp.md
+  - shared/otlp.md
 safe-outputs:
   create-issue:
     expires: 2d

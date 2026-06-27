@@ -4,7 +4,7 @@ import path from "path";
 
 describe("parse_copilot_log.cjs", () => {
   let mockCore, originalConsole, originalProcess;
-  let main, parseCopilotLog, extractPremiumRequestCount;
+  let main, parseCopilotLog;
 
   beforeEach(async () => {
     originalConsole = global.console;
@@ -45,7 +45,6 @@ describe("parse_copilot_log.cjs", () => {
     const module = await import("./parse_copilot_log.cjs?" + Date.now());
     main = module.main;
     parseCopilotLog = module.parseCopilotLog;
-    extractPremiumRequestCount = module.extractPremiumRequestCount;
   });
 
   afterEach(() => {
@@ -56,6 +55,8 @@ describe("parse_copilot_log.cjs", () => {
   });
 
   describe("parseCopilotLog function", () => {
+    const getSessionResultData = entries => entries.find(e => e.type === "session.result")?.data;
+
     it("should parse JSON array format", () => {
       const jsonArrayLog = JSON.stringify([
         { type: "system", subtype: "init", session_id: "copilot-test-123", tools: ["Bash", "Read", "mcp__github__create_issue"], model: "gpt-5" },
@@ -104,6 +105,37 @@ describe("parse_copilot_log.cjs", () => {
       expect(result.markdown).toContain("copilot-789");
       expect(result.markdown).toContain("ls -la");
       expect(result.markdown).toContain("Total Cost");
+    });
+
+    it("normalizes Copilot SDK events.jsonl entries into trace entries for rendering", () => {
+      const sdkEventsLog = [
+        '{"type":"user.message","timestamp":"2026-06-05T00:44:01.367Z","data":{}}',
+        '{"type":"tool.execution_start","timestamp":"2026-06-05T00:44:04.520Z","data":{"toolName":"report_intent","mcpServerName":""}}',
+        '{"type":"tool.execution_complete","timestamp":"2026-06-05T00:44:04.700Z","data":{"toolName":"report_intent","mcpServerName":"","success":true}}',
+        '{"type":"assistant.message","timestamp":"2026-06-05T00:44:59.769Z","data":{"content":"Rendered summary content"}}',
+      ].join("\n");
+
+      const result = parseCopilotLog(sdkEventsLog);
+
+      expect(result.markdown).toContain("🤖 Commands and Tools");
+      expect(result.markdown).toContain("report_intent");
+      expect(result.markdown).toContain("Rendered summary content");
+      const resultData = getSessionResultData(result.logEntries);
+      expect(resultData?.numTurns).toBe(1);
+    });
+
+    it("renders tool output preview from result.content in Copilot CLI events.jsonl", () => {
+      const eventsLog = [
+        '{"type":"user.message","timestamp":"2026-06-05T00:44:01.367Z","data":{}}',
+        '{"type":"tool.execution_start","timestamp":"2026-06-05T00:44:04.520Z","data":{"toolName":"bash","mcpServerName":""}}',
+        '{"type":"tool.execution_complete","timestamp":"2026-06-05T00:44:04.700Z","data":{"toolName":"bash","mcpServerName":"","success":true,"result":{"content":"file1.txt\\nfile2.txt\\nfile3.txt"}}}',
+        '{"type":"assistant.message","timestamp":"2026-06-05T00:44:59.769Z","data":{"content":"Done"}}',
+      ].join("\n");
+
+      const result = parseCopilotLog(eventsLog);
+
+      expect(result.markdown).toContain("bash");
+      expect(result.markdown).toContain("file1.txt");
     });
 
     it("should handle tool calls with details in HTML format", () => {
@@ -215,14 +247,6 @@ describe("parse_copilot_log.cjs", () => {
       expect(result.markdown).toContain("2,000");
     });
 
-    it("should set premium flag and use _premium_requests from pretty-print format", () => {
-      const prettyLog = ["● Bash", "    └ ok", "", "Breakdown by AI model:", "  gpt-4o  10k in, 2k out (Est. 1 Premium request)", "", "Total usage est: 12k tokens"].join("\n");
-
-      const result = parseCopilotLog(prettyLog);
-
-      expect(result.markdown).toContain("Premium Requests Consumed");
-    });
-
     it("should use Turns: count from pretty-print format when available", () => {
       const prettyLog = ["● Bash", "    └ ok", "● Bash", "    └ ok2", "", "Turns: 5", "Total usage est: 100 tokens"].join("\n");
 
@@ -230,9 +254,92 @@ describe("parse_copilot_log.cjs", () => {
 
       // num_turns should be 5 (from Turns: line), not 2 (from toolEntries.length)
       expect(result.logEntries).toBeDefined();
-      const resultEntry = result.logEntries.find(e => e.type === "result");
+      const resultData = getSessionResultData(result.logEntries);
+      expect(resultData).toBeDefined();
+      expect(resultData?.numTurns).toBe(5);
+    });
+
+    it("strips harness driver lines from rendered pretty-print output", () => {
+      const prettyLog = [
+        "[copilot-harness] 2026-05-16T08:21:00.991Z starting: command=/usr/local/bin/copilot",
+        "[copilot-harness] 2026-05-16T08:21:01.135Z attempt 1: spawning copilot",
+        "● Bash",
+        "    └ ok",
+        "Some final agent thought.",
+        "[copilot-harness] 2026-05-16T08:21:33.527Z attempt 1: process exit event exitCode=0",
+        "[copilot-harness] 2026-05-16T08:21:33.532Z done: exitCode=0 totalDuration=32s",
+      ].join("\n");
+
+      const result = parseCopilotLog(prettyLog);
+
+      expect(result.markdown).not.toContain("[copilot-harness]");
+      expect(result.markdown).not.toContain("attempt 1: spawning");
+      expect(result.markdown).toContain("Some final agent thought.");
+    });
+
+    it("suppresses the new Copilot CLI footer stats (Changes/Duration/Tokens) from agent text", () => {
+      const prettyLog = ["● Bash", "    └ ok", "The work is done.", "", "Changes   +0 -0", "Duration  31s", "Tokens    ↑ 290.1k • ↓ 1.4k • 247.4k (cached)"].join("\n");
+
+      const result = parseCopilotLog(prettyLog);
+
+      expect(result.markdown).toContain("The work is done.");
+      expect(result.markdown).not.toMatch(/^Changes\s+\+0 -0$/m);
+      expect(result.markdown).not.toMatch(/^Duration\s+31s$/m);
+      expect(result.markdown).not.toMatch(/^Tokens\s+↑/m);
+    });
+
+    it("extracts token counts from the new Copilot CLI footer (Tokens ↑X • ↓Y • Z (cached))", () => {
+      const prettyLog = ["● Bash", "    └ ok", "The work is done.", "", "Changes   +0 -0", "Duration  11s", "Tokens    ↑ 163.9k • ↓ 567 • 149.2k (cached)"].join("\n");
+
+      const result = parseCopilotLog(prettyLog);
+      const resultEntry = getSessionResultData(result.logEntries);
+
       expect(resultEntry).toBeDefined();
-      expect(resultEntry?.num_turns).toBe(5);
+      expect(resultEntry.usage).toEqual(
+        expect.objectContaining({
+          input_tokens: 163900,
+          output_tokens: 567,
+          cache_read_input_tokens: 149200,
+        })
+      );
+      // Information section should render the parsed tokens
+      expect(result.markdown).toContain("Token Usage");
+      expect(result.markdown).toContain("163,900");
+      expect(result.markdown).toContain("567");
+      expect(result.markdown).toContain("149,200");
+    });
+
+    it("extracts token counts when cached is shown inline after the up-arrow (Tokens ↑X (Y cached) • ↓Z)", () => {
+      // Format emitted by Copilot CLI 1.0.55: the cached count appears inline in
+      // parentheses after the up-arrow rather than trailing the line.
+      const prettyLog = ["● Bash", "    └ ok", "The work is done.", "", "Changes    +0 -0", "Duration   3m 13s", "Tokens     ↑ 422.2k (375.0k cached) • ↓ 2.4k"].join("\n");
+
+      const result = parseCopilotLog(prettyLog);
+      const resultEntry = getSessionResultData(result.logEntries);
+
+      expect(resultEntry).toBeDefined();
+      expect(resultEntry.usage).toEqual(
+        expect.objectContaining({
+          input_tokens: 422200,
+          output_tokens: 2400,
+          cache_read_input_tokens: 375000,
+        })
+      );
+      expect(result.markdown).toContain("Token Usage");
+      expect(result.markdown).toContain("422,200");
+      expect(result.markdown).toContain("2,400");
+      expect(result.markdown).toContain("375,000");
+    });
+
+    it("handles the new footer without a cached segment", () => {
+      const prettyLog = ["● Bash", "    └ ok", "", "Tokens    ↑ 1.2k • ↓ 50"].join("\n");
+
+      const result = parseCopilotLog(prettyLog);
+      const resultEntry = getSessionResultData(result.logEntries);
+
+      expect(resultEntry.usage.input_tokens).toBe(1200);
+      expect(resultEntry.usage.output_tokens).toBe(50);
+      expect(resultEntry.usage.cache_read_input_tokens).toBeUndefined();
     });
 
     it("should parse debug log format with reasoning_text", () => {
@@ -268,6 +375,35 @@ describe("parse_copilot_log.cjs", () => {
       expect(result.markdown).toContain("echo hello");
     });
 
+    it("should render reasoning_text with open circle icon and italic styling", () => {
+      const debugLog = [
+        "2026-02-21T00:06:13.708Z [INFO] Starting Copilot CLI: 0.0.412",
+        "2026-02-21T00:06:23.701Z [DEBUG] data:",
+        "2026-02-21T00:06:23.702Z [DEBUG] {",
+        '  "model": "gpt-5",',
+        '  "usage": { "prompt_tokens": 100, "completion_tokens": 50 },',
+        '  "choices": [',
+        "    {",
+        '      "message": {',
+        '        "reasoning_text": "I need to think carefully about the approach.",',
+        '        "content": "Here is my answer.",',
+        '        "tool_calls": null',
+        "      }",
+        "    }",
+        "  ]",
+        "}",
+        "2026-02-21T00:06:24.000Z [INFO] Done",
+      ].join("\n");
+
+      const result = parseCopilotLog(debugLog);
+
+      // Reasoning should appear with open circle icon
+      expect(result.markdown).toContain("◐");
+      expect(result.markdown).toContain("I need to think carefully about the approach.");
+      // Regular content should appear without open circle
+      expect(result.markdown).toContain("Here is my answer.");
+    });
+
     it("should handle model info with cost multiplier", () => {
       const structuredLog = JSON.stringify([
         { type: "system", subtype: "init", session_id: "cost-test", tools: ["Bash"], model: "gpt-4", model_info: { is_premium: true, cost_multiplier: 3 } },
@@ -276,16 +412,6 @@ describe("parse_copilot_log.cjs", () => {
       const result = parseCopilotLog(structuredLog);
 
       expect(result.markdown).toContain("gpt-4");
-    });
-
-    it("should not display premium requests for non-premium models", () => {
-      const structuredLog = JSON.stringify([
-        { type: "system", subtype: "init", session_id: "non-premium-test", tools: ["Bash"], model: "gpt-3.5-turbo", model_info: { is_premium: false } },
-        { type: "result", num_turns: 3, usage: { input_tokens: 500, output_tokens: 200 } },
-      ]);
-      const result = parseCopilotLog(structuredLog);
-
-      expect(result.markdown).not.toContain("**Premium Requests:**");
     });
 
     it("renders AWF token steering warnings from structured log entries", () => {
@@ -310,32 +436,6 @@ describe("parse_copilot_log.cjs", () => {
 
       expect(result.markdown).toContain("Firewall Steering");
       expect(result.markdown).toContain("[AWF TOKEN WARNING] You have used 90% of your effective token budget.");
-    });
-  });
-
-  describe("extractPremiumRequestCount function", () => {
-    it("should default to 1 if no match found", () => {
-      expect(extractPremiumRequestCount("No premium info here")).toBe(1);
-    });
-
-    it("should ignore invalid numbers", () => {
-      expect(extractPremiumRequestCount("Premium requests: abc")).toBe(1);
-    });
-
-    it("should parse integer premium request count", () => {
-      expect(extractPremiumRequestCount("premium requests consumed: 2")).toBe(2);
-    });
-
-    it("should parse decimal premium request count (e.g. gemini-3-flash-preview)", () => {
-      expect(extractPremiumRequestCount("premium requests consumed: 0.33")).toBe(0.33);
-    });
-
-    it("should parse decimal in alternate format", () => {
-      expect(extractPremiumRequestCount("0.33 premium requests consumed")).toBe(0.33);
-    });
-
-    it("should parse decimal in consumed-first format", () => {
-      expect(extractPremiumRequestCount("consumed 0.5 premium requests")).toBe(0.5);
     });
   });
 

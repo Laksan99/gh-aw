@@ -1,30 +1,61 @@
 ---
-description: Guide for leveraging skills (SKILL.md files) in agentic workflows — hint strategy and fusion strategy
+description: Guide for leveraging skills (SKILL.md files) in agentic workflows — hint, fusion, and inline fusion strategies
 ---
 
 # Skills in Agentic Workflows
 
-Consult this file when you want a workflow to take advantage of skills — domain-specific knowledge files (`SKILL.md`) that live in the repository under `skills/` or `.github/skills/`.
+Use skills — domain-specific knowledge files (`SKILL.md`) under `skills/` or `.github/skills/` — in workflows.
 
 ---
 
 ## Detecting Skills
 
-At runtime, find skill files with:
-
 ```bash
 find "${GITHUB_WORKSPACE}" -name "SKILL.md" -maxdepth 6
 ```
 
-List available skills and their locations before deciding which strategy to apply.
+List available skills before choosing a strategy.
+
+---
+
+## Inline Skills (Fusion at Authoring Time)
+
+**Use when**: keeping the main prompt compact while shipping task-specific skill guidance with the workflow.
+
+Inline skills embed a complete skill or fragment under `## skill: \`name\``. Extraction runs in the setup/interpolation step (not at compile time): gh-aw writes each block to engine-specific skill locations and removes it from the main prompt body.
+
+Use to fuse:
+
+- A full skill when the workflow needs a self-contained capability.
+- Partial sections when only targeted guidance is needed.
+
+**Pattern**:
+
+```markdown
+on:
+  workflow_dispatch:
+engine: copilot
+---
+
+Triage the issue and propose next steps.
+
+## skill: `issue-triage`
+---
+description: Classify issues and suggest next actions.
+---
+Classify by bug / feature / question, identify missing information, and suggest
+the smallest actionable next step.
+```
+
+Use a unique inline skill name per workflow file. Name must start with a lowercase letter, then lowercase letters, digits, `_`, or `-`. Avoid collisions with file-based skills under `.github/skills/<name>/SKILL.md` — inline extraction writes to the same paths.
 
 ---
 
 ## Strategy 1 — Hint (Generalist)
 
-**Use when**: The task strategy is not fully known at authoring time, or when the agent must adapt to whatever skills are available.
+**Use when**: the task strategy is unknown at authoring time, or the agent must adapt to whatever skills are available.
 
-The workflow prompt hints that skills exist and asks the agent to discover and apply the relevant ones itself. The agent decides which skill files to read and how much of each to use.
+The prompt tells the agent skills exist and to discover/apply the relevant ones itself.
 
 **Pattern**:
 
@@ -38,9 +69,9 @@ guidance it provides.
 
 ## Strategy 2 — Fusion (Ultra-Cognitive)
 
-**Use when**: You know exactly which skill (or which part of a skill) is needed, and you want to minimise context overhead.
+**Use when**: you know exactly which skill (or part of it) is needed and want minimal context overhead.
 
-Extract and inline **only the specific sections** of the skill content that the agent needs. Do not paste the entire SKILL.md; identify the minimal fragment, then remix it into the workflow prompt so the agent receives precise, surgical guidance without loading the full file.
+Inline **only the specific sections** of the skill the agent needs. Do not paste the entire SKILL.md.
 
 **Pattern**:
 
@@ -64,7 +95,7 @@ environment. Never prompt the user for credentials.
 | **Determinism** | Lower (agent chooses) | Higher (exact fragment) |
 | **Scale** | Poor (entire skills loaded) | Good (minimal content) |
 
-Fusion scales better because entire skills are never loaded. Prefer fusion when you know the task domain and the specific skill sections required.
+Fusion scales better because entire skills are never loaded. Prefer fusion when the task domain and required skill sections are known.
 
 ---
 

@@ -1,11 +1,13 @@
 package cli
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"path/filepath"
 
 	"github.com/github/gh-aw/pkg/console"
+	"github.com/github/gh-aw/pkg/fileutil"
 	"github.com/github/gh-aw/pkg/gitutil"
 	"github.com/github/gh-aw/pkg/logger"
 	"github.com/github/gh-aw/pkg/stringutil"
@@ -16,13 +18,13 @@ var addWorkflowCompilationLog = logger.New("cli:add_workflow_compilation")
 
 // compileWorkflow compiles a workflow file without refreshing stop time.
 // This is a convenience wrapper around compileWorkflowWithRefresh.
-func compileWorkflow(filePath string, verbose bool, quiet bool, engineOverride string) error {
-	return compileWorkflowWithRefresh(filePath, verbose, quiet, engineOverride, false)
+func compileWorkflow(ctx context.Context, filePath string, verbose bool, quiet bool, engineOverride string) error {
+	return compileWorkflowWithRefresh(ctx, filePath, verbose, quiet, engineOverride, false)
 }
 
 // compileWorkflowWithRefresh compiles a workflow file with optional stop time refresh.
 // This function handles the compilation process and ensures .gitattributes is updated.
-func compileWorkflowWithRefresh(filePath string, verbose bool, quiet bool, engineOverride string, refreshStopTime bool) error {
+func compileWorkflowWithRefresh(ctx context.Context, filePath string, verbose bool, quiet bool, engineOverride string, refreshStopTime bool) error {
 	addWorkflowCompilationLog.Printf("Compiling workflow: file=%s, refresh_stop_time=%v, engine=%s", filePath, refreshStopTime, engineOverride)
 
 	// Create compiler with auto-detected version and action mode
@@ -33,7 +35,7 @@ func compileWorkflowWithRefresh(filePath string, verbose bool, quiet bool, engin
 
 	compiler.SetRefreshStopTime(refreshStopTime)
 	compiler.SetQuiet(quiet)
-	if err := CompileWorkflowWithValidation(compiler, filePath, verbose, false, false, false, false, false); err != nil {
+	if err := CompileWorkflowWithValidation(ctx, compiler, filePath, CompileValidationOptions{Verbose: verbose}); err != nil {
 		addWorkflowCompilationLog.Printf("Compilation failed: %v", err)
 		return err
 	}
@@ -55,23 +57,20 @@ func compileWorkflowWithRefresh(filePath string, verbose bool, quiet bool, engin
 
 // compileWorkflowWithTracking compiles a workflow and tracks generated files.
 // This is a convenience wrapper around compileWorkflowWithTrackingAndRefresh.
-func compileWorkflowWithTracking(filePath string, verbose bool, quiet bool, engineOverride string, tracker *FileTracker) error {
-	return compileWorkflowWithTrackingAndRefresh(filePath, verbose, quiet, engineOverride, tracker, false)
+func compileWorkflowWithTracking(ctx context.Context, filePath string, verbose bool, quiet bool, engineOverride string, tracker *FileTracker) error {
+	return compileWorkflowWithTrackingAndRefresh(ctx, filePath, verbose, quiet, engineOverride, tracker, false)
 }
 
 // compileWorkflowWithTrackingAndRefresh compiles a workflow, tracks generated files, and optionally refreshes stop time.
 // This function ensures that the file tracker records all files created or modified during compilation.
-func compileWorkflowWithTrackingAndRefresh(filePath string, verbose bool, quiet bool, engineOverride string, tracker *FileTracker, refreshStopTime bool) error {
+func compileWorkflowWithTrackingAndRefresh(ctx context.Context, filePath string, verbose bool, quiet bool, engineOverride string, tracker *FileTracker, refreshStopTime bool) error {
 	addWorkflowCompilationLog.Printf("Compiling workflow with tracking: file=%s, refresh_stop_time=%v", filePath, refreshStopTime)
 
 	// Generate the expected lock file path
 	lockFile := stringutil.MarkdownToLockFile(filePath)
 
 	// Check if lock file exists before compilation
-	lockFileExists := false
-	if _, err := os.Stat(lockFile); err == nil {
-		lockFileExists = true
-	}
+	lockFileExists := fileutil.FileExists(lockFile)
 
 	addWorkflowCompilationLog.Printf("Lock file %s exists: %v", lockFile, lockFileExists)
 
@@ -82,9 +81,7 @@ func compileWorkflowWithTrackingAndRefresh(filePath string, verbose bool, quiet 
 	gitAttributesExisted := false
 	if gitRootErr == nil {
 		gitAttributesPath = filepath.Join(gitRoot, ".gitattributes")
-		if _, err := os.Stat(gitAttributesPath); err == nil {
-			gitAttributesExisted = true
-		}
+		gitAttributesExisted = fileutil.FileExists(gitAttributesPath)
 	}
 
 	// Track the lock file before compilation
@@ -102,7 +99,7 @@ func compileWorkflowWithTrackingAndRefresh(filePath string, verbose bool, quiet 
 	compiler.SetFileTracker(tracker)
 	compiler.SetRefreshStopTime(refreshStopTime)
 	compiler.SetQuiet(quiet)
-	if err := CompileWorkflowWithValidation(compiler, filePath, verbose, false, false, false, false, false); err != nil {
+	if err := CompileWorkflowWithValidation(ctx, compiler, filePath, CompileValidationOptions{Verbose: verbose}); err != nil {
 		return err
 	}
 
@@ -128,7 +125,7 @@ func compileWorkflowWithTrackingAndRefresh(filePath string, verbose bool, quiet 
 // workflowFile that are present locally but lack a corresponding .lock.yml. This must be
 // called before compiling the main workflow, because the dispatch-workflow validator
 // requires every referenced .md workflow to have an up-to-date .lock.yml.
-func compileDispatchWorkflowDependencies(workflowFile string, verbose, quiet bool, engineOverride string, tracker *FileTracker) {
+func compileDispatchWorkflowDependencies(ctx context.Context, workflowFile string, verbose, quiet bool, engineOverride string, tracker *FileTracker) {
 	// Parse the merged safe-outputs to get the canonical list of dispatch-workflow names.
 	compiler := workflow.NewCompiler()
 	data, err := compiler.ParseWorkflowFile(workflowFile)
@@ -146,7 +143,7 @@ func compileDispatchWorkflowDependencies(workflowFile string, verbose, quiet boo
 		if _, mdErr := os.Stat(mdPath); mdErr != nil {
 			continue // .md doesn't exist locally
 		}
-		if _, lockErr := os.Stat(lockPath); lockErr == nil {
+		if fileutil.FileExists(lockPath) {
 			continue // .lock.yml already exists, nothing to do
 		}
 
@@ -157,9 +154,9 @@ func compileDispatchWorkflowDependencies(workflowFile string, verbose, quiet boo
 
 		var compileErr error
 		if tracker != nil {
-			compileErr = compileWorkflowWithTracking(mdPath, verbose, quiet, engineOverride, tracker)
+			compileErr = compileWorkflowWithTracking(ctx, mdPath, verbose, quiet, engineOverride, tracker)
 		} else {
-			compileErr = compileWorkflow(mdPath, verbose, quiet, engineOverride)
+			compileErr = compileWorkflow(ctx, mdPath, verbose, quiet, engineOverride)
 		}
 		if compileErr != nil {
 			// Best-effort: log and continue so the main workflow can still give a clear error.

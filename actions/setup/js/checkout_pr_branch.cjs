@@ -29,6 +29,7 @@ const { getErrorMessage } = require("./error_helpers.cjs");
 const { renderTemplateFromFile, getPromptPath } = require("./messages_core.cjs");
 const { detectForkPR } = require("./pr_helpers.cjs");
 const { ERR_API } = require("./error_codes.cjs");
+const TRUSTED_CHECKOUT_PERMISSIONS = ["write", "maintain", "admin"];
 
 /**
  * Log detailed PR context information for debugging
@@ -110,6 +111,68 @@ function logCheckoutStrategy(eventName, strategy, reason) {
   core.endGroup();
 }
 
+/**
+ * Ensure checkout step only runs in trusted runtime contexts.
+ * - repository must not be a fork
+ * - triggering actor must have write-or-higher repository permission
+ */
+async function assertTrustedCheckoutRuntime() {
+  const repository = context.payload.repository;
+  if (repository?.fork === true) {
+    throw new Error("Refusing PR checkout in forked repository runtime context");
+  }
+
+  // context.actor is preferred when available; sender.login and GITHUB_ACTOR
+  // are retained as event/runtime-compatible fallbacks.
+  const actor = context.actor || context.payload.sender?.login || process.env.GITHUB_ACTOR;
+  if (!actor) {
+    throw new Error("Refusing PR checkout: unable to determine triggering actor");
+  }
+
+  // Bot and app actors (e.g. Copilot, dependabot[bot]) are not regular GitHub
+  // users and cannot be resolved via the collaborators API (returns 404).
+  // Trust them implicitly: the non-fork repository check above already ensures
+  // the workflow is running in a controlled context.
+  const senderType = context.payload.sender?.type;
+  if (senderType === "Bot") {
+    core.info(`Runtime safety check passed for bot/app actor '${actor}' (sender type: ${senderType})`);
+    return;
+  }
+
+  try {
+    const { data: permissionData } = await github.rest.repos.getCollaboratorPermissionLevel({
+      owner: context.repo.owner,
+      repo: context.repo.repo,
+      username: actor,
+    });
+
+    const permission = permissionData?.permission || "none";
+    const hasWriteOrHigher = TRUSTED_CHECKOUT_PERMISSIONS.includes(permission);
+    if (!hasWriteOrHigher) {
+      throw new Error(`Refusing PR checkout: actor '${actor}' has '${permission}' permission (requires write or higher)`);
+    }
+
+    core.info(`Runtime safety check passed for actor '${actor}' with '${permission}' permission`);
+  } catch (err) {
+    // A 404 here is ambiguous: it can indicate either a non-user app/bot actor
+    // or a real user that is not a collaborator. Disambiguate via users API.
+    // Real users resolve via users.getByUsername; app/bot actors return 404.
+    if (err.status === 404) {
+      try {
+        await github.rest.users.getByUsername({ username: actor });
+        throw new Error(`Refusing PR checkout: actor '${actor}' is not a collaborator (requires write or higher)`);
+      } catch (userErr) {
+        if (userErr.status === 404) {
+          core.info(`Runtime safety check passed for app actor '${actor}' (not a regular user)`);
+          return;
+        }
+        throw userErr;
+      }
+    }
+    throw err;
+  }
+}
+
 async function main() {
   const eventName = context.eventName;
   // For pull_request events, the PR context is in context.payload.pull_request.
@@ -142,6 +205,8 @@ async function main() {
   }
 
   try {
+    await assertTrustedCheckoutRuntime();
+
     // Log detailed context for debugging
     const { isFork } = logPRContext(eventName, pullRequest);
 

@@ -167,6 +167,19 @@ func TestValidateMainWorkflowFrontmatterWithSchemaAndLocation(t *testing.T) {
 			wantErr:  false,
 		},
 		{
+			name: "valid pull_request_target ready_for_review trigger",
+			frontmatter: map[string]any{
+				"on": map[string]any{
+					"pull_request_target": map[string]any{
+						"types": []any{"ready_for_review"},
+					},
+				},
+				"engine": "claude",
+			},
+			filePath: "/test/workflow.md",
+			wantErr:  false,
+		},
+		{
 			name: "invalid workflow frontmatter with location",
 			frontmatter: map[string]any{
 				"on":      "push",
@@ -250,6 +263,81 @@ func TestValidateMainWorkflowFrontmatterWithSchemaAndLocation_AdditionalProperti
 			wantErr:     true,
 			errContains: "/test/workflow.md:2:1:",
 		},
+		{
+			name: "workflow_call input typo now fails with additional property error",
+			frontmatter: map[string]any{
+				"on": map[string]any{
+					"workflow_call": map[string]any{
+						"inputs": map[string]any{
+							"payload": map[string]any{
+								"type":    "string",
+								"requird": true,
+							},
+						},
+					},
+				},
+			},
+			filePath:    "/test/workflow.md",
+			wantErr:     true,
+			errContains: "requird",
+		},
+		{
+			name: "workflow_call secret typo now fails with additional property error",
+			frontmatter: map[string]any{
+				"on": map[string]any{
+					"workflow_call": map[string]any{
+						"secrets": map[string]any{
+							"token": map[string]any{
+								"requird": true,
+							},
+						},
+					},
+				},
+			},
+			filePath:    "/test/workflow.md",
+			wantErr:     true,
+			errContains: "requird",
+		},
+		{
+			name: "dispatch_repository input typo now fails with additional property error",
+			frontmatter: map[string]any{
+				"on": "workflow_dispatch",
+				"safe-outputs": map[string]any{
+					"dispatch_repository": map[string]any{
+						"relay": map[string]any{
+							"event_type": "dispatch",
+							"repository": "github/gh-aw",
+							"inputs": map[string]any{
+								"payload": map[string]any{
+									"type":    "string",
+									"requird": true,
+								},
+							},
+						},
+					},
+				},
+			},
+			filePath:    "/test/workflow.md",
+			wantErr:     true,
+			errContains: "requird",
+		},
+		{
+			name: "valid workflow_call input still compiles",
+			frontmatter: map[string]any{
+				"on": map[string]any{
+					"workflow_call": map[string]any{
+						"inputs": map[string]any{
+							"payload": map[string]any{
+								"type":     "string",
+								"required": true,
+							},
+						},
+					},
+				},
+			},
+			filePath: "/test/workflow.md",
+			wantErr:  false,
+		},
 	}
 
 	for _, tt := range tests {
@@ -272,6 +360,133 @@ func TestValidateMainWorkflowFrontmatterWithSchemaAndLocation_AdditionalProperti
 				}
 			}
 		})
+	}
+}
+
+func TestValidateMainWorkflowFrontmatterWithSchemaAndLocation_AcceptsJobRunsOnObjectForm(t *testing.T) {
+	frontmatter := map[string]any{
+		"on": "workflow_dispatch",
+		"jobs": map[string]any{
+			"my-prefetch": map[string]any{
+				"runs-on": map[string]any{
+					"group": "arc-custom",
+				},
+				"steps": []any{
+					map[string]any{
+						"run": "echo hello",
+					},
+				},
+			},
+		},
+	}
+
+	err := ValidateMainWorkflowFrontmatterWithSchemaAndLocation(frontmatter, "/test/workflow.md")
+	if err != nil {
+		t.Fatalf("ValidateMainWorkflowFrontmatterWithSchemaAndLocation() unexpected error = %v", err)
+	}
+}
+
+func TestValidateMainWorkflowFrontmatterWithSchemaAndLocation_AcceptsJobRunsOnStringForm(t *testing.T) {
+	frontmatter := map[string]any{
+		"on": "workflow_dispatch",
+		"jobs": map[string]any{
+			"my-prefetch": map[string]any{
+				"runs-on": "ubuntu-latest",
+				"steps": []any{
+					map[string]any{
+						"run": "echo hello",
+					},
+				},
+			},
+		},
+	}
+
+	err := ValidateMainWorkflowFrontmatterWithSchemaAndLocation(frontmatter, "/test/workflow.md")
+	if err != nil {
+		t.Fatalf("ValidateMainWorkflowFrontmatterWithSchemaAndLocation() unexpected error = %v", err)
+	}
+}
+
+func TestValidateMainWorkflowFrontmatterWithSchemaAndLocation_AcceptsJobRunsOnArrayForm(t *testing.T) {
+	frontmatter := map[string]any{
+		"on": "workflow_dispatch",
+		"jobs": map[string]any{
+			"my-prefetch": map[string]any{
+				"runs-on": []any{"self-hosted", "linux"},
+				"steps": []any{
+					map[string]any{
+						"run": "echo hello",
+					},
+				},
+			},
+		},
+	}
+
+	err := ValidateMainWorkflowFrontmatterWithSchemaAndLocation(frontmatter, "/test/workflow.md")
+	if err != nil {
+		t.Fatalf("ValidateMainWorkflowFrontmatterWithSchemaAndLocation() unexpected error = %v", err)
+	}
+}
+
+func TestValidateMainWorkflowFrontmatterWithSchemaAndLocation_AcceptsRunsOnSlimArrayForm(t *testing.T) {
+	frontmatter := map[string]any{
+		"on":           "workflow_dispatch",
+		"runs-on-slim": []any{"self-hosted", "linux"},
+	}
+
+	err := ValidateMainWorkflowFrontmatterWithSchemaAndLocation(frontmatter, "/test/workflow.md")
+	if err != nil {
+		t.Fatalf("ValidateMainWorkflowFrontmatterWithSchemaAndLocation() unexpected error = %v", err)
+	}
+}
+
+func TestValidateMainWorkflowFrontmatterWithSchemaAndLocation_AcceptsRunsOnSlimObjectForm(t *testing.T) {
+	frontmatter := map[string]any{
+		"on": "workflow_dispatch",
+		"runs-on-slim": map[string]any{
+			"group":  "arc-custom",
+			"labels": []any{"ubuntu2404", "x64"},
+		},
+	}
+
+	err := ValidateMainWorkflowFrontmatterWithSchemaAndLocation(frontmatter, "/test/workflow.md")
+	if err != nil {
+		t.Fatalf("ValidateMainWorkflowFrontmatterWithSchemaAndLocation() unexpected error = %v", err)
+	}
+}
+
+func TestValidateMainWorkflowFrontmatterWithSchemaAndLocation_AcceptsSafeOutputsRunsOnArrayForm(t *testing.T) {
+	frontmatter := map[string]any{
+		"on": "workflow_dispatch",
+		"safe-outputs": map[string]any{
+			"create-issue": map[string]any{},
+			"runs-on":      []any{"self-hosted", "linux", "x64"},
+		},
+	}
+
+	err := ValidateMainWorkflowFrontmatterWithSchemaAndLocation(frontmatter, "/test/workflow.md")
+	if err != nil {
+		t.Fatalf("ValidateMainWorkflowFrontmatterWithSchemaAndLocation() unexpected error = %v", err)
+	}
+}
+
+func TestValidateMainWorkflowFrontmatterWithSchemaAndLocation_AcceptsThreatDetectionRunsOnObjectForm(t *testing.T) {
+	frontmatter := map[string]any{
+		"on": "workflow_dispatch",
+		"safe-outputs": map[string]any{
+			"create-issue": map[string]any{},
+			"threat-detection": map[string]any{
+				"runs-on": map[string]any{
+					"group":  "arc-custom",
+					"labels": []any{"linux", "x64"},
+				},
+			},
+		},
+	}
+
+	err := ValidateMainWorkflowFrontmatterWithSchemaAndLocation(frontmatter, "/test/workflow.md")
+	if err != nil {
+		t.Fatalf("ValidateMainWorkflowFrontmatterWithSchemaAndLocation() unexpected error = %v", err)
 	}
 }
 
@@ -308,6 +523,73 @@ func TestValidateMainWorkflowFrontmatterWithSchemaAndLocation_AcceptsAllowedBase
 	}
 }
 
+func TestValidateMainWorkflowFrontmatterWithSchemaAndLocation_AcceptsPatchLimitsInCreatePullRequest(t *testing.T) {
+	frontmatter := map[string]any{
+		"on": map[string]any{
+			"workflow_dispatch": map[string]any{},
+		},
+		"permissions": map[string]any{
+			"contents":      "read",
+			"pull-requests": "read",
+		},
+		"engine": map[string]any{
+			"id":    "copilot",
+			"model": "gpt-5.4",
+		},
+		"network": map[string]any{
+			"allowed": []any{"defaults"},
+		},
+		"tools": map[string]any{
+			"edit": map[string]any{},
+			"bash": true,
+		},
+		"safe-outputs": map[string]any{
+			"create-pull-request": map[string]any{
+				"max-patch-size":  2048,
+				"max-patch-files": 300,
+			},
+		},
+	}
+
+	err := ValidateMainWorkflowFrontmatterWithSchemaAndLocation(frontmatter, "/test/workflow.md")
+	if err != nil {
+		t.Fatalf("expected patch limits to be accepted under safe-outputs.create-pull-request, got error: %v", err)
+	}
+}
+
+func TestValidateMainWorkflowFrontmatterWithSchemaAndLocation_AcceptsPatchSizeInPushToPullRequestBranch(t *testing.T) {
+	frontmatter := map[string]any{
+		"on": map[string]any{
+			"workflow_dispatch": map[string]any{},
+		},
+		"permissions": map[string]any{
+			"contents":      "read",
+			"pull-requests": "read",
+		},
+		"engine": map[string]any{
+			"id":    "copilot",
+			"model": "gpt-5.4",
+		},
+		"network": map[string]any{
+			"allowed": []any{"defaults"},
+		},
+		"tools": map[string]any{
+			"edit": map[string]any{},
+			"bash": true,
+		},
+		"safe-outputs": map[string]any{
+			"push-to-pull-request-branch": map[string]any{
+				"max-patch-size": 2048,
+			},
+		},
+	}
+
+	err := ValidateMainWorkflowFrontmatterWithSchemaAndLocation(frontmatter, "/test/workflow.md")
+	if err != nil {
+		t.Fatalf("expected max-patch-size to be accepted under safe-outputs.push-to-pull-request-branch, got error: %v", err)
+	}
+}
+
 func TestValidateMainWorkflowFrontmatterWithSchemaAndLocation_RejectsTopLevelCommand(t *testing.T) {
 	frontmatter := map[string]any{
 		"on":      "push",
@@ -321,5 +603,29 @@ func TestValidateMainWorkflowFrontmatterWithSchemaAndLocation_RejectsTopLevelCom
 
 	if !strings.Contains(err.Error(), "Unknown property: command") {
 		t.Fatalf("expected unknown property error for command, got: %v", err)
+	}
+}
+
+func TestValidateIncludedFileFrontmatterWithSchemaAndLocation_SkipsCustomAgentFiles(t *testing.T) {
+	// Custom agent files may contain Copilot-specific fields that are not in the
+	// gh-aw main workflow schema (e.g. user-invokable, disable-model-invocation,
+	// tools as an array).  Schema validation must be skipped for these files.
+	agentFrontmatter := map[string]any{
+		"description":              "My custom agent",
+		"user-invokable":           true,
+		"disable-model-invocation": false,
+	}
+
+	agentPaths := []string{
+		"/repo/.github/agents/my-agent.md",
+		".github/agents/my-agent.md",
+		"/some/path/.github/agents/sub/helper.md",
+	}
+
+	for _, path := range agentPaths {
+		err := ValidateIncludedFileFrontmatterWithSchemaAndLocation(agentFrontmatter, path)
+		if err != nil {
+			t.Errorf("expected custom agent file %q to pass validation without errors, got: %v", path, err)
+		}
 	}
 }

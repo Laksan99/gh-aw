@@ -51,14 +51,12 @@ and blocked domain counts.
 
 When a workflow ID or file is specified, lists all effective allowed and blocked
 domains for that workflow, including domains expanded from ecosystem identifiers
-(e.g. "node", "python", "github") and engine defaults.
+(e.g., "node", "python", "github") and engine defaults.
 
 The workflow argument can be:
 - A workflow ID (basename without .md extension, e.g., "weekly-research")
-- A file path (e.g., "weekly-research.md" or ".github/workflows/weekly-research.md")
-
-Examples:
-  ` + string(constants.CLIExtensionPrefix) + ` domains                      # List all workflows with domain counts
+- A file path (e.g., "weekly-research.md" or ".github/workflows/weekly-research.md")`,
+		Example: `  ` + string(constants.CLIExtensionPrefix) + ` domains                      # List all workflows with domain counts
   ` + string(constants.CLIExtensionPrefix) + ` domains weekly-research       # List domains for weekly-research workflow
   ` + string(constants.CLIExtensionPrefix) + ` domains --json                # Output summary in JSON format
   ` + string(constants.CLIExtensionPrefix) + ` domains weekly-research --json # Output workflow domains in JSON format`,
@@ -92,7 +90,7 @@ func RunListDomains(jsonOutput bool) error {
 
 	if len(mdFiles) == 0 {
 		if jsonOutput {
-			fmt.Println("[]")
+			fmt.Fprintln(os.Stdout, "[]")
 			return nil
 		}
 		fmt.Fprintln(os.Stderr, console.FormatInfoMessage("No workflow files found."))
@@ -121,7 +119,7 @@ func RunListDomains(jsonOutput bool) error {
 		if err != nil {
 			return fmt.Errorf("failed to marshal JSON: %w", err)
 		}
-		fmt.Println(string(jsonBytes))
+		fmt.Fprintln(os.Stdout, string(jsonBytes))
 		return nil
 	}
 
@@ -161,7 +159,7 @@ func RunWorkflowDomains(workflowArg string, jsonOutput bool) error {
 		if err != nil {
 			return fmt.Errorf("failed to marshal JSON: %w", err)
 		}
-		fmt.Println(string(jsonBytes))
+		fmt.Fprintln(os.Stdout, string(jsonBytes))
 		return nil
 	}
 

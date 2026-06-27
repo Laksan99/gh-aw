@@ -1,4 +1,6 @@
 ---
+private: true
+emoji: "✅"
 name: Daily Rendering Scripts Verifier
 description: Daily verification that the engine-specific log parser and rendering scripts correctly handle real agentic workflow output files
 on:
@@ -25,7 +27,10 @@ tools:
     - "jq*"
     - "node *"
     - "npm*"
+    - "npx *"
+    - "make *"
     - "cd *"
+    - "mkdir *"
     - "head*"
     - "tail*"
     - "wc*"
@@ -51,7 +56,12 @@ imports:
       title-prefix: "[rendering-scripts] "
       expires: 3d
 
-  - shared/observability-otlp.md
+  - shared/otlp.md
+features:
+  gh-aw-detection: true
+sandbox:
+  agent:
+    sudo: false
 ---
 
 # Daily Rendering Scripts Verifier
@@ -139,7 +149,7 @@ Note the engine type, total tokens, and any errors in the audit output.
 Create a test harness that mocks GitHub Actions globals and runs the engine-specific parser:
 
 ```bash
-cat > /tmp/gh-aw-parser-harness.cjs << 'EOF'
+cat > /tmp/gh-aw/agent-parser-harness.cjs << 'EOF'
 // @ts-check
 "use strict";
 
@@ -222,7 +232,7 @@ AGENT_OUTPUT_FILE="$(find /tmp/gh-aw/aw-mcp/logs/run-* -name 'agent-stdio.log' -
 echo "Engine: $ENGINE"
 echo "Agent output file: $AGENT_OUTPUT_FILE"
 
-node /tmp/gh-aw-parser-harness.cjs "$AGENT_OUTPUT_FILE" "$ENGINE"
+node /tmp/gh-aw/agent-parser-harness.cjs "$AGENT_OUTPUT_FILE" "$ENGINE"
 echo "Exit code: $?"
 ```
 
@@ -233,7 +243,7 @@ Capture the full output and exit code. A non-zero exit code or `[ERROR]`/`[FAILU
 Test the `render_template.cjs` rendering logic with known cases:
 
 ```bash
-cat > /tmp/gh-aw-render-test.cjs << 'EOF'
+cat > /tmp/gh-aw/agent-render-test.cjs << 'EOF'
 // @ts-check
 "use strict";
 
@@ -294,7 +304,7 @@ console.log("\nResults:", passed, "passed,", failed, "failed");
 EOF
 
 cd ${{ github.workspace }}/actions/setup/js
-node /tmp/gh-aw-render-test.cjs
+node /tmp/gh-aw/agent-render-test.cjs
 echo "Render test exit code: $?"
 ```
 
@@ -345,8 +355,8 @@ If you found parser or rendering issues:
 3. **Verify the fix resolves the issue**:
    ```bash
    cd ${{ github.workspace }}/actions/setup/js
-   node /tmp/gh-aw-parser-harness.cjs "$AGENT_OUTPUT_FILE" "$ENGINE"
-   node /tmp/gh-aw-render-test.cjs
+   node /tmp/gh-aw/agent-parser-harness.cjs "$AGENT_OUTPUT_FILE" "$ENGINE"
+   node /tmp/gh-aw/agent-render-test.cjs
    ```
 
 4. **Run the existing test suite** to ensure no regressions:
@@ -356,13 +366,48 @@ If you found parser or rendering issues:
    npm test -- --run render_template 2>&1 | tail -20
    ```
 
-5. If tests pass, create a pull request using the `create_pull_request` safe output tool with:
-   - A clear title describing what was fixed
-   - A body that explains:
-     - The run ID and engine that triggered the discovery
-     - What the parsing/rendering failure was
-     - What changes were applied and why
-     - Test results confirming the fix
+5. If tests pass, create a pull request using the `create_pull_request` safe output tool.
+
+## PR Body Format
+
+> Use `###` (h3) or lower for all headers. Wrap verbose content in `<details><summary>...</summary>` tags to keep the PR body scannable.
+
+Use this structure:
+
+```markdown
+### Summary
+
+Brief description of what was fixed and why.
+
+### Trigger
+
+- **Run ID**: [§<RUN_ID>](https://github.com/${{ github.repository }}/actions/runs/<RUN_ID>)
+- **Engine**: ENGINE
+- **Date**: DATE
+
+### Changes
+
+Description of what was changed and why.
+
+<details>
+<summary>Parser failure details</summary>
+
+[Full error output, stack traces, or raw log excerpts]
+
+</details>
+
+### Test Results
+
+- Parser harness: PASS / FAIL
+- Render template tests: PASS / FAIL
+
+<details>
+<summary>Full test output</summary>
+
+[Complete test run output]
+
+</details>
+```
 
 ## Guidelines
 

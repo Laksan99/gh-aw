@@ -8,7 +8,7 @@
 const { getErrorMessage } = require("./error_helpers.cjs");
 const { getPRNumber } = require("./update_context_helpers.cjs");
 const { logStagedPreviewInfo } = require("./staged_preview.cjs");
-const { isStagedMode } = require("./safe_output_helpers.cjs");
+const { isStagedMode, checkRequiredFilter } = require("./safe_output_helpers.cjs");
 const { createAuthenticatedGitHubClient } = require("./handler_auth.cjs");
 const { resolveTargetRepoConfig, validateTargetRepo } = require("./repo_helpers.cjs");
 
@@ -80,6 +80,27 @@ async function resolveReviewThreadAPI(github, threadId) {
 }
 
 /**
+ * Check whether a GraphQL error indicates integration-token actor restrictions.
+ * @param {unknown} error
+ * @returns {boolean}
+ */
+function isIntegrationAccessError(error) {
+  const integrationErrorFragment = "resource not accessible by integration";
+  /** @type {string[]} */
+  const messages = [getErrorMessage(error)];
+
+  if (error && typeof error === "object" && "errors" in error && Array.isArray(error.errors)) {
+    for (const graphQLError of error.errors) {
+      if (typeof graphQLError?.message === "string") {
+        messages.push(graphQLError.message);
+      }
+    }
+  }
+
+  return messages.some(message => message.toLowerCase().includes(integrationErrorFragment));
+}
+
+/**
  * Main handler factory for resolve_pull_request_review_thread
  * Returns a message handler function that processes individual resolve messages.
  *
@@ -105,6 +126,11 @@ async function main(config = {}) {
 
   // Check if we're in staged mode
   const isStaged = isStagedMode(config);
+
+  const requiredLabels = Array.isArray(config.required_labels) ? config.required_labels : [];
+  const requiredTitlePrefix = config.required_title_prefix || "";
+  if (requiredLabels.length > 0) core.info(`Required labels (all): ${requiredLabels.join(", ")}`);
+  if (requiredTitlePrefix) core.info(`Required title prefix: ${requiredTitlePrefix}`);
 
   core.info(`Resolve PR review thread configuration: max=${maxCount}, target=${resolveTarget}, triggeringPR=${triggeringPRNumber || "none"}`);
   core.info(`Default target repo: ${defaultTargetRepo}`);
@@ -250,6 +276,12 @@ async function main(config = {}) {
 
       core.info(`Resolving review thread: ${threadId} (PR #${threadPRNumber}${threadRepo ? " in " + threadRepo : ""})`);
 
+      // Apply required-labels/required-title-prefix filter
+      const [threadOwner, threadRepoName] = (threadRepo || `${context.repo.owner}/${context.repo.repo}`).split("/");
+      const repoParts = { owner: threadOwner, repo: threadRepoName };
+      const filterResult = await checkRequiredFilter(githubClient, repoParts, threadPRNumber, requiredLabels, requiredTitlePrefix, "resolve_pull_request_review_thread");
+      if (filterResult) return filterResult;
+
       // If in staged mode, preview without executing
       if (isStaged) {
         logStagedPreviewInfo(`Would resolve review thread ${threadId}`);
@@ -263,7 +295,24 @@ async function main(config = {}) {
         };
       }
 
-      const resolveResult = await resolveReviewThreadAPI(githubClient, threadId);
+      let resolveResult;
+      try {
+        resolveResult = await resolveReviewThreadAPI(githubClient, threadId);
+      } catch (error) {
+        if (isIntegrationAccessError(error)) {
+          const warningMessage =
+            `Skipping resolve_pull_request_review_thread for ${threadId}: configuration mismatch ` +
+            `(GitHub integration token cannot resolve this review thread: Resource not accessible by integration). ` +
+            `Use safe-outputs.resolve-pull-request-review-thread.github-token with a token that can resolve review threads.`;
+          core.warning(warningMessage);
+          return {
+            success: false,
+            skipped: true,
+            error: warningMessage,
+          };
+        }
+        throw error;
+      }
 
       if (resolveResult.isResolved) {
         core.info(`Successfully resolved review thread: ${threadId}`);

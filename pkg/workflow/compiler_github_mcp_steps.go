@@ -23,12 +23,14 @@ func (c *Compiler) generateGitHubMCPLockdownDetectionStep(yaml *strings.Builder,
 	// Check if GitHub tool is present
 	githubTool, hasGitHub := data.Tools["github"]
 	if !hasGitHub || githubTool == false {
+		githubConfigLog.Print("Skipping GitHub MCP lockdown detection step: GitHub tool not enabled")
 		return
 	}
+	githubToolMap, _ := githubTool.(map[string]any)
 
 	// Skip when guard policy is already fully configured in the workflow.
 	// The step is only needed to auto-configure guard policies for public repos.
-	if len(getGitHubGuardPolicies(githubTool)) > 0 {
+	if len(getGitHubGuardPolicies(githubToolMap)) > 0 {
 		githubConfigLog.Print("Guard policy already configured in workflow, skipping automatic guard policy determination")
 		return
 	}
@@ -94,6 +96,7 @@ func (c *Compiler) generateGitHubMCPLockdownDetectionStep(yaml *strings.Builder,
 func (c *Compiler) generateGitHubMCPAppTokenMintingSteps(data *WorkflowData) []string {
 	// Check if GitHub tool has app configuration
 	if data.ParsedTools == nil || data.ParsedTools.GitHub == nil || data.ParsedTools.GitHub.GitHubApp == nil {
+		githubConfigLog.Print("Skipping GitHub MCP app token minting: no github-app configuration on GitHub tool")
 		return nil
 	}
 
@@ -134,44 +137,15 @@ func (c *Compiler) generateGitHubMCPAppTokenMintingSteps(data *WorkflowData) []s
 	}
 
 	// Generate the token minting step using the existing helper from safe_outputs_app.go
-	rawSteps := c.buildGitHubAppTokenMintStep(app, permissions, "")
-
-	// Replace the default step ID with github-mcp-app-token to differentiate it from
-	// the safe-outputs app token.
-	var steps []string
-	for _, step := range rawSteps {
-		steps = append(steps, strings.ReplaceAll(step, "id: safe-outputs-app-token", "id: github-mcp-app-token"))
-	}
-	return steps
-}
-
-// generateGitHubMCPAppTokenInvalidationStep generates a step to invalidate the GitHub App token for GitHub MCP server
-// This step always runs (even on failure) to ensure tokens are properly cleaned up.
-// The token was minted in the agent job and is referenced via steps.github-mcp-app-token.outputs.token.
-func (c *Compiler) generateGitHubMCPAppTokenInvalidationStep(yaml *strings.Builder, data *WorkflowData) {
-	// Check if GitHub tool has app configuration
-	if data.ParsedTools == nil || data.ParsedTools.GitHub == nil || data.ParsedTools.GitHub.GitHubApp == nil {
-		return
-	}
-
-	githubConfigLog.Print("Generating GitHub App token invalidation step for GitHub MCP server")
-
-	// The token was minted in the agent job; reference it via steps output.
-	const tokenExpr = "steps.github-mcp-app-token.outputs.token"
-
-	yaml.WriteString("      - name: Invalidate GitHub App token\n")
-	fmt.Fprintf(yaml, "        if: always() && %s != ''\n", tokenExpr)
-	yaml.WriteString("        env:\n")
-	fmt.Fprintf(yaml, "          TOKEN: ${{ %s }}\n", tokenExpr)
-	yaml.WriteString("        run: |\n")
-	yaml.WriteString("          echo \"Revoking GitHub App installation token...\"\n")
-	yaml.WriteString("          # GitHub CLI will auth with the token being revoked.\n")
-	yaml.WriteString("          gh api \\\n")
-	yaml.WriteString("            --method DELETE \\\n")
-	yaml.WriteString("            -H \"Authorization: token $TOKEN\" \\\n")
-	yaml.WriteString("            /installation/token || echo \"Token revoke may already be expired.\"\n")
-	yaml.WriteString("          \n")
-	yaml.WriteString("          echo \"Token invalidation step complete.\"\n")
+	rawSteps := c.buildGitHubAppTokenMintStepWithMeta(
+		app,
+		permissions,
+		"",
+		inferSingleCheckoutRepositoryForGitHubAppOwner(data),
+		"Generate GitHub App token",
+		"github-mcp-app-token",
+	)
+	return rawSteps
 }
 
 // generateParseGuardVarsStep generates a step that parses the blocked-users, trusted-users, and
@@ -192,11 +166,14 @@ func (c *Compiler) generateGitHubMCPAppTokenInvalidationStep(yaml *strings.Build
 func (c *Compiler) generateParseGuardVarsStep(yaml *strings.Builder, data *WorkflowData) {
 	githubTool, hasGitHub := data.Tools["github"]
 	if !hasGitHub || githubTool == false {
+		githubConfigLog.Print("Skipping parse-guard-vars step: GitHub tool not enabled")
 		return
 	}
+	githubToolMap, _ := githubTool.(map[string]any)
 
 	// Only generate the step when guard policies are configured.
-	if len(getGitHubGuardPolicies(githubTool)) == 0 {
+	if len(getGitHubGuardPolicies(githubToolMap)) == 0 {
+		githubConfigLog.Print("Skipping parse-guard-vars step: no explicit guard policies configured")
 		return
 	}
 

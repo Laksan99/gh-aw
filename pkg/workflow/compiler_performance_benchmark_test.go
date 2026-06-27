@@ -155,6 +155,8 @@ Review and test the pull request with multiple tools.
 	}
 
 	compiler := NewCompiler(WithNoEmit(true))
+	compiler.SetQuiet(true)
+	compiler.SetApprove(true)
 
 	// Warm up: run once before timing to prime one-time caches (schema compilation, etc.)
 	_ = compiler.CompileWorkflow(testFile)
@@ -344,8 +346,9 @@ Test YAML generation.
 		b.Fatal(err)
 	}
 
-	compiler := NewCompiler()
-	compiler.SetNoEmit(true)
+	compiler := NewCompiler(WithNoEmit(true))
+	compiler.SetQuiet(true)
+	compiler.SetApprove(true)
 
 	// Warm up: run once before timing to prime one-time caches (schema compilation, etc.)
 	_ = compiler.CompileWorkflow(testFile)

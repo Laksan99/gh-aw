@@ -33,11 +33,15 @@ const {
   sendOTLPToAllEndpoints,
   appendToOTLPJSONL,
   readJSONIfExists,
+  buildCustomOTLPAttributes,
 } = require("./send_otlp_span.cjs");
 
 const AW_INFO_PATH = "/tmp/gh-aw/aw_info.json";
 const EVALUATIONS_PATH = "/tmp/gh-aw/outcome-evaluations.jsonl";
 const SUMMARY_PATH = "/tmp/gh-aw/outcome-summary.json";
+const OTLP_STATUS_UNSET = 0;
+const OTLP_STATUS_OK = 1;
+const OTLP_STATUS_ERROR = 2;
 
 /**
  * Read a JSONL file, returning an array of parsed objects.
@@ -82,12 +86,12 @@ async function main() {
     console.log("[outcome-otel] No OTLP endpoints configured, writing JSONL mirror only");
   }
 
-  // Read aw_info.json first: GH_AW_INFO_VERSION and GH_AW_INFO_STAGED are only
-  // present during setup, while aw_info.json is the authoritative runtime
-  // source for later github-script steps. Prefer agent_version when available
-  // to match the other OTEL helpers' service/scope version attribution.
+  // Read aw_info.json first: GH_AW_INFO_* env vars are only present during setup,
+  // while aw_info.json is the authoritative runtime source for later
+  // github-script steps. Prefer cli_version for CLI-named version dimensions,
+  // and only fall back to engine version fields when CLI version is unavailable.
   const staged = awInfo.staged === true || process.env.GH_AW_INFO_STAGED === "true";
-  const scopeVersion = awInfo.agent_version || awInfo.version || process.env.GH_AW_INFO_VERSION || "unknown";
+  const scopeVersion = (typeof awInfo.cli_version === "string" ? awInfo.cli_version : "") || process.env.GH_AW_INFO_CLI_VERSION || awInfo.agent_version || awInfo.version || process.env.GH_AW_INFO_VERSION || "unknown";
   const traceId = (process.env.GITHUB_AW_OTEL_TRACE_ID || "").trim().toLowerCase() || generateTraceId();
   const parentSpanId = (process.env.GITHUB_AW_OTEL_PARENT_SPAN_ID || "").trim().toLowerCase() || "";
   const summarySpanId = generateSpanId();
@@ -135,6 +139,11 @@ async function main() {
   for (const eval_ of evaluations) {
     const type = typeof eval_.type === "string" ? eval_.type : "";
     const result = typeof eval_.result === "string" ? eval_.result : "unknown";
+    // Fall back to the legacy result field so older JSONL artifacts still render
+    // useful spans while newer artifacts carry explicit normalized fields.
+    const outcomeStatus = typeof eval_.outcome_status === "string" ? eval_.outcome_status : result;
+    const evidenceStrength = typeof eval_.evidence_strength === "string" ? eval_.evidence_strength : "weak";
+    const signal = typeof eval_.signal === "string" ? eval_.signal : "";
     const detail = typeof eval_.detail === "string" ? eval_.detail : "";
     const workflow = typeof eval_.workflow === "string" ? eval_.workflow : "";
     const sourceRunId = typeof eval_.run_id === "number" ? eval_.run_id : 0;
@@ -148,11 +157,18 @@ async function main() {
     const changedFiles = typeof eval_.changed_files === "number" ? eval_.changed_files : null;
     const additions = typeof eval_.additions === "number" ? eval_.additions : null;
     const deletions = typeof eval_.deletions === "number" ? eval_.deletions : null;
+    const reactionsTotal = typeof eval_.reactions_total === "number" ? eval_.reactions_total : null;
+    const reactionsPositive = typeof eval_.reactions_positive === "number" ? eval_.reactions_positive : null;
+    const reactionsNegative = typeof eval_.reactions_negative === "number" ? eval_.reactions_negative : null;
+    const comments = typeof eval_.comments === "number" ? eval_.comments : null;
+    const zeroTouch = eval_.zero_touch === true;
 
     const attributes = [
       buildAttr("gh-aw.exporter.name", "outcome-collector"),
       buildAttr("gh-aw.outcome.type", type),
       buildAttr("gh-aw.outcome.result", result),
+      buildAttr("gh-aw.outcome.outcome_status", outcomeStatus),
+      buildAttr("gh-aw.outcome.evidence_strength", evidenceStrength),
       buildAttr("gh-aw.outcome.workflow", workflow),
       buildAttr("gh-aw.outcome.run_id", sourceRunId),
       buildAttr("gh-aw.outcome.repo", repo),
@@ -160,6 +176,7 @@ async function main() {
 
     if (url) attributes.push(buildAttr("gh-aw.outcome.url", url));
     if (detail) attributes.push(buildAttr("gh-aw.outcome.detail", detail));
+    if (signal) attributes.push(buildAttr("gh-aw.outcome.signal", signal));
     if (timestamp) attributes.push(buildAttr("gh-aw.outcome.created_at", timestamp));
     if (event) attributes.push(buildAttr("gh-aw.outcome.event", event));
     if (resolutionSec !== null) attributes.push(buildAttr("gh-aw.outcome.resolution_sec", resolutionSec));
@@ -168,9 +185,14 @@ async function main() {
     if (changedFiles !== null) attributes.push(buildAttr("gh-aw.outcome.changed_files", changedFiles));
     if (additions !== null) attributes.push(buildAttr("gh-aw.outcome.additions", additions));
     if (deletions !== null) attributes.push(buildAttr("gh-aw.outcome.deletions", deletions));
+    if (reactionsTotal !== null) attributes.push(buildAttr("gh-aw.outcome.reactions_total", reactionsTotal));
+    if (reactionsPositive !== null) attributes.push(buildAttr("gh-aw.outcome.reactions_positive", reactionsPositive));
+    if (reactionsNegative !== null) attributes.push(buildAttr("gh-aw.outcome.reactions_negative", reactionsNegative));
+    if (comments !== null) attributes.push(buildAttr("gh-aw.outcome.comments", comments));
+    if (zeroTouch) attributes.push(buildAttr("gh-aw.outcome.zero_touch", true));
 
-    // Map result to OTLP status: accepted=OK, rejected=ERROR, noop=UNSET, pending/ignored=UNSET
-    const statusCode = result === "rejected" ? 2 : result === "accepted" ? 1 : 0;
+    // Map normalized outcome_status to OTLP status: accepted=OK, rejected=ERROR, all others=UNSET
+    const statusCode = outcomeStatus === "rejected" ? OTLP_STATUS_ERROR : outcomeStatus === "accepted" ? OTLP_STATUS_OK : OTLP_STATUS_UNSET;
 
     itemSpans.push(
       buildOTLPSpan({
@@ -202,9 +224,15 @@ async function main() {
     buildAttr("gh-aw.outcome.ignored", getSummaryNumber("ignored", 0)),
     buildAttr("gh-aw.outcome.pending", getSummaryNumber("pending", 0)),
     buildAttr("gh-aw.outcome.noop", getSummaryNumber("noop", 0)),
+    buildAttr("gh-aw.outcome.accepted_strong", getSummaryNumber("accepted_strong", 0)),
+    buildAttr("gh-aw.outcome.accepted_medium", getSummaryNumber("accepted_medium", 0)),
+    buildAttr("gh-aw.outcome.accepted_weak", getSummaryNumber("accepted_weak", 0)),
+    buildAttr("gh-aw.outcome.fallback_exists_only_count", getSummaryNumber("fallback_exists_only_count", 0)),
     buildAttr("gh-aw.outcome.acceptance_rate", getSummaryNumber("acceptance_rate", 0)),
     buildAttr("gh-aw.outcome.waste_rate", getSummaryNumber("waste_rate", 0)),
     buildAttr("gh-aw.outcome.noop_rate", getSummaryNumber("noop_rate", 0)),
+    buildAttr("gh-aw.outcome.zero_touch_count", getSummaryNumber("zero_touch", 0)),
+    buildAttr("gh-aw.outcome.zero_touch_rate", getSummaryNumber("zero_touch_rate", 0)),
     buildAttr("gh-aw.outcome.item_count", evaluations.length),
   ];
 
@@ -212,15 +240,20 @@ async function main() {
     summaryAttributes.push(buildAttr("gh-aw.outcome.date", summary.date));
   }
 
-  // Median time-to-resolution for resolved items
-  const resolutionTimes = evaluations
-    .filter(e => typeof e.resolution_sec === "number" && e.resolution_sec > 0)
-    .map(e => e.resolution_sec)
-    .sort((a, b) => a - b);
-  if (resolutionTimes.length > 0) {
-    const mid = Math.floor(resolutionTimes.length / 2);
-    const median = resolutionTimes.length % 2 !== 0 ? resolutionTimes[mid] : Math.round((resolutionTimes[mid - 1] + resolutionTimes[mid]) / 2);
-    summaryAttributes.push(buildAttr("gh-aw.outcome.median_resolution_sec", median));
+  // Median time-to-resolution: prefer summary value, fall back to local computation
+  const summaryMedian = summary && typeof summary.median_resolution_sec === "number" ? summary.median_resolution_sec : null;
+  if (summaryMedian !== null) {
+    summaryAttributes.push(buildAttr("gh-aw.outcome.median_resolution_sec", summaryMedian));
+  } else {
+    const resolutionTimes = evaluations
+      .filter(e => typeof e.resolution_sec === "number" && e.resolution_sec > 0)
+      .map(e => e.resolution_sec)
+      .sort((a, b) => a - b);
+    if (resolutionTimes.length > 0) {
+      const mid = Math.floor(resolutionTimes.length / 2);
+      const median = resolutionTimes.length % 2 !== 0 ? resolutionTimes[mid] : Math.round((resolutionTimes[mid - 1] + resolutionTimes[mid]) / 2);
+      summaryAttributes.push(buildAttr("gh-aw.outcome.median_resolution_sec", median));
+    }
   }
 
   // Trigger type distribution
@@ -240,6 +273,9 @@ async function main() {
   if (types.length > 0) {
     summaryAttributes.push(buildAttr("gh-aw.outcome.types", types.join(",")));
   }
+
+  // Append user-defined custom attributes from observability.otlp.attributes.
+  summaryAttributes.push(...buildCustomOTLPAttributes());
 
   const summarySpan = buildOTLPSpan({
     traceId,

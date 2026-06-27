@@ -1,11 +1,13 @@
 // @ts-check
 /// <reference types="@actions/github-script" />
 
+const { isStagedMode } = require("./safe_output_helpers.cjs");
+
 /**
  * upload_artifact handler
  *
  * Validates artifact upload requests emitted by the model via the upload_artifact safe output
- * tool, then uploads the approved files directly via the @actions/artifact REST API client.
+ * tool, then uploads the approved files directly via the internal artifact client.
  *
  * Files can be pre-staged in /tmp/gh-aw/safeoutputs/upload-artifacts/ or referenced by their
  * original path.  When a requested path is not found in the staging directory the handler
@@ -34,10 +36,12 @@
 
 const fs = require("fs");
 const path = require("path");
+const { DefaultArtifactClient } = require("./artifact_client.cjs");
 const { getErrorMessage } = require("./error_helpers.cjs");
 const { globPatternToRegex } = require("./glob_pattern_helpers.cjs");
 const { ERR_VALIDATION } = require("./error_codes.cjs");
 const { isTemporaryId, normalizeTemporaryId } = require("./temporary_id.cjs");
+const { lstatGuard } = require("./symlink_guard.cjs");
 
 /**
  * Staging directory where the model places files to be uploaded.
@@ -83,9 +87,8 @@ function resolveTemporaryArtifactId(message) {
   const declared = message.temporary_id;
   if (declared && typeof declared === "string") {
     const trimmed = declared.trim();
-    const normalized = trimmed.startsWith("#") ? trimmed.substring(1) : trimmed;
-    if (isTemporaryId(normalized)) {
-      return normalizeTemporaryId(normalized);
+    if (isTemporaryId(trimmed)) {
+      return normalizeTemporaryId(trimmed);
     }
     if (typeof core !== "undefined") {
       core.warning(`upload_artifact: invalid temporary_id format '${declared}'. ` + `Temporary IDs must be 'aw_' followed by 3–12 alphanumeric or underscore characters. ` + `A random ID will be generated instead.`);
@@ -139,8 +142,7 @@ function listFilesRecursive(dir, baseDir) {
     } else if (entry.isFile()) {
       // Reject symlinks – entry.isFile() returns false for symlinks unless dereferenced.
       // We check explicitly to avoid following symlinks.
-      const stat = fs.lstatSync(fullPath);
-      if (!stat.isSymbolicLink()) {
+      if (lstatGuard(fullPath) !== null) {
         files.push(path.relative(baseDir, fullPath));
       } else {
         core.warning(`Skipping symlink: ${fullPath}`);
@@ -165,8 +167,8 @@ function copySingleFileToStaging(sourcePath, destRelPath) {
     core.info(`Skipping auto-copy for ${destRelPath}: already exists in staging directory`);
     return { error: null };
   }
-  const stat = fs.lstatSync(sourcePath);
-  if (stat.isSymbolicLink()) {
+  const stat = lstatGuard(sourcePath);
+  if (stat === null) {
     return { error: `symlinks are not allowed: ${sourcePath}` };
   }
   if (!stat.isFile()) {
@@ -191,16 +193,16 @@ function copyDirectoryToStaging(sourceDir, destRelDir) {
   for (const entry of entries) {
     const srcFull = path.join(sourceDir, entry.name);
     const destRel = path.join(destRelDir, entry.name);
-    const stat = fs.lstatSync(srcFull);
-    if (stat.isSymbolicLink()) {
+    const stat = lstatGuard(srcFull);
+    if (stat === null) {
       core.warning(`Skipping symlink during auto-copy: ${srcFull}`);
       continue;
     }
-    if (entry.isDirectory()) {
+    if (stat.isDirectory()) {
       const sub = copyDirectoryToStaging(srcFull, destRel);
       if (sub.error) return sub;
       copiedCount += sub.copiedCount;
-    } else if (entry.isFile()) {
+    } else if (stat.isFile()) {
       const result = copySingleFileToStaging(srcFull, destRel);
       if (result.error) return { copiedCount, error: result.error };
       copiedCount++;
@@ -227,8 +229,8 @@ function autoCopyToStaging(reqPath) {
     if (!fs.existsSync(reqPath)) {
       return { copied: false, relPath: "", error: `absolute path does not exist: ${reqPath}` };
     }
-    const stat = fs.lstatSync(reqPath);
-    if (stat.isSymbolicLink()) {
+    const stat = lstatGuard(reqPath);
+    if (stat === null) {
       return { copied: false, relPath: "", error: `symlinks are not allowed: ${reqPath}` };
     }
     // Derive a relative destination path from the basename (or relative to filesystem root for nested paths).
@@ -258,8 +260,8 @@ function autoCopyToStaging(reqPath) {
   for (const root of searchRoots) {
     const candidate = path.resolve(root, reqPath);
     if (!fs.existsSync(candidate)) continue;
-    const stat = fs.lstatSync(candidate);
-    if (stat.isSymbolicLink()) {
+    const stat = lstatGuard(candidate);
+    if (stat === null) {
       return { copied: false, relPath: "", error: `symlinks are not allowed: ${candidate}` };
     }
     if (stat.isDirectory()) {
@@ -292,12 +294,13 @@ function autoCopyToStaging(reqPath) {
  * @returns {{ files: string[], error: string|null }}
  */
 function resolveFiles(request, allowedPaths, defaultInclude, defaultExclude) {
-  const hasMutuallyExclusive = ("path" in request ? 1 : 0) + ("filters" in request ? 1 : 0);
-  if (hasMutuallyExclusive !== 1) {
+  const hasPath = "path" in request;
+  const hasFilters = "filters" in request;
+  if (hasPath === hasFilters) {
     return { files: [], error: "exactly one of 'path' or 'filters' must be present" };
   }
 
-  /** @type {string[]} candidateRelPaths */
+  /** @type {string[]} */
   let candidateRelPaths;
 
   if ("path" in request) {
@@ -339,8 +342,8 @@ function resolveFiles(request, allowedPaths, defaultInclude, defaultExclude) {
       reqPath = copyResult.relPath;
     }
 
-    const stat = fs.lstatSync(path.resolve(STAGING_DIR, reqPath));
-    if (stat.isSymbolicLink()) {
+    const stat = lstatGuard(path.resolve(STAGING_DIR, reqPath));
+    if (stat === null) {
       return { files: [], error: `symlinks are not allowed: ${reqPath}` };
     }
     if (stat.isDirectory()) {
@@ -355,11 +358,7 @@ function resolveFiles(request, allowedPaths, defaultInclude, defaultExclude) {
     const include = /** @type {string[]} */ requestFilters.include || defaultInclude;
     const exclude = /** @type {string[]} */ requestFilters.exclude || defaultExclude;
 
-    candidateRelPaths = allFiles.filter(f => {
-      if (include.length > 0 && !matchesAnyPattern(f, include)) return false;
-      if (exclude.length > 0 && matchesAnyPattern(f, exclude)) return false;
-      return true;
-    });
+    candidateRelPaths = allFiles.filter(f => (include.length === 0 || matchesAnyPattern(f, include)) && (exclude.length === 0 || !matchesAnyPattern(f, exclude)));
   }
 
   // Apply allowed-paths policy filter.
@@ -425,16 +424,14 @@ function deriveArtifactName(request, slotIndex) {
 }
 
 /**
- * Create or return the @actions/artifact DefaultArtifactClient.
+ * Create or return the internal DefaultArtifactClient.
  * global.__createArtifactClient can be set in tests to inject a mock client factory.
- * Uses dynamic import() because @actions/artifact v2+ is an ES module.
  * @returns {Promise<{ uploadArtifact: (name: string, files: string[], rootDir: string, opts: object) => Promise<{id?: number, size?: number}> }>}
  */
 async function getArtifactClient() {
   if (typeof global.__createArtifactClient === "function") {
     return global.__createArtifactClient();
   }
-  const { DefaultArtifactClient } = await import("@actions/artifact");
   return new DefaultArtifactClient();
 }
 
@@ -454,7 +451,7 @@ async function main(config = {}) {
   const allowedPaths = Array.isArray(config["allowed-paths"]) ? config["allowed-paths"] : [];
   const filtersInclude = Array.isArray(config["filters-include"]) ? config["filters-include"] : [];
   const filtersExclude = Array.isArray(config["filters-exclude"]) ? config["filters-exclude"] : [];
-  const isStaged = config["staged"] === true || process.env.GH_AW_SAFE_OUTPUTS_STAGED === "true";
+  const isStaged = isStagedMode(config);
 
   core.info(`upload_artifact handler: max_uploads=${maxUploads}, retention_days=${retentionDays}, skip_archive=${skipArchive}`);
   core.info(`Allowed paths: ${allowedPaths.length > 0 ? allowedPaths.join(", ") : "(none – all staging files allowed)"}`);
@@ -536,7 +533,7 @@ async function main(config = {}) {
     let artifactUrl = "";
 
     if (!isStaged) {
-      // Upload files directly via @actions/artifact REST API.
+      // Upload files directly via the internal artifact client.
       const absoluteFiles = files.map(f => path.join(STAGING_DIR, f));
       const client = await getArtifactClient();
       try {

@@ -5,12 +5,15 @@ sidebar:
   badge: { text: 'Multi-phase', variant: 'caution' }
 ---
 
-ResearchPlanAssignOps is a four-phase development pattern that moves from automated discovery to merged code with human control at every decision point. A research agent surfaces insights, a planning agent converts them into actionable issues, a coding agent implements the work, and a human reviews and merges.
+ResearchPlanAssignOps is a four-phase development pattern that moves from automated discovery to merged code with human control at every decision point. A research agent surfaces insights, a planning agent converts them into actionable issues, a coding agent implements the work by [assigning issues to GitHub Copilot](/gh-aw/reference/copilot-cloud-agent/), and a human reviews and merges.
 
 ## The Four Phases
 
-```
-Research → Plan → Assign → Merge
+```mermaid
+flowchart LR
+    research([Research]) --> plan[Plan issues]
+    plan --> assign[Assign to Copilot]
+    assign --> merge[Review & merge]
 ```
 
 Each phase produces a concrete artifact consumed by the next, and every transition is a human checkpoint.
@@ -24,16 +27,20 @@ The [`go-fan`](https://github.com/github/gh-aw/blob/main/.github/workflows/go-fa
 ```aw wrap
 ---
 name: Go Fan
+
 on:
   schedule: daily on weekdays
   workflow_dispatch:
+
 engine: claude
+
 safe-outputs:
   create-discussion:
     title-prefix: "[go-fan] "
     category: "audits"
     max: 1
     close-older-discussions: true
+
 tools:
   cache-memory: true
   github:
@@ -70,10 +77,13 @@ Issues can be assigned individually through the GitHub UI, or pre-assigned in bu
 ```aw wrap
 ---
 name: Auto-assign plan issues to Copilot
+
 on:
   issues:
     types: [labeled]
+
 engine: copilot
+
 safe-outputs:
   assign-to-user:
     target: "*"
@@ -94,57 +104,19 @@ Copilot's pull request is reviewed by a human maintainer. The maintainer checks 
 
 ## End-to-End Example
 
-The following trace shows the full cycle using `go-fan` as the research driver.
+A full cycle driven by `go-fan`:
 
-**Monday 7 AM** — `go-fan` runs and creates a discussion:
-
-> **[go-fan] Go Module Review: spf13/cobra**
->
-> Current usage creates a new `Command` per invocation. cobra v1.8 introduced
-> `SetContext` for propagating cancellation. Quick wins: pass context through
-> subcommands, use `PersistentPreRunE` for shared setup.
-
-**Monday afternoon** — Developer reads the discussion and types:
-
-```
-/plan
-```
-
-The planner creates a parent tracking issue `[plan] cobra improvements` with three sub-issues:
-
-- `[plan] Pass context through subcommands using cobra SetContext`
-- `[plan] Refactor shared setup into PersistentPreRunE`
-- `[plan] Add context cancellation tests`
-
-**Monday afternoon** — Developer assigns the first two issues to Copilot. Both open PRs within minutes.
-
-**Tuesday** — Developer reviews PRs, requests a minor change on one, approves the other. Both merge by end of day. The tracking issue closes.
+- **Monday 7 AM** — `go-fan` posts a discussion *"[go-fan] Go Module Review: spf13/cobra"* recommending context propagation via cobra's `SetContext` and shared setup via `PersistentPreRunE`.
+- **Monday afternoon** — A developer types `/plan` on the discussion. The planner opens a `[plan] cobra improvements` tracking issue with three sub-issues (context propagation, `PersistentPreRunE` refactor, cancellation tests), then assigns the first two to Copilot, which opens PRs within minutes.
+- **Tuesday** — The developer reviews the PRs, requests one minor change, and merges both. The tracking issue closes automatically.
 
 ## Workflow Configuration Patterns
 
-### Research: produce one discussion per run
+The Phase 1 example already shows the core research config (`create-discussion` with `close-older-discussions: true`, plus `cache-memory`). Two more safe-output knobs shape the later phases.
 
-```aw wrap
-safe-outputs:
-  create-discussion:
-    expires: 1d
-    category: "research"
-    max: 1
-    close-older-discussions: true
-```
+### Plan: group sub-issues
 
-`close-older-discussions: true` prevents discussion accumulation—only the latest finding stays open for the planner.
-
-### Research: maintain memory across runs
-
-```aw wrap
-tools:
-  cache-memory: true
-```
-
-Use `cache-memory` to track state between scheduled runs—which items have been reviewed, trend data, or historical baselines.
-
-### Plan: issue grouping
+`group: true` creates the parent tracking issue automatically—do not create it manually:
 
 ```aw wrap
 safe-outputs:
@@ -156,11 +128,9 @@ safe-outputs:
     group: true
 ```
 
-`group: true` creates a parent tracking issue automatically. Do not create the parent manually—the workflow handles it.
+### Assign: skip planning with `assignees`
 
-### Assign: pre-assign via `assignees`
-
-For research workflows that produce self-contained, well-scoped issues, skip the manual plan phase and assign directly:
+When research produces self-contained, well-scoped issues, assign directly and skip the manual plan phase—as `duplicate-code-detector` does for narrow duplication fixes:
 
 ```aw wrap
 safe-outputs:
@@ -170,7 +140,13 @@ safe-outputs:
     assignees: copilot
 ```
 
-The `duplicate-code-detector` workflow uses this approach—duplication fixes are narrow enough that a planning phase adds no value.
+## Customization
+
+Adapt the pattern by varying the **research focus** (static analysis, performance, documentation quality, security, code duplication, test coverage), the **frequency** (daily, weekly, on-demand), the **report format** (discussions for open-ended findings, issues for self-contained tasks), and the **assignment method** (pre-assign in the research workflow, bulk-assign via an orchestrator, or assign individually through the GitHub UI).
+
+## Limitations
+
+The multi-phase approach takes longer than direct execution and requires developers to review research reports and generated issues. Research agents may surface findings that don't require action (false positives), and each phase transition needs clear handoffs. Research agents often require specialized MCPs (Serena, Tavily, etc.) for deeper analysis.
 
 ## When to Use ResearchPlanAssignOps
 
@@ -198,9 +174,9 @@ Prefer a simpler pattern when:
 | Plan | [`plan`](https://github.com/github/gh-aw/blob/main/.github/workflows/plan.md) | `/plan` slash command—converts issues or discussions into sub-issues |
 | Assign | GitHub UI / workflow | [Assign issues to Copilot](https://docs.github.com/en/copilot/how-tos/use-copilot-agents/coding-agent/create-a-pr#assigning-an-issue-to-copilot) for automated PR creation |
 
-## Related Patterns
+## Related Documentation
 
-- **[TaskOps](/gh-aw/patterns/task-ops/)** — Detailed breakdown of the three-phase Research → Plan → Assign strategy with configuration guidance
-- **[Orchestration](/gh-aw/patterns/orchestration/)** — Fan out work across multiple worker workflows
-- **[DailyOps](/gh-aw/patterns/daily-ops/)** — Scheduled incremental improvements without a separate planning phase
-- **[DispatchOps](/gh-aw/patterns/dispatch-ops/)** — Manually triggered research and one-off investigations
+- [DispatchOps](/gh-aw/patterns/dispatch-ops/) — Manually triggered research and one-off investigations
+- [WorkQueueOps](/gh-aw/patterns/workqueue-ops/) — Sequential queue processing for large backlogs
+- [Safe Outputs](/gh-aw/reference/safe-outputs/) — Secure write operations
+- [Copilot Cloud Agent](/gh-aw/reference/copilot-cloud-agent/) — Assigning issues to GitHub Copilot

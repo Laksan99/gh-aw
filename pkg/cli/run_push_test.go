@@ -165,7 +165,7 @@ on: workflow_dispatch
 	assert.True(t, fileSet[baseSharedPath], "Should include base-shared.md file")
 }
 
-func TestResolveImportPathLocal(t *testing.T) {
+func TestResolveImportPath_RunPushOpts_LocalPathSemantics(t *testing.T) {
 	// Create a temporary directory for testing
 	tmpDir := t.TempDir()
 	baseDir := filepath.Join(tmpDir, "workflows")
@@ -206,8 +206,8 @@ func TestResolveImportPathLocal(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			result := resolveImportPathLocal(tt.importPath, tt.baseDir)
-			assert.Equal(t, tt.expected, result, "resolveImportPathLocal(%q, %q) = %v, want %v", tt.importPath, tt.baseDir, result, tt.expected)
+			result := resolveImportPath(tt.importPath, tt.baseDir, importPathRunPushOpts)
+			assert.Equal(t, tt.expected, result, "resolveImportPath(%q, %q, importPathRunPushOpts) = %v, want %v", tt.importPath, tt.baseDir, result, tt.expected)
 		})
 	}
 }
@@ -406,6 +406,46 @@ jobs:
 	assert.True(t, mismatch, "Should detect mismatch when JSON metadata hash differs")
 }
 
+func TestPushWorkflowFiles_CancelledContext(t *testing.T) {
+	// Create a temporary directory for testing
+	tmpDir := t.TempDir()
+
+	// Initialize a git repo
+	cmd := exec.Command("git", "init")
+	cmd.Dir = tmpDir
+	err := cmd.Run()
+	require.NoError(t, err)
+
+	// Configure git
+	cmd = exec.Command("git", "config", "user.email", "test@example.com")
+	cmd.Dir = tmpDir
+	err = cmd.Run()
+	require.NoError(t, err)
+
+	cmd = exec.Command("git", "config", "user.name", "Test User")
+	cmd.Dir = tmpDir
+	err = cmd.Run()
+	require.NoError(t, err)
+
+	// Save current directory and change to tmpDir
+	originalDir, err := os.Getwd()
+	require.NoError(t, err)
+	err = os.Chdir(tmpDir)
+	require.NoError(t, err)
+	defer os.Chdir(originalDir)
+
+	workflowFile := filepath.Join(tmpDir, "workflow.md")
+	err = os.WriteFile(workflowFile, []byte("# Test"), 0644)
+	require.NoError(t, err)
+
+	// Pass an already-cancelled context — the first git subprocess should fail with context.Canceled.
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	err = pushWorkflowFiles(ctx, "test-workflow", []string{workflowFile}, "", false)
+	require.Error(t, err)
+}
+
 func TestPushWorkflowFiles_WithStagedFiles(t *testing.T) {
 	// Create a temporary directory for testing
 	tmpDir := t.TempDir()
@@ -449,7 +489,7 @@ func TestPushWorkflowFiles_WithStagedFiles(t *testing.T) {
 	err = os.WriteFile(workflowFile, []byte("# Test"), 0644)
 	require.NoError(t, err)
 
-	err = pushWorkflowFiles("test-workflow", []string{workflowFile}, "", false)
+	err = pushWorkflowFiles(context.Background(), "test-workflow", []string{workflowFile}, "", false)
 
 	// Should return an error about staged files
 	require.Error(t, err)

@@ -1,5 +1,7 @@
 # agentdrain Package
 
+> Drain-style log template miner and anomaly detector for structured agent pipeline events — groups log lines into similarity clusters and produces scored anomaly reports.
+
 The `agentdrain` package implements the [Drain](https://jiemingzhu.github.io/pub/pjhe_icws2017.pdf) log template mining algorithm adapted for analyzing structured agent pipeline events. It is used for anomaly detection in agentic workflow runs.
 
 ## Overview
@@ -162,14 +164,29 @@ err = coord.LoadWeightsJSON(data)
 
 Post-processes `MatchResult` values to produce an `AnomalyReport`.
 
+#### `NewAnomalyDetector(simThreshold float64, rareClusterThreshold int) (*AnomalyDetector, error)`
+
+Creates a new `AnomalyDetector`. Returns an error if `simThreshold` is outside `[0,1]` or `rareClusterThreshold` is negative.
+
+#### `(*AnomalyDetector).Analyze(result *MatchResult, isNew bool, cluster *Cluster) *AnomalyReport`
+
+Evaluates `result` and produces an `AnomalyReport`. `isNew` indicates that `result` created a brand-new cluster; `cluster` is the matched or newly created `Cluster`.
+
 ```go
 detector, err := agentdrain.NewAnomalyDetector(cfg.SimThreshold, cfg.RareClusterThreshold)
+if err != nil {
+    panic(err)
+}
 report := detector.Analyze(result, isNew, cluster)
 ```
 
 ### `Masker`
 
 Applies `MaskRule` substitutions to log lines before tokenization.
+
+#### `(*Masker).Mask(line string) string`
+
+Applies all compiled mask rules to `line` in order, returning the normalized string.
 
 ```go
 masker, err := agentdrain.NewMasker(cfg.MaskRules)
@@ -243,6 +260,16 @@ if report.IsNewTemplate {
         report.AnomalyScore, report.Reason)
 }
 ```
+
+## Thread Safety
+
+Both `Miner` and `Coordinator` are safe for concurrent use from multiple goroutines. All mutating operations are protected by an internal `sync.RWMutex`:
+
+- `Miner.Train`, `Miner.TrainEvent`, `Miner.AnalyzeEvent` — acquire a write lock
+- `Miner.Clusters` — acquires a read lock
+- `Miner.SaveJSON` / `Miner.LoadJSON` — read and write lock respectively
+- `Coordinator.TrainEvent`, `Coordinator.AnalyzeEvent` — delegate to per-stage `Miner` instances
+- `Coordinator.AllClusters`, `Coordinator.SaveSnapshots` — acquire a read lock on the coordinator map
 
 ## Dependencies
 

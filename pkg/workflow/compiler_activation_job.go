@@ -4,9 +4,11 @@ import (
 	"fmt"
 	"strings"
 
+	"github.com/goccy/go-yaml"
+
 	"github.com/github/gh-aw/pkg/constants"
 	"github.com/github/gh-aw/pkg/logger"
-	"github.com/goccy/go-yaml"
+	"github.com/github/gh-aw/pkg/setutil"
 )
 
 var compilerActivationJobLog = logger.New("workflow:compiler_activation_job")
@@ -29,16 +31,20 @@ func (c *Compiler) buildActivationJob(data *WorkflowData, preActivationJobCreate
 	if err != nil {
 		return nil, fmt.Errorf("failed to create activation job build context: %w", err)
 	}
+	if !c.effectiveStrictMode(data.RawFrontmatter) {
+		ctx.steps = append(ctx.steps, buildPolicyStrictEnforcementStep()...)
+	}
 
 	if err := c.addActivationFeedbackAndValidationSteps(ctx); err != nil {
-		return nil, err
+		return nil, fmt.Errorf("failed to add activation feedback and validation steps: %w", err)
 	}
 	if err := c.addActivationRepositoryAndOutputSteps(ctx); err != nil {
-		return nil, err
+		return nil, fmt.Errorf("failed to add activation repository and output steps: %w", err)
 	}
 	if err := c.addActivationCommandAndLabelOutputs(ctx); err != nil {
-		return nil, err
+		return nil, fmt.Errorf("failed to add activation command and label outputs: %w", err)
 	}
+	ctx.steps = append(ctx.steps, buildRuntimeFeaturesSummaryStep()...)
 
 	// Generate experiment selection steps when experiments are declared in the frontmatter.
 	// These steps run before the prompt is built so that experiments.name expressions
@@ -49,6 +55,11 @@ func (c *Compiler) buildActivationJob(data *WorkflowData, preActivationJobCreate
 		// Expose the combined experiment JSON as a job output so downstream jobs can access
 		// the variant assignments via needs.activation.outputs.experiments.
 		ctx.outputs["experiments"] = "${{ steps.pick-experiment.outputs.experiments }}"
+		// Also expose each experiment variant individually so downstream jobs can reference
+		// needs.activation.outputs.<name> in timeout-minutes or other expressions.
+		for _, name := range sortedExperimentNames(data.Experiments) {
+			ctx.outputs[name] = "${{ steps.pick-experiment.outputs." + name + " }}"
+		}
 	}
 
 	c.configureActivationNeedsAndCondition(ctx)
@@ -63,13 +74,19 @@ func (c *Compiler) buildActivationJob(data *WorkflowData, preActivationJobCreate
 		ctx.steps = append(ctx.steps, c.generateScriptModeCleanupStep())
 	}
 
+	permissions, err := c.buildActivationPermissions(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("failed to build activation permissions: %w", err)
+	}
+
 	return &Job{
 		Name:                       string(constants.ActivationJobName),
 		If:                         ctx.activationCondition,
 		HasWorkflowRunSafetyChecks: workflowRunRepoSafety != "",
 		RunsOn:                     c.formatFrameworkJobRunsOn(data),
-		Permissions:                c.buildActivationPermissions(ctx),
+		Permissions:                permissions,
 		Environment:                c.buildActivationEnvironment(ctx),
+		Env:                        buildDailyAICActivationJobEnv(data),
 		Steps:                      ctx.steps,
 		Outputs:                    ctx.outputs,
 		Needs:                      ctx.activationNeeds,
@@ -78,99 +95,64 @@ func (c *Compiler) buildActivationJob(data *WorkflowData, preActivationJobCreate
 
 func addActivationInteractionPermissions(
 	perms *Permissions,
-	onSection string,
-	hasReaction bool,
-	reactionIncludesIssues bool,
-	reactionIncludesPullRequests bool,
-	reactionIncludesDiscussions bool,
-	hasStatusComment bool,
-	statusCommentIncludesIssues bool,
-	statusCommentIncludesPullRequests bool,
-	statusCommentIncludesDiscussions bool,
+	options activationInteractionPermissionsOptions,
 ) {
 	if perms == nil {
 		return
 	}
 	permsMap := make(map[PermissionScope]PermissionLevel)
-	addActivationInteractionPermissionsMap(
-		permsMap,
-		onSection,
-		hasReaction,
-		reactionIncludesIssues,
-		reactionIncludesPullRequests,
-		reactionIncludesDiscussions,
-		hasStatusComment,
-		statusCommentIncludesIssues,
-		statusCommentIncludesPullRequests,
-		statusCommentIncludesDiscussions,
-	)
+	addActivationInteractionPermissionsMap(permsMap, options)
 	for scope, level := range permsMap {
 		perms.Set(scope, level)
 	}
 }
 
+type activationInteractionPermissionsOptions struct {
+	onSection                         string
+	hasReaction                       bool
+	reactionIncludesIssues            bool
+	reactionIncludesPullRequests      bool
+	reactionIncludesDiscussions       bool
+	hasStatusComment                  bool
+	statusCommentIncludesIssues       bool
+	statusCommentIncludesPullRequests bool
+	statusCommentIncludesDiscussions  bool
+}
+
 func addActivationInteractionPermissionsMap(
 	permsMap map[PermissionScope]PermissionLevel,
-	onSection string,
-	hasReaction bool,
-	reactionIncludesIssues bool,
-	reactionIncludesPullRequests bool,
-	reactionIncludesDiscussions bool,
-	hasStatusComment bool,
-	statusCommentIncludesIssues bool,
-	statusCommentIncludesPullRequests bool,
-	statusCommentIncludesDiscussions bool,
+	options activationInteractionPermissionsOptions,
 ) {
-	if !hasReaction && !hasStatusComment {
+	if !options.hasReaction && !options.hasStatusComment {
 		return
 	}
 
 	// Fallback for unit tests or synthetic WorkflowData instances that do not populate the "on" section.
 	// Real compiled workflows always have a populated trigger section.
-	if onSection == "" {
+	if options.onSection == "" {
 		compilerActivationJobLog.Print("Empty on section while computing activation permissions; using broad fallback permissions")
-		addBroadActivationInteractionPermissions(
-			permsMap,
-			hasReaction,
-			reactionIncludesIssues,
-			reactionIncludesPullRequests,
-			reactionIncludesDiscussions,
-			hasStatusComment,
-			statusCommentIncludesIssues,
-			statusCommentIncludesPullRequests,
-			statusCommentIncludesDiscussions,
-		)
+		addBroadActivationInteractionPermissions(permsMap, options)
 		return
 	}
 
-	eventSet, eventSetParsed := activationEventSet(onSection)
+	eventSet, eventSetParsed := activationEventSet(options.onSection)
 	if !eventSetParsed {
 		compilerActivationJobLog.Print("Unable to parse activation trigger events while computing permissions; using broad fallback permissions")
-		addBroadActivationInteractionPermissions(
-			permsMap,
-			hasReaction,
-			reactionIncludesIssues,
-			reactionIncludesPullRequests,
-			reactionIncludesDiscussions,
-			hasStatusComment,
-			statusCommentIncludesIssues,
-			statusCommentIncludesPullRequests,
-			statusCommentIncludesDiscussions,
-		)
+		addBroadActivationInteractionPermissions(permsMap, options)
 		return
 	}
 
-	hasIssuesEvent := eventSet["issues"]
-	hasIssueCommentEvent := eventSet["issue_comment"]
-	hasPullRequestEvent := eventSet["pull_request"]
-	hasPullRequestReviewCommentEvent := eventSet["pull_request_review_comment"]
-	hasDiscussionEvent := eventSet["discussion"]
-	hasDiscussionCommentEvent := eventSet["discussion_comment"]
+	hasIssuesEvent := setutil.Contains(eventSet, "issues")
+	hasIssueCommentEvent := setutil.Contains(eventSet, "issue_comment")
+	hasPullRequestEvent := setutil.Contains(eventSet, "pull_request")
+	hasPullRequestReviewCommentEvent := setutil.Contains(eventSet, "pull_request_review_comment")
+	hasDiscussionEvent := setutil.Contains(eventSet, "discussion")
+	hasDiscussionCommentEvent := setutil.Contains(eventSet, "discussion_comment")
 
-	if hasReaction {
+	if options.hasReaction {
 		// Reactions on issues, issue comments, and pull requests use issues endpoints.
-		needsIssuesWriteForIssueEvents := reactionIncludesIssues && (hasIssuesEvent || hasIssueCommentEvent)
-		needsIssuesWriteForPullRequestEvents := reactionIncludesPullRequests && hasPullRequestEvent
+		needsIssuesWriteForIssueEvents := options.reactionIncludesIssues && (hasIssuesEvent || hasIssueCommentEvent)
+		needsIssuesWriteForPullRequestEvents := options.reactionIncludesPullRequests && hasPullRequestEvent
 		needsIssuesWriteForReaction := needsIssuesWriteForIssueEvents || needsIssuesWriteForPullRequestEvents
 		if needsIssuesWriteForReaction {
 			permsMap[PermissionIssues] = PermissionWrite
@@ -178,23 +160,23 @@ func addActivationInteractionPermissionsMap(
 		// Reactions on pull requests and PR review comments require pull-requests: write.
 		// issue_comment events also fire for PR comments (slash_command with events:[pull_request_comment]
 		// compiles to issue_comment), so pull-requests: write is also needed when issue_comment is present.
-		if reactionIncludesPullRequests && (hasPullRequestEvent || hasPullRequestReviewCommentEvent || hasIssueCommentEvent) {
+		if options.reactionIncludesPullRequests && (hasPullRequestEvent || hasPullRequestReviewCommentEvent || hasIssueCommentEvent) {
 			permsMap[PermissionPullRequests] = PermissionWrite
 		}
 		// Reactions on discussions use GraphQL discussion APIs.
-		if reactionIncludesDiscussions && (hasDiscussionEvent || hasDiscussionCommentEvent) {
+		if options.reactionIncludesDiscussions && (hasDiscussionEvent || hasDiscussionCommentEvent) {
 			permsMap[PermissionDiscussions] = PermissionWrite
 		}
 	}
 
-	if hasStatusComment {
+	if options.hasStatusComment {
 		// Status comments for issue and pull request related events use issue comment endpoints.
-		if (statusCommentIncludesIssues && (hasIssuesEvent || hasIssueCommentEvent)) ||
-			(statusCommentIncludesPullRequests && (hasPullRequestEvent || hasPullRequestReviewCommentEvent)) {
+		if (options.statusCommentIncludesIssues && (hasIssuesEvent || hasIssueCommentEvent)) ||
+			(options.statusCommentIncludesPullRequests && (hasPullRequestEvent || hasPullRequestReviewCommentEvent)) {
 			permsMap[PermissionIssues] = PermissionWrite
 		}
 		// Status comments for discussions use discussion comment APIs and can be disabled via frontmatter.
-		if statusCommentIncludesDiscussions && (hasDiscussionEvent || hasDiscussionCommentEvent) {
+		if options.statusCommentIncludesDiscussions && (hasDiscussionEvent || hasDiscussionCommentEvent) {
 			permsMap[PermissionDiscussions] = PermissionWrite
 		}
 	}
@@ -202,28 +184,23 @@ func addActivationInteractionPermissionsMap(
 
 func addBroadActivationInteractionPermissions(
 	permsMap map[PermissionScope]PermissionLevel,
-	hasReaction bool,
-	reactionIncludesIssues bool,
-	reactionIncludesPullRequests bool,
-	reactionIncludesDiscussions bool,
-	hasStatusComment bool,
-	statusCommentIncludesIssues bool,
-	statusCommentIncludesPullRequests bool,
-	statusCommentIncludesDiscussions bool,
+	options activationInteractionPermissionsOptions,
 ) {
-	if !hasReaction && !hasStatusComment {
+	if !options.hasReaction && !options.hasStatusComment {
 		return
 	}
 
-	needsIssuesWriteForReaction := hasReaction && (reactionIncludesIssues || reactionIncludesPullRequests)
-	needsIssuesWriteForStatusComment := statusCommentIncludesIssues || statusCommentIncludesPullRequests
+	needsIssuesWriteForReaction := options.hasReaction && (options.reactionIncludesIssues || options.reactionIncludesPullRequests)
+	needsIssuesWriteForStatusComment := options.hasStatusComment &&
+		(options.statusCommentIncludesIssues || options.statusCommentIncludesPullRequests)
 	if needsIssuesWriteForReaction || needsIssuesWriteForStatusComment {
 		permsMap[PermissionIssues] = PermissionWrite
 	}
-	if hasReaction && reactionIncludesPullRequests {
+	if options.hasReaction && options.reactionIncludesPullRequests {
 		permsMap[PermissionPullRequests] = PermissionWrite
 	}
-	if (hasReaction && reactionIncludesDiscussions) || statusCommentIncludesDiscussions {
+	if (options.hasReaction && options.reactionIncludesDiscussions) ||
+		(options.hasStatusComment && options.statusCommentIncludesDiscussions) {
 		permsMap[PermissionDiscussions] = PermissionWrite
 	}
 }
@@ -270,8 +247,10 @@ func shouldIncludeDiscussionStatusComments(data *WorkflowData) bool {
 	return *data.StatusCommentDiscussions
 }
 
-func activationEventSet(onSection string) (map[string]bool, bool) {
-	events := make(map[string]bool)
+func activationEventSet(onSection string) (map[string]struct {
+}, bool) {
+	events := make(map[string]struct {
+	})
 	var onData map[string]any
 	if err := yaml.Unmarshal([]byte(onSection), &onData); err != nil {
 		compilerActivationJobLog.Printf("Failed to parse on section for activation permission scoping: %v", err)
@@ -286,11 +265,13 @@ func activationEventSet(onSection string) (map[string]bool, bool) {
 
 	switch v := onValue.(type) {
 	case string:
-		events[v] = true
+		events[v] = struct {
+		}{}
 	case []any:
 		for _, item := range v {
 			if eventName, ok := item.(string); ok {
-				events[eventName] = true
+				events[eventName] = struct {
+				}{}
 			}
 		}
 	case map[string]any:
@@ -298,7 +279,8 @@ func activationEventSet(onSection string) (map[string]bool, bool) {
 			if isActivationMetadataTriggerField(eventName) {
 				continue
 			}
-			events[eventName] = true
+			events[eventName] = struct {
+			}{}
 		}
 	default:
 		compilerActivationJobLog.Printf("Unsupported on section type for activation permission scoping: %T", onValue)
@@ -320,9 +302,11 @@ func isActivationMetadataTriggerField(eventName string) bool {
 func buildCentralizedCommandOnSection(commandEvents []string) string {
 	filteredEvents := FilterCommentEvents(commandEvents)
 	// Map to actual GitHub event names and deduplicate.
-	eventSet := make(map[string]bool)
+	eventSet := make(map[string]struct {
+	})
 	for _, mapping := range filteredEvents {
-		eventSet[GetActualGitHubEventName(mapping.EventName)] = true
+		eventSet[GetActualGitHubEventName(mapping.EventName)] = struct {
+		}{}
 	}
 	if len(eventSet) == 0 {
 		return ""
@@ -330,11 +314,13 @@ func buildCentralizedCommandOnSection(commandEvents []string) string {
 	var b strings.Builder
 	b.WriteString("on:\n")
 	// Derive ordering from GetAllCommentEvents to stay consistent with the rest of the codebase.
-	seen := make(map[string]bool)
+	seen := make(map[string]struct {
+	})
 	for _, mapping := range GetAllCommentEvents() {
 		name := GetActualGitHubEventName(mapping.EventName)
-		if eventSet[name] && !seen[name] {
-			seen[name] = true
+		if setutil.Contains(eventSet, name) && !setutil.Contains(seen, name) {
+			seen[name] = struct {
+			}{}
 			b.WriteString("  " + name + ":\n    types: [created]\n")
 		}
 	}
@@ -379,7 +365,7 @@ func (c *Compiler) generateResolveHostRepoStep(data *WorkflowData) string {
 	var step strings.Builder
 	step.WriteString("      - name: Resolve host repo for activation checkout\n")
 	step.WriteString("        id: resolve-host-repo\n")
-	step.WriteString(fmt.Sprintf("        uses: %s\n", getCachedActionPin("actions/github-script", data)))
+	fmt.Fprintf(&step, "        uses: %s\n", getCachedActionPin("actions/github-script", data))
 	step.WriteString("        env:\n")
 	step.WriteString("          JOB_WORKFLOW_REPOSITORY: ${{ job.workflow_repository }}\n")
 	step.WriteString("          JOB_WORKFLOW_SHA: ${{ job.workflow_sha }}\n")
@@ -435,10 +421,11 @@ func (c *Compiler) generateCheckoutGitHubFolderForActivation(data *WorkflowData)
 	// .github and .agents are already included in GenerateGitHubFolderCheckoutStep's hardcoded list.
 	// Root instruction files (AGENTS.md, CLAUDE.md, GEMINI.md) are excluded — they are not needed
 	// during activation and are omitted to keep the shallow checkout minimal.
-	defaultSparseCheckoutDirs := map[string]bool{".github": true, ".agents": true}
+	defaultSparseCheckoutDirs := map[string]struct {
+	}{".github": {}, ".agents": {}}
 	registry := GetGlobalEngineRegistry()
 	for _, folder := range registry.GetAllAgentManifestFolders() {
-		if !defaultSparseCheckoutDirs[folder] {
+		if !setutil.Contains(defaultSparseCheckoutDirs, folder) {
 			extraPaths = append(extraPaths, folder)
 		}
 	}
@@ -535,7 +522,7 @@ func injectIfConditionAfterName(step, condition string) string {
 		fieldIndent = nameIndent + "  "
 	}
 
-	newLines := make([]string, 0, len(lines)+1)
+	newLines := make([]string, 0, safeAllocationCapacity(len(lines), 1))
 	newLines = append(newLines, lines[:nameLineIdx+1]...)
 	newLines = append(newLines, fieldIndent+"if: "+condition)
 	newLines = append(newLines, lines[nameLineIdx+1:]...)

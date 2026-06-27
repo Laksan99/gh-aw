@@ -6,6 +6,7 @@ import (
 
 	"github.com/github/gh-aw/pkg/constants"
 	"github.com/github/gh-aw/pkg/logger"
+	"github.com/github/gh-aw/pkg/workflow/compilerenv"
 )
 
 var geminiLog = logger.New("workflow:gemini_engine")
@@ -24,7 +25,7 @@ func NewGeminiEngine() *GeminiEngine {
 			experimental: false,
 			capabilities: EngineCapabilities{
 				ToolsAllowlist:   true,
-				MaxTurns:         false,
+				MaxTurns:         true,
 				MaxContinuations: false, // Gemini CLI does not support --max-autopilot-continues-style continuation mode
 				WebSearch:        false,
 				NativeAgentFile:  false, // Gemini does not support agent file natively; the compiler prepends the agent file content to prompt.txt
@@ -68,6 +69,14 @@ func (e *GeminiEngine) GetRequiredSecretNames(workflowData *WorkflowData) []stri
 	return secrets
 }
 
+// GetSupportedEnvVarKeys returns the engine.env variable names that the Gemini engine
+// supports as defined in the AWF specification.
+func (e *GeminiEngine) GetSupportedEnvVarKeys() []string {
+	return []string{
+		constants.GeminiAPIKey,
+	}
+}
+
 // GetSecretValidationStep returns the secret validation step for the Gemini engine.
 // Returns an empty step if custom command is specified.
 func (e *GeminiEngine) GetSecretValidationStep(workflowData *WorkflowData) GitHubActionStep {
@@ -88,7 +97,7 @@ func (e *GeminiEngine) GetInstallationSteps(workflowData *WorkflowData) []GitHub
 		return []GitHubActionStep{}
 	}
 
-	npmSteps := BuildStandardNpmEngineInstallSteps(
+	npmSteps := BuildStandardNpmEngineInstallStepsNoCooldown(
 		"@google/gemini-cli",
 		string(constants.DefaultGeminiVersion),
 		"Install Gemini CLI",
@@ -106,7 +115,7 @@ func (e *GeminiEngine) GetInstallationSteps(workflowData *WorkflowData) []GitHub
 // ancestor under /tmp/gh-aw/ and the actions/upload-artifact LCA calculation stays correct.
 func (e *GeminiEngine) GetDeclaredOutputFiles() []string {
 	return []string{
-		"/tmp/gh-aw/gemini-client-error-*.json",
+		constants.TmpGeminiClientErrorGlob,
 	}
 }
 
@@ -193,6 +202,7 @@ func (e *GeminiEngine) GetExecutionSteps(workflowData *WorkflowData, logFile str
 
 	// Append the prompt arg raw (not through shellJoinArgs) to preserve shell expansion
 	geminiCommand := fmt.Sprintf(`%s %s --prompt "$(cat /tmp/gh-aw/aw-prompts/prompt.txt)"`, commandName, shellJoinArgs(geminiArgs))
+	geminiCommand = getWorkspaceCommandPrefixFor(workflowData.EngineConfig) + geminiCommand
 
 	// Build the full command with AWF wrapping if enabled
 	var command string
@@ -248,10 +258,11 @@ touch %s
 	// Build environment variables
 	env := map[string]string{
 		"GEMINI_API_KEY": "${{ secrets.GEMINI_API_KEY }}",
-		"GH_AW_PROMPT":   "/tmp/gh-aw/aw-prompts/prompt.txt",
+		"GH_AW_PROMPT":   constants.AwPromptsFile,
 		// Tag the step as a GitHub AW agentic execution for discoverability by agents
 		"GITHUB_AW":        "true",
 		"GITHUB_WORKSPACE": "${{ github.workspace }}",
+		"RUNNER_TEMP":      "${{ runner.temp }}",
 		// Override GITHUB_STEP_SUMMARY with a path that exists inside the sandbox.
 		// The runner's original path is unreachable within the AWF isolated filesystem;
 		// we create this file before the agent starts and append it to the real
@@ -266,6 +277,7 @@ touch %s
 		// approval mode when the workspace is untrusted, which causes exit code 55.
 		"GEMINI_CLI_TRUST_WORKSPACE": "true",
 	}
+	injectWorkflowCallNetworkAllowedEnv(env, workflowData)
 	// Indicate the phase: "agent" for the main run, "detection" for threat detection
 	// Include the compiler version so agents can identify which gh-aw version generated the workflow
 	if workflowData.IsDetectionRun {
@@ -298,6 +310,15 @@ touch %s
 	// Add safe outputs env
 	applySafeOutputEnvToMap(env, workflowData)
 
+	// Propagate W3C trace context so engine spans nest under the gh-aw.agent.setup span.
+	applyTraceContextEnvToMap(env)
+
+	if workflowData.EngineConfig != nil && workflowData.EngineConfig.MaxTurns != "" {
+		env["GH_AW_MAX_TURNS"] = workflowData.EngineConfig.MaxTurns
+	} else {
+		env["GH_AW_MAX_TURNS"] = compilerenv.BuildDefaultMaxTurnsExpression()
+	}
+
 	// Set the model environment variable only when explicitly configured.
 	// When model is configured, use the native GEMINI_MODEL env var - the Gemini CLI reads it
 	// directly, avoiding the need to embed the value in the shell command (which would fail
@@ -311,6 +332,7 @@ touch %s
 	// Add custom environment variables from engine config.
 	// This allows users to override the default engine token expression (e.g.
 	// GEMINI_API_KEY: ${{ secrets.MY_ORG_GEMINI_KEY }}) via engine.env.
+	applyEngineCwdEnv(env, workflowData)
 	if workflowData.EngineConfig != nil && len(workflowData.EngineConfig.Env) > 0 {
 		maps.Copy(env, workflowData.EngineConfig.Env)
 	}

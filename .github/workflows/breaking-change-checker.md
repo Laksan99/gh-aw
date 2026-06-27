@@ -1,13 +1,21 @@
 ---
+emoji: "⚠️"
 description: Daily analysis of recent commits and merged PRs for breaking CLI changes
 on:
   schedule: "daily around 14:00 on weekdays"  # ~2 PM UTC, weekdays only
   workflow_dispatch:
+max-daily-ai-credits: 10000
 permissions:
   contents: read
   actions: read
-engine: copilot
+  copilot-requests: write
+engine:
+  id: copilot
+  copilot-sdk: true
 tracker-id: breaking-change-checker
+sandbox:
+  agent:
+    sudo: false
 tools:
   cli-proxy: true
   github:
@@ -30,18 +38,17 @@ imports:
       expires: "2d"
       labels: [breaking-change, automated-analysis, cookie]
       assignees: [copilot]
-  - shared/observability-otlp.md
+  - shared/otlp.md
 safe-outputs:
   messages:
-    footer: "> ⚠️ *Compatibility report by [{workflow_name}]({run_url})*{effective_tokens_suffix}{history_link}"
+    footer: "> ⚠️ *Compatibility report by [{workflow_name}]({run_url})*{ai_credits_suffix}{history_link}"
     footer-workflow-recompile: "> 🛠️ *Workflow maintenance by [{workflow_name}]({run_url}) for {repository}*"
     run-started: "🔬 Breaking Change Checker online! [{workflow_name}]({run_url}) is analyzing API compatibility on this {event_type}..."
     run-success: "✅ Analysis complete! [{workflow_name}]({run_url}) has reviewed all changes. Compatibility verdict delivered! 📋"
     run-failure: "🔬 Analysis interrupted! [{workflow_name}]({run_url}) {status}. Compatibility status unknown..."
 timeout-minutes: 10
 features:
-  copilot-requests: true
-
+  gh-aw-detection: true
 ---
 
 # Breaking Change Checker

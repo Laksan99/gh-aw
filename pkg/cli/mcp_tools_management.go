@@ -3,6 +3,7 @@ package cli
 import (
 	"context"
 	"strconv"
+	"strings"
 
 	"github.com/github/gh-aw/pkg/logger"
 	"github.com/modelcontextprotocol/go-sdk/jsonrpc"
@@ -23,7 +24,7 @@ func registerAddTool(server *mcp.Server, execCmd execCmdFunc) {
 	mcp.AddTool(server, &mcp.Tool{
 		Name: "add",
 		Annotations: &mcp.ToolAnnotations{
-			OpenWorldHint: boolPtr(true),
+			OpenWorldHint: new(true),
 		},
 		Description: "Add workflows from remote repositories to .github/workflows",
 		Icons: []mcp.Icon{
@@ -40,6 +41,14 @@ func registerAddTool(server *mcp.Server, execCmd execCmdFunc) {
 		// Validate required arguments
 		if len(args.Workflows) == 0 {
 			return nil, nil, newMCPError(jsonrpc.CodeInvalidParams, "missing required parameter: at least one workflow specification is required", nil)
+		}
+		for _, workflowSpec := range args.Workflows {
+			if isRepositoryOnlyWorkflowSpec(workflowSpec) {
+				return nil, nil, newMCPError(jsonrpc.CodeInvalidParams, "failed to add workflows", map[string]any{
+					"error": "workflow specification must be in format 'owner/repo/workflow-name[@version]'",
+					"spec":  workflowSpec,
+				})
+			}
 		}
 
 		mcpToolsManagementLog.Printf("add tool invoked: workflows=%d, number=%d, name=%q", len(args.Workflows), args.Number, args.Name)
@@ -59,8 +68,7 @@ func registerAddTool(server *mcp.Server, execCmd execCmdFunc) {
 		}
 
 		// Execute the CLI command
-		cmd := execCmd(ctx, cmdArgs...)
-		output, err := cmd.CombinedOutput()
+		output, err := runMCPExecCombinedOutput(ctx, execCmd, cmdArgs...)
 
 		if err != nil {
 			return nil, nil, newMCPError(jsonrpc.CodeInternalError, "failed to add workflows", map[string]any{"error": err.Error(), "output": string(output)})
@@ -72,6 +80,17 @@ func registerAddTool(server *mcp.Server, execCmd execCmdFunc) {
 			},
 		}, nil, nil
 	})
+}
+
+func isRepositoryOnlyWorkflowSpec(spec string) bool {
+	if strings.HasPrefix(spec, "http://") || strings.HasPrefix(spec, "https://") || isLocalWorkflowPath(spec) {
+		return false
+	}
+
+	// Strip optional @version suffix so owner/repo@v1 is treated as repository-only.
+	specWithoutVersion := strings.SplitN(spec, "@", 2)[0]
+	slashParts := strings.Split(specWithoutVersion, "/")
+	return len(slashParts) == 2 && slashParts[0] != "" && slashParts[1] != ""
 }
 
 // updateArgs holds the input parameters for the update tool.
@@ -86,7 +105,7 @@ func registerUpdateTool(server *mcp.Server, execCmd execCmdFunc) {
 	mcp.AddTool(server, &mcp.Tool{
 		Name: "update",
 		Annotations: &mcp.ToolAnnotations{
-			OpenWorldHint: boolPtr(true),
+			OpenWorldHint: new(true),
 		},
 		Description: `Update workflows from their source repositories and check for gh-aw updates.
 
@@ -132,8 +151,7 @@ Returns formatted text output showing:
 		}
 
 		// Execute the CLI command
-		cmd := execCmd(ctx, cmdArgs...)
-		output, err := cmd.CombinedOutput()
+		output, err := runMCPExecCombinedOutput(ctx, execCmd, cmdArgs...)
 
 		if err != nil {
 			return nil, nil, newMCPError(jsonrpc.CodeInternalError, "failed to update workflows", map[string]any{"error": err.Error(), "output": string(output)})
@@ -160,8 +178,8 @@ func registerFixTool(server *mcp.Server, execCmd execCmdFunc) {
 		Name: "fix",
 		Annotations: &mcp.ToolAnnotations{
 			IdempotentHint:  true,
-			DestructiveHint: boolPtr(false),
-			OpenWorldHint:   boolPtr(false),
+			DestructiveHint: new(false),
+			OpenWorldHint:   new(false),
 		},
 		Description: `Apply automatic codemod-style fixes to agentic workflow files.
 
@@ -214,8 +232,7 @@ Returns formatted text output showing:
 		}
 
 		// Execute the CLI command
-		cmd := execCmd(ctx, cmdArgs...)
-		output, err := cmd.CombinedOutput()
+		output, err := runMCPExecCombinedOutput(ctx, execCmd, cmdArgs...)
 
 		if err != nil {
 			return nil, nil, newMCPError(jsonrpc.CodeInternalError, "failed to fix workflows", map[string]any{"error": err.Error(), "output": string(output)})

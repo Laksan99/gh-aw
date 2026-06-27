@@ -1,4 +1,5 @@
 ---
+emoji: "🔬"
 name: Copilot PR Conversation NLP Analysis
 description: Performs natural language processing analysis on Copilot PR conversations to extract insights and patterns from user interactions
 on:
@@ -7,13 +8,17 @@ on:
     - cron: "daily around 10:00 on weekdays"
   workflow_dispatch:
 
+max-daily-ai-credits: 10000
 permissions:
   contents: read
   pull-requests: read
   actions: read
   issues: read
 
-engine: copilot
+  copilot-requests: write
+engine:
+  id: copilot
+  copilot-sdk: true
 
 network:
   allowed:
@@ -22,7 +27,9 @@ network:
     - node
 
 sandbox:
-  agent: awf  # Firewall enabled (migrated from network.firewall)
+  agent:
+    id: awf
+    sudo: false
 imports:
   - uses: shared/daily-audit-base.md
     with:
@@ -37,7 +44,7 @@ imports:
   - shared/python-nlp.md
   - shared/reporting.md
 
-  - shared/observability-otlp.md
+  - shared/otlp.md
 steps:
   - name: Fetch PR comments for detailed analysis
     env:
@@ -45,31 +52,30 @@ steps:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
     run: |
       # Create comments directory
-      mkdir -p /tmp/gh-aw/pr-comments
+      mkdir -p /tmp/gh-aw/agent/pr-comments
 
       # Fetch detailed comments for each PR from the pre-fetched data
-      PR_COUNT=$(jq 'length' /tmp/gh-aw/pr-data/copilot-prs.json)
+      PR_COUNT=$(jq 'length' /tmp/gh-aw/agent/pr-data/copilot-prs.json)
       echo "Fetching comments for $PR_COUNT PRs..."
 
-      jq -r '.[].number' /tmp/gh-aw/pr-data/copilot-prs.json | while read -r PR_NUM; do
+      jq -r '.[].number' /tmp/gh-aw/agent/pr-data/copilot-prs.json | while read -r PR_NUM; do
         echo "Fetching comments for PR #${PR_NUM}"
         gh pr view "${PR_NUM}" \
           --json comments,reviews,reviewComments \
-          > "/tmp/gh-aw/pr-comments/pr-${PR_NUM}.json" 2>/dev/null || echo "{}" > "/tmp/gh-aw/pr-comments/pr-${PR_NUM}.json"
+          > "/tmp/gh-aw/agent/pr-comments/pr-${PR_NUM}.json" 2>/dev/null || echo "{}" > "/tmp/gh-aw/agent/pr-comments/pr-${PR_NUM}.json"
         sleep 0.5  # Rate limiting
       done
 
-      echo "Comment data saved to /tmp/gh-aw/pr-comments/"
+      echo "Comment data saved to /tmp/gh-aw/agent/pr-comments/"
 
 timeout-minutes: 20
 
-features:
-  copilot-requests: true
-
 tools:
   cli-proxy: true
-
+features:
+  gh-aw-detection: true
 ---
+
 # Copilot PR Conversation NLP Analysis
 
 You are an AI analytics agent specialized in Natural Language Processing (NLP) and conversation analysis. Your mission is to analyze GitHub Copilot pull request conversations to identify trends, sentiment patterns, and recurring topics.
@@ -83,8 +89,8 @@ Generate a daily NLP-based analysis report of Copilot-created PRs merged within 
 - **Repository**: ${{ github.repository }}
 - **Analysis Period**: Last 24 hours (merged PRs only)
 - **Data Location**: 
-  - PR metadata: `/tmp/gh-aw/pr-data/copilot-prs.json`
-  - PR comments: `/tmp/gh-aw/pr-comments/pr-*.json`
+  - PR metadata: `/tmp/gh-aw/agent/pr-data/copilot-prs.json`
+  - PR comments: `/tmp/gh-aw/agent/pr-comments/pr-*.json`
 - **Python Environment**: NumPy, Pandas, Matplotlib, Seaborn, SciPy, NLTK, scikit-learn, TextBlob, WordCloud
 - **Output Directory**: `/tmp/gh-aw/python/charts/`
 
@@ -93,31 +99,31 @@ Generate a daily NLP-based analysis report of Copilot-created PRs merged within 
 - Python analysis dependencies are already installed by pre-agent workflow steps.
 - **Do NOT run any `pip install` commands in agent turns.**
 - If an import unexpectedly fails, report the missing package in the output and continue with reduced analysis instead of installing dependencies in agent turns.
-- Run Python scripts with `/tmp/gh-aw/venv/bin/python3` to use the preinstalled environment.
+- Run Python scripts with `/tmp/gh-aw/agent/venv/bin/python3` to use the preinstalled environment.
 
 ## Task Overview
 
 ### Phase 1: Load and Parse PR Conversation Data
 
 **Pre-fetched Data Available**: The shared component has downloaded all Copilot PRs from the last 30 days. The data is available at:
-- `/tmp/gh-aw/pr-data/copilot-prs.json` - Full PR data in JSON format
-- `/tmp/gh-aw/pr-data/copilot-prs-schema.json` - Schema showing the structure
+- `/tmp/gh-aw/agent/pr-data/copilot-prs.json` - Full PR data in JSON format
+- `/tmp/gh-aw/agent/pr-data/copilot-prs-schema.json` - Schema showing the structure
 
 **Note**: This workflow focuses on merged PRs from the last 24 hours. Use jq to filter:
 ```bash
 # Get PRs merged in the last 24 hours
 DATE_24H_AGO=$(date -d '1 day ago' '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null || date -v-1d '+%Y-%m-%dT%H:%M:%SZ')
-jq --arg date "$DATE_24H_AGO" '[.[] | select(.mergedAt != null and .mergedAt >= $date)]' /tmp/gh-aw/pr-data/copilot-prs.json
+jq --arg date "$DATE_24H_AGO" '[.[] | select(.mergedAt != null and .mergedAt >= $date)]' /tmp/gh-aw/agent/pr-data/copilot-prs.json
 ```
 
 1. **Load PR metadata**:
    ```bash
-   cat /tmp/gh-aw/pr-data/copilot-prs.json
-   echo "Total PRs: $(jq 'length' /tmp/gh-aw/pr-data/copilot-prs.json)"
+   cat /tmp/gh-aw/agent/pr-data/copilot-prs.json
+   echo "Total PRs: $(jq 'length' /tmp/gh-aw/agent/pr-data/copilot-prs.json)"
    ```
 
 2. **Parse conversation threads** using `jq`:
-   - For each PR in `/tmp/gh-aw/pr-comments/pr-*.json`, extract:
+   - For each PR in `/tmp/gh-aw/agent/pr-comments/pr-*.json`, extract:
      - Comments (from `comments` array)
      - Review comments (from `reviewComments` array)
      - Reviews (from `reviews` array)
@@ -140,7 +146,7 @@ jq --arg date "$DATE_24H_AGO" '[.[] | select(.mergedAt != null and .mergedAt >= 
 1. **Use jq to extract conversation threads**:
    ```bash
    # Example: Extract all comment bodies from a PR
-   jq '.comments[].body' /tmp/gh-aw/pr-comments/pr-123.json
+   jq '.comments[].body' /tmp/gh-aw/agent/pr-comments/pr-123.json
    ```
 
 2. **Create Python script** (`/tmp/gh-aw/python/parse_conversations.py`) to:
@@ -261,9 +267,11 @@ Post a comprehensive discussion with the following structure:
 
 **Title**: `Copilot PR Conversation NLP Analysis - [DATE]`
 
+Use h3 (`###`) or lower for all headers in the discussion body. Never use h1 (`#`) or h2 (`##`) — these are reserved for the GitHub Discussion title rendered by the platform.
+
 **Content Template** (substitute `[SENTIMENT_DIST_URL]`, `[SENTIMENT_TIME_URL]`, `[TOPIC_FREQ_URL]`, `[TOPICS_CLOUD_URL]`, and `[KEYWORD_TRENDS_URL]` with the literal URL strings read by Python from the files above):
 ````markdown
-# 🤖 Copilot PR Conversation NLP Analysis - [DATE]
+### 🤖 Copilot PR Conversation NLP Analysis - [DATE]
 
 ### Executive Summary
 

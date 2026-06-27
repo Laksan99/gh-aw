@@ -1,4 +1,5 @@
 ---
+emoji: "📊"
 name: Copilot Agent PR Analysis
 description: Analyzes GitHub Copilot coding agent usage patterns in pull requests to provide insights on agent effectiveness and behavior
 on:
@@ -7,6 +8,7 @@ on:
     - cron: daily
   workflow_dispatch:
 
+max-daily-ai-credits: 10000
 permissions:
   contents: read
   issues: read
@@ -15,6 +17,23 @@ permissions:
 
 engine: claude
 strict: true
+
+experiments:
+  output_format:
+    variants: [structured, prose]
+    description: "Test whether a prose-style discussion summary reduces AI credit consumption vs. the current table-centric structured format without sacrificing completeness."
+    hypothesis: "H0: no change in ai_credits_used. H1: prose format reduces ai_credits_used by >=15% while keeping empty_discussion_rate <=5%"
+    metric: ai_credits_used
+    secondary_metrics: [run_duration_seconds, output_length_chars]
+    guardrail_metrics:
+      - name: empty_discussion_rate
+        direction: min
+        threshold: 0.05
+    min_samples: 30
+    weight: [50, 50]
+    start_date: "2026-06-08"
+    analysis_type: t_test
+    tags: [cost-efficiency, output-quality, daily-report]
 
 network:
   allowed:
@@ -32,13 +51,18 @@ imports:
       description: "Historical agent performance metrics"
   - shared/copilot-pr-analysis-base.md
 
-  - shared/observability-otlp.md
+  - shared/otlp.md
 timeout-minutes: 15
 
+sandbox:
+  agent:
+    sudo: false
 tools:
   cli-proxy: true
-
-
+  github:
+    mode: gh-proxy
+features:
+  gh-aw-detection: true
 ---
 # Copilot Agent PR Analysis
 
@@ -58,103 +82,29 @@ Daily analysis of pull requests created by copilot-swe-agent in the last 24 hour
 ### Phase 1: Collect PR Data
 
 **Pre-fetched Data Available**: This workflow includes a preparation step that has already fetched Copilot PR data for the last 30 days using gh CLI. The data is available at:
-- `/tmp/gh-aw/pr-data/copilot-prs.json` - Full PR data in JSON format
-- `/tmp/gh-aw/pr-data/copilot-prs-schema.json` - Schema showing the structure
+- `/tmp/gh-aw/agent/pr-data/copilot-prs.json` - Full PR data in JSON format
+- `/tmp/gh-aw/agent/pr-data/copilot-prs-schema.json` - Schema showing the structure
 
 You can use `jq` to process this data directly. For example:
 ```bash
 # Get PRs from the last 24 hours
 TODAY="$(date -d '24 hours ago' '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null || date -v-24H '+%Y-%m-%dT%H:%M:%SZ')"
-jq --arg today "$TODAY" '[.[] | select(.createdAt >= $today)]' /tmp/gh-aw/pr-data/copilot-prs.json
+jq --arg today "$TODAY" '[.[] | select(.createdAt >= $today)]' /tmp/gh-aw/agent/pr-data/copilot-prs.json
 
 # Count total PRs
-jq 'length' /tmp/gh-aw/pr-data/copilot-prs.json
+jq 'length' /tmp/gh-aw/agent/pr-data/copilot-prs.json
 
 # Get PR numbers for the last 24 hours
-jq --arg today "$TODAY" '[.[] | select(.createdAt >= $today) | .number]' /tmp/gh-aw/pr-data/copilot-prs.json
+jq --arg today "$TODAY" '[.[] | select(.createdAt >= $today) | .number]' /tmp/gh-aw/agent/pr-data/copilot-prs.json
 ```
 
-**Alternative Approaches** (if you need additional data not in the pre-fetched file):
-
-Search for pull requests created by Copilot in the last 24 hours.
-
-**Important**: The Copilot coding agent creates branches with the `copilot/` prefix, making branch-based search the most reliable method.
-
-**Recommended Approach**: The workflow uses `gh pr list --search "head:copilot/"` which provides reliable server-side filtering based on branch prefix.
-
-Use the GitHub tools with one of these strategies:
-
-1. **Use `gh pr list --search "head:copilot/"` (Recommended - used by this workflow)**:
-   ```bash
-   # Server-side filtering by branch prefix (current workflow approach)
-   DATE="$(date -d '24 hours ago' '+%Y-%m-%d')"
-   gh pr list --repo ${{ github.repository }} \
-     --search "head:copilot/ created:>=${DATE}" \
-     --state all \
-     --limit 1000 \
-     --json number,title,state,createdAt,closedAt,author
-   ```
-   
-   **Pros**: Most reliable method, server-side filtering, up to 1000 results
-   **Cons**: None
-   **Best for**: Production workflows (this is what the workflow uses)
-
-2. **Search by author (Alternative, but less reliable)**:
-   ```bash
-   # Author-based search (may miss some PRs)
-   DATE="$(date -d '24 hours ago' '+%Y-%m-%d')"
-   gh pr list --repo ${{ github.repository }} \
-     --author "app/github-copilot" \
-     --limit 100 \
-     --state all \
-     --json number,title,createdAt,author
-   ```
-   
-   **Pros**: Simple, targets specific author
-   **Cons**: Limited to 100 results, may not capture all Copilot PRs
-   **Best for**: Quick ad-hoc queries when branch naming is inconsistent
-
-3. **Search by branch pattern with git**:
-   ```bash
-   # List copilot branches
-   git branch -r | grep copilot
-   ```
-   This finds all remote branches with "copilot" in the name.
-
-4. **List all PRs and filter by author**:
-   Use `list_pull_requests` tool to get recent PRs, then filter by checking if:
-   - `user.login == "copilot"` or `user.login == "app/github-copilot"`
-   - Branch name starts with `copilot/`
-   - `user.type == "Bot"`
-
-   This is more reliable but requires processing all recent PRs.
-
-5. **Get PR Details**: For each found PR, use `pull_request_read` to get:
-   - PR number
-   - Title and description
-   - Creation timestamp
-   - Merge/close timestamp
-   - Current state (open, merged, closed)
-   - Number of comments
-   - Number of commits
-   - Files changed
-   - Review status
+**Alternative Approaches** (if you need additional data not in the pre-fetched file): Use `gh pr list --search "head:copilot/"` with `--state all` or `list_pull_requests` filtered by `user.login == "app/github-copilot"` or branch prefix `copilot/`.
 
 ### Phase 2: Analyze Each PR
 
-For each PR created by Copilot in the last 24 hours:
+For each PR created by Copilot in the last 24 hours, determine outcome (Merged / Closed without merge / Still Open), then:
 
-#### 2.1 Determine Outcome
-- **Merged**: PR was successfully merged
-- **Closed without merge**: PR was closed but not merged
-- **Still Open**: PR is still open (pending)
-
-#### 2.2 Count Human Comments
-Count comments from human users (exclude bot comments):
-- Use `pull_request_read` with method `get` to get PR details including comments
-- Use `pull_request_read` with method `get_review_comments` to get review comments
-- Filter out comments from bots (check comment author)
-- Count unique human comments
+- **Count human comments**: Use `pull_request_read` with methods `get` and `get_review_comments`; filter out bots; count unique human comments.
 
 #### 2.3 Calculate Timing Metrics
 
@@ -247,7 +197,7 @@ If the history file doesn't exist or has gaps in the data, rebuild it by queryin
 
 Store today's metrics (see standardized metric names in scratchpad/metrics-glossary.md):
 - Total PRs created today (`agent_prs_total`)
-- Number merged/closed/open (`agent_prs_merged`)
+- Number merged/closed/open (`agent_prs_merged`, `closed_prs`, `open_prs`)
 - Average comments per PR
 - Average agent duration
 - Average total duration
@@ -297,18 +247,6 @@ Or use `list_pull_requests` with date filtering and filter results by agent crit
 - **Maximum 3 days** of historical data for concise reporting
 - Prioritize data quality over quantity
 
-#### 4.3 Store Today's Metrics
-
-After ensuring historical data is available (either from existing repo memory or rebuilt), add today's metrics (see scratchpad/metrics-glossary.md):
-- Total PRs created today (`agent_prs_total`)
-- Number merged/closed/open (`agent_prs_merged`, `closed_prs`, `open_prs`)
-- Average comments per PR
-- Average agent duration
-- Average total duration
-- Success rate (`agent_success_rate`)
-
-Append to history.json in the repo memory.
-
 #### 4.4 Analyze Trends
 
 **Concise Trend Analysis** - If historical data exists (at least 3 days), show:
@@ -334,6 +272,7 @@ Create a **concise** discussion with your findings using the safe-outputs create
 
 **Discussion Title**: `Daily Copilot Agent Analysis - [DATE]`
 
+{{#if experiments.output_format == 'structured' }}
 **Concise Discussion Template**:
 ```markdown
 ### 🤖 Copilot Agent PR Analysis - [DATE]
@@ -341,7 +280,7 @@ Create a **concise** discussion with your findings using the safe-outputs create
 **Analysis Period**: Last 24 hours
 **Total PRs** (`agent_prs_total`): [count] | **Merged** (`agent_prs_merged`): [count] ([percentage]%) | **Avg Duration**: [time]
 
-#### Performance Metrics
+**Performance Metrics**
 
 | Date | PRs | Merged | Success Rate | Avg Duration | Avg Comments |
 |------|-----|--------|--------------|--------------|--------------|
@@ -367,16 +306,16 @@ Create a **concise** discussion with your findings using the safe-outputs create
 
 [Only list if there are failures, closures, or issues - otherwise omit this section]
 
-#### Issues ⚠️
+**Issues ⚠️**
 - **PR #[number]**: [title] - [brief reason for failure/closure]
 
-#### Open PRs ⏳
+**Open PRs ⏳**
 [Only list if open for >24 hours]
 - **PR #[number]**: [title] - [age]
 
 </details>
 
-#### Key Insights
+**Key Insights**
 
 [1-2 bullet points only, focus on actionable items or notable observations]
 
@@ -419,6 +358,24 @@ The "Agent Task Texts" section should include a table showing all PRs created in
 - **Remove "Instruction File Changes"** section entirely
 - **Eliminate "Recommendations"** section - fold into "Key Insights" (1-2 bullets max)
 - **Remove verbose methodology** and historical context sections
+{{/if}}
+{{#if experiments.output_format == 'prose' }}
+**Prose Discussion Template**:
+```markdown
+### 🤖 Copilot Agent PR Analysis - [DATE]
+
+**Analysis Period**: Last 24 hours
+
+In the last 24 hours, Copilot agent created [count] PRs (`agent_prs_total`), of which [count] were merged ([percentage]% success rate, `agent_prs_merged`) with an average duration of [time] and [count] human comments per PR. [One sentence on 3-day trend only if success rate changed >10%, e.g. "Success rate improved from X% to Y% over the last 3 days." — otherwise omit.] [One sentence listing any notable PRs by number only if failures, closures, or PRs open >24h exist — otherwise omit.]
+
+- [Key insight 1: single most actionable observation — omit bullet entirely if nothing notable]
+- [Key insight 2: secondary pattern or trend worth flagging — omit bullet entirely if nothing notable]
+
+---
+
+_Generated by Copilot Agent Analysis (Run: [run_id])_
+```
+{{/if}}
 
 ## Important Guidelines
 

@@ -1,4 +1,6 @@
 ---
+private: true
+emoji: "🔬"
 description: Performs web research on any topic using Tavily search and creates a discussion with findings
 on:
   workflow_dispatch:
@@ -21,12 +23,14 @@ network:
     - node
 
 sandbox:
-  agent: awf  # Firewall enabled (migrated from network.firewall)
+  agent:
+    id: awf
+    sudo: false
 imports:
   - shared/mcp/tavily.md
   - shared/reporting.md
 
-  - shared/observability-otlp.md
+  - shared/otlp.md
 safe-outputs:
   create-discussion:
     expires: 1d

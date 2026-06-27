@@ -11,8 +11,11 @@ import (
 	"time"
 
 	"github.com/github/gh-aw/pkg/constants"
+	"github.com/github/gh-aw/pkg/fileutil"
+	"github.com/github/gh-aw/pkg/github"
 	"github.com/github/gh-aw/pkg/logger"
 	"github.com/github/gh-aw/pkg/sliceutil"
+	"github.com/github/gh-aw/pkg/stringutil"
 	"github.com/github/gh-aw/pkg/timeutil"
 )
 
@@ -76,7 +79,6 @@ type Recommendation struct {
 // PerformanceMetrics provides aggregated performance statistics
 type PerformanceMetrics struct {
 	TokensPerMinute float64 `json:"tokens_per_minute,omitempty"`
-	CostEfficiency  string  `json:"cost_efficiency,omitempty"` // e.g., "good", "poor"
 	AvgToolDuration string  `json:"avg_tool_duration,omitempty"`
 	MostUsedTool    string  `json:"most_used_tool,omitempty"`
 	NetworkRequests int     `json:"network_requests,omitempty"`
@@ -102,14 +104,13 @@ type OverviewData struct {
 
 // MetricsData contains execution metrics
 type MetricsData struct {
-	TokenUsage      int                    `json:"token_usage,omitempty" console:"header:Token Usage,format:number,omitempty"`
-	EffectiveTokens int                    `json:"effective_tokens,omitempty" console:"header:Effective Tokens,format:number,omitempty"`
-	AmbientContext  *AmbientContextMetrics `json:"ambient_context,omitempty" console:"title:Ambient Context,omitempty"`
-	EstimatedCost   float64                `json:"estimated_cost,omitempty" console:"header:Estimated Cost,format:cost,omitempty"`
-	ActionMinutes   float64                `json:"action_minutes,omitempty" console:"header:Action Minutes,omitempty"`
-	Turns           int                    `json:"turns,omitempty" console:"header:Turns,omitempty"`
-	ErrorCount      int                    `json:"error_count" console:"header:Errors"`
-	WarningCount    int                    `json:"warning_count" console:"header:Warnings"`
+	TokenUsage     int                    `json:"token_usage,omitempty" console:"header:Token Usage,format:number,omitempty"`
+	AIC            float64                `json:"aic,omitempty"`
+	AmbientContext *AmbientContextMetrics `json:"ambient_context,omitempty" console:"title:Ambient Context,omitempty"`
+	ActionMinutes  float64                `json:"action_minutes,omitempty" console:"header:Action Minutes,omitempty"`
+	Turns          int                    `json:"turns,omitempty" console:"header:Turns,omitempty"`
+	ErrorCount     int                    `json:"error_count" console:"header:Errors"`
+	WarningCount   int                    `json:"warning_count" console:"header:Warnings"`
 }
 
 // JobData contains information about individual jobs
@@ -131,12 +132,15 @@ type FileInfo struct {
 // URL is present for creation types (e.g. create_issue, add_comment) but may be empty
 // for modification types (e.g. add_labels, close_issue) that do not return a URL.
 type CreatedItemReport struct {
-	Type        string `json:"type" console:"header:Type"`
-	URL         string `json:"url,omitempty" console:"header:URL,omitempty"`
-	Number      int    `json:"number,omitempty" console:"header:Number,omitempty"`
-	Repo        string `json:"repo,omitempty" console:"header:Repo,omitempty"`
-	TemporaryID string `json:"temporaryId,omitempty" console:"header:Temp ID,omitempty"`
-	Timestamp   string `json:"timestamp" console:"header:Timestamp"`
+	Type        string         `json:"type" console:"header:Type"`
+	URL         string         `json:"url,omitempty" console:"header:URL,omitempty"`
+	Number      int            `json:"number,omitempty" console:"header:Number,omitempty"`
+	Repo        string         `json:"repo,omitempty" console:"header:Repo,omitempty"`
+	TemporaryID string         `json:"temporaryId,omitempty" console:"header:Temp ID,omitempty"`
+	Metadata    map[string]any `json:"metadata,omitempty" console:"-"`
+	BeforeState map[string]any `json:"before_state,omitempty" console:"-"`
+	AfterState  map[string]any `json:"after_state,omitempty" console:"-"`
+	Timestamp   string         `json:"timestamp" console:"header:Timestamp"`
 }
 
 // ErrorInfo contains detailed error information
@@ -154,6 +158,7 @@ type ToolUsageInfo struct {
 	MaxInputSize  int    `json:"max_input_size,omitempty" console:"header:Max Input,format:number,omitempty"`
 	MaxOutputSize int    `json:"max_output_size,omitempty" console:"header:Max Output,format:number,omitempty"`
 	MaxDuration   string `json:"max_duration,omitempty" console:"header:Max Duration,omitempty"`
+	OutputSample  string `json:"output_sample,omitempty" console:"header:Response Preview,omitempty"`
 }
 
 // MCPToolUsageData contains detailed MCP tool usage statistics and individual call records
@@ -181,20 +186,23 @@ type MCPToolSummary struct {
 
 // MCPToolCall represents a single MCP tool call with full details
 type MCPToolCall struct {
-	Timestamp  string `json:"timestamp"`
-	ServerName string `json:"server_name"`
-	ToolName   string `json:"tool_name"`
-	Method     string `json:"method,omitempty"`
-	InputSize  int    `json:"input_size"`
-	OutputSize int    `json:"output_size"`
-	Duration   string `json:"duration,omitempty"`
-	Status     string `json:"status"`
-	Error      string `json:"error,omitempty"`
+	Timestamp           string `json:"timestamp"`
+	ServerName          string `json:"server_name"`
+	ToolName            string `json:"tool_name"`
+	Method              string `json:"method,omitempty"`
+	InputSize           int    `json:"input_size"`
+	OutputSize          int    `json:"output_size"`
+	Duration            string `json:"duration,omitempty"`
+	Status              string `json:"status"`
+	Error               string `json:"error,omitempty"`
+	EffectiveTokenDelta int    `json:"effective_token_delta,omitempty"` // Change in effective tokens caused by this tool call result
 }
 
 // MCPServerStats contains server-level statistics
 type MCPServerStats struct {
-	ServerName      string `json:"server_name" console:"header:Server"`
+	ServerName string `json:"server_name" console:"header:Server"`
+	// RequestCount is kept for backward-compatible report schemas that label per-server
+	// request volume; in MCP usage summaries this currently mirrors ToolCallCount.
 	RequestCount    int    `json:"request_count" console:"header:Requests"`
 	ToolCallCount   int    `json:"tool_call_count" console:"header:Tool Calls"`
 	TotalInputSize  int    `json:"total_input_size" console:"header:Total Input,format:number"`
@@ -286,11 +294,10 @@ func buildAuditData(processedRun ProcessedRun, metrics LogMetrics, mcpToolUsage 
 
 	// Build metrics
 	metricsData := MetricsData{
-		TokenUsage:    run.TokenUsage,
-		EstimatedCost: run.EstimatedCost,
-		Turns:         run.Turns,
-		ErrorCount:    run.ErrorCount,
-		WarningCount:  run.WarningCount,
+		TokenUsage:   run.TokenUsage,
+		Turns:        run.Turns,
+		ErrorCount:   run.ErrorCount,
+		WarningCount: run.WarningCount,
 	}
 
 	needsFallbackMetrics := metricsData.TokenUsage == 0 || metricsData.Turns == 0
@@ -319,12 +326,8 @@ func buildAuditData(processedRun ProcessedRun, metrics LogMetrics, mcpToolUsage 
 		metricsData.Turns = fallbackMetrics.Turns
 	}
 
-	// Populate effective tokens from the firewall proxy summary when available,
-	// otherwise fall back to the effective tokens stored on the run itself.
-	if processedRun.TokenUsage != nil && processedRun.TokenUsage.TotalEffectiveTokens > 0 {
-		metricsData.EffectiveTokens = processedRun.TokenUsage.TotalEffectiveTokens
-	} else if run.EffectiveTokens > 0 {
-		metricsData.EffectiveTokens = run.EffectiveTokens
+	if processedRun.TokenUsage != nil && processedRun.TokenUsage.TotalAIC > 0 {
+		metricsData.AIC = processedRun.TokenUsage.TotalAIC
 	}
 	if processedRun.TokenUsage != nil && processedRun.TokenUsage.AmbientContext != nil {
 		metricsData.AmbientContext = processedRun.TokenUsage.AmbientContext
@@ -434,52 +437,63 @@ func buildAuditData(processedRun ProcessedRun, metrics LogMetrics, mcpToolUsage 
 
 	// Evaluate outcomes for created items if any exist
 	if len(createdItems) > 0 {
-		outcomeReports := EvaluateOutcomes(createdItems, "")
+		mapping := github.LoadObjectiveMappingFromConfig()
+		outcomeReports := EvaluateOutcomes(createdItems, "", mapping)
 		auditData.Outcomes = outcomeReports
-		outcomeSummary := ComputeOutcomeSummary(outcomeReports, metricsData.EstimatedCost)
+		outcomeSummary := ComputeOutcomeSummary(outcomeReports, mapping)
 		auditData.OutcomeSummary = &outcomeSummary
 	}
 
 	return auditData
 }
 
-// extractDownloadedFiles scans the logs directory and returns file information
+// extractDownloadedFiles scans the logs directory recursively and returns file information.
+// It walks subdirectories (aw-prompts/, base/, etc.) so the JSON output enumerates every
+// file available for inspection. Baseline directories are excluded to keep output focused.
 func extractDownloadedFiles(logsPath string) []FileInfo {
 	auditReportLog.Printf("Extracting downloaded files from: %s", logsPath)
 	var files []FileInfo
 
-	entries, err := os.ReadDir(logsPath)
+	absLogsPath, err := filepath.Abs(logsPath)
 	if err != nil {
-		auditReportLog.Printf("Failed to read logs directory: %v", err)
-		return files
+		auditReportLog.Printf("Failed to resolve absolute logs path: %v", err)
+		absLogsPath = logsPath
 	}
 
-	for _, entry := range entries {
-		// Skip directories
-		if entry.IsDir() {
-			continue
+	err = filepath.WalkDir(absLogsPath, func(path string, d os.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return nil // skip unreadable entries
 		}
 
-		name := entry.Name()
-		fullPath := filepath.Join(logsPath, name)
+		// Skip baseline directories — they belong to comparison runs, not the audited run
+		if d.IsDir() && strings.HasPrefix(d.Name(), "baseline-") {
+			return filepath.SkipDir
+		}
 
-		// Use absolute path so callers get a directly usable path
-		absPath, err := filepath.Abs(fullPath)
-		if err != nil {
-			auditReportLog.Printf("Failed to resolve absolute path for %s: %v", fullPath, err)
-			absPath = fullPath
+		// Skip the base/ directory — it's the full cloned repo, not a log artifact
+		if d.IsDir() && d.Name() == "base" && path == filepath.Join(absLogsPath, "base") {
+			return filepath.SkipDir
+		}
+
+		// Skip directories themselves (we only list files)
+		if d.IsDir() {
+			return nil
 		}
 
 		fileInfo := FileInfo{
-			Path:        absPath,
-			Description: describeFile(name),
+			Path:        path,
+			Description: describeFile(d.Name()),
 		}
 
-		if info, err := os.Stat(fullPath); err == nil {
+		if info, statErr := os.Stat(path); statErr == nil {
 			fileInfo.Size = info.Size()
 		}
 
 		files = append(files, fileInfo)
+		return nil
+	})
+	if err != nil {
+		auditReportLog.Printf("Failed to walk logs directory: %v", err)
 	}
 
 	auditReportLog.Printf("Extracted %d files from logs directory", len(files))
@@ -605,7 +619,7 @@ func parseDurationString(s string) time.Duration {
 func extractPreAgentStepErrors(logsPath string) []ErrorInfo {
 	// If agent-stdio.log exists, the agent ran - don't scan step logs
 	agentStdioPath := filepath.Join(logsPath, "agent-stdio.log")
-	if _, err := os.Stat(agentStdioPath); err == nil {
+	if fileutil.FileExists(agentStdioPath) {
 		auditReportLog.Printf("agent-stdio.log found, skipping pre-agent step error extraction")
 		return nil
 	}
@@ -678,9 +692,7 @@ func extractPreAgentStepErrors(logsPath string) []ErrorInfo {
 
 			if len(errorLines) > 0 {
 				message := strings.Join(errorLines, "\n")
-				if len(message) > maxMessageLen {
-					message = message[:maxMessageLen] + "..."
-				}
+				message = stringutil.Truncate(message, maxMessageLen)
 				auditReportLog.Printf("Extracted ##[error] annotations from flat job log %s (job %d)", jobName, num)
 				errorAnnotations = append(errorAnnotations, ErrorInfo{
 					Type:    "step_failure",
@@ -734,9 +746,7 @@ func extractPreAgentStepErrors(logsPath string) []ErrorInfo {
 
 			if len(errorLines) > 0 {
 				message := strings.Join(errorLines, "\n")
-				if len(message) > maxMessageLen {
-					message = message[:maxMessageLen] + "..."
-				}
+				message = stringutil.Truncate(message, maxMessageLen)
 				auditReportLog.Printf("Extracted ##[error] annotations from %s (step %d)", stepKey, num)
 				errorAnnotations = append(errorAnnotations, ErrorInfo{
 					Type:    "step_failure",
@@ -769,9 +779,7 @@ func extractPreAgentStepErrors(logsPath string) []ErrorInfo {
 		return nil
 	}
 
-	if len(message) > maxMessageLen {
-		message = message[:maxMessageLen] + "..."
-	}
+	message = stringutil.Truncate(message, maxMessageLen)
 
 	auditReportLog.Printf("Extracted pre-agent step error from %s (step %d) as fallback", lastStep.stepKey, lastStep.num)
 	return []ErrorInfo{{

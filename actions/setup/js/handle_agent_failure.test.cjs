@@ -9,7 +9,13 @@ describe("handle_agent_failure", () => {
   let main;
   let buildCodePushFailureContext;
   let buildPushRepoMemoryFailureContext;
+  let buildReportIncompleteContext;
+  let buildFailureIssueTitle;
+  let buildSecretVerificationContext;
+  let buildAssignmentErrorsContext;
   let getActionFailureIssueExpiresHours;
+  const ENGINE_RATE_LIMIT_TEMPLATE = "> [!WARNING]\n> **Engine Rate Limited (HTTP 429)**\n> OTLP telemetry\n> {engine_label}\n";
+  const ENGINE_MAX_RUNS_EXCEEDED_TEMPLATE = "> [!WARNING]\n> **Engine Max Runs Exceeded**\n> max-runs guardrail\n> {engine_label}\n";
 
   beforeEach(() => {
     // Provide minimal GitHub Actions globals expected by require-time code
@@ -26,7 +32,16 @@ describe("handle_agent_failure", () => {
 
     // Reset module registry so each test gets a fresh require
     vi.resetModules();
-    ({ main, buildCodePushFailureContext, buildPushRepoMemoryFailureContext, getActionFailureIssueExpiresHours } = require("./handle_agent_failure.cjs"));
+    ({
+      main,
+      buildCodePushFailureContext,
+      buildPushRepoMemoryFailureContext,
+      buildReportIncompleteContext,
+      buildFailureIssueTitle,
+      buildSecretVerificationContext,
+      buildAssignmentErrorsContext,
+      getActionFailureIssueExpiresHours,
+    } = require("./handle_agent_failure.cjs"));
   });
 
   afterEach(() => {
@@ -35,6 +50,7 @@ describe("handle_agent_failure", () => {
     delete global.context;
     delete process.env.GITHUB_SHA;
     delete process.env.GH_AW_ACTION_FAILURE_ISSUE_EXPIRES_HOURS;
+    delete process.env.GH_AW_GROUP_REPORTS;
   });
 
   describe("getActionFailureIssueExpiresHours", () => {
@@ -52,6 +68,51 @@ describe("handle_agent_failure", () => {
       expect(getActionFailureIssueExpiresHours()).toBe(168);
       process.env.GH_AW_ACTION_FAILURE_ISSUE_EXPIRES_HOURS = "invalid";
       expect(getActionFailureIssueExpiresHours()).toBe(168);
+    });
+  });
+
+  describe("buildFailureIssueTitle", () => {
+    const baseOptions = {
+      workflowName: "Test Workflow",
+      isTimedOut: false,
+      hasMissingSafeOutputs: false,
+      hasReportIncomplete: false,
+      hasMissingTool: false,
+      hasMissingData: false,
+      hasCacheMissMisconfiguration: false,
+      hasToolDenialsExceeded: false,
+      hasAppTokenMintingFailed: false,
+      hasLockdownCheckFailed: false,
+      hasStaleLockFileFailed: false,
+      hasDailyAICExceeded: false,
+      aiCreditsRateLimitError: false,
+      maxAICreditsExceeded: false,
+      hasAssignmentErrors: false,
+    };
+
+    const cases = [
+      { flag: "hasDailyAICExceeded", expected: "[aw] Test Workflow exceeded daily AI credits budget" },
+      { flag: "maxAICreditsExceeded", expected: "[aw] Test Workflow exceeded max AI credits" },
+      { flag: "aiCreditsRateLimitError", expected: "[aw] Test Workflow hit AI credits rate limit" },
+      { flag: "hasAppTokenMintingFailed", expected: "[aw] Test Workflow failed to mint GitHub App token" },
+      { flag: "hasLockdownCheckFailed", expected: "[aw] Test Workflow failed lockdown check" },
+      { flag: "hasStaleLockFileFailed", expected: "[aw] Test Workflow has stale lock file" },
+      { flag: "isTimedOut", expected: "[aw] Test Workflow timed out" },
+      { flag: "hasToolDenialsExceeded", expected: "[aw] Test Workflow exceeded tool denial limit" },
+      { flag: "hasCacheMissMisconfiguration", expected: "[aw] Test Workflow has cache-memory miss misconfiguration" },
+      { flag: "hasReportIncomplete", expected: "[aw] Test Workflow reported incomplete result" },
+      { flag: "hasMissingSafeOutputs", expected: "[aw] Test Workflow produced no safe outputs" },
+      { flag: "hasMissingTool", expected: "[aw] Test Workflow is missing required tool" },
+      { flag: "hasMissingData", expected: "[aw] Test Workflow is missing required data" },
+      { flag: "hasAssignmentErrors", expected: "[aw] Test Workflow failed to assign agent" },
+    ];
+
+    it.each(cases)("returns expected title for isolated $flag", ({ flag, expected }) => {
+      expect(buildFailureIssueTitle({ ...baseOptions, [flag]: true })).toBe(expected);
+    });
+
+    it("falls back to generic failed title when no specific condition matches", () => {
+      expect(buildFailureIssueTitle(baseOptions)).toBe("[aw] Test Workflow failed");
     });
   });
 
@@ -73,6 +134,9 @@ describe("handle_agent_failure", () => {
       // Minimal templates used by main()
       fs.writeFileSync(path.join(promptsDir, "agent_failure_comment.md"), "COMMENT TEMPLATE CONTENT");
       fs.writeFileSync(path.join(promptsDir, "agent_failure_issue.md"), "ISSUE TEMPLATE CONTENT");
+      fs.writeFileSync(path.join(promptsDir, "daily_cap_rollup_issue.md"), "Daily cap rollup issue body cap={cap} window={window_hours}");
+      fs.writeFileSync(path.join(promptsDir, "daily_cap_rollup_comment.md"), "Failure suppressed workflow={workflow_name} run={run_url} categories={summary} cap={cap} window={window_hours}h");
+      fs.writeFileSync(path.join(promptsDir, "optimize_token_consumption_context.md"), "OPTIMIZE CONTEXT guardrail={guardrail_name} run={run_url}");
 
       process.env.RUNNER_TEMP = tmpDir;
       process.env.GH_AW_WORKFLOW_NAME = "Test Workflow";
@@ -81,6 +145,8 @@ describe("handle_agent_failure", () => {
       process.env.GH_AW_AGENT_CONCLUSION = "failure";
       process.env.GH_AW_DETECTION_CONCLUSION = "warning";
       process.env.GH_AW_DETECTION_REASON = "threat_detected";
+      process.env.GITHUB_HEAD_REF = "feature/detection-caution";
+      process.env.GITHUB_WORKSPACE = tmpDir;
     });
 
     afterEach(() => {
@@ -91,6 +157,8 @@ describe("handle_agent_failure", () => {
       delete process.env.GH_AW_AGENT_CONCLUSION;
       delete process.env.GH_AW_DETECTION_CONCLUSION;
       delete process.env.GH_AW_DETECTION_REASON;
+      delete process.env.GITHUB_HEAD_REF;
+      delete process.env.GITHUB_WORKSPACE;
 
       if (tmpDir && fs.existsSync(tmpDir)) {
         fs.rmSync(tmpDir, { recursive: true, force: true });
@@ -111,7 +179,16 @@ describe("handle_agent_failure", () => {
               return {
                 data: {
                   total_count: 1,
-                  items: [{ number: 42, html_url: "https://github.com/owner/repo/issues/42" }],
+                  items: [
+                    {
+                      number: 42,
+                      html_url: "https://github.com/owner/repo/issues/42",
+                      body:
+                        "> footer\n> - [x] expires <!-- gh-aw-expires: 2099-01-01T00:00:00.000Z --> on Jan 1, 2099, 12:00 AM UTC\n\n" +
+                        "<!-- gh-aw-agentic-workflow: Test Workflow, workflow_id: test-workflow, run: https://github.com/owner/repo/actions/runs/123456 -->\n" +
+                        "<!-- gh-aw-failure-issue: true, workflow_id: test-workflow, branch: feature/detection-caution, failure_categories: agent_failure -->",
+                    },
+                  ],
                 },
               };
             }),
@@ -145,10 +222,7 @@ describe("handle_agent_failure", () => {
       global.github = {
         rest: {
           search: {
-            issuesAndPullRequests: vi.fn(async ({ q }) => {
-              if (q.includes("is:pr")) {
-                return { data: { total_count: 0, items: [] } };
-              }
+            issuesAndPullRequests: vi.fn(async () => {
               return { data: { total_count: 0, items: [] } };
             }),
           },
@@ -174,6 +248,1121 @@ describe("handle_agent_failure", () => {
       expect(capturedIssueBody.indexOf("> [!CAUTION]")).toBeLessThan(capturedIssueBody.indexOf("ISSUE TEMPLATE CONTENT"));
       expect((capturedIssueBody.match(/> \[!CAUTION\]/g) || []).length).toBe(1);
       expect(capturedIssueBody).toContain("> Generated from [Test Workflow]");
+    });
+
+    it("includes AIC and ambient context metrics in the generated failure issue footer", async () => {
+      process.env.GH_AW_AIC = "1.25";
+      process.env.GH_AW_AMBIENT_CONTEXT = "900";
+      /** @type {string} */
+      let capturedIssueBody = "";
+
+      global.github = {
+        rest: {
+          search: {
+            issuesAndPullRequests: vi.fn(async ({ q }) => {
+              if (q.includes("is:pr")) {
+                return { data: { total_count: 0, items: [] } };
+              }
+              return { data: { total_count: 0, items: [] } };
+            }),
+          },
+          issues: {
+            create: vi.fn(async ({ body }) => {
+              capturedIssueBody = body;
+              return {
+                data: { number: 101, html_url: "https://github.com/owner/repo/issues/101", node_id: "I_123" },
+              };
+            }),
+          },
+          pulls: {
+            get: vi.fn(),
+          },
+        },
+        graphql: vi.fn(),
+      };
+
+      try {
+        await main();
+
+        expect(capturedIssueBody).toContain("> Generated from [Test Workflow](https://github.com/owner/repo/actions/runs/123456) · 1.25 AIC · ⊞ 900");
+      } finally {
+        delete process.env.GH_AW_AIC;
+        delete process.env.GH_AW_AMBIENT_CONTEXT;
+      }
+    });
+
+    it("includes AIC in failure issue footer when resolved from audit log and GH_AW_AIC is unset", async () => {
+      const auditPath = path.join(tmpDir, "sandbox", "firewall", "audit");
+      fs.mkdirSync(auditPath, { recursive: true });
+      fs.writeFileSync(path.join(auditPath, "log.jsonl"), `${JSON.stringify({ ai_credits: "2.5" })}\n`);
+      process.env.GH_AW_AGENT_OUTPUT = path.join(tmpDir, "agent-output.json");
+      expect(process.env.GH_AW_AIC).toBeUndefined();
+      /** @type {string} */
+      let capturedIssueBody = "";
+
+      global.github = {
+        rest: {
+          search: {
+            issuesAndPullRequests: vi.fn(async () => ({ data: { total_count: 0, items: [] } })),
+          },
+          issues: {
+            create: vi.fn(async ({ body }) => {
+              capturedIssueBody = body;
+              return {
+                data: { number: 101, html_url: "https://github.com/owner/repo/issues/101", node_id: "I_123" },
+              };
+            }),
+          },
+          pulls: {
+            get: vi.fn(),
+          },
+        },
+        graphql: vi.fn(),
+      };
+
+      try {
+        await main();
+        expect(capturedIssueBody).toContain("> Generated from [Test Workflow](https://github.com/owner/repo/actions/runs/123456) · 2.5 AIC");
+      } finally {
+        delete process.env.GH_AW_AGENT_OUTPUT;
+      }
+    });
+
+    it("includes AIC in failure comment footer when resolved from audit log and GH_AW_AIC is unset", async () => {
+      const auditPath = path.join(tmpDir, "sandbox", "firewall", "audit");
+      fs.mkdirSync(auditPath, { recursive: true });
+      fs.writeFileSync(path.join(auditPath, "log.jsonl"), `${JSON.stringify({ ai_credits: "2.5" })}\n`);
+      process.env.GH_AW_AGENT_OUTPUT = path.join(tmpDir, "agent-output.json");
+      expect(process.env.GH_AW_AIC).toBeUndefined();
+      /** @type {string} */
+      let capturedCommentBody = "";
+
+      global.github = {
+        rest: {
+          search: {
+            issuesAndPullRequests: vi.fn(async ({ q }) => {
+              if (q.includes("is:pr")) {
+                return { data: { total_count: 0, items: [] } };
+              }
+              return {
+                data: {
+                  total_count: 1,
+                  items: [
+                    {
+                      number: 42,
+                      html_url: "https://github.com/owner/repo/issues/42",
+                      body:
+                        "> footer\n> - [x] expires <!-- gh-aw-expires: 2099-01-01T00:00:00.000Z --> on Jan 1, 2099, 12:00 AM UTC\n\n" +
+                        "<!-- gh-aw-agentic-workflow: Test Workflow, workflow_id: test-workflow, run: https://github.com/owner/repo/actions/runs/123456 -->\n" +
+                        "<!-- gh-aw-failure-issue: true, workflow_id: test-workflow, branch: feature/detection-caution, failure_categories: agent_failure -->",
+                    },
+                  ],
+                },
+              };
+            }),
+          },
+          issues: {
+            createComment: vi.fn(async ({ body }) => {
+              capturedCommentBody = body;
+              return { data: { id: 1001 } };
+            }),
+          },
+          pulls: {
+            get: vi.fn(),
+          },
+        },
+        graphql: vi.fn(),
+      };
+
+      try {
+        await main();
+        expect(capturedCommentBody).toContain("> Generated from [Test Workflow](https://github.com/owner/repo/actions/runs/123456) · 2.5 AIC");
+      } finally {
+        delete process.env.GH_AW_AGENT_OUTPUT;
+      }
+    });
+  });
+
+  describe("main() precise failure issue matching", () => {
+    const fs = require("fs");
+    const path = require("path");
+    const os = require("os");
+
+    /** @type {string} */
+    let tmpDir;
+    /** @type {string} */
+    let promptsDir;
+
+    function buildExistingIssueBody({ branch, categories, expires = "2099-01-01T00:00:00.000Z", pullRequestNumber, workflowName = "Test Workflow", workflowId = "test-workflow" } = {}) {
+      const prPart = pullRequestNumber ? `, pull_request: ${pullRequestNumber}` : "";
+      return (
+        `> Generated from [${workflowName}](https://github.com/owner/repo/actions/runs/123456)\n` +
+        `> - [x] expires <!-- gh-aw-expires: ${expires} --> on Jan 1, 2099, 12:00 AM UTC\n\n` +
+        `<!-- gh-aw-agentic-workflow: ${workflowName}, workflow_id: ${workflowId}, run: https://github.com/owner/repo/actions/runs/123456 -->\n` +
+        `<!-- gh-aw-failure-issue: true, workflow_id: ${workflowId}, branch: ${branch || ""}, failure_categories: ${categories.join("|")}${prPart} -->`
+      );
+    }
+
+    function buildWorkflowMarkerOnlyIssueBody({ expires = "2099-01-01T00:00:00.000Z", workflowName = "Test Workflow", workflowId = "test-workflow" } = {}) {
+      return (
+        `> Generated from [${workflowName}](https://github.com/owner/repo/actions/runs/123456)\n` +
+        `> - [x] expires <!-- gh-aw-expires: ${expires} --> on Jan 1, 2099, 12:00 AM UTC\n\n` +
+        `<!-- gh-aw-agentic-workflow: ${workflowName}, workflow_id: ${workflowId}, run: https://github.com/owner/repo/actions/runs/123456 -->`
+      );
+    }
+
+    beforeEach(() => {
+      tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "aw-handle-agent-failure-match-"));
+      promptsDir = path.join(tmpDir, "gh-aw", "prompts");
+      fs.mkdirSync(promptsDir, { recursive: true });
+      fs.writeFileSync(path.join(promptsDir, "agent_failure_comment.md"), "COMMENT TEMPLATE CONTENT");
+      fs.writeFileSync(path.join(promptsDir, "agent_failure_issue.md"), "ISSUE TEMPLATE CONTENT");
+      fs.writeFileSync(path.join(promptsDir, "daily_cap_rollup_issue.md"), "Daily cap rollup issue body cap={cap} window={window_hours}");
+      fs.writeFileSync(path.join(promptsDir, "daily_cap_rollup_comment.md"), "Failure suppressed workflow={workflow_name} run={run_url} categories={summary} cap={cap} window={window_hours}h");
+      fs.writeFileSync(path.join(promptsDir, "optimize_token_consumption_context.md"), "OPTIMIZE CONTEXT guardrail={guardrail_name} run={run_url}");
+
+      process.env.RUNNER_TEMP = tmpDir;
+      process.env.GH_AW_WORKFLOW_NAME = "Test Workflow";
+      process.env.GH_AW_WORKFLOW_ID = "test-workflow";
+      process.env.GH_AW_RUN_URL = "https://github.com/owner/repo/actions/runs/123456";
+      process.env.GH_AW_AGENT_CONCLUSION = "success";
+      process.env.GITHUB_HEAD_REF = "feature/current";
+      process.env.GITHUB_WORKSPACE = tmpDir;
+    });
+
+    afterEach(() => {
+      delete process.env.RUNNER_TEMP;
+      delete process.env.GH_AW_WORKFLOW_NAME;
+      delete process.env.GH_AW_WORKFLOW_ID;
+      delete process.env.GH_AW_RUN_URL;
+      delete process.env.GH_AW_AGENT_CONCLUSION;
+      delete process.env.GH_AW_FAILURE_REPORT_AS_ISSUE;
+      delete process.env.GH_AW_AGENTIC_ENGINE_TIMEOUT;
+      delete process.env.GITHUB_HEAD_REF;
+      delete process.env.GITHUB_WORKSPACE;
+      if (tmpDir && fs.existsSync(tmpDir)) {
+        fs.rmSync(tmpDir, { recursive: true, force: true });
+      }
+    });
+
+    it("adds a comment only when the existing issue metadata matches exactly", async () => {
+      const createCommentMock = vi.fn(async () => ({ data: { id: 1001 } }));
+      const createIssueMock = vi.fn();
+
+      global.github = {
+        rest: {
+          search: {
+            issuesAndPullRequests: vi.fn(async ({ q }) => {
+              if (q.includes("is:pr")) {
+                return { data: { total_count: 0, items: [] } };
+              }
+              return {
+                data: {
+                  total_count: 1,
+                  items: [
+                    {
+                      number: 42,
+                      html_url: "https://github.com/owner/repo/issues/42",
+                      body: buildExistingIssueBody({ branch: "feature/current", categories: ["missing_safe_outputs"] }),
+                    },
+                  ],
+                },
+              };
+            }),
+          },
+          issues: {
+            create: createIssueMock,
+            createComment: createCommentMock,
+          },
+          pulls: { get: vi.fn() },
+        },
+        graphql: vi.fn(),
+      };
+
+      await main();
+
+      expect(createCommentMock).toHaveBeenCalledOnce();
+      expect(createIssueMock).not.toHaveBeenCalled();
+    });
+
+    it("adds a comment when existing issue metadata contains commas in free-form values", async () => {
+      const createCommentMock = vi.fn(async () => ({ data: { id: 1001 } }));
+      const createIssueMock = vi.fn();
+
+      process.env.GH_AW_WORKFLOW_NAME = "Test Workflow, Retry";
+      process.env.GITHUB_HEAD_REF = "feature/current,with-comma";
+
+      global.github = {
+        rest: {
+          search: {
+            issuesAndPullRequests: vi.fn(async ({ q }) => {
+              if (q.includes("is:pr")) {
+                return { data: { total_count: 0, items: [] } };
+              }
+              return {
+                data: {
+                  total_count: 1,
+                  items: [
+                    {
+                      number: 42,
+                      html_url: "https://github.com/owner/repo/issues/42",
+                      body: buildExistingIssueBody({
+                        workflowName: "Test Workflow, Retry",
+                        branch: "feature/current,with-comma",
+                        categories: ["missing_safe_outputs"],
+                      }),
+                    },
+                  ],
+                },
+              };
+            }),
+          },
+          issues: {
+            create: createIssueMock,
+            createComment: createCommentMock,
+          },
+          pulls: { get: vi.fn() },
+        },
+        graphql: vi.fn(),
+      };
+
+      await main();
+
+      expect(createCommentMock).toHaveBeenCalledOnce();
+      expect(createIssueMock).not.toHaveBeenCalled();
+    });
+
+    it("creates a new issue when an open issue only has workflow XML metadata without failure metadata", async () => {
+      const createCommentMock = vi.fn();
+      const createIssueMock = vi.fn();
+      const searchMock = vi.fn(async ({ q }) => {
+        if (q.includes("is:pr")) {
+          return { data: { total_count: 0, items: [] } };
+        }
+        return {
+          data: {
+            total_count: 1,
+            items: [
+              {
+                number: 42,
+                title: "[aw] Test Workflow failed",
+                html_url: "https://github.com/owner/repo/issues/42",
+                body: buildWorkflowMarkerOnlyIssueBody(),
+              },
+            ],
+          },
+        };
+      });
+
+      global.github = {
+        rest: {
+          search: {
+            issuesAndPullRequests: searchMock,
+          },
+          issues: {
+            create: createIssueMock,
+            createComment: createCommentMock,
+          },
+          pulls: { get: vi.fn() },
+        },
+        graphql: vi.fn(),
+      };
+
+      await main();
+
+      expect(createCommentMock).not.toHaveBeenCalled();
+      expect(createIssueMock).toHaveBeenCalledOnce();
+      const createCall = createIssueMock.mock.calls[0][0];
+      expect(createCall.headers).toEqual({ "X-GitHub-Api-Version": "2022-11-28" });
+      expect(searchMock).toHaveBeenCalledWith(expect.objectContaining({ q: expect.stringContaining('"gh-aw-agentic-workflow:"') }));
+      expect(searchMock).toHaveBeenCalledWith(expect.objectContaining({ q: expect.stringContaining('"workflow_id: test-workflow" in:body') }));
+    });
+
+    it("creates a parent issue with the API version header when group reports are enabled", async () => {
+      const createCommentMock = vi.fn();
+      const createIssueMock = vi.fn(async ({ title }) => ({
+        data: {
+          number: title === "[aw] Failed runs" ? 200 : 201,
+          html_url: `https://github.com/owner/repo/issues/${title === "[aw] Failed runs" ? 200 : 201}`,
+          node_id: title === "[aw] Failed runs" ? "I_parent" : "I_child",
+        },
+      }));
+      const searchMock = vi.fn(async ({ q }) => {
+        if (q.includes("is:pr")) {
+          return { data: { total_count: 0, items: [] } };
+        }
+        return { data: { total_count: 0, items: [] } };
+      });
+
+      process.env.GH_AW_GROUP_REPORTS = "true";
+
+      global.github = {
+        rest: {
+          search: {
+            issuesAndPullRequests: searchMock,
+          },
+          issues: {
+            create: createIssueMock,
+            createComment: createCommentMock,
+          },
+          pulls: { get: vi.fn() },
+        },
+        graphql: vi.fn(),
+      };
+
+      await main();
+
+      const parentCreateCall = createIssueMock.mock.calls.map(([call]) => call).find(call => call.title === "[aw] Failed runs");
+      expect(parentCreateCall).toBeDefined();
+      expect(parentCreateCall.headers).toEqual({ "X-GitHub-Api-Version": "2022-11-28" });
+      expect(createCommentMock).not.toHaveBeenCalled();
+      expect(searchMock).toHaveBeenCalledWith(expect.objectContaining({ q: expect.stringContaining('"[aw] Failed runs"') }));
+    });
+
+    it("escapes workflow IDs before searching for legacy XML marker matches", async () => {
+      const createCommentMock = vi.fn(async () => ({ data: { id: 1001 } }));
+      const createIssueMock = vi.fn();
+      const workflowId = 'test"workflow\\path\nnext-line';
+      const searchMock = vi.fn(async ({ q }) => {
+        if (q.includes("is:pr")) {
+          return { data: { total_count: 0, items: [] } };
+        }
+        return {
+          data: {
+            total_count: 1,
+            items: [
+              {
+                number: 42,
+                title: "[aw] Test Workflow failed",
+                html_url: "https://github.com/owner/repo/issues/42",
+                body: buildExistingIssueBody({
+                  workflowId,
+                  branch: "feature/current",
+                  categories: ["missing_safe_outputs"],
+                }),
+              },
+            ],
+          },
+        };
+      });
+
+      process.env.GH_AW_WORKFLOW_ID = workflowId;
+
+      global.github = {
+        rest: {
+          search: {
+            issuesAndPullRequests: searchMock,
+          },
+          issues: {
+            create: createIssueMock,
+            createComment: createCommentMock,
+          },
+          pulls: { get: vi.fn() },
+        },
+        graphql: vi.fn(),
+      };
+
+      await main();
+
+      expect(createCommentMock).toHaveBeenCalledOnce();
+      expect(createIssueMock).not.toHaveBeenCalled();
+      expect(searchMock).toHaveBeenCalledWith(expect.objectContaining({ q: expect.stringContaining('"workflow_id: test\\"workflow\\\\path next-line" in:body') }));
+    });
+
+    it("adds a comment when branch differs but workflow/category markers match", async () => {
+      const createCommentMock = vi.fn(async () => ({ data: { id: 1001 } }));
+      const createIssueMock = vi.fn(async () => ({
+        data: { number: 101, html_url: "https://github.com/owner/repo/issues/101", node_id: "I_123" },
+      }));
+
+      global.github = {
+        rest: {
+          search: {
+            issuesAndPullRequests: vi.fn(async ({ q }) => {
+              if (q.includes("is:pr")) {
+                return { data: { total_count: 0, items: [] } };
+              }
+              return {
+                data: {
+                  total_count: 2,
+                  items: [
+                    {
+                      number: 42,
+                      title: "[aw] Test Workflow failed",
+                      html_url: "https://github.com/owner/repo/issues/42",
+                      body: buildExistingIssueBody({ branch: "feature/other", categories: ["missing_safe_outputs"] }),
+                    },
+                    {
+                      number: 43,
+                      title: "[aw] Test Workflow failed",
+                      html_url: "https://github.com/owner/repo/issues/43",
+                      body: buildExistingIssueBody({ branch: "feature/current", categories: ["agent_failure"] }),
+                    },
+                  ],
+                },
+              };
+            }),
+          },
+          issues: {
+            create: createIssueMock,
+            createComment: createCommentMock,
+          },
+          pulls: { get: vi.fn() },
+        },
+        graphql: vi.fn(),
+      };
+
+      await main();
+
+      expect(createCommentMock).toHaveBeenCalledOnce();
+      expect(createIssueMock).not.toHaveBeenCalled();
+    });
+
+    it("creates a new issue instead of commenting on an expired issue", async () => {
+      const createCommentMock = vi.fn();
+      const createIssueMock = vi.fn(async () => ({
+        data: { number: 101, html_url: "https://github.com/owner/repo/issues/101", node_id: "I_123" },
+      }));
+
+      global.github = {
+        rest: {
+          search: {
+            issuesAndPullRequests: vi.fn(async ({ q }) => {
+              if (q.includes("is:pr")) {
+                return { data: { total_count: 0, items: [] } };
+              }
+              return {
+                data: {
+                  total_count: 1,
+                  items: [
+                    {
+                      number: 42,
+                      html_url: "https://github.com/owner/repo/issues/42",
+                      body: buildExistingIssueBody({
+                        branch: "feature/current",
+                        categories: ["missing_safe_outputs"],
+                        expires: "2000-01-01T00:00:00.000Z",
+                      }),
+                    },
+                  ],
+                },
+              };
+            }),
+          },
+          issues: {
+            create: createIssueMock,
+            createComment: createCommentMock,
+          },
+          pulls: { get: vi.fn() },
+        },
+        graphql: vi.fn(),
+      };
+
+      await main();
+
+      expect(createCommentMock).not.toHaveBeenCalled();
+      expect(createIssueMock).toHaveBeenCalledOnce();
+    });
+
+    it("creates a new issue when the only matching issue is older than 24 hours", async () => {
+      const createCommentMock = vi.fn();
+      const createIssueMock = vi.fn(async () => ({
+        data: { number: 101, html_url: "https://github.com/owner/repo/issues/101", node_id: "I_123" },
+      }));
+      const oldTimestamp = new Date(Date.now() - 25 * 60 * 60 * 1000).toISOString();
+
+      global.github = {
+        rest: {
+          search: {
+            issuesAndPullRequests: vi.fn(async ({ q }) => {
+              if (q.includes("is:pr")) {
+                return { data: { total_count: 0, items: [] } };
+              }
+              return {
+                data: {
+                  total_count: 1,
+                  items: [
+                    {
+                      number: 42,
+                      html_url: "https://github.com/owner/repo/issues/42",
+                      created_at: oldTimestamp,
+                      body: buildExistingIssueBody({
+                        branch: "feature/current",
+                        categories: ["missing_safe_outputs"],
+                      }),
+                    },
+                  ],
+                },
+              };
+            }),
+          },
+          issues: {
+            create: createIssueMock,
+            createComment: createCommentMock,
+          },
+          pulls: { get: vi.fn() },
+        },
+        graphql: vi.fn(),
+      };
+
+      await main();
+
+      expect(createCommentMock).not.toHaveBeenCalled();
+      expect(createIssueMock).toHaveBeenCalledOnce();
+    });
+
+    it("uses a precise timeout title when the agent times out", async () => {
+      const createIssueMock = vi.fn(async () => ({
+        data: { number: 101, html_url: "https://github.com/owner/repo/issues/101", node_id: "I_123" },
+      }));
+      fs.writeFileSync(path.join(promptsDir, "agent_timeout.md"), "TIMEOUT TEMPLATE");
+      process.env.GH_AW_AGENT_CONCLUSION = "timed_out";
+      process.env.GH_AW_FAILURE_REPORT_AS_ISSUE = "true";
+
+      global.github = {
+        rest: {
+          search: {
+            issuesAndPullRequests: vi.fn(async () => ({ data: { total_count: 0, items: [] } })),
+          },
+          issues: {
+            create: createIssueMock,
+            createComment: vi.fn(),
+          },
+          pulls: { get: vi.fn() },
+        },
+        graphql: vi.fn(),
+      };
+
+      try {
+        await main();
+      } finally {
+        delete process.env.GH_AW_FAILURE_REPORT_AS_ISSUE;
+      }
+
+      expect(createIssueMock).toHaveBeenCalledOnce();
+      const createCall = createIssueMock.mock.calls[0][0];
+      expect(createCall.title).toBe("[aw] Test Workflow timed out");
+    });
+
+    it("uses a precise missing safe outputs title", async () => {
+      const createIssueMock = vi.fn(async () => ({
+        data: { number: 101, html_url: "https://github.com/owner/repo/issues/101", node_id: "I_123" },
+      }));
+      process.env.GH_AW_FAILURE_REPORT_AS_ISSUE = "true";
+
+      global.github = {
+        rest: {
+          search: {
+            issuesAndPullRequests: vi.fn(async () => ({ data: { total_count: 0, items: [] } })),
+          },
+          issues: {
+            create: createIssueMock,
+            createComment: vi.fn(),
+          },
+          pulls: { get: vi.fn() },
+        },
+        graphql: vi.fn(),
+      };
+
+      try {
+        await main();
+      } finally {
+        delete process.env.GH_AW_FAILURE_REPORT_AS_ISSUE;
+      }
+
+      expect(createIssueMock).toHaveBeenCalledOnce();
+      const createCall = createIssueMock.mock.calls[0][0];
+      expect(createCall.title).toBe("[aw] Test Workflow produced no safe outputs");
+    });
+
+    it("uses a precise report incomplete title", async () => {
+      const createIssueMock = vi.fn(async () => ({
+        data: { number: 101, html_url: "https://github.com/owner/repo/issues/101", node_id: "I_123" },
+      }));
+      const agentOutputPath = path.join(tmpDir, "agent_output.json");
+      fs.writeFileSync(agentOutputPath, JSON.stringify({ items: [{ type: "report_incomplete", reason: "tool failed" }] }));
+      process.env.GH_AW_AGENT_OUTPUT = agentOutputPath;
+
+      global.github = {
+        rest: {
+          search: {
+            issuesAndPullRequests: vi.fn(async () => ({ data: { total_count: 0, items: [] } })),
+          },
+          issues: {
+            create: createIssueMock,
+            createComment: vi.fn(),
+          },
+          pulls: { get: vi.fn() },
+        },
+        graphql: vi.fn(),
+      };
+
+      try {
+        await main();
+      } finally {
+        delete process.env.GH_AW_AGENT_OUTPUT;
+      }
+
+      expect(createIssueMock).toHaveBeenCalledOnce();
+      const createCall = createIssueMock.mock.calls[0][0];
+      expect(createCall.title).toBe("[aw] Test Workflow reported incomplete result");
+    });
+
+    it("continues searching later pages until it finds an exact metadata match", async () => {
+      const createCommentMock = vi.fn(async () => ({ data: { id: 1001 } }));
+      const createIssueMock = vi.fn();
+      const searchMock = vi.fn(async ({ q, page }) => {
+        if (q.includes("is:pr")) {
+          return { data: { total_count: 0, items: [] } };
+        }
+
+        if (page === 1) {
+          return {
+            data: {
+              total_count: 101,
+              items: Array.from({ length: 100 }, (_, index) => ({
+                number: index + 1,
+                html_url: `https://github.com/owner/repo/issues/${index + 1}`,
+                body: buildExistingIssueBody({ branch: `feature/other-${index + 1}`, categories: ["agent_failure"] }),
+              })),
+            },
+          };
+        }
+
+        return {
+          data: {
+            total_count: 101,
+            items: [
+              {
+                number: 101,
+                html_url: "https://github.com/owner/repo/issues/101",
+                body: buildExistingIssueBody({ branch: "feature/current", categories: ["missing_safe_outputs"] }),
+              },
+            ],
+          },
+        };
+      });
+
+      global.github = {
+        rest: {
+          search: {
+            issuesAndPullRequests: searchMock,
+          },
+          issues: {
+            create: createIssueMock,
+            createComment: createCommentMock,
+          },
+          pulls: { get: vi.fn() },
+        },
+        graphql: vi.fn(),
+      };
+
+      await main();
+
+      expect(createCommentMock).toHaveBeenCalledOnce();
+      expect(createIssueMock).not.toHaveBeenCalled();
+      expect(searchMock).toHaveBeenCalledWith(expect.objectContaining({ page: 1 }));
+      expect(searchMock).toHaveBeenCalledWith(expect.objectContaining({ page: 2 }));
+    });
+
+    it("adds a comment when pull request metadata differs but workflow/category markers match", async () => {
+      const createCommentMock = vi.fn(async () => ({ data: { id: 1001 } }));
+      const createIssueMock = vi.fn(async () => ({
+        data: { number: 101, html_url: "https://github.com/owner/repo/issues/101", node_id: "I_123" },
+      }));
+
+      global.github = {
+        rest: {
+          search: {
+            issuesAndPullRequests: vi.fn(async ({ q }) => {
+              if (q.includes("is:pr")) {
+                return {
+                  data: {
+                    total_count: 1,
+                    items: [{ number: 123, html_url: "https://github.com/owner/repo/pull/123" }],
+                  },
+                };
+              }
+              return {
+                data: {
+                  total_count: 1,
+                  items: [
+                    {
+                      number: 42,
+                      title: "[aw] Test Workflow failed",
+                      html_url: "https://github.com/owner/repo/issues/42",
+                      body: buildExistingIssueBody({
+                        branch: "feature/current",
+                        categories: ["missing_safe_outputs"],
+                        pullRequestNumber: 999,
+                      }),
+                    },
+                  ],
+                },
+              };
+            }),
+          },
+          issues: {
+            create: createIssueMock,
+            createComment: createCommentMock,
+          },
+          pulls: {
+            get: vi.fn(async () => ({
+              data: {
+                head: { sha: "abc123" },
+                mergeable: true,
+                mergeable_state: "clean",
+                updated_at: "2026-05-18T00:00:00Z",
+              },
+            })),
+          },
+        },
+        graphql: vi.fn(),
+      };
+
+      await main();
+
+      expect(createCommentMock).toHaveBeenCalledOnce();
+      expect(createIssueMock).not.toHaveBeenCalled();
+    });
+
+    it("creates a centralized rollup issue and adds a comment when per-category daily cap is reached", async () => {
+      const createCommentMock = vi.fn(async () => ({ data: { id: 2001 } }));
+      const createIssueMock = vi.fn(async () => ({
+        data: { number: 999, html_url: "https://github.com/owner/repo/issues/999", node_id: "I_999" },
+      }));
+      const now = new Date().toISOString();
+
+      global.github = {
+        rest: {
+          search: {
+            issuesAndPullRequests: vi.fn(async ({ q }) => {
+              if (q.includes("is:pr")) {
+                return { data: { total_count: 0, items: [] } };
+              }
+              if (q.includes('"workflow_id: test-workflow" in:body')) {
+                return { data: { total_count: 0, items: [] } };
+              }
+              if (q.includes('"gh-aw-failure-issue:"') && q.includes('"failure_categories:"')) {
+                return {
+                  data: {
+                    total_count: 50,
+                    items: Array.from({ length: 50 }, (_, index) => ({
+                      number: index + 1,
+                      html_url: `https://github.com/owner/repo/issues/${index + 1}`,
+                      created_at: now,
+                      body: buildExistingIssueBody({
+                        branch: `feature/any-${index + 1}`,
+                        categories: ["missing_safe_outputs"],
+                      }),
+                    })),
+                  },
+                };
+              }
+              return { data: { total_count: 0, items: [] } };
+            }),
+          },
+          issues: {
+            create: createIssueMock,
+            createComment: createCommentMock,
+          },
+          pulls: {
+            get: vi.fn(),
+          },
+        },
+        graphql: vi.fn(),
+      };
+
+      await main();
+
+      expect(global.core.warning).toHaveBeenCalledWith(expect.stringContaining("Daily per-category issue cap reached"));
+      expect(global.core.info).toHaveBeenCalledWith(expect.stringContaining("Summarize-and-stop"));
+      const createCall = createIssueMock.mock.calls[0][0];
+      expect(createCall.title).toBe("[aw] Daily failure issue cap exceeded");
+      expect(createCall.headers).toEqual({ "X-GitHub-Api-Version": "2022-11-28" });
+      expect(createCommentMock).toHaveBeenCalledOnce();
+      expect(createCommentMock).toHaveBeenCalledWith(expect.objectContaining({ issue_number: 999 }));
+      expect(global.github.rest.search.issuesAndPullRequests).toHaveBeenCalledWith(expect.objectContaining({ q: expect.stringContaining("is:open") }));
+    });
+
+    it("reuses an existing rollup issue when per-category daily cap is reached", async () => {
+      const createCommentMock = vi.fn(async () => ({ data: { id: 2002 } }));
+      const createIssueMock = vi.fn();
+      const now = new Date().toISOString();
+
+      global.github = {
+        rest: {
+          search: {
+            issuesAndPullRequests: vi.fn(async ({ q }) => {
+              if (q.includes("is:pr")) {
+                return { data: { total_count: 0, items: [] } };
+              }
+              if (q.includes('"workflow_id: test-workflow" in:body')) {
+                return { data: { total_count: 0, items: [] } };
+              }
+              if (q.includes('"gh-aw-failure-issue:"') && q.includes('"failure_categories:"')) {
+                return {
+                  data: {
+                    total_count: 50,
+                    items: Array.from({ length: 50 }, (_, index) => ({
+                      number: index + 1,
+                      html_url: `https://github.com/owner/repo/issues/${index + 1}`,
+                      created_at: now,
+                      body: buildExistingIssueBody({
+                        branch: `feature/any-${index + 1}`,
+                        categories: ["missing_safe_outputs"],
+                      }),
+                    })),
+                  },
+                };
+              }
+              if (q.includes("[aw] Daily failure issue cap exceeded")) {
+                return {
+                  data: {
+                    total_count: 1,
+                    items: [{ number: 888, html_url: "https://github.com/owner/repo/issues/888" }],
+                  },
+                };
+              }
+              return { data: { total_count: 0, items: [] } };
+            }),
+          },
+          issues: {
+            create: createIssueMock,
+            createComment: createCommentMock,
+          },
+          pulls: {
+            get: vi.fn(),
+          },
+        },
+        graphql: vi.fn(),
+      };
+
+      await main();
+
+      expect(global.core.warning).toHaveBeenCalledWith(expect.stringContaining("Daily per-category issue cap reached"));
+      expect(createIssueMock).not.toHaveBeenCalled();
+      expect(createCommentMock).toHaveBeenCalledOnce();
+      expect(createCommentMock).toHaveBeenCalledWith(expect.objectContaining({ issue_number: 888 }));
+    });
+  });
+
+  describe("main() writes failure_categories.json", () => {
+    const fs = require("fs");
+    const path = require("path");
+    const os = require("os");
+
+    /** @type {string} */
+    let tmpDir;
+    /** @type {string} */
+    let promptsDir;
+    let { FAILURE_CATEGORIES_PATH } = require("./handle_agent_failure.cjs");
+
+    beforeEach(() => {
+      tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "aw-failure-categories-"));
+      promptsDir = path.join(tmpDir, "gh-aw", "prompts");
+      fs.mkdirSync(promptsDir, { recursive: true });
+      fs.writeFileSync(path.join(promptsDir, "agent_failure_comment.md"), "COMMENT TEMPLATE CONTENT");
+      fs.writeFileSync(path.join(promptsDir, "agent_failure_issue.md"), "ISSUE TEMPLATE CONTENT");
+      fs.writeFileSync(path.join(promptsDir, "daily_cap_rollup_issue.md"), "Daily cap rollup issue body cap={cap} window={window_hours}");
+      fs.writeFileSync(path.join(promptsDir, "daily_cap_rollup_comment.md"), "Failure suppressed workflow={workflow_name} run={run_url} categories={summary} cap={cap} window={window_hours}h");
+      fs.writeFileSync(path.join(promptsDir, "optimize_token_consumption_context.md"), "OPTIMIZE CONTEXT guardrail={guardrail_name} run={run_url}");
+
+      process.env.RUNNER_TEMP = tmpDir;
+      process.env.GH_AW_WORKFLOW_NAME = "Test Workflow";
+      process.env.GH_AW_WORKFLOW_ID = "test-workflow";
+      process.env.GH_AW_RUN_URL = "https://github.com/owner/repo/actions/runs/123456";
+      process.env.GH_AW_AGENT_CONCLUSION = "failure";
+      process.env.GITHUB_HEAD_REF = "feature/test";
+      process.env.GITHUB_WORKSPACE = tmpDir;
+    });
+
+    afterEach(() => {
+      delete process.env.RUNNER_TEMP;
+      delete process.env.GH_AW_WORKFLOW_NAME;
+      delete process.env.GH_AW_WORKFLOW_ID;
+      delete process.env.GH_AW_RUN_URL;
+      delete process.env.GH_AW_AGENT_CONCLUSION;
+      delete process.env.GITHUB_HEAD_REF;
+      delete process.env.GITHUB_WORKSPACE;
+      if (tmpDir && fs.existsSync(tmpDir)) {
+        fs.rmSync(tmpDir, { recursive: true, force: true });
+      }
+    });
+
+    it("writes failure_categories.json with the computed failure categories", async () => {
+      const writeSpy = vi.spyOn(fs, "writeFileSync").mockImplementation(() => {});
+
+      global.github = {
+        rest: {
+          search: {
+            issuesAndPullRequests: vi.fn(async ({ q }) => {
+              if (q.includes("is:pr")) {
+                return { data: { total_count: 0, items: [] } };
+              }
+              return { data: { total_count: 0, items: [] } };
+            }),
+          },
+          issues: {
+            create: vi.fn(async () => ({
+              data: { number: 101, html_url: "https://github.com/owner/repo/issues/101", node_id: "I_123" },
+            })),
+          },
+          pulls: { get: vi.fn() },
+        },
+        graphql: vi.fn(),
+      };
+
+      let writeCalls;
+      try {
+        await main();
+        writeCalls = writeSpy.mock.calls.slice();
+      } finally {
+        writeSpy.mockRestore();
+      }
+
+      const categoriesCall = writeCalls.find(([filePath]) => filePath === FAILURE_CATEGORIES_PATH);
+      expect(categoriesCall).toBeDefined();
+      const written = JSON.parse(categoriesCall[1]);
+      expect(Array.isArray(written)).toBe(true);
+      expect(written).toContain("agent_failure");
+    });
+
+    it("includes timed_out category when GH_AW_AGENTIC_ENGINE_TIMEOUT is set", async () => {
+      process.env.GH_AW_AGENTIC_ENGINE_TIMEOUT = "true";
+      const writeSpy = vi.spyOn(fs, "writeFileSync").mockImplementation(() => {});
+
+      global.github = {
+        rest: {
+          search: {
+            issuesAndPullRequests: vi.fn(async ({ q }) => {
+              if (q.includes("is:pr")) {
+                return { data: { total_count: 0, items: [] } };
+              }
+              return { data: { total_count: 0, items: [] } };
+            }),
+          },
+          issues: {
+            create: vi.fn(async () => ({
+              data: { number: 102, html_url: "https://github.com/owner/repo/issues/102", node_id: "I_456" },
+            })),
+          },
+          pulls: { get: vi.fn() },
+        },
+        graphql: vi.fn(),
+      };
+
+      let writeCalls;
+      try {
+        await main();
+        writeCalls = writeSpy.mock.calls.slice();
+      } finally {
+        writeSpy.mockRestore();
+      }
+
+      const categoriesCall = writeCalls.find(([filePath]) => filePath === FAILURE_CATEGORIES_PATH);
+      expect(categoriesCall).toBeDefined();
+      const written = JSON.parse(categoriesCall[1]);
+      expect(written).toContain("timed_out");
+    });
+  });
+
+  describe("agent failure templates", () => {
+    const fs = require("fs");
+    const path = require("path");
+    const { renderTemplate } = require("./messages_core.cjs");
+    const reportIncompleteMarker = "MARKER: cannot continue";
+
+    it("renders report_incomplete context in both comment and issue templates", () => {
+      const reportIncompleteContext = buildReportIncompleteContext([{ type: "report_incomplete", reason: reportIncompleteMarker }]);
+      const templateContext = {
+        run_id: "123456",
+        run_url: "https://github.com/owner/repo/actions/runs/123456",
+        workflow_name: "Test Workflow",
+        workflow_source_url: "https://github.com/owner/repo/blob/main/.github/workflows/test.md",
+        branch: "main",
+        pull_request_info: "",
+        secret_verification_context: "",
+        credential_auth_error_context: "",
+        inference_access_error_context: "",
+        mcp_policy_error_context: "",
+        model_not_supported_error_context: "",
+        ai_credits_rate_limit_error_context: "",
+        app_token_minting_failed_context: "",
+        lockdown_check_failed_context: "",
+        stale_lock_file_failed_context: "",
+        assignment_errors_context: "",
+        assign_copilot_failure_context: "",
+        create_discussion_errors_context: "",
+        code_push_failure_context: "",
+        repo_memory_validation_context: "",
+        push_repo_memory_failure_context: "",
+        missing_data_context: "",
+        missing_tool_context: "",
+        permission_denied_context: "",
+        tool_denials_exceeded_context: "",
+        report_incomplete_context: reportIncompleteContext,
+        missing_safe_outputs_context: "",
+        engine_failure_context: "",
+        timeout_context: "",
+        fork_context: "",
+      };
+
+      const commentTemplate = fs.readFileSync(path.join(__dirname, "../md/agent_failure_comment.md"), "utf8");
+      const issueTemplate = fs.readFileSync(path.join(__dirname, "../md/agent_failure_issue.md"), "utf8");
+
+      expect(renderTemplate(commentTemplate, templateContext)).toContain(reportIncompleteMarker);
+      expect(renderTemplate(issueTemplate, templateContext)).toContain(reportIncompleteMarker);
+    });
+  });
+
+  describe("buildSecretVerificationContext", () => {
+    it("returns empty string when verification did not fail", () => {
+      expect(buildSecretVerificationContext("", "copilot")).toBe("");
+      expect(buildSecretVerificationContext("success", "copilot")).toBe("");
+      expect(buildSecretVerificationContext("", "")).toBe("");
+    });
+
+    describe("buildAssignmentErrorsContext", () => {
+      it("returns empty string when there are no assignment errors", () => {
+        expect(buildAssignmentErrorsContext("")).toBe("");
+      });
+
+      it("returns empty string for whitespace-only input", () => {
+        expect(buildAssignmentErrorsContext("   ")).toBe("");
+        expect(buildAssignmentErrorsContext("\n")).toBe("");
+        expect(buildAssignmentErrorsContext("\n\n")).toBe("");
+      });
+
+      it("renders assignment failures with token guidance docs", () => {
+        const result = buildAssignmentErrorsContext("issue:42:copilot:Bad credentials\npr:7:copilot:copilot coding agent is not available for this repository");
+
+        expect(result).toContain("Agent Assignment Failed");
+        expect(result).toContain("Issue #42 (agent: copilot): Bad credentials");
+        expect(result).toContain("PR #7 (agent: copilot): copilot coding agent is not available for this repository");
+        expect(result).toContain("GH_AW_AGENT_TOKEN");
+        expect(result).toContain("Agent tasks: read and write");
+        expect(result).not.toContain("copilot-requests: write");
+        expect(result).toContain("https://github.github.com/gh-aw/reference/copilot-cloud-agent/#authentication");
+      });
+    });
+
+    it("returns generic warning for non-copilot engines when verification failed", () => {
+      const result = buildSecretVerificationContext("failed", "claude");
+      expect(result).toContain("Secret Verification Failed");
+      expect(result).toContain("required secrets are configured");
+      expect(result).toContain("https://github.github.com/gh-aw/reference/engines/");
+      expect(result).not.toContain("copilot-requests");
+    });
+
+    it("returns copilot-specific message with copilot-requests: write permissions suggestion when verification failed", () => {
+      const result = buildSecretVerificationContext("failed", "copilot");
+      const mixedCaseResult = buildSecretVerificationContext("failed", "Copilot");
+      expect(result).toContain("Secret Verification Failed");
+      expect(result).toContain("required secrets are configured");
+      expect(result).toContain("```yaml\npermissions:\n  copilot-requests: write\n```");
+      expect(result).toContain("https://github.github.com/gh-aw/reference/engines/#github-copilot-default");
+      expect(mixedCaseResult).toContain("copilot-requests: write");
     });
   });
 
@@ -316,6 +1505,28 @@ describe("handle_agent_failure", () => {
       expect(result).toContain("https://github.com/owner/repo/pull/99");
     });
 
+    it("includes download instructions with run ID when runUrl is provided for patch size exceeded", () => {
+      const errors = "create_pull_request:Patch size (2048 KB) exceeds maximum allowed size (4096 KB)";
+      const runUrl = "https://github.com/owner/repo/actions/runs/12345678";
+      const result = buildCodePushFailureContext(errors, null, runUrl);
+      expect(result).toContain("📥 Download the oversized patch");
+      expect(result).toContain("gh run download 12345678");
+      expect(result).toContain("View run and download artifacts");
+      expect(result).toContain(runUrl);
+      expect(result).toContain("<details>");
+      expect(result).toContain("Download the oversized patch to inspect or apply manually");
+    });
+
+    it("includes generic download instructions when no runUrl is provided for patch size exceeded", () => {
+      const errors = "create_pull_request:Patch size (2048 KB) exceeds maximum allowed size (4096 KB)";
+      const result = buildCodePushFailureContext(errors);
+      expect(result).toContain("📥 Download the oversized patch");
+      expect(result).toContain("git am --3way");
+      expect(result).not.toContain("gh run download");
+      expect(result).toContain("<details>");
+      expect(result).toContain("Download the oversized patch to inspect or apply manually");
+    });
+
     it("does not show patch size section for generic errors", () => {
       const errors = "push_to_pull_request_branch:Branch not found";
       const result = buildCodePushFailureContext(errors);
@@ -415,7 +1626,8 @@ describe("handle_agent_failure", () => {
 
     it("shows generic failure message when failure but no patch size exceeded", () => {
       const result = buildPushRepoMemoryFailureContext(true, [], "https://example.com/run");
-      expect(result).toContain("⚠️ Repo-Memory Push Failed");
+      expect(result).toContain("> [!WARNING]");
+      expect(result).toContain("Repo-Memory Push Failed");
       expect(result).toContain("https://example.com/run");
       expect(result).not.toContain("📦 Repo-Memory Patch Size Exceeded");
     });
@@ -652,6 +1864,105 @@ describe("handle_agent_failure", () => {
   });
 
   // ──────────────────────────────────────────────────────
+  // buildOptimizeTokenConsumptionContext
+  // ──────────────────────────────────────────────────────
+
+  describe("buildOptimizeTokenConsumptionContext", () => {
+    let buildOptimizeTokenConsumptionContext;
+    const fs = require("fs");
+    const path = require("path");
+    const templateContent = fs.readFileSync(path.join(__dirname, "../md/optimize_token_consumption_context.md"), "utf8");
+    const originalReadFileSync = fs.readFileSync.bind(fs);
+
+    beforeEach(() => {
+      vi.resetModules();
+      process.env.RUNNER_TEMP = "/nonexistent";
+      // Stub readFileSync so the runtime path resolves to the source-tree template
+      fs.readFileSync = (filePath, encoding) => {
+        if (typeof filePath === "string" && filePath.includes("optimize_token_consumption_context.md")) {
+          return templateContent;
+        }
+        return originalReadFileSync(filePath, encoding);
+      };
+      ({ buildOptimizeTokenConsumptionContext } = require("./handle_agent_failure.cjs"));
+    });
+
+    afterEach(() => {
+      fs.readFileSync = originalReadFileSync;
+      delete process.env.RUNNER_TEMP;
+    });
+
+    it("returns empty string when no guardrail was triggered", () => {
+      const result = buildOptimizeTokenConsumptionContext({
+        maxAICreditsExceeded: false,
+        hasDailyAICExceeded: false,
+        hasToolDenialsExceeded: false,
+        isTimedOut: false,
+        runUrl: "https://github.com/owner/repo/actions/runs/123",
+      });
+      expect(result).toBe("");
+    });
+
+    it("returns optimize context when maxAICreditsExceeded is true", () => {
+      const result = buildOptimizeTokenConsumptionContext({
+        maxAICreditsExceeded: true,
+        hasDailyAICExceeded: false,
+        hasToolDenialsExceeded: false,
+        isTimedOut: false,
+        runUrl: "https://github.com/owner/repo/actions/runs/123",
+      });
+      expect(result).toContain("Optimize token consumption");
+      expect(result).toContain("max-ai-credits");
+      expect(result).toContain("https://github.com/owner/repo/actions/runs/123");
+      expect(result).toContain("optimize.md");
+    });
+
+    it("returns optimize context when hasDailyAICExceeded is true", () => {
+      const result = buildOptimizeTokenConsumptionContext({
+        maxAICreditsExceeded: false,
+        hasDailyAICExceeded: true,
+        hasToolDenialsExceeded: false,
+        isTimedOut: false,
+        runUrl: "https://github.com/owner/repo/actions/runs/456",
+      });
+      expect(result).toContain("max-daily-ai-credits");
+    });
+
+    it("returns optimize context when hasToolDenialsExceeded is true", () => {
+      const result = buildOptimizeTokenConsumptionContext({
+        maxAICreditsExceeded: false,
+        hasDailyAICExceeded: false,
+        hasToolDenialsExceeded: true,
+        isTimedOut: false,
+        runUrl: "https://github.com/owner/repo/actions/runs/456",
+      });
+      expect(result).toContain("max-tool-denials");
+    });
+
+    it("returns optimize context when isTimedOut is true", () => {
+      const result = buildOptimizeTokenConsumptionContext({
+        maxAICreditsExceeded: false,
+        hasDailyAICExceeded: false,
+        hasToolDenialsExceeded: false,
+        isTimedOut: true,
+        runUrl: "https://github.com/owner/repo/actions/runs/789",
+      });
+      expect(result).toContain("max-turns / timeout");
+    });
+
+    it("prefers maxAICreditsExceeded label when multiple guardrails are true", () => {
+      const result = buildOptimizeTokenConsumptionContext({
+        maxAICreditsExceeded: true,
+        hasDailyAICExceeded: true,
+        hasToolDenialsExceeded: false,
+        isTimedOut: false,
+        runUrl: "https://github.com/owner/repo/actions/runs/789",
+      });
+      expect(result).toContain("max-ai-credits");
+    });
+  });
+
+  // ──────────────────────────────────────────────────────
   // timeout classification (isTimedOut logic in main)
   // ──────────────────────────────────────────────────────
 
@@ -689,6 +2000,47 @@ describe("handle_agent_failure", () => {
     });
   });
 
+  describe("shouldBuildEngineFailureContext", () => {
+    const { shouldBuildEngineFailureContext } = require("./handle_agent_failure.cjs");
+
+    it("returns true for plain failure without timeout or tool-denials-exceeded", () => {
+      expect(shouldBuildEngineFailureContext("failure", false, false)).toBe(true);
+    });
+
+    it("returns false when timeout is detected", () => {
+      expect(shouldBuildEngineFailureContext("failure", false, true)).toBe(false);
+    });
+
+    it("returns false when tool-denials-exceeded is present", () => {
+      expect(shouldBuildEngineFailureContext("failure", true, false)).toBe(false);
+    });
+
+    it("returns false for non-failure conclusions", () => {
+      expect(shouldBuildEngineFailureContext("timed_out", false, true)).toBe(false);
+      expect(shouldBuildEngineFailureContext("success", false, false)).toBe(false);
+    });
+  });
+
+  describe("isIssueWritePermissionError", () => {
+    const { isIssueWritePermissionError } = require("./handle_agent_failure.cjs");
+
+    it("returns true for 403 Resource not accessible by integration", () => {
+      expect(isIssueWritePermissionError({ status: 403, message: "Resource not accessible by integration" })).toBe(true);
+    });
+
+    it("returns true for 403 insufficient permissions", () => {
+      expect(isIssueWritePermissionError({ status: 403, message: "Insufficient permissions to create issue" })).toBe(true);
+    });
+
+    it("returns true for 403 resource not accessible by personal access token", () => {
+      expect(isIssueWritePermissionError({ status: 403, message: "Resource not accessible by personal access token" })).toBe(true);
+    });
+
+    it("returns false for non-403 errors", () => {
+      expect(isIssueWritePermissionError({ status: 500, message: "Internal server error" })).toBe(false);
+    });
+  });
+
   // ──────────────────────────────────────────────────────
   // buildEngineFailureContext
   // ──────────────────────────────────────────────────────
@@ -711,8 +2063,11 @@ describe("handle_agent_failure", () => {
       vi.resetModules();
       tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "aw-test-"));
       stdioLogPath = path.join(tmpDir, "agent-stdio.log");
+      process.env.GH_AW_OTEL_JSONL_PATH = path.join(tmpDir, "otel.jsonl");
       promptsDir = path.join(tmpDir, "gh-aw", "prompts");
       fs.mkdirSync(promptsDir, { recursive: true });
+      fs.writeFileSync(path.join(promptsDir, "engine_rate_limit_429.md"), ENGINE_RATE_LIMIT_TEMPLATE);
+      fs.writeFileSync(path.join(promptsDir, "engine_max_runs_exceeded.md"), ENGINE_MAX_RUNS_EXCEEDED_TEMPLATE);
       process.env.GH_AW_AGENT_OUTPUT = path.join(tmpDir, "agent_output.json");
       process.env.RUNNER_TEMP = tmpDir;
       ({ buildEngineFailureContext } = require("./handle_agent_failure.cjs"));
@@ -721,6 +2076,7 @@ describe("handle_agent_failure", () => {
     afterEach(() => {
       delete process.env.GH_AW_AGENT_OUTPUT;
       delete process.env.GH_AW_ENGINE_ID;
+      delete process.env.GH_AW_OTEL_JSONL_PATH;
       delete process.env.RUNNER_TEMP;
       // Clean up temp dir
       if (fs.existsSync(tmpDir)) {
@@ -749,6 +2105,65 @@ describe("handle_agent_failure", () => {
       expect(result).toContain("Engine Failure");
       expect(result).toContain("quota exceeded");
       expect(result).toContain("Error details:");
+      expect(result).toContain("> [!WARNING]");
+    });
+
+    it("returns dedicated context for engine 429/rate-limit failures in stdio logs", () => {
+      fs.writeFileSync(stdioLogPath, "Failed to get response from the AI model; retried 5 times. Last error: CAPIError: 429 429 Sorry, you've exceeded your rate limit for utility models.\n");
+      const result = buildEngineFailureContext();
+      expect(result).toContain("Engine Rate Limited (HTTP 429)");
+      expect(result).toContain("OTLP telemetry");
+      expect(result).not.toContain("Last agent output");
+    });
+
+    it("returns dedicated context for max-runs guardrail failures in stdio logs", () => {
+      fs.writeFileSync(stdioLogPath, '[ERROR] API error (attempt 1/11): {"error":{"type":"max_runs_exceeded","message":"Maximum LLM invocations exceeded (50 / 50)."}}\n');
+      const result = buildEngineFailureContext();
+      expect(result).toContain("Engine Max Runs Exceeded");
+      expect(result).toContain("max-runs guardrail");
+      expect(result).not.toContain("Last agent output");
+    });
+
+    it("returns dedicated context when only max-runs message text is present", () => {
+      fs.writeFileSync(stdioLogPath, "Maximum LLM invocations exceeded (50 / 50).\n");
+      const result = buildEngineFailureContext();
+      expect(result).toContain("Engine Max Runs Exceeded");
+      expect(result).toContain("max-runs guardrail");
+      expect(result).not.toContain("Last agent output");
+    });
+
+    it("suppresses engine 429 context when max-ai-credits-exceeded takes precedence", () => {
+      fs.writeFileSync(stdioLogPath, "Failed to get response from the AI model; retried 5 times. Last error: CAPIError: 429 429 Sorry, you've exceeded your rate limit for utility models.\n");
+      const result = buildEngineFailureContext({ suppressEngineRateLimit429: true });
+      expect(result).not.toContain("Engine Rate Limited (HTTP 429)");
+      expect(result).toContain("Engine Failure");
+    });
+
+    it("returns dedicated context when 429/rate-limit is only present in OTLP mirror", () => {
+      fs.writeFileSync(stdioLogPath, "Agent terminated unexpectedly without clear error details\n");
+      fs.writeFileSync(
+        process.env.GH_AW_OTEL_JSONL_PATH,
+        JSON.stringify({
+          resourceSpans: [
+            {
+              scopeSpans: [
+                {
+                  spans: [
+                    {
+                      name: "gh-aw.agent.conclusion",
+                      status: { code: 2, message: "agent failure: CAPIError: 429 Too Many Requests" },
+                    },
+                  ],
+                },
+              ],
+            },
+          ],
+        }) + "\n"
+      );
+      const result = buildEngineFailureContext();
+      expect(result).toContain("Engine Rate Limited (HTTP 429)");
+      expect(result).toContain("OTLP telemetry");
+      expect(result).not.toContain("Last agent output");
     });
 
     it("detects Error: prefix pattern (Node.js style)", () => {
@@ -756,6 +2171,24 @@ describe("handle_agent_failure", () => {
       const result = buildEngineFailureContext();
       expect(result).toContain("Engine Failure");
       expect(result).toContain("connect ECONNREFUSED 127.0.0.1:8080");
+    });
+
+    it("extracts AWF startup errors from dependency lines and container startup failures", () => {
+      const lines = [
+        " Container awf-squid  Error",
+        "dependency failed to start: container awf-squid is unhealthy",
+        "[ERROR] Failed to start containers: Error: Command failed with exit code 1: docker compose up -d --pull never",
+        "  stdout: undefined,",
+        "  stderr: undefined,",
+      ];
+      fs.writeFileSync(stdioLogPath, lines.join("\n") + "\n");
+      const result = buildEngineFailureContext();
+      expect(result).toContain("Engine Failure");
+      expect(result).toContain("dependency failed to start: container awf-squid is unhealthy");
+      expect(result).toContain("Failed to start containers: Error: Command failed with exit code 1: docker compose up -d --pull never");
+      expect(result).not.toContain("Last agent output");
+      expect(result).not.toContain("stdout: undefined");
+      expect(result).not.toContain("stderr: undefined");
     });
 
     it("detects Fatal: prefix pattern", () => {
@@ -838,6 +2271,7 @@ describe("handle_agent_failure", () => {
         "[SUCCESS] Containers stopped successfully",
         "[INFO] Agent session state preserved at: /tmp/awf-agent-session-state-abc123",
         "[INFO] API proxy logs available at: /tmp/gh-aw/sandbox/firewall/logs/api-proxy-logs",
+        "[ERROR] Command completed with exit code: 1",
         "[WARN] Command completed with exit code: 1",
         "Process exiting with code: 1",
       ];
@@ -850,6 +2284,7 @@ describe("handle_agent_failure", () => {
       expect(result).not.toContain("Last agent output");
       expect(result).not.toContain("awf-squid");
       expect(result).not.toContain("Command completed with exit code");
+      expect(result).not.toContain("[ERROR]");
       expect(result).not.toContain("Process exiting with code");
     });
 
@@ -969,6 +2404,302 @@ describe("handle_agent_failure", () => {
       expect(result).toContain("Cyber Policy Violation");
       expect(result).not.toContain("Engine Failure");
     });
+
+    it("detects AWF firewall startup failure with DNS failure (EAI_AGAIN)", () => {
+      // Representative log from run 28172712935: cli-proxy cannot resolve awmg-cli-proxy DNS
+      const lines = [
+        "[INFO] CLI proxy sidecar enabled - connecting to external DIFC proxy at awmg-cli-proxy:18443",
+        " Container awf-cli-proxy  Creating",
+        " Container awf-cli-proxy  Error",
+        "dependency failed to start: container awf-cli-proxy is unhealthy",
+        "[ERROR] awf-cli-proxy container logs (last 50 lines):",
+        "[cli-proxy] DIFC proxy probe failed (attempt 1/10, diagnosis=not-yet-ready (ECONNREFUSED)), retrying in 1s...",
+        "[cli-proxy] DIFC proxy probe failed (attempt 2/10, diagnosis=unknown), retrying in 2s...",
+        "[tcp-tunnel] Upstream error (::1:48576): getaddrinfo EAI_AGAIN awmg-cli-proxy",
+        "[ERROR] Fatal error: Error: AWF firewall failed to start: awf-cli-proxy could not connect to the external DIFC proxy",
+      ];
+      fs.writeFileSync(stdioLogPath, lines.join("\n") + "\n");
+      const result = buildEngineFailureContext();
+      expect(result).toContain("AWF Firewall Startup Failure");
+      expect(result).toContain("EAI_AGAIN");
+      expect(result).toContain("awmg-cli-proxy");
+      expect(result).toContain("dependency failed to start: container awf-cli-proxy is unhealthy");
+      expect(result).toContain("https://github.com/github/gh-aw-firewall/blob/main/docs/diagnosing-awf-failures.md");
+      expect(result).not.toContain("Last agent output");
+      expect(result).not.toContain("Engine Failure");
+    });
+
+    it("detects AWF firewall startup failure without DNS failure", () => {
+      const lines = [" Container awf-cli-proxy  Error", "dependency failed to start: container awf-cli-proxy is unhealthy", "[ERROR] Fatal error: Error: AWF firewall failed to start: awf-cli-proxy could not connect"];
+      fs.writeFileSync(stdioLogPath, lines.join("\n") + "\n");
+      const result = buildEngineFailureContext();
+      expect(result).toContain("AWF Firewall Startup Failure");
+      expect(result).toContain("dependency failed to start: container awf-cli-proxy is unhealthy");
+      expect(result).toContain("https://github.com/github/gh-aw-firewall/blob/main/docs/diagnosing-awf-failures.md");
+      expect(result).not.toContain("EAI_AGAIN");
+      expect(result).not.toContain("Diagnosis:");
+    });
+
+    it("detects AWF firewall startup failure with diagnosis=unknown but no EAI_AGAIN", () => {
+      // When only diagnosis=unknown triggers the DNS signal (no EAI_AGAIN in log),
+      // the diagnosis message should NOT claim EAI_AGAIN as the cause.
+      const lines = [
+        "[INFO] CLI proxy sidecar enabled - connecting to external DIFC proxy at awmg-cli-proxy:18443",
+        " Container awf-cli-proxy  Error",
+        "dependency failed to start: container awf-cli-proxy is unhealthy",
+        "[cli-proxy] DIFC proxy probe failed (attempt 1/10, diagnosis=unknown), retrying in 1s...",
+        "[ERROR] Fatal error: Error: AWF firewall failed to start: awf-cli-proxy could not connect to the external DIFC proxy",
+      ];
+      fs.writeFileSync(stdioLogPath, lines.join("\n") + "\n");
+      const result = buildEngineFailureContext();
+      expect(result).toContain("AWF Firewall Startup Failure");
+      expect(result).toContain("Diagnosis:");
+      expect(result).toContain("diagnosis=unknown");
+      expect(result).not.toContain("EAI_AGAIN");
+      expect(result).toContain("https://github.com/github/gh-aw-firewall/blob/main/docs/diagnosing-awf-failures.md");
+    });
+
+    it("detects AWF firewall startup failure from infra-only log with specific failure signal", () => {
+      // When the log contains only infra lines but includes a specific AWF firewall failure signal.
+      // Note: container lifecycle lines like " Container awf-cli-proxy  Started" are NOT enough —
+      // the detection requires a specific failure pattern ("AWF firewall failed to start" or
+      // "dependency failed to start: container awf-cli-proxy").
+      const lines = [
+        "[INFO] CLI proxy sidecar enabled - connecting to external DIFC proxy at awmg-cli-proxy:18443",
+        "[ERROR] Fatal error: Error: AWF firewall failed to start: awf-cli-proxy could not connect",
+        "[ERROR] Command completed with exit code: 1",
+        "Process exiting with code: 1",
+      ];
+      fs.writeFileSync(stdioLogPath, lines.join("\n") + "\n");
+      const result = buildEngineFailureContext();
+      expect(result).toContain("AWF Firewall Startup Failure");
+      expect(result).toContain("https://github.com/github/gh-aw-firewall/blob/main/docs/diagnosing-awf-failures.md");
+      expect(result).not.toContain("transient infrastructure issue");
+      expect(result).not.toContain("Engine Failure");
+    });
+
+    it("does not trigger AWF firewall detection for infra-only log with container lifecycle lines only", () => {
+      // Container lifecycle lines mentioning awf-cli-proxy appear on successful runs too
+      // and must NOT trigger AWF firewall startup failure detection.
+      const lines = [
+        " Container awf-cli-proxy  Starting",
+        " Container awf-cli-proxy  Started",
+        "[INFO] CLI proxy sidecar enabled - connecting to external DIFC proxy at awmg-cli-proxy:18443",
+        "[ERROR] Command completed with exit code: 1",
+        "Process exiting with code: 1",
+      ];
+      fs.writeFileSync(stdioLogPath, lines.join("\n") + "\n");
+      const result = buildEngineFailureContext();
+      // Should fall through to the generic "transient infrastructure" message
+      expect(result).toContain("Engine Failure");
+      expect(result).toContain("transient infrastructure issue");
+      expect(result).not.toContain("AWF Firewall Startup Failure");
+      expect(result).not.toContain("diagnosing-awf-failures");
+    });
+
+    it("does not trigger AWF firewall detection for unrelated awf-squid dependency failures", () => {
+      // awf-squid is a different AWF component — should NOT trigger cli-proxy detection
+      const lines = [" Container awf-squid  Error", "dependency failed to start: container awf-squid is unhealthy", "[ERROR] Failed to start containers: Error: Command failed with exit code 1: docker compose up -d --pull never"];
+      fs.writeFileSync(stdioLogPath, lines.join("\n") + "\n");
+      const result = buildEngineFailureContext();
+      expect(result).toContain("Engine Failure");
+      expect(result).toContain("dependency failed to start: container awf-squid is unhealthy");
+      // Should NOT show AWF firewall startup failure message (awf-squid is not awf-cli-proxy)
+      expect(result).not.toContain("AWF Firewall Startup Failure");
+      expect(result).not.toContain("diagnosing-awf-failures");
+    });
+  });
+
+  // ──────────────────────────────────────────────────────
+  // detectAWFFirewallStartupFailureFromLog
+  // ──────────────────────────────────────────────────────
+
+  describe("detectAWFFirewallStartupFailureFromLog", () => {
+    let detectAWFFirewallStartupFailureFromLog;
+    const fs = require("fs");
+    const path = require("path");
+    const os = require("os");
+
+    /** @type {string} */
+    let tmpDir;
+    /** @type {string} */
+    let stdioLogPath;
+
+    beforeEach(() => {
+      vi.resetModules();
+      tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "aw-test-"));
+      stdioLogPath = path.join(tmpDir, "agent-stdio.log");
+      process.env.GH_AW_AGENT_OUTPUT = path.join(tmpDir, "agent_output.json");
+      process.env.RUNNER_TEMP = tmpDir;
+      ({ detectAWFFirewallStartupFailureFromLog } = require("./handle_agent_failure.cjs"));
+    });
+
+    afterEach(() => {
+      delete process.env.GH_AW_AGENT_OUTPUT;
+      delete process.env.RUNNER_TEMP;
+      if (fs.existsSync(tmpDir)) {
+        fs.rmSync(tmpDir, { recursive: true, force: true });
+      }
+    });
+
+    it("returns false when log file does not exist", () => {
+      expect(detectAWFFirewallStartupFailureFromLog()).toBe(false);
+    });
+
+    it("returns false for unrelated agent failures", () => {
+      fs.writeFileSync(stdioLogPath, "ERROR: quota exceeded\n");
+      expect(detectAWFFirewallStartupFailureFromLog()).toBe(false);
+    });
+
+    it("returns true when log contains AWF firewall failed to start message", () => {
+      fs.writeFileSync(stdioLogPath, "[ERROR] Fatal error: Error: AWF firewall failed to start: awf-cli-proxy could not connect\n");
+      expect(detectAWFFirewallStartupFailureFromLog()).toBe(true);
+    });
+
+    it("returns true when log contains awf-cli-proxy reference", () => {
+      fs.writeFileSync(stdioLogPath, "dependency failed to start: container awf-cli-proxy is unhealthy\n");
+      expect(detectAWFFirewallStartupFailureFromLog()).toBe(true);
+    });
+
+    it("returns false for container lifecycle lines mentioning awf-cli-proxy (false-positive guard)", () => {
+      // Container lifecycle lines appear on successful runs and must not trigger detection
+      const lines = [" Container awf-cli-proxy  Starting", " Container awf-cli-proxy  Started", "[INFO] CLI proxy sidecar enabled - connecting to external DIFC proxy at awmg-cli-proxy:18443"];
+      fs.writeFileSync(stdioLogPath, lines.join("\n") + "\n");
+      expect(detectAWFFirewallStartupFailureFromLog()).toBe(false);
+    });
+
+    it("returns false when log references other awf containers (e.g., awf-squid)", () => {
+      fs.writeFileSync(stdioLogPath, "dependency failed to start: container awf-squid is unhealthy\n");
+      expect(detectAWFFirewallStartupFailureFromLog()).toBe(false);
+    });
+  });
+
+  // ──────────────────────────────────────────────────────
+  // hasEngineMaxRunsExceededSignal
+  // ──────────────────────────────────────────────────────
+
+  describe("hasEngineMaxRunsExceededSignal", () => {
+    let hasEngineMaxRunsExceededSignal;
+
+    beforeEach(() => {
+      vi.resetModules();
+      ({ hasEngineMaxRunsExceededSignal } = require("./handle_agent_failure.cjs"));
+    });
+
+    it("returns false for empty-like content", () => {
+      expect(hasEngineMaxRunsExceededSignal("")).toBe(false);
+      expect(hasEngineMaxRunsExceededSignal(null)).toBe(false);
+      expect(hasEngineMaxRunsExceededSignal(undefined)).toBe(false);
+    });
+
+    it("returns true when max_runs_exceeded marker is present", () => {
+      expect(hasEngineMaxRunsExceededSignal('{"error":{"type":"max_runs_exceeded"}}')).toBe(true);
+    });
+
+    it("returns true when Maximum LLM invocations exceeded text is present", () => {
+      expect(hasEngineMaxRunsExceededSignal("Maximum LLM invocations exceeded (50 / 50).")).toBe(true);
+    });
+
+    it("returns false for unrelated content", () => {
+      expect(hasEngineMaxRunsExceededSignal("request failed for unrelated reason")).toBe(false);
+    });
+  });
+
+  // ──────────────────────────────────────────────────────
+  // buildEngineMaxRunsExceededContext
+  // ──────────────────────────────────────────────────────
+
+  describe("buildEngineMaxRunsExceededContext", () => {
+    let buildEngineMaxRunsExceededContext;
+    const fs = require("fs");
+    const path = require("path");
+    const os = require("os");
+
+    /** @type {string} */
+    let tmpDir;
+
+    /** @type {string} */
+    let promptsDir;
+
+    beforeEach(() => {
+      vi.resetModules();
+      tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "aw-test-engine-max-runs-"));
+      promptsDir = path.join(tmpDir, "gh-aw", "prompts");
+      fs.mkdirSync(promptsDir, { recursive: true });
+      process.env.RUNNER_TEMP = tmpDir;
+      ({ buildEngineMaxRunsExceededContext } = require("./handle_agent_failure.cjs"));
+      fs.writeFileSync(path.join(promptsDir, "engine_max_runs_exceeded.md"), ENGINE_MAX_RUNS_EXCEEDED_TEMPLATE);
+    });
+
+    afterEach(() => {
+      delete process.env.RUNNER_TEMP;
+      if (fs.existsSync(tmpDir)) {
+        fs.rmSync(tmpDir, { recursive: true, force: true });
+      }
+    });
+
+    it("renders template content for a provided engine label", () => {
+      const result = buildEngineMaxRunsExceededContext("Claude");
+      expect(result).toContain("Engine Max Runs Exceeded");
+      expect(result).toContain("max-runs guardrail");
+      expect(result).toContain("Claude");
+    });
+
+    it("falls back to AI when engine label is empty or whitespace", () => {
+      expect(buildEngineMaxRunsExceededContext("")).toContain("AI");
+      expect(buildEngineMaxRunsExceededContext("   ")).toContain("AI");
+    });
+
+    it("trims leading/trailing whitespace from engine label", () => {
+      const result = buildEngineMaxRunsExceededContext("  copilot  ");
+      expect(result).toContain("copilot");
+      expect(result).not.toContain("  copilot  ");
+    });
+  });
+
+  // ──────────────────────────────────────────────────────
+  // buildEngineRateLimit429Context
+  // ──────────────────────────────────────────────────────
+
+  describe("buildEngineRateLimit429Context", () => {
+    let buildEngineRateLimit429Context;
+    const fs = require("fs");
+    const path = require("path");
+    const os = require("os");
+
+    /** @type {string} */
+    let tmpDir;
+
+    /** @type {string} */
+    let promptsDir;
+
+    beforeEach(() => {
+      vi.resetModules();
+      tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "aw-test-engine-rate-limit-"));
+      promptsDir = path.join(tmpDir, "gh-aw", "prompts");
+      fs.mkdirSync(promptsDir, { recursive: true });
+      process.env.RUNNER_TEMP = tmpDir;
+      ({ buildEngineRateLimit429Context } = require("./handle_agent_failure.cjs"));
+    });
+
+    afterEach(() => {
+      delete process.env.RUNNER_TEMP;
+      if (fs.existsSync(tmpDir)) {
+        fs.rmSync(tmpDir, { recursive: true, force: true });
+      }
+    });
+
+    it("renders template content when engine rate-limit template exists", () => {
+      fs.writeFileSync(path.join(promptsDir, "engine_rate_limit_429.md"), ENGINE_RATE_LIMIT_TEMPLATE);
+      const result = buildEngineRateLimit429Context("Copilot");
+      expect(result).toContain("Engine Rate Limited (HTTP 429)");
+      expect(result).toContain("Copilot");
+      expect(result).toContain("OTLP telemetry");
+    });
+
+    it("throws when engine rate-limit template is missing", () => {
+      expect(() => buildEngineRateLimit429Context("Copilot")).toThrow(/ENOENT|no such file/i);
+    });
   });
 
   // ──────────────────────────────────────────────────────
@@ -1021,11 +2752,8 @@ describe("handle_agent_failure", () => {
       expect(result).toContain("docs.github.com/en/copilot/how-tos/administer-copilot/manage-mcp-usage/configure-mcp-server-access");
     });
 
-    it("returns inline fallback message when template is missing", () => {
-      // No template file written
-      const result = buildMCPPolicyErrorContext(true);
-      expect(result).toContain("MCP Servers Blocked by Policy");
-      expect(result).toContain("configure-mcp-server-access");
+    it("throws when template is missing", () => {
+      expect(() => buildMCPPolicyErrorContext(true)).toThrow(/ENOENT|no such file/i);
     });
   });
 
@@ -1071,16 +2799,89 @@ describe("handle_agent_failure", () => {
       expect(result).toContain("Model Not Supported");
     });
 
-    it("returns inline fallback message when template is missing", () => {
-      // No template file written
-      const result = buildModelNotSupportedErrorContext(true);
-      expect(result).toContain("Model Not Supported");
-      expect(result).toContain("gpt-5-mini");
+    it("throws when template is missing", () => {
+      expect(() => buildModelNotSupportedErrorContext(true)).toThrow(/ENOENT|no such file/i);
     });
   });
 
-  // buildMissingDataContext
+  // buildUnknownModelAICreditsContext
   // ──────────────────────────────────────────────────────
+
+  describe("buildUnknownModelAICreditsContext", () => {
+    let buildUnknownModelAICreditsContext;
+    const fs = require("fs");
+    const path = require("path");
+    const os = require("os");
+
+    /** @type {string} */
+    let tmpDir;
+
+    /** @type {string} */
+    let promptsDir;
+
+    beforeEach(() => {
+      vi.resetModules();
+      tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "aw-test-unknown-model-aic-"));
+      promptsDir = path.join(tmpDir, "gh-aw", "prompts");
+      fs.mkdirSync(promptsDir, { recursive: true });
+      process.env.RUNNER_TEMP = tmpDir;
+      ({ buildUnknownModelAICreditsContext } = require("./handle_agent_failure.cjs"));
+    });
+
+    afterEach(() => {
+      delete process.env.RUNNER_TEMP;
+      if (fs.existsSync(tmpDir)) {
+        fs.rmSync(tmpDir, { recursive: true, force: true });
+      }
+    });
+
+    it("returns empty string when no unknown_model_ai_credits error", () => {
+      expect(buildUnknownModelAICreditsContext(false)).toBe("");
+    });
+
+    it("returns template content when error is true and template exists", () => {
+      const templateContent = "\n> [!WARNING]\n> **Unknown Model for AI Credits Pricing**: Test message.\n";
+      fs.writeFileSync(path.join(promptsDir, "unknown_model_ai_credits.md"), templateContent);
+      const result = buildUnknownModelAICreditsContext(true);
+      expect(result).toContain("Unknown Model for AI Credits Pricing");
+    });
+
+    it("throws when template is missing", () => {
+      expect(() => buildUnknownModelAICreditsContext(true)).toThrow(/ENOENT|no such file/i);
+    });
+  });
+  // ──────────────────────────────────────────────────────
+
+  describe("resolveCacheMemoryRestored", () => {
+    let resolveCacheMemoryRestored;
+
+    beforeEach(() => {
+      vi.resetModules();
+      ({ resolveCacheMemoryRestored } = require("./handle_agent_failure.cjs"));
+    });
+
+    afterEach(() => {
+      for (const key of Object.keys(process.env)) {
+        if (key.startsWith("GH_AW_CACHE_MEMORY_RESTORE_")) {
+          delete process.env[key];
+        }
+      }
+    });
+
+    it("returns false when restore signals are absent", () => {
+      expect(resolveCacheMemoryRestored()).toBe(false);
+    });
+
+    it("returns true when matched key exists", () => {
+      process.env.GH_AW_CACHE_MEMORY_RESTORE_0_MATCHED_KEY = "memory-none-default";
+      expect(resolveCacheMemoryRestored()).toBe(true);
+    });
+
+    it("returns true when cache-hit is true", () => {
+      process.env.GH_AW_CACHE_MEMORY_RESTORE_1_CACHE_HIT = "true";
+      expect(resolveCacheMemoryRestored()).toBe(true);
+    });
+  });
 
   describe("buildMissingDataContext", () => {
     let buildMissingDataContext;
@@ -1113,16 +2914,16 @@ describe("handle_agent_failure", () => {
     });
 
     it("returns empty string when agent output file does not exist", () => {
-      expect(buildMissingDataContext(false)).toBe("");
-      expect(buildMissingDataContext(true)).toBe("");
+      expect(buildMissingDataContext(false, false)).toBe("");
+      expect(buildMissingDataContext(true, false)).toBe("");
     });
 
     it("returns empty string when agent output has no missing_data items", () => {
       fs.writeFileSync(path.join(tmpDir, "agent_output.json"), JSON.stringify({ items: [{ type: "noop", reason: "done" }] }));
       vi.resetModules();
       ({ buildMissingDataContext } = require("./handle_agent_failure.cjs"));
-      expect(buildMissingDataContext(false)).toBe("");
-      expect(buildMissingDataContext(true)).toBe("");
+      expect(buildMissingDataContext(false, false)).toBe("");
+      expect(buildMissingDataContext(true, false)).toBe("");
     });
 
     it("returns missing data context without cache warning when cacheMemoryEnabled is false", () => {
@@ -1134,13 +2935,13 @@ describe("handle_agent_failure", () => {
       );
       vi.resetModules();
       ({ buildMissingDataContext } = require("./handle_agent_failure.cjs"));
-      const result = buildMissingDataContext(false);
+      const result = buildMissingDataContext(false, false);
       expect(result).toContain("Missing Data Reported");
       expect(result).toContain("cache\\_memory"); // data_type after markdown escaping
       expect(result).not.toContain("Cache Configuration Problem");
     });
 
-    it("appends cache configuration warning when cacheMemoryEnabled is true and cache_memory_miss item present", () => {
+    it("appends cache configuration warning when cache restore matched and cache_memory_miss item present", () => {
       fs.writeFileSync(
         path.join(tmpDir, "agent_output.json"),
         JSON.stringify({
@@ -1150,15 +2951,15 @@ describe("handle_agent_failure", () => {
       const templateContent =
         "> [!WARNING]\n" +
         "> <details>\n" +
-        "> <summary>Cache Configuration Problem: cache miss detected despite cache-memory being configured.</summary>\n>\n" +
+        "> <summary>Cache Configuration Problem: cache miss detected after cache restore succeeded.</summary>\n>\n" +
         "> Review the [cache-memory configuration](https://github.github.com/gh-aw/reference/cache-memory/) and ensure the agent prompt correctly references files inside the cache directory.\n>\n" +
         "> **File naming convention:** Cache files are stored at `/tmp/gh-aw/cache-memory/`.\n>\n" +
         "> </details>";
       fs.writeFileSync(path.join(promptsDir, "cache_memory_miss.md"), templateContent);
       vi.resetModules();
       ({ buildMissingDataContext } = require("./handle_agent_failure.cjs"));
-      const result = buildMissingDataContext(true);
-      expect(result).toContain("Missing Data Reported");
+      const result = buildMissingDataContext(true, true);
+      expect(result).not.toContain("Missing Data Reported");
       expect(result).toContain("Cache Configuration Problem");
       expect(result).toContain("> [!WARNING]");
       expect(result).toContain("<summary>");
@@ -1175,16 +2976,75 @@ describe("handle_agent_failure", () => {
           items: [{ type: "missing_data", reason: "cache_memory_miss" }],
         })
       );
-      const templateContent = "> [!WARNING]\n" + "> <details>\n" + "> <summary>Cache Configuration Problem: cache miss detected despite cache-memory being configured.</summary>\n>\n" + "> Details here.\n>\n" + "> </details>";
+      const templateContent = "> [!WARNING]\n" + "> <details>\n" + "> <summary>Cache Configuration Problem: cache miss detected after cache restore succeeded.</summary>\n>\n" + "> Details here.\n>\n" + "> </details>";
       fs.writeFileSync(path.join(promptsDir, "cache_memory_miss.md"), templateContent);
       vi.resetModules();
       ({ buildMissingDataContext } = require("./handle_agent_failure.cjs"));
-      const result = buildMissingDataContext(true);
-      expect(result).toContain("Missing Data Reported");
+      const result = buildMissingDataContext(true, true);
+      expect(result).not.toContain("Missing Data Reported");
       expect(result).toContain("Cache Configuration Problem");
       expect(result).toContain("> [!WARNING]");
       expect(result).toContain("<summary>");
       expect(result).toContain("<details>");
+    });
+
+    it("does not append cache configuration warning when cache restore did not match", () => {
+      fs.writeFileSync(
+        path.join(tmpDir, "agent_output.json"),
+        JSON.stringify({
+          items: [{ type: "missing_data", data_type: "cache_memory", reason: "cache_memory_miss" }],
+        })
+      );
+      vi.resetModules();
+      ({ buildMissingDataContext } = require("./handle_agent_failure.cjs"));
+      const result = buildMissingDataContext(true, false);
+      expect(result).toContain("Missing Data Reported");
+      expect(result).toContain("cache\\_memory");
+      expect(result).not.toContain("Cache Configuration Problem");
+    });
+
+    it("shows generic missing-data context for non-cache items while still appending cache warning", () => {
+      fs.writeFileSync(
+        path.join(tmpDir, "agent_output.json"),
+        JSON.stringify({
+          items: [
+            { type: "missing_data", data_type: "cache_memory", reason: "cache_memory_miss" },
+            { type: "missing_data", data_type: "user_data", reason: "not_provided" },
+          ],
+        })
+      );
+      const templateContent = "> [!WARNING]\n> <details>\n> <summary>Cache Configuration Problem: cache miss detected after cache restore succeeded.</summary>\n>\n> Details here.\n>\n> </details>";
+      fs.writeFileSync(path.join(promptsDir, "cache_memory_miss.md"), templateContent);
+      vi.resetModules();
+      ({ buildMissingDataContext } = require("./handle_agent_failure.cjs"));
+      const result = buildMissingDataContext(true, true);
+      expect(result).toContain("Missing Data Reported");
+      expect(result).toContain("user\\_data");
+      expect(result).toContain("Cache Configuration Problem");
+      expect(result).not.toContain("cache\\_memory");
+      expect(result).not.toContain("cache\\_memory\\_miss");
+    });
+
+    it("keeps cache warning and report_incomplete context without duplicate missing-data section", () => {
+      fs.writeFileSync(
+        path.join(tmpDir, "agent_output.json"),
+        JSON.stringify({
+          items: [
+            { type: "missing_data", data_type: "cache_memory", reason: "cache_memory_miss" },
+            { type: "report_incomplete", reason: "mcp_crash" },
+          ],
+        })
+      );
+      const templateContent = "> [!WARNING]\n> <details>\n> <summary>Cache Configuration Problem: cache miss detected after cache restore succeeded.</summary>\n>\n> Details here.\n>\n> </details>";
+      fs.writeFileSync(path.join(promptsDir, "cache_memory_miss.md"), templateContent);
+      vi.resetModules();
+      const { buildMissingDataContext: buildMissingDataContextFn, buildReportIncompleteContext } = require("./handle_agent_failure.cjs");
+      const missingDataResult = buildMissingDataContextFn(true, true);
+      const reportIncompleteResult = buildReportIncompleteContext();
+      expect(missingDataResult).not.toContain("Missing Data Reported");
+      expect(missingDataResult).toContain("Cache Configuration Problem");
+      expect(reportIncompleteResult).toContain("Task Could Not Be Completed");
+      expect(reportIncompleteResult).toContain("mcp_crash");
     });
 
     it("does not append cache warning for unrelated missing_data reasons when cacheMemoryEnabled is true", () => {
@@ -1196,7 +3056,7 @@ describe("handle_agent_failure", () => {
       );
       vi.resetModules();
       ({ buildMissingDataContext } = require("./handle_agent_failure.cjs"));
-      const result = buildMissingDataContext(true);
+      const result = buildMissingDataContext(true, true);
       expect(result).toContain("Missing Data Reported");
       expect(result).not.toContain("Cache Configuration Problem");
     });
@@ -1255,6 +3115,8 @@ describe("handle_agent_failure", () => {
       expect(result).toContain("Missing Tools Reported");
       expect(result).toContain("bash");
       expect(result).toContain("bash is not available");
+      expect(result).toContain("> [!WARNING]");
+      expect(result).not.toContain("**⚠️ Missing Tools Reported**");
     });
 
     it("returns missing tool context for tool with alternatives", () => {
@@ -1301,11 +3163,431 @@ describe("handle_agent_failure", () => {
       expect(result).toContain("tool1");
       expect(result).toContain("tool2");
     });
+
+    it("suppresses generic context for repeated permission denied missing_tool entries", () => {
+      fs.writeFileSync(
+        path.join(tmpDir, "agent_output.json"),
+        JSON.stringify({
+          items: [{ type: "missing_tool", tool: "tool/permission", reason: "permission denied", denied_commands: ["go version 2>&1"] }],
+        })
+      );
+      vi.resetModules();
+      ({ buildMissingToolContext } = require("./handle_agent_failure.cjs"));
+      expect(buildMissingToolContext()).toBe("");
+    });
+
+    it("does not suppress tool/permission entry when denied_commands is empty", () => {
+      fs.writeFileSync(
+        path.join(tmpDir, "agent_output.json"),
+        JSON.stringify({
+          items: [{ type: "missing_tool", tool: "tool/permission", reason: "permission queried", denied_commands: [] }],
+        })
+      );
+      vi.resetModules();
+      ({ buildMissingToolContext } = require("./handle_agent_failure.cjs"));
+      const result = buildMissingToolContext();
+      expect(result).toContain("Missing Tools Reported");
+      expect(result).toContain("tool/permission");
+    });
+
+    it("keeps non-permission missing tools when permission-denied entries are present", () => {
+      fs.writeFileSync(
+        path.join(tmpDir, "agent_output.json"),
+        JSON.stringify({
+          items: [
+            { type: "missing_tool", tool: "tool/permission", reason: "permission denied", denied_commands: ["go version 2>&1"] },
+            { type: "missing_tool", tool: "bash", reason: "bash is not available" },
+          ],
+        })
+      );
+      vi.resetModules();
+      ({ buildMissingToolContext } = require("./handle_agent_failure.cjs"));
+      const result = buildMissingToolContext();
+      expect(result).toContain("Missing Tools Reported");
+      expect(result).toContain("bash");
+      expect(result).not.toContain("tool/permission");
+    });
   });
 
   // ──────────────────────────────────────────────────────
-  // report-as-failure feature flags (GH_AW_MISSING_TOOL_REPORT_AS_FAILURE / GH_AW_MISSING_DATA_REPORT_AS_FAILURE)
+  // buildPermissionDeniedContext
   // ──────────────────────────────────────────────────────
+
+  describe("buildPermissionDeniedContext", () => {
+    let buildPermissionDeniedContext;
+    const fs = require("fs");
+    const path = require("path");
+    const os = require("os");
+
+    /** @type {string} */
+    let tmpDir;
+    /** @type {string} */
+    let promptsDir;
+
+    function writePermissionDeniedTemplate() {
+      fs.writeFileSync(path.join(promptsDir, "permission_denied_context.md"), "> [!WARNING]\n> **Repeated Permission Denied**\n\n**Denied Commands:**\n{denied_commands_list}\n\nworkflow: {workflow_id}\n");
+    }
+
+    beforeEach(() => {
+      vi.resetModules();
+      tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "aw-test-permission-denied-"));
+      process.env.RUNNER_TEMP = tmpDir;
+      process.env.GH_AW_AGENT_OUTPUT = path.join(tmpDir, "agent_output.json");
+      promptsDir = path.join(tmpDir, "gh-aw", "prompts");
+      fs.mkdirSync(promptsDir, { recursive: true });
+      ({ buildPermissionDeniedContext } = require("./handle_agent_failure.cjs"));
+    });
+
+    afterEach(() => {
+      delete process.env.RUNNER_TEMP;
+      delete process.env.GH_AW_AGENT_OUTPUT;
+      if (fs.existsSync(tmpDir)) {
+        fs.rmSync(tmpDir, { recursive: true, force: true });
+      }
+    });
+
+    it("returns empty string when agent output file does not exist", () => {
+      expect(buildPermissionDeniedContext()).toBe("");
+    });
+
+    it("returns empty string when there are no tool/permission items", () => {
+      fs.writeFileSync(path.join(tmpDir, "agent_output.json"), JSON.stringify({ items: [{ type: "noop", reason: "done" }] }));
+      expect(buildPermissionDeniedContext()).toBe("");
+    });
+
+    it("returns empty string when tool/permission item has no denied_commands", () => {
+      fs.writeFileSync(
+        path.join(tmpDir, "agent_output.json"),
+        JSON.stringify({
+          items: [{ type: "missing_tool", tool: "tool/permission", reason: "permission denied", denied_commands: [] }],
+        })
+      );
+      expect(buildPermissionDeniedContext()).toBe("");
+    });
+
+    it("renders template with denied command", () => {
+      writePermissionDeniedTemplate();
+      const items = [{ type: "missing_tool", tool: "tool/permission", reason: "permission denied", denied_commands: ["go version 2>&1"] }];
+      const result = buildPermissionDeniedContext(items);
+      expect(result).toContain("go version 2>&1");
+      expect(result).toContain("Repeated Permission Denied");
+    });
+
+    it("renders template with denied commands listed", () => {
+      writePermissionDeniedTemplate();
+      const items = [{ type: "missing_tool", tool: "tool/permission", reason: "permission denied", denied_commands: ["go version 2>&1", "ls /usr/local/go/bin/go"] }];
+      const result = buildPermissionDeniedContext(items);
+      expect(result).toContain("`go version 2>&1`");
+      expect(result).toContain("`ls /usr/local/go/bin/go`");
+    });
+
+    it("parses denied commands from alternatives when denied_commands is omitted", () => {
+      writePermissionDeniedTemplate();
+      const items = [
+        {
+          type: "missing_tool",
+          tool: "tool/permission",
+          reason: "permission denied",
+          alternatives: "Verify token scopes, repository permissions, and MCP/tool access configuration. Denied commands: shell(find specs -type f -name '*.md' | sort) | read(/home/runner/work/gh-aw/gh-aw/specs)",
+        },
+      ];
+      const result = buildPermissionDeniedContext(items);
+      expect(result).toContain("`shell(find specs -type f -name '*.md' | sort)`");
+      expect(result).toContain("`read(...)`");
+    });
+
+    it("parses denied commands from Daily SPDD Spec Planner alternatives", () => {
+      writePermissionDeniedTemplate();
+      const items = [
+        {
+          type: "missing_tool",
+          tool: "tool/permission",
+          reason: "numerous permission denied errors detected",
+          alternatives:
+            'Verify token scopes, repository permissions, and MCP/tool access configuration. Denied commands: shell(mkdir -p /tmp/gh-aw/cache-memory/spdd-daily/ && touch /tmp/gh-aw/cache-memory/spdd-daily/.preflight && echo "preflight_ok") | read(/home/runner/work/gh-aw/gh-aw) | read(/tmp/gh-aw/cache-memory/spdd-daily/rotation.json)',
+        },
+      ];
+      const result = buildPermissionDeniedContext(items);
+      expect(result).toContain('`shell(mkdir -p /tmp/gh-aw/cache-memory/spdd-daily/ && touch /tmp/gh-aw/cache-memory/spdd-daily/.preflight && echo "preflight_ok")`');
+      expect(result).toContain("`read(...)`");
+      expect(result).not.toContain("`read(/home/runner/work/gh-aw/gh-aw)`");
+      expect(result).not.toContain("`read(/tmp/gh-aw/cache-memory/spdd-daily/rotation.json)`");
+    });
+
+    it("deduplicates denied commands across multiple tool/permission items", () => {
+      writePermissionDeniedTemplate();
+      const items = [
+        { type: "missing_tool", tool: "tool/permission", reason: "permission denied", denied_commands: ["go version 2>&1", "ls /usr/local/go/bin/go"] },
+        { type: "missing_tool", tool: "tool/permission", reason: "permission denied", denied_commands: ["go version 2>&1", "which go"] },
+      ];
+      const result = buildPermissionDeniedContext(items);
+      const deniedCommandsSection = (result.match(/\*\*Denied Commands:\*\*\n([\s\S]*?)\n\n/) || [])[1] || "";
+      // "go version 2>&1" should appear exactly once (deduplicated) in the denied commands list section
+      const listOccurrences = (deniedCommandsSection.match(/`go version 2>&1`/g) || []).length;
+      expect(listOccurrences).toBe(1);
+      expect(result).toContain("`ls /usr/local/go/bin/go`");
+      expect(result).toContain("`which go`");
+    });
+
+    it("collapses read(path) denials to a single read(...) entry", () => {
+      writePermissionDeniedTemplate();
+      const items = [
+        {
+          type: "missing_tool",
+          tool: "tool/permission",
+          reason: "permission denied",
+          denied_commands: ["read(/home/runner/work/gh-aw/gh-aw)", "read(/tmp/gh-aw/cache-memory/spdd-daily/rotation.json)"],
+        },
+      ];
+      const result = buildPermissionDeniedContext(items);
+      const readOccurrences = (result.match(/`read\(\.\.\.\)`/g) || []).length;
+      expect(readOccurrences).toBe(1);
+      expect(result).not.toContain("`read(/home/runner/work/gh-aw/gh-aw)`");
+      expect(result).not.toContain("`read(/tmp/gh-aw/cache-memory/spdd-daily/rotation.json)`");
+    });
+
+    it("throws when permission_denied_context template is missing", () => {
+      const items = [{ type: "missing_tool", tool: "tool/permission", reason: "permission denied", denied_commands: ["go version 2>&1"] }];
+      expect(() => buildPermissionDeniedContext(items)).toThrow(/ENOENT|no such file/i);
+    });
+
+    it("renders template when permission_denied_context.md is available", () => {
+      writePermissionDeniedTemplate();
+      const items = [{ type: "missing_tool", tool: "tool/permission", reason: "permission denied", denied_commands: ["go version 2>&1"] }];
+      const result = buildPermissionDeniedContext(items, "my-workflow");
+      expect(result).toContain("go version 2>&1");
+      expect(result).toContain("my-workflow");
+      expect(result).toContain("Repeated Permission Denied");
+    });
+  });
+
+  describe("tool_denials_exceeded context", () => {
+    const fs = require("fs");
+    const path = require("path");
+    const os = require("os");
+    let loadToolDenialsExceededEvents;
+    let buildToolDenialsExceededContext;
+    /** @type {string} */
+    let tmpDir;
+
+    beforeEach(() => {
+      vi.resetModules();
+      try {
+        fs.rmSync(path.join(os.tmpdir(), "gh-aw", "sandbox", "agent", "logs", "copilot-session-state"), { recursive: true, force: true });
+      } catch {}
+      tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "aw-test-tool-denials-exceeded-"));
+      process.env.RUNNER_TEMP = tmpDir;
+      ({ loadToolDenialsExceededEvents, buildToolDenialsExceededContext } = require("./handle_agent_failure.cjs"));
+    });
+
+    afterEach(() => {
+      delete process.env.RUNNER_TEMP;
+      if (fs.existsSync(tmpDir)) {
+        fs.rmSync(tmpDir, { recursive: true, force: true });
+      }
+      try {
+        fs.rmSync(path.join(os.tmpdir(), "gh-aw", "sandbox", "agent", "logs", "copilot-session-state"), { recursive: true, force: true });
+      } catch {}
+    });
+
+    it("loads guard.tool_denials_exceeded events from copilot session events.jsonl", () => {
+      const sessionDir = path.join(os.tmpdir(), "gh-aw", "sandbox", "agent", "logs", "copilot-session-state", "session-1");
+      fs.mkdirSync(sessionDir, { recursive: true });
+      fs.writeFileSync(
+        path.join(sessionDir, "events.jsonl"),
+        [
+          JSON.stringify({ type: "tool.execution_start", timestamp: "2026-06-06T00:00:00Z", data: { toolName: "read", mcpServerName: "mcp__safeoutputs" } }),
+          JSON.stringify({ type: "assistant.message", timestamp: "2026-06-06T00:00:00Z", data: { content: "" } }),
+          JSON.stringify({
+            type: "guard.tool_denials_exceeded",
+            timestamp: "2026-06-06T00:00:01Z",
+            data: { denialCount: 5, threshold: 5, reason: "permission denied: read" },
+          }),
+        ].join("\n") + "\n"
+      );
+
+      const events = loadToolDenialsExceededEvents();
+      expect(events).toEqual([{ denialCount: 5, threshold: 5, reason: "permission denied: read", recentToolCalls: ["mcp__safeoutputs.read"], timestamp: "2026-06-06T00:00:01Z" }]);
+    });
+
+    it("renders dedicated context for tool denial threshold events", () => {
+      const promptsDir = path.join(tmpDir, "gh-aw", "prompts");
+      fs.mkdirSync(promptsDir, { recursive: true });
+      fs.copyFileSync(path.join(__dirname, "../md/tool_denials_exceeded_context.md"), path.join(promptsDir, "tool_denials_exceeded_context.md"));
+
+      const result = buildToolDenialsExceededContext([{ denialCount: 5, threshold: 5, reason: "permission denied: read", recentToolCalls: ["read(...)", "bash(git status)"] }], "daily-spdd-spec-planner");
+      expect(result).toContain("Excessive Tool Denials");
+      expect(result).toContain("5/5");
+      expect(result).toContain("guard.tool_denials_exceeded");
+      expect(result).toContain("daily-spdd-spec-planner");
+      expect(result).toContain("> [!WARNING]");
+      expect(result).toContain("<details>");
+      expect(result).toContain("<summary><strong>Last denied request</strong></summary>");
+      expect(result).toContain("<summary><strong>Last 5 tool calls</strong></summary>");
+      expect(result).toContain("```text");
+      expect(result).toContain("\nread\n");
+      expect(result).toContain("- `read(...)`");
+      expect(result).toContain("- `bash(git status)`");
+    });
+
+    it("normalizes Python 3 heredoc reason to a single-line summary", () => {
+      const promptsDir = path.join(tmpDir, "gh-aw", "prompts");
+      fs.mkdirSync(promptsDir, { recursive: true });
+      fs.copyFileSync(path.join(__dirname, "../md/tool_denials_exceeded_context.md"), path.join(promptsDir, "tool_denials_exceeded_context.md"));
+
+      const python3Reason = 'permission denied: shell(python3 << \'EOF\'\nimport re\n\nfiles = [("foo.go", "/path/foo.go")]\nfor f, p in files:\n    print(f)\nEOF)';
+      const result = buildToolDenialsExceededContext([{ denialCount: 5, threshold: 5, reason: python3Reason }], "daily-compiler-quality");
+      expect(result).toContain("shell(python3 ...)");
+      expect(result).not.toContain("`shell(python3 ...)`");
+      // The full multi-line program body should not appear in the output
+      expect(result).not.toContain("import re");
+      expect(result).not.toContain("for f, p in files");
+    });
+
+    it("captures only the last 5 tool calls before guard event", () => {
+      const sessionDir = path.join(os.tmpdir(), "gh-aw", "sandbox", "agent", "logs", "copilot-session-state", "session-1");
+      fs.mkdirSync(sessionDir, { recursive: true });
+      fs.writeFileSync(
+        path.join(sessionDir, "events.jsonl"),
+        [
+          JSON.stringify({ type: "tool.execution_start", timestamp: "2026-06-06T00:00:00Z", data: { toolName: "list" } }),
+          JSON.stringify({ type: "tool.execution_start", timestamp: "2026-06-06T00:00:01Z", data: { toolName: "read" } }),
+          JSON.stringify({ type: "tool.execution_start", timestamp: "2026-06-06T00:00:02Z", data: { toolName: "edit" } }),
+          JSON.stringify({ type: "tool.execution_start", timestamp: "2026-06-06T00:00:03Z", data: { toolName: "bash" } }),
+          JSON.stringify({ type: "tool.execution_start", timestamp: "2026-06-06T00:00:04Z", data: { toolName: "grep" } }),
+          JSON.stringify({ type: "tool.execution_start", timestamp: "2026-06-06T00:00:05Z", data: { toolName: "glob" } }),
+          JSON.stringify({ type: "tool.execution_start", timestamp: "2026-06-06T00:00:06Z", data: { toolName: "write" } }),
+          JSON.stringify({
+            type: "guard.tool_denials_exceeded",
+            timestamp: "2026-06-06T00:00:07Z",
+            data: { denialCount: 5, threshold: 5, reason: "permission denied: read" },
+          }),
+        ].join("\n") + "\n"
+      );
+
+      const events = loadToolDenialsExceededEvents();
+      expect(events).toEqual([
+        {
+          denialCount: 5,
+          threshold: 5,
+          reason: "permission denied: read",
+          recentToolCalls: ["edit", "bash", "grep", "glob", "write"],
+          timestamp: "2026-06-06T00:00:07Z",
+        },
+      ]);
+    });
+
+    it("captures shell command details for recent bash tool calls", () => {
+      const sessionDir = path.join(os.tmpdir(), "gh-aw", "sandbox", "agent", "logs", "copilot-session-state", "session-1");
+      fs.mkdirSync(sessionDir, { recursive: true });
+      fs.writeFileSync(
+        path.join(sessionDir, "events.jsonl"),
+        [
+          JSON.stringify({
+            type: "tool.execution_start",
+            timestamp: "2026-06-06T00:00:00Z",
+            data: { toolName: "bash", mcpServerName: "terminal", command: "cd /home/runner/work/gh-aw/gh-aw && git diff --name-only" },
+          }),
+          JSON.stringify({
+            type: "guard.tool_denials_exceeded",
+            timestamp: "2026-06-06T00:00:01Z",
+            data: { denialCount: 5, threshold: 5, reason: "permission denied: bash" },
+          }),
+        ].join("\n") + "\n"
+      );
+
+      const events = loadToolDenialsExceededEvents();
+      expect(events).toEqual([
+        {
+          denialCount: 5,
+          threshold: 5,
+          reason: "permission denied: bash",
+          recentToolCalls: ["terminal.bash(cd /home/runner/work/gh-aw/gh-aw && git diff --name-only)"],
+          timestamp: "2026-06-06T00:00:01Z",
+        },
+      ]);
+    });
+
+    it("sanitizes backticks in shell command previews", () => {
+      const sessionDir = path.join(os.tmpdir(), "gh-aw", "sandbox", "agent", "logs", "copilot-session-state", "session-1");
+      fs.mkdirSync(sessionDir, { recursive: true });
+      fs.writeFileSync(
+        path.join(sessionDir, "events.jsonl"),
+        [
+          JSON.stringify({
+            type: "tool.execution_start",
+            timestamp: "2026-06-06T00:00:00Z",
+            data: { toolName: "bash", mcpServerName: "terminal", command: "echo `hostname` && echo ok" },
+          }),
+          JSON.stringify({
+            type: "guard.tool_denials_exceeded",
+            timestamp: "2026-06-06T00:00:01Z",
+            data: { denialCount: 5, threshold: 5, reason: "permission denied: bash" },
+          }),
+        ].join("\n") + "\n"
+      );
+
+      const events = loadToolDenialsExceededEvents();
+      expect(events).toEqual([
+        {
+          denialCount: 5,
+          threshold: 5,
+          reason: "permission denied: bash",
+          recentToolCalls: ["terminal.bash(echo 'hostname' && echo ok)"],
+          timestamp: "2026-06-06T00:00:01Z",
+        },
+      ]);
+    });
+  });
+
+  // ──────────────────────────────────────────────────────
+  // normalizeDeniedPermissionCommand
+  // ──────────────────────────────────────────────────────
+
+  describe("normalizeDeniedPermissionCommand", () => {
+    let normalizeDeniedPermissionCommand;
+
+    beforeEach(() => {
+      vi.resetModules();
+      ({ normalizeDeniedPermissionCommand } = require("./handle_agent_failure.cjs"));
+    });
+
+    it("returns empty string for empty/non-string input", () => {
+      expect(normalizeDeniedPermissionCommand("")).toBe("");
+      expect(normalizeDeniedPermissionCommand(null)).toBe("");
+      expect(normalizeDeniedPermissionCommand(undefined)).toBe("");
+    });
+
+    it("collapses read(path) to read(...)", () => {
+      expect(normalizeDeniedPermissionCommand("read(/some/path/file.go)")).toBe("read(...)");
+      expect(normalizeDeniedPermissionCommand("read(/home/runner/work/repo/go.mod)")).toBe("read(...)");
+    });
+
+    it("returns non-read single-line commands unchanged", () => {
+      expect(normalizeDeniedPermissionCommand("bash(echo hello)")).toBe("bash(echo hello)");
+      expect(normalizeDeniedPermissionCommand("permission denied: shell(python3 --version)")).toBe("shell(python3 --version)");
+    });
+
+    it("collapses shell(python3 << 'EOF' ...) heredoc to shell(python3 ...)", () => {
+      const cmd = "shell(python3 << 'EOF'\nimport re\nprint('hello')\nEOF)";
+      expect(normalizeDeniedPermissionCommand(cmd)).toBe("shell(python3 ...)");
+    });
+
+    it('collapses shell(python3 << "EOF" ...) heredoc with double-quoted marker', () => {
+      const cmd = 'shell(python3 << "EOF"\nimport sys\nsys.exit(0)\nEOF)';
+      expect(normalizeDeniedPermissionCommand(cmd)).toBe("shell(python3 ...)");
+    });
+
+    it("collapses shell(python << 'EOF' ...) heredoc for unversioned python", () => {
+      const cmd = "shell(python << 'EOF'\nprint(1)\nEOF)";
+      expect(normalizeDeniedPermissionCommand(cmd)).toBe("shell(python ...)");
+    });
+
+    it("collapses any shell heredoc program, not just python3", () => {
+      const cmd = "shell(node << 'EOF'\nconsole.log('hi');\nEOF)";
+      expect(normalizeDeniedPermissionCommand(cmd)).toBe("shell(node ...)");
+    });
+  });
 
   describe("missing_tool and missing_data report-as-failure flags", () => {
     const fs = require("fs");
@@ -1469,6 +3751,7 @@ describe("handle_agent_failure", () => {
       tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "aw-test-engine-fail-guard-"));
       stdioLogPath = path.join(tmpDir, "agent-stdio.log");
       process.env.GH_AW_AGENT_OUTPUT = path.join(tmpDir, "agent_output.json");
+      process.env.GH_AW_OTEL_JSONL_PATH = path.join(tmpDir, "otel.jsonl");
       process.env.RUNNER_TEMP = tmpDir;
       ({ buildEngineFailureContext } = require("./handle_agent_failure.cjs"));
     });
@@ -1476,6 +3759,7 @@ describe("handle_agent_failure", () => {
     afterEach(() => {
       delete process.env.GH_AW_AGENT_OUTPUT;
       delete process.env.GH_AW_ENGINE_ID;
+      delete process.env.GH_AW_OTEL_JSONL_PATH;
       delete process.env.RUNNER_TEMP;
       if (fs.existsSync(tmpDir)) {
         fs.rmSync(tmpDir, { recursive: true, force: true });
@@ -1530,6 +3814,11 @@ describe("handle_agent_failure", () => {
 
     beforeEach(() => {
       vi.resetModules();
+      for (const key of Object.keys(process.env)) {
+        if (key.startsWith("GH_AW_")) {
+          delete process.env[key];
+        }
+      }
       tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "aw-test-completed-despite-failure-"));
       promptsDir = path.join(tmpDir, "gh-aw", "prompts");
       fs.mkdirSync(promptsDir, { recursive: true });
@@ -1544,6 +3833,7 @@ describe("handle_agent_failure", () => {
       process.env.GH_AW_RUN_URL = "https://github.com/owner/repo/actions/runs/123456";
       process.env.GH_AW_AGENT_CONCLUSION = "failure";
       process.env.GH_AW_AGENT_OUTPUT = path.join(tmpDir, "agent_output.json");
+      process.env.GH_AW_CHECKOUT_PR_SUCCESS = "true";
     });
 
     afterEach(() => {
@@ -1553,6 +3843,7 @@ describe("handle_agent_failure", () => {
       delete process.env.GH_AW_RUN_URL;
       delete process.env.GH_AW_AGENT_CONCLUSION;
       delete process.env.GH_AW_AGENT_OUTPUT;
+      delete process.env.GH_AW_CHECKOUT_PR_SUCCESS;
       if (fs.existsSync(tmpDir)) {
         fs.rmSync(tmpDir, { recursive: true, force: true });
       }
@@ -1792,258 +4083,50 @@ describe("handle_agent_failure", () => {
     });
   });
 
-  describe("parseMaxEffectiveTokensFromAuditLog", () => {
+  describe("readTokenUsageMarkdown", () => {
+    let readTokenUsageMarkdown;
     const fs = require("fs");
     const os = require("os");
     const path = require("path");
-
     let tmpDir;
-    let parseMaxEffectiveTokensFromAuditLog;
-    let parseEffectiveTokensErrorInfoFromAuditLog;
 
     beforeEach(() => {
-      global.core = { info: vi.fn(), warning: vi.fn(), error: vi.fn(), debug: vi.fn(), setOutput: vi.fn(), setFailed: vi.fn() };
-      global.github = {};
-      global.context = { repo: { owner: "owner", repo: "repo" } };
       vi.resetModules();
-      ({ parseMaxEffectiveTokensFromAuditLog, parseEffectiveTokensErrorInfoFromAuditLog } = require("./handle_agent_failure.cjs"));
-      tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "aw-max-et-"));
+      tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "rt-usage-test-"));
+      ({ readTokenUsageMarkdown } = require("./handle_agent_failure.cjs"));
     });
 
     afterEach(() => {
-      delete global.core;
-      delete global.github;
-      delete global.context;
-      delete process.env.GH_AW_AGENT_OUTPUT;
-      if (tmpDir && fs.existsSync(tmpDir)) {
-        fs.rmSync(tmpDir, { recursive: true, force: true });
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    });
+
+    it("returns null when no token-usage.jsonl files exist", () => {
+      const result = readTokenUsageMarkdown();
+      expect(result).toBeNull();
+    });
+
+    it("returns markdown and model aliases when a valid token-usage.jsonl file is present", () => {
+      const { TOKEN_USAGE_PATH } = require("./parse_token_usage.cjs");
+      fs.mkdirSync(path.dirname(TOKEN_USAGE_PATH), { recursive: true });
+      const entry = JSON.stringify({ model: "claude-sonnet-4.5", input_tokens: 1000, output_tokens: 500, cache_read_tokens: 0, cache_write_tokens: 0, duration_ms: 1000 });
+      const origContent = fs.existsSync(TOKEN_USAGE_PATH) ? fs.readFileSync(TOKEN_USAGE_PATH, "utf8") : null;
+      fs.writeFileSync(TOKEN_USAGE_PATH, entry + "\n");
+      try {
+        vi.resetModules();
+        ({ readTokenUsageMarkdown } = require("./handle_agent_failure.cjs"));
+        const result = readTokenUsageMarkdown();
+        expect(result).not.toBeNull();
+        expect(result.markdown).toContain("sonnet45");
+        expect(result.markdown).toContain("1,000");
+        expect(result.markdown).toContain("Alias");
+        expect(result.modelNames).toEqual(["claude-sonnet-4.5"]);
+      } finally {
+        if (origContent !== null) {
+          fs.writeFileSync(TOKEN_USAGE_PATH, origContent);
+        } else if (fs.existsSync(TOKEN_USAGE_PATH)) {
+          fs.unlinkSync(TOKEN_USAGE_PATH);
+        }
       }
-    });
-
-    it("returns empty string when file does not exist", () => {
-      const result = parseMaxEffectiveTokensFromAuditLog(path.join(tmpDir, "missing.jsonl"));
-      expect(result).toBe("");
-    });
-
-    it("parses max_effective_tokens from audit log entries", () => {
-      const jsonlPath = path.join(tmpDir, "log.jsonl");
-      fs.writeFileSync(jsonlPath, [JSON.stringify({ _schema: "audit/v0.26.0", ts: 1, max_effective_tokens: 12345 }), JSON.stringify({ _schema: "audit/v0.26.0", ts: 2, max_effective_tokens: 23456 })].join("\n"));
-      const result = parseMaxEffectiveTokensFromAuditLog(jsonlPath);
-      expect(result).toBe("23456");
-    });
-
-    it("parses nested camelCase maxEffectiveTokens values", () => {
-      const jsonlPath = path.join(tmpDir, "log.jsonl");
-      fs.writeFileSync(jsonlPath, JSON.stringify({ _schema: "audit/v0.26.0", ts: 1, awf: { budget: { maxEffectiveTokens: "9999" } } }));
-      const result = parseMaxEffectiveTokensFromAuditLog(jsonlPath);
-      expect(result).toBe("9999");
-    });
-
-    it("uses derived default path and prefers log.jsonl", () => {
-      const auditDir = path.join(tmpDir, "sandbox", "firewall", "audit");
-      fs.mkdirSync(auditDir, { recursive: true });
-      fs.writeFileSync(path.join(auditDir, "audit.jsonl"), JSON.stringify({ _schema: "audit/v0.26.0", ts: 1, max_effective_tokens: 1111 }));
-      fs.writeFileSync(path.join(auditDir, "log.jsonl"), JSON.stringify({ _schema: "audit/v0.26.0", ts: 1, max_effective_tokens: 2222 }));
-      process.env.GH_AW_AGENT_OUTPUT = path.join(tmpDir, "agent_output.json");
-      const result = parseMaxEffectiveTokensFromAuditLog();
-      expect(result).toBe("2222");
-    });
-
-    it("parses effective token rate-limit metadata from audit log entries", () => {
-      const jsonlPath = path.join(tmpDir, "log.jsonl");
-      fs.writeFileSync(
-        jsonlPath,
-        [
-          JSON.stringify({ _schema: "audit/v0.26.0", ts: 1, effective_tokens: 4321, effective_tokens_rate_limit_error: false }),
-          JSON.stringify({ _schema: "audit/v0.26.0", ts: 2, effective_tokens: 5432, effective_tokens_rate_limit_error: true }),
-        ].join("\n")
-      );
-      const result = parseEffectiveTokensErrorInfoFromAuditLog(jsonlPath);
-      expect(result).toEqual({ effectiveTokens: "5432", rateLimitError: true });
-    });
-
-    it("parses nested camelCase effective token metadata from default log.jsonl", () => {
-      const auditDir = path.join(tmpDir, "sandbox", "firewall", "audit");
-      fs.mkdirSync(auditDir, { recursive: true });
-      fs.writeFileSync(path.join(auditDir, "log.jsonl"), JSON.stringify({ _schema: "audit/v0.26.0", ts: 1, awf: { budget: { effectiveTokens: "7777" }, errors: { effectiveTokensRateLimitError: "true" } } }));
-      process.env.GH_AW_AGENT_OUTPUT = path.join(tmpDir, "agent_output.json");
-      const result = parseEffectiveTokensErrorInfoFromAuditLog();
-      expect(result).toEqual({ effectiveTokens: "7777", rateLimitError: true });
-    });
-
-    it("detects effective token rate-limit errors from text fields", () => {
-      const jsonlPath = path.join(tmpDir, "log.jsonl");
-      fs.writeFileSync(jsonlPath, JSON.stringify({ _schema: "audit/v0.26.0", ts: 1, details: "429 too many requests: effective tokens budget exceeded" }));
-      const result = parseEffectiveTokensErrorInfoFromAuditLog(jsonlPath);
-      expect(result).toEqual({ effectiveTokens: "", rateLimitError: true });
-    });
-  });
-
-  describe("resolveEffectiveTokensFailureState", () => {
-    const fs = require("fs");
-    const os = require("os");
-    const path = require("path");
-
-    let tmpDir;
-    let resolveEffectiveTokensFailureState;
-
-    beforeEach(() => {
-      vi.resetModules();
-      ({ resolveEffectiveTokensFailureState } = require("./effective_tokens_context.cjs"));
-      tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "aw-resolve-et-"));
-    });
-
-    afterEach(() => {
-      delete process.env.GH_AW_AGENT_OUTPUT;
-      delete process.env.GH_AW_EFFECTIVE_TOKENS;
-      delete process.env.GH_AW_MAX_EFFECTIVE_TOKENS;
-      delete process.env.GH_AW_EFFECTIVE_TOKENS_RATE_LIMIT_ERROR;
-      if (tmpDir && fs.existsSync(tmpDir)) {
-        fs.rmSync(tmpDir, { recursive: true, force: true });
-      }
-    });
-
-    it("suppresses ET budget exhaustion when usage is below the configured maximum", () => {
-      const auditDir = path.join(tmpDir, "sandbox", "firewall", "audit");
-      fs.mkdirSync(auditDir, { recursive: true });
-      fs.writeFileSync(
-        path.join(auditDir, "log.jsonl"),
-        JSON.stringify({
-          _schema: "audit/v0.26.0",
-          ts: 1,
-          effective_tokens: 2097968,
-          max_effective_tokens: 10000000,
-          effective_tokens_rate_limit_error: true,
-        })
-      );
-      process.env.GH_AW_AGENT_OUTPUT = path.join(tmpDir, "agent_output.json");
-
-      expect(resolveEffectiveTokensFailureState()).toEqual({
-        effectiveTokens: "2097968",
-        maxEffectiveTokens: "10000000",
-        effectiveTokensRateLimitError: false,
-      });
-    });
-
-    it("uses firewall reflect ET totals to suppress false ET budget exhaustion signals", () => {
-      const firewallDir = path.join(tmpDir, "sandbox", "firewall");
-      fs.mkdirSync(firewallDir, { recursive: true });
-      fs.writeFileSync(
-        path.join(firewallDir, "awf-reflect.json"),
-        JSON.stringify({
-          effective_tokens: {
-            total_effective_tokens: 1355879.9999999995,
-            max_effective_tokens: 10000000,
-          },
-        })
-      );
-      process.env.GH_AW_AGENT_OUTPUT = path.join(tmpDir, "agent_output.json");
-      process.env.GH_AW_EFFECTIVE_TOKENS = "12202920";
-      process.env.GH_AW_EFFECTIVE_TOKENS_RATE_LIMIT_ERROR = "true";
-
-      expect(resolveEffectiveTokensFailureState()).toEqual({
-        effectiveTokens: "1355879",
-        maxEffectiveTokens: "10000000",
-        effectiveTokensRateLimitError: false,
-      });
-    });
-
-    it("keeps ET budget exhaustion when usage meets the configured maximum", () => {
-      const auditDir = path.join(tmpDir, "sandbox", "firewall", "audit");
-      fs.mkdirSync(auditDir, { recursive: true });
-      fs.writeFileSync(
-        path.join(auditDir, "log.jsonl"),
-        JSON.stringify({
-          _schema: "audit/v0.26.0",
-          ts: 1,
-          effective_tokens: 10000000,
-          max_effective_tokens: 10000000,
-          effective_tokens_rate_limit_error: true,
-        })
-      );
-      process.env.GH_AW_AGENT_OUTPUT = path.join(tmpDir, "agent_output.json");
-
-      expect(resolveEffectiveTokensFailureState()).toEqual({
-        effectiveTokens: "10000000",
-        maxEffectiveTokens: "10000000",
-        effectiveTokensRateLimitError: true,
-      });
-    });
-
-    it("keeps ET budget exhaustion when the rate-limit signal is present but no max is available", () => {
-      process.env.GH_AW_EFFECTIVE_TOKENS = "2097968";
-      process.env.GH_AW_EFFECTIVE_TOKENS_RATE_LIMIT_ERROR = "true";
-
-      expect(resolveEffectiveTokensFailureState()).toEqual({
-        effectiveTokens: "2097968",
-        maxEffectiveTokens: "",
-        effectiveTokensRateLimitError: true,
-      });
-    });
-
-    it("ignores invalid env token counts when reconciling ET budget exhaustion", () => {
-      process.env.GH_AW_EFFECTIVE_TOKENS = "2097968";
-      process.env.GH_AW_MAX_EFFECTIVE_TOKENS = "not-a-number";
-      process.env.GH_AW_EFFECTIVE_TOKENS_RATE_LIMIT_ERROR = "true";
-
-      expect(resolveEffectiveTokensFailureState()).toEqual({
-        effectiveTokens: "2097968",
-        maxEffectiveTokens: "",
-        effectiveTokensRateLimitError: true,
-      });
-    });
-
-    it("does not report ET budget exhaustion without a rate-limit signal", () => {
-      process.env.GH_AW_EFFECTIVE_TOKENS = "10000000";
-      process.env.GH_AW_MAX_EFFECTIVE_TOKENS = "10000000";
-
-      expect(resolveEffectiveTokensFailureState()).toEqual({
-        effectiveTokens: "10000000",
-        maxEffectiveTokens: "10000000",
-        effectiveTokensRateLimitError: false,
-      });
-    });
-  });
-
-  describe("buildEffectiveTokensRateLimitErrorContext", () => {
-    let buildEffectiveTokensRateLimitErrorContext;
-
-    beforeEach(() => {
-      global.core = { info: vi.fn(), warning: vi.fn(), error: vi.fn(), debug: vi.fn(), setOutput: vi.fn(), setFailed: vi.fn() };
-      global.github = {};
-      global.context = { repo: { owner: "owner", repo: "repo" } };
-      vi.resetModules();
-      ({ buildEffectiveTokensRateLimitErrorContext } = require("./handle_agent_failure.cjs"));
-    });
-
-    afterEach(() => {
-      delete global.core;
-      delete global.github;
-      delete global.context;
-    });
-
-    it("formats effective token values in friendly compact form", () => {
-      const result = buildEffectiveTokensRateLimitErrorContext(true, "10000000", "2500000", "https://example.com/run/1");
-      expect(result).toContain("Effective tokens used: `10M`");
-      expect(result).toContain("Configured ET budget: `2.5M`");
-    });
-
-    it("returns empty string when rate-limit error is not set", () => {
-      const result = buildEffectiveTokensRateLimitErrorContext(false, "10000000", "2500000", "https://example.com/run/1");
-      expect(result).toBe("");
-    });
-
-    it("falls back to raw values when effective token values are not numeric", () => {
-      const result = buildEffectiveTokensRateLimitErrorContext(true, "unknown", "n/a", "https://example.com/run/1");
-      expect(result).toContain("Effective tokens used: `unknown`");
-      expect(result).toContain("Configured ET budget: `n/a`");
-    });
-
-    it("omits optional lines when values are missing", () => {
-      const result = buildEffectiveTokensRateLimitErrorContext(true, "", "", "");
-      expect(result).not.toContain("Effective tokens used:");
-      expect(result).not.toContain("Configured ET budget:");
-      expect(result).not.toContain("- Run:");
     });
   });
 
@@ -2121,6 +4204,533 @@ describe("handle_agent_failure", () => {
 
       const result = buildCredentialAuthErrorContext();
       expect(result).toContain("OpenAI");
+    });
+  });
+
+  describe("detectAndHandleFailureCascade", () => {
+    let detectAndHandleFailureCascade;
+    let findRecentFailureIssues;
+    let CASCADE_THRESHOLD;
+    let CASCADE_LABEL;
+    let CASCADE_ROLLUP_LABEL;
+    let CASCADE_ROLLUP_TITLE;
+    let CASCADE_WINDOW_MINUTES;
+
+    /**
+     * Build a list of N fake `[aw] * failed` items starting at issue number `startNum`.
+     * @param {number} count
+     * @param {number} [startNum=100]
+     */
+    function makeFailureItems(count, startNum = 100) {
+      return Array.from({ length: count }, (_, i) => ({
+        number: startNum + i,
+        title: `[aw] Workflow ${i} failed`,
+        html_url: `https://github.com/owner/repo/issues/${startNum + i}`,
+        created_at: new Date().toISOString(),
+      }));
+    }
+
+    beforeEach(() => {
+      vi.resetModules();
+      ({ detectAndHandleFailureCascade, findRecentFailureIssues, CASCADE_THRESHOLD, CASCADE_LABEL, CASCADE_ROLLUP_LABEL, CASCADE_ROLLUP_TITLE, CASCADE_WINDOW_MINUTES } = require("./handle_agent_failure.cjs"));
+    });
+
+    it("exports cascade constants with expected values", () => {
+      expect(CASCADE_THRESHOLD).toBe(10);
+      expect(CASCADE_WINDOW_MINUTES).toBe(60);
+      expect(CASCADE_LABEL).toBe("cascade-suspected");
+      expect(CASCADE_ROLLUP_LABEL).toBe("cascade-rollup");
+      expect(CASCADE_ROLLUP_TITLE).toBe("[aw] Failure cascade detected");
+    });
+
+    it("does nothing when fewer than CASCADE_THRESHOLD issues are in the window", async () => {
+      const createIssueMock = vi.fn();
+      const addLabelsMock = vi.fn();
+      const searchMock = vi.fn(async ({ q }) => {
+        if (q.includes("cascade-rollup")) return { data: { total_count: 0, items: [] } };
+        // Return 5 issues — below threshold
+        const items = makeFailureItems(5);
+        return { data: { total_count: items.length, items } };
+      });
+
+      global.github = {
+        rest: {
+          search: { issuesAndPullRequests: searchMock },
+          issues: {
+            getLabel: vi.fn().mockResolvedValue({ data: {} }),
+            create: createIssueMock,
+            update: vi.fn(),
+            addLabels: addLabelsMock,
+          },
+        },
+        graphql: vi.fn(),
+      };
+
+      await detectAndHandleFailureCascade("owner", "repo", 999);
+
+      expect(createIssueMock).not.toHaveBeenCalled();
+      expect(addLabelsMock).not.toHaveBeenCalled();
+    });
+
+    it("creates a rollup issue and labels individual issues when CASCADE_THRESHOLD is met", async () => {
+      const createIssueMock = vi.fn().mockResolvedValue({
+        data: { number: 200, html_url: "https://github.com/owner/repo/issues/200", node_id: "I_200" },
+      });
+      const addLabelsMock = vi.fn().mockResolvedValue({});
+      const getLabelMock = vi.fn().mockResolvedValue({ data: {} });
+
+      const recentItems = makeFailureItems(10);
+
+      const searchMock = vi.fn(async ({ q }) => {
+        if (q.includes("cascade-rollup")) return { data: { total_count: 0, items: [] } };
+        return { data: { total_count: recentItems.length, items: recentItems } };
+      });
+
+      global.github = {
+        rest: {
+          search: { issuesAndPullRequests: searchMock },
+          issues: {
+            getLabel: getLabelMock,
+            create: createIssueMock,
+            update: vi.fn(),
+            addLabels: addLabelsMock,
+          },
+        },
+        graphql: vi.fn(),
+      };
+
+      // triggeringIssueNumber is already in recentItems (100)
+      await detectAndHandleFailureCascade("owner", "repo", 100);
+
+      // Rollup issue created
+      expect(createIssueMock).toHaveBeenCalledOnce();
+      const createCall = createIssueMock.mock.calls[0][0];
+      expect(createCall.title).toBe(CASCADE_ROLLUP_TITLE);
+      expect(createCall.labels).toContain(CASCADE_ROLLUP_LABEL);
+      expect(createCall.labels).toContain("agentic-workflows");
+      expect(createCall.headers).toEqual({ "X-GitHub-Api-Version": "2022-11-28" });
+
+      // All 10 issues labeled
+      expect(addLabelsMock).toHaveBeenCalledTimes(10);
+      for (const call of addLabelsMock.mock.calls) {
+        expect(call[0].labels).toContain(CASCADE_LABEL);
+      }
+    });
+
+    it("triggers cascade when triggering issue is not in search results (search indexing lag)", async () => {
+      const createIssueMock = vi.fn().mockResolvedValue({
+        data: { number: 201, html_url: "https://github.com/owner/repo/issues/201", node_id: "I_201" },
+      });
+      const addLabelsMock = vi.fn().mockResolvedValue({});
+
+      // Search returns only 9 issues (not the triggering one — simulating indexing lag)
+      const recentItems = makeFailureItems(9);
+
+      const searchMock = vi.fn(async ({ q }) => {
+        if (q.includes("cascade-rollup")) return { data: { total_count: 0, items: [] } };
+        return { data: { total_count: recentItems.length, items: recentItems } };
+      });
+
+      global.github = {
+        rest: {
+          search: { issuesAndPullRequests: searchMock },
+          issues: {
+            getLabel: vi.fn().mockResolvedValue({ data: {} }),
+            create: createIssueMock,
+            update: vi.fn(),
+            addLabels: addLabelsMock,
+          },
+        },
+        graphql: vi.fn(),
+      };
+
+      // Triggering issue (109) is NOT in recentItems — total becomes 10 once merged
+      await detectAndHandleFailureCascade("owner", "repo", 109);
+
+      expect(createIssueMock).toHaveBeenCalledOnce();
+      // 9 from search + 1 triggering issue = 10 addLabels calls
+      expect(addLabelsMock).toHaveBeenCalledTimes(10);
+    });
+
+    it("updates existing rollup issue instead of creating a new one", async () => {
+      const createIssueMock = vi.fn();
+      const updateIssueMock = vi.fn().mockResolvedValue({});
+      const addLabelsMock = vi.fn().mockResolvedValue({});
+
+      const recentItems = makeFailureItems(10);
+
+      const searchMock = vi.fn(async ({ q }) => {
+        if (q.includes("cascade-rollup")) {
+          return {
+            data: {
+              total_count: 1,
+              items: [{ number: 50, html_url: "https://github.com/owner/repo/issues/50" }],
+            },
+          };
+        }
+        return { data: { total_count: recentItems.length, items: recentItems } };
+      });
+
+      global.github = {
+        rest: {
+          search: { issuesAndPullRequests: searchMock },
+          issues: {
+            getLabel: vi.fn().mockResolvedValue({ data: {} }),
+            create: createIssueMock,
+            update: updateIssueMock,
+            addLabels: addLabelsMock,
+          },
+        },
+        graphql: vi.fn(),
+      };
+
+      await detectAndHandleFailureCascade("owner", "repo", 100);
+
+      // Should update, not create
+      expect(createIssueMock).not.toHaveBeenCalled();
+      expect(updateIssueMock).toHaveBeenCalledOnce();
+      expect(updateIssueMock.mock.calls[0][0].issue_number).toBe(50);
+    });
+
+    it("creates cascade-suspected label when it does not exist (404)", async () => {
+      const createLabelMock = vi.fn().mockResolvedValue({});
+      const createIssueMock = vi.fn().mockResolvedValue({
+        data: { number: 202, html_url: "https://github.com/owner/repo/issues/202", node_id: "I_202" },
+      });
+      const addLabelsMock = vi.fn().mockResolvedValue({});
+
+      const recentItems = makeFailureItems(10);
+
+      const searchMock = vi.fn(async ({ q }) => {
+        if (q.includes("cascade-rollup")) return { data: { total_count: 0, items: [] } };
+        return { data: { total_count: recentItems.length, items: recentItems } };
+      });
+
+      const getLabelMock = vi.fn().mockRejectedValue(Object.assign(new Error("Not Found"), { status: 404 }));
+
+      global.github = {
+        rest: {
+          search: { issuesAndPullRequests: searchMock },
+          issues: {
+            getLabel: getLabelMock,
+            createLabel: createLabelMock,
+            create: createIssueMock,
+            update: vi.fn(),
+            addLabels: addLabelsMock,
+          },
+        },
+        graphql: vi.fn(),
+      };
+
+      await detectAndHandleFailureCascade("owner", "repo", 100);
+
+      // Both cascade-suspected and cascade-rollup labels should be created
+      expect(createLabelMock).toHaveBeenCalledTimes(2);
+      const createdNames = createLabelMock.mock.calls.map(c => c[0].name);
+      expect(createdNames).toContain(CASCADE_LABEL);
+      expect(createdNames).toContain(CASCADE_ROLLUP_LABEL);
+    });
+
+    it("rollup body includes affected workflow list", async () => {
+      let capturedBody = "";
+      const createIssueMock = vi.fn(async ({ body }) => {
+        capturedBody = body;
+        return { data: { number: 203, html_url: "https://github.com/owner/repo/issues/203", node_id: "I_203" } };
+      });
+
+      const recentItems = makeFailureItems(10);
+
+      const searchMock = vi.fn(async ({ q }) => {
+        if (q.includes("cascade-rollup")) return { data: { total_count: 0, items: [] } };
+        return { data: { total_count: recentItems.length, items: recentItems } };
+      });
+
+      global.github = {
+        rest: {
+          search: { issuesAndPullRequests: searchMock },
+          issues: {
+            getLabel: vi.fn().mockResolvedValue({ data: {} }),
+            create: createIssueMock,
+            update: vi.fn(),
+            addLabels: vi.fn().mockResolvedValue({}),
+          },
+        },
+        graphql: vi.fn(),
+      };
+
+      await detectAndHandleFailureCascade("owner", "repo", 100);
+
+      expect(capturedBody).toContain("⚠️ Failure Cascade Detected");
+      expect(capturedBody).toContain("cascade-suspected");
+      expect(capturedBody).toContain("#100");
+      expect(capturedBody).toContain("[aw] Workflow 0 failed");
+    });
+
+    it("filters out non-[aw] issues from findRecentFailureIssues", async () => {
+      const mixedItems = [
+        {
+          number: 1,
+          title: "[aw] My Workflow failed",
+          html_url: "https://github.com/owner/repo/issues/1",
+          created_at: new Date().toISOString(),
+        },
+        {
+          number: 2,
+          title: "Some other issue title",
+          html_url: "https://github.com/owner/repo/issues/2",
+          created_at: new Date().toISOString(),
+        },
+        {
+          number: 3,
+          title: "[aw] Another Workflow timed out",
+          html_url: "https://github.com/owner/repo/issues/3",
+          created_at: new Date().toISOString(),
+        },
+        {
+          number: 4,
+          title: "Workflow timed out",
+          html_url: "https://github.com/owner/repo/issues/4",
+          created_at: new Date().toISOString(),
+        },
+        {
+          number: 5,
+          title: "[aw] Budget Workflow exceeded daily AI credits budget",
+          html_url: "https://github.com/owner/repo/issues/5",
+          created_at: new Date().toISOString(),
+        },
+        {
+          number: 6,
+          title: "[aw] Rate Limit Workflow hit AI credits rate limit",
+          html_url: "https://github.com/owner/repo/issues/6",
+          created_at: new Date().toISOString(),
+        },
+      ];
+
+      const searchMock = vi.fn().mockResolvedValue({ data: { total_count: mixedItems.length, items: mixedItems } });
+
+      global.github = {
+        rest: {
+          search: { issuesAndPullRequests: searchMock },
+          issues: { getLabel: vi.fn(), addLabels: vi.fn() },
+        },
+        graphql: vi.fn(),
+      };
+
+      const result = await findRecentFailureIssues("owner", "repo");
+      expect(result).toHaveLength(4);
+      expect(result.map(i => i.number)).toEqual([1, 3, 5, 6]);
+      expect(result.map(i => i.number)).not.toContain(2);
+      expect(result.map(i => i.number)).not.toContain(4);
+      const query = searchMock.mock.calls[0][0].q;
+      expect(query).toContain('"[aw]" in:title');
+      expect(query).not.toContain('"failed" in:title');
+    });
+
+    it("is non-fatal: handles search API errors gracefully", async () => {
+      global.github = {
+        rest: {
+          search: {
+            issuesAndPullRequests: vi.fn().mockRejectedValue(new Error("API rate limit exceeded")),
+          },
+          issues: {
+            getLabel: vi.fn(),
+            create: vi.fn(),
+            addLabels: vi.fn(),
+          },
+        },
+        graphql: vi.fn(),
+      };
+
+      // Should not throw
+      await expect(detectAndHandleFailureCascade("owner", "repo", 999)).resolves.toBeUndefined();
+    });
+  });
+
+  describe("failure categories generation", () => {
+    let buildFailureMatchCategories;
+
+    beforeEach(() => {
+      vi.resetModules();
+      ({ buildFailureMatchCategories } = require("./handle_agent_failure.cjs"));
+    });
+
+    it("returns expected categories for agent failure", () => {
+      const categories = buildFailureMatchCategories({
+        agentConclusion: "failure",
+        isTimedOut: false,
+      });
+      expect(categories).toContain("agent_failure");
+      expect(categories.length).toBeGreaterThan(0);
+    });
+
+    it("returns timed_out category", () => {
+      const categories = buildFailureMatchCategories({
+        isTimedOut: true,
+      });
+      expect(categories).toContain("timed_out");
+    });
+
+    it("returns missing_safe_outputs category", () => {
+      const categories = buildFailureMatchCategories({
+        hasMissingSafeOutputs: true,
+      });
+      expect(categories).toContain("missing_safe_outputs");
+    });
+
+    it("returns report_incomplete category", () => {
+      const categories = buildFailureMatchCategories({
+        hasReportIncomplete: true,
+      });
+      expect(categories).toContain("report_incomplete");
+    });
+
+    it("returns sorted categories", () => {
+      const categories = buildFailureMatchCategories({
+        hasMissingSafeOutputs: true,
+        isTimedOut: true,
+        hasReportIncomplete: true,
+      });
+      // Should be sorted alphabetically
+      for (let i = 1; i < categories.length; i++) {
+        expect(categories[i] >= categories[i - 1]).toBe(true);
+      }
+    });
+
+    it("returns awf_firewall_startup_failed category when isAWFFirewallStartupFailed is true", () => {
+      const categories = buildFailureMatchCategories({
+        agentConclusion: "failure",
+        isTimedOut: false,
+        isAWFFirewallStartupFailed: true,
+      });
+      expect(categories).toContain("awf_firewall_startup_failed");
+      expect(categories).toContain("agent_failure");
+    });
+
+    it("does not return awf_firewall_startup_failed category when isAWFFirewallStartupFailed is false", () => {
+      const categories = buildFailureMatchCategories({
+        agentConclusion: "failure",
+        isTimedOut: false,
+        isAWFFirewallStartupFailed: false,
+      });
+      expect(categories).not.toContain("awf_firewall_startup_failed");
+    });
+  });
+
+  describe("failure categories filter behavior", () => {
+    const fs = require("fs");
+    const path = require("path");
+    const os = require("os");
+
+    /** @type {string} */
+    let tmpDir;
+    /** @type {string} */
+    let promptsDir;
+
+    const setupGithubMock = () => {
+      const createIssueMock = vi.fn(async () => ({
+        data: { number: 101, html_url: "https://github.com/owner/repo/issues/101", node_id: "I_101" },
+      }));
+
+      global.github = {
+        rest: {
+          search: {
+            issuesAndPullRequests: vi.fn(async ({ q }) => {
+              if (q.includes("is:pr")) {
+                return { data: { total_count: 0, items: [] } };
+              }
+              return { data: { total_count: 0, items: [] } };
+            }),
+          },
+          issues: {
+            create: createIssueMock,
+            createComment: vi.fn(),
+            getLabel: vi.fn(),
+            addLabels: vi.fn(),
+          },
+          pulls: { get: vi.fn() },
+        },
+        graphql: vi.fn(),
+      };
+
+      return { createIssueMock };
+    };
+
+    beforeEach(() => {
+      tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "aw-failure-filter-"));
+      promptsDir = path.join(tmpDir, "gh-aw", "prompts");
+      fs.mkdirSync(promptsDir, { recursive: true });
+      fs.writeFileSync(path.join(promptsDir, "agent_failure_comment.md"), "COMMENT TEMPLATE CONTENT");
+      fs.writeFileSync(path.join(promptsDir, "agent_failure_issue.md"), "ISSUE TEMPLATE CONTENT");
+      fs.writeFileSync(path.join(promptsDir, "daily_cap_rollup_issue.md"), "Daily cap rollup issue body cap={cap} window={window_hours}");
+      fs.writeFileSync(path.join(promptsDir, "daily_cap_rollup_comment.md"), "Failure suppressed workflow={workflow_name} run={run_url} categories={summary} cap={cap} window={window_hours}h");
+      fs.writeFileSync(path.join(promptsDir, "optimize_token_consumption_context.md"), "OPTIMIZE CONTEXT guardrail={guardrail_name} run={run_url}");
+
+      process.env.RUNNER_TEMP = tmpDir;
+      process.env.GH_AW_WORKFLOW_NAME = "Test Workflow";
+      process.env.GH_AW_WORKFLOW_ID = "test-workflow";
+      process.env.GH_AW_RUN_URL = "https://github.com/owner/repo/actions/runs/123456";
+      process.env.GH_AW_AGENT_CONCLUSION = "failure";
+      process.env.GITHUB_HEAD_REF = "feature/test";
+      process.env.GITHUB_WORKSPACE = tmpDir;
+    });
+
+    afterEach(() => {
+      delete process.env.RUNNER_TEMP;
+      delete process.env.GH_AW_WORKFLOW_NAME;
+      delete process.env.GH_AW_WORKFLOW_ID;
+      delete process.env.GH_AW_RUN_URL;
+      delete process.env.GH_AW_AGENT_CONCLUSION;
+      delete process.env.GITHUB_HEAD_REF;
+      delete process.env.GITHUB_WORKSPACE;
+      delete process.env.GH_AW_FAILURE_CATEGORIES_FILTER;
+      delete process.env.GH_AW_FAILURE_EXCLUDED_CATEGORIES_FILTER;
+
+      if (tmpDir && fs.existsSync(tmpDir)) {
+        fs.rmSync(tmpDir, { recursive: true, force: true });
+      }
+    });
+
+    it.each([
+      {
+        name: "include-only filter creates issue when category matches",
+        includeFilter: ["agent_failure"],
+        excludeFilter: null,
+        shouldCreateIssue: true,
+      },
+      {
+        name: "include-only filter skips issue when category does not match",
+        includeFilter: ["missing_safe_outputs"],
+        excludeFilter: null,
+        shouldCreateIssue: false,
+      },
+      {
+        name: "exclude-only filter skips issue when category is excluded",
+        includeFilter: null,
+        excludeFilter: ["agent_failure"],
+        shouldCreateIssue: false,
+      },
+      {
+        name: "mixed include+exclude filter skips issue when excluded category is present",
+        includeFilter: ["agent_failure"],
+        excludeFilter: ["agent_failure"],
+        shouldCreateIssue: false,
+      },
+    ])("$name", async ({ includeFilter, excludeFilter, shouldCreateIssue }) => {
+      const { createIssueMock } = setupGithubMock();
+      if (includeFilter) {
+        process.env.GH_AW_FAILURE_CATEGORIES_FILTER = JSON.stringify(includeFilter);
+      }
+      if (excludeFilter) {
+        process.env.GH_AW_FAILURE_EXCLUDED_CATEGORIES_FILTER = JSON.stringify(excludeFilter);
+      }
+
+      await main();
+
+      if (shouldCreateIssue) {
+        expect(createIssueMock).toHaveBeenCalledOnce();
+      } else {
+        expect(createIssueMock).not.toHaveBeenCalled();
+      }
     });
   });
 });

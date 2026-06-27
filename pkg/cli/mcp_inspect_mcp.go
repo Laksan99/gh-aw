@@ -11,10 +11,13 @@ import (
 	"strings"
 	"time"
 
+	"github.com/modelcontextprotocol/go-sdk/mcp"
+
 	"github.com/github/gh-aw/pkg/console"
 	"github.com/github/gh-aw/pkg/logger"
 	"github.com/github/gh-aw/pkg/parser"
-	"github.com/modelcontextprotocol/go-sdk/mcp"
+	"github.com/github/gh-aw/pkg/setutil"
+	"github.com/github/gh-aw/pkg/stringutil"
 )
 
 var mcpInspectServerLog = logger.New("cli:mcp_inspect_server")
@@ -147,12 +150,12 @@ func connectStdioMCPServer(ctx context.Context, config parser.RegistryMCPServerC
 	if config.Container != "" {
 		// Docker container mode
 		args := append([]string{"run", "--rm", "-i"}, config.Args...)
-		cmd = exec.Command("docker", args...)
+		cmd = exec.CommandContext(ctx, "docker", args...)
 	} else {
 		// Direct command mode
 		// #nosec G204 -- config.Command is validated via exec.LookPath above (line 138);
 		// exec.Command with separate args (not shell execution) prevents shell injection.
-		cmd = exec.Command(config.Command, config.Args...)
+		cmd = exec.CommandContext(ctx, config.Command, config.Args...)
 	}
 
 	// Set environment variables
@@ -194,6 +197,7 @@ func connectStdioMCPServer(ctx context.Context, config parser.RegistryMCPServerC
 
 	// List tools
 	listToolsCtx, cancel := context.WithTimeout(ctx, MCPOperationTimeout)
+	defer cancel()
 	toolsResult, err := session.ListTools(listToolsCtx, &mcp.ListToolsParams{})
 	cancel()
 	if err != nil {
@@ -206,6 +210,7 @@ func connectStdioMCPServer(ctx context.Context, config parser.RegistryMCPServerC
 
 	// List resources
 	listResourcesCtx, cancel := context.WithTimeout(ctx, MCPOperationTimeout)
+	defer cancel()
 	resourcesResult, err := session.ListResources(listResourcesCtx, &mcp.ListResourcesParams{})
 	cancel()
 	if err != nil {
@@ -283,6 +288,7 @@ func connectHTTPMCPServer(ctx context.Context, config parser.RegistryMCPServerCo
 
 	// List tools
 	listToolsCtx, cancel := context.WithTimeout(ctx, MCPOperationTimeout)
+	defer cancel()
 	toolsResult, err := session.ListTools(listToolsCtx, &mcp.ListToolsParams{})
 	cancel()
 	if err != nil {
@@ -295,6 +301,7 @@ func connectHTTPMCPServer(ctx context.Context, config parser.RegistryMCPServerCo
 
 	// List resources
 	listResourcesCtx, cancel := context.WithTimeout(ctx, MCPOperationTimeout)
+	defer cancel()
 	resourcesResult, err := session.ListResources(listResourcesCtx, &mcp.ListResourcesParams{})
 	cancel()
 	if err != nil {
@@ -382,10 +389,7 @@ func displayServerCapabilities(info *parser.MCPServerInfo, toolFilter string) {
 		rows := make([][]string, 0, len(info.Resources))
 
 		for _, resource := range info.Resources {
-			description := resource.Description
-			if len(description) > 40 {
-				description = description[:37] + "..."
-			}
+			description := stringutil.Truncate(resource.Description, 40)
 
 			mimeType := resource.MIMEType
 			if mimeType == "" {
@@ -536,15 +540,17 @@ func displayDetailedToolInfo(info *parser.MCPServerInfo, toolName string) {
 // displayToolAllowanceHint shows helpful information about how to allow tools in workflow frontmatter
 func displayToolAllowanceHint(info *parser.MCPServerInfo) {
 	// Create a map for quick lookup of allowed tools
-	allowedMap := make(map[string]bool)
+	allowedMap := make(map[string]struct {
+	})
 	for _, allowed := range info.Config.Allowed {
-		allowedMap[allowed] = true
+		allowedMap[allowed] = struct {
+		}{}
 	}
 
 	// Count blocked tools and collect their names
 	var blockedTools []string
 	for _, tool := range info.Tools {
-		if len(info.Config.Allowed) > 0 && !allowedMap[tool.Name] {
+		if len(info.Config.Allowed) > 0 && !setutil.Contains(allowedMap, tool.Name) {
 			blockedTools = append(blockedTools, tool.Name)
 		}
 	}

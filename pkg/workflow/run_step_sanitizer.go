@@ -47,11 +47,13 @@ package workflow
 import (
 	"fmt"
 	"maps"
-	"sort"
+	"slices"
 	"strings"
 
-	"github.com/github/gh-aw/pkg/logger"
 	"github.com/goccy/go-yaml"
+
+	"github.com/github/gh-aw/pkg/logger"
+	"github.com/github/gh-aw/pkg/setutil"
 )
 
 var runStepSanitizerLog = logger.New("workflow:run_step_sanitizer")
@@ -86,10 +88,10 @@ func sanitizeRunStepExpressions(step map[string]any) (map[string]any, []string, 
 		return step, nil, false
 	}
 
-	// Only scan the non-heredoc portion of the run script so that expressions
-	// inside heredoc blocks (which are written to files rather than executed)
-	// are not extracted.
-	scanContent := removeHeredocContent(runVal)
+	// Only scan executable script content:
+	//   - strip heredoc bodies (written to files/stdin, not executed)
+	//   - strip bash line comments (not executed)
+	scanContent := stripShellLineComments(removeHeredocContent(runVal))
 	if !hasExpressionMarker(scanContent) {
 		return step, nil, false
 	}
@@ -102,15 +104,17 @@ func sanitizeRunStepExpressions(step map[string]any) (map[string]any, []string, 
 
 	// Build a deduplicated, ordered list of expressions to extract.
 	extractor := NewExpressionExtractor()
-	seen := make(map[string]bool)
+	seen := make(map[string]struct {
+	})
 	var ordered []sanitizedExpression
 
 	for _, match := range matches {
 		original := match[0]
-		if seen[original] {
+		if setutil.Contains(seen, original) {
 			continue
 		}
-		seen[original] = true
+		seen[original] = struct {
+		}{}
 		content := strings.TrimSpace(match[1])
 		envVar := extractor.generateEnvVarName(content)
 		ordered = append(ordered, sanitizedExpression{
@@ -126,8 +130,15 @@ func sanitizeRunStepExpressions(step map[string]any) (map[string]any, []string, 
 
 	// Sort longest expressions first to avoid partial replacements when one
 	// expression is a substring of another.
-	sort.Slice(ordered, func(i, j int) bool {
-		return len(ordered[i].Original) > len(ordered[j].Original)
+	slices.SortFunc(ordered, func(a, b sanitizedExpression) int {
+		switch {
+		case len(a.Original) > len(b.Original):
+			return -1
+		case len(a.Original) < len(b.Original):
+			return 1
+		default:
+			return 0
+		}
 	})
 
 	// Merge extracted env vars into a copy of the existing env: map.
@@ -136,7 +147,7 @@ func sanitizeRunStepExpressions(step map[string]any) (map[string]any, []string, 
 	//   - If it exists with a different value → pick an alternate name by appending
 	//     a numeric suffix (_2, _3, …) so the original user-defined value is preserved.
 	existingEnv, _ := step["env"].(map[string]any)
-	newEnv := make(map[string]any, len(existingEnv)+len(ordered))
+	newEnv := make(map[string]any, safeAllocationCapacity(len(existingEnv), len(ordered)))
 	maps.Copy(newEnv, existingEnv)
 
 	for i := range ordered {
@@ -187,7 +198,7 @@ func sanitizeRunStepExpressions(step map[string]any) (map[string]any, []string, 
 	}
 
 	// Build the sanitized step as a shallow copy.
-	sanitized := make(map[string]any, len(step)+1)
+	sanitized := make(map[string]any, len(step))
 	maps.Copy(sanitized, step)
 	sanitized["run"] = newRun
 	sanitized["env"] = newEnv

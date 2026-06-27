@@ -1,21 +1,28 @@
 ---
+private: true
+emoji: "🏗️"
 description: Enforces Architecture Decision Records (ADRs) before implementation work can merge, detecting missing design decisions and generating draft ADRs using AI analysis
 on:
   pull_request:
     types: [labeled, ready_for_review]
     names: ["implementation"]
+  slash_command:
+    strategy: centralized
+    name: review
+    events: [pull_request_comment, pull_request_review_comment]
   workflow_dispatch:
     inputs:
       pr_number:
         description: "Pull request number to check"
-        required: true
+        required: false
 permissions:
   contents: read
   pull-requests: read
   issues: read
+max-turns: 20
 engine:
   id: claude
-  max-turns: 20
+  model: claude-sonnet-4-6
 safe-outputs:
   add-comment:
     max: 2
@@ -28,18 +35,20 @@ safe-outputs:
     commit-title-suffix: " [design-decision-gate]"
   noop:
   messages:
-    footer: "> 🏗️ *ADR gate enforced by [{workflow_name}]({run_url})*{effective_tokens_suffix}{history_link}"
+    footer: "> 🏗️ *ADR gate enforced by [{workflow_name}]({run_url})*{ai_credits_suffix}{history_link}"
     run-started: "🔍 [{workflow_name}]({run_url}) is checking for design decision records on this {event_type}..."
     run-success: "✅ [{workflow_name}]({run_url}) completed the design decision gate check."
     run-failure: "❌ [{workflow_name}]({run_url}) {status} during design decision gate check."
 timeout-minutes: 15
 sandbox:
+  agent:
+    sudo: false
   mcp:
     keepalive-interval: 60
 imports:
   - ../agents/adr-writer.agent.md
   - shared/reporting.md
-  - shared/observability-otlp.md
+  - shared/otlp.md
 tools:
   cli-proxy: true
   github:
@@ -62,25 +71,41 @@ steps:
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       PR_NUMBER: ${{ github.event.pull_request.number || github.event.inputs.pr_number }}
+      EXPR_GITHUB_EVENT_NAME: ${{ github.event_name }}
+      EXPR_GITHUB_REPOSITORY: ${{ github.repository }}
+      EXPR_GITHUB_WORKSPACE: ${{ github.workspace }}
     run: |
       set -euo pipefail
+
+      if [ "$EXPR_GITHUB_EVENT_NAME" = "workflow_dispatch" ] && [ -z "${PR_NUMBER:-}" ]; then
+        echo "::error::workflow_dispatch requires inputs.pr_number"
+        exit 1
+      fi
 
       mkdir -p /tmp/gh-aw/agent
 
       gh pr view "$PR_NUMBER" \
-        --repo "${{ github.repository }}" \
+        --repo "$EXPR_GITHUB_REPOSITORY" \
         --json number,title,body,labels,baseRefName,headRefName,author,url \
         > /tmp/gh-aw/agent/pr.json
 
-      gh pr diff "$PR_NUMBER" \
-        --repo "${{ github.repository }}" \
-        > /tmp/gh-aw/agent/pr.diff
-
-      gh api --paginate "repos/${{ github.repository }}/pulls/$PR_NUMBER/files?per_page=100" \
+      gh api --paginate "repos/$EXPR_GITHUB_REPOSITORY/pulls/$PR_NUMBER/files?per_page=100" \
         --jq '.[]' | jq -s '.' > /tmp/gh-aw/agent/pr-files.json
 
-      if [ -f "${{ github.workspace }}/.design-gate.yml" ]; then
-        cp "${{ github.workspace }}/.design-gate.yml" /tmp/gh-aw/agent/design-gate-config.yml
+      FILE_COUNT=$(jq 'length' /tmp/gh-aw/agent/pr-files.json)
+
+      if [ "$FILE_COUNT" -gt 300 ]; then
+        echo "::warning::PR has $FILE_COUNT changed files (exceeds the 300-file GitHub diff API limit). Skipping full diff; file listing is available in pr-files.json."
+        printf '# Diff unavailable: PR has %s changed files (exceeds the 300-file GitHub diff API limit).\n# Use pr-files.json for the full file listing instead.\n' "$FILE_COUNT" \
+          > /tmp/gh-aw/agent/pr.diff
+      else
+        gh pr diff "$PR_NUMBER" \
+          --repo "$EXPR_GITHUB_REPOSITORY" \
+          > /tmp/gh-aw/agent/pr.diff
+      fi
+
+      if [ -f "$EXPR_GITHUB_WORKSPACE/.design-gate.yml" ]; then
+        cp "$EXPR_GITHUB_WORKSPACE/.design-gate.yml" /tmp/gh-aw/agent/design-gate-config.yml
         HAS_CUSTOM_CONFIG=true
       else
         echo "No .design-gate.yml found — using defaults" > /tmp/gh-aw/agent/design-gate-config.yml
@@ -96,13 +121,17 @@ steps:
         --argjson has_custom_config "$HAS_CUSTOM_CONFIG" \
         --arg pr_number "$PR_NUMBER" \
         --arg threshold "100" \
+        --argjson file_count "$FILE_COUNT" \
+        --argjson diff_available "$(jq -n --argjson fc "$FILE_COUNT" 'if $fc <= 300 then true else false end')" \
         '{
           pr_number: ($pr_number | tonumber),
           threshold: ($threshold | tonumber),
           has_custom_config: $has_custom_config,
           has_implementation_label: $has_implementation_label,
           default_business_additions: $default_business_additions,
-          requires_adr_by_default_volume: ($default_business_additions > ($threshold | tonumber))
+          requires_adr_by_default_volume: ($default_business_additions > ($threshold | tonumber)),
+          file_count: $file_count,
+          diff_available: $diff_available
         }' > /tmp/gh-aw/agent/adr-prefetch-summary.json
 
 ---
@@ -155,7 +184,7 @@ Stop and emit a safe output **immediately** when any of the following is true:
 2. If a pre-fetched file is missing or returns a permission error, fall back to the equivalent GitHub MCP tool immediately (do not retry the file read):
    - Missing `pr.json` → `mcp__github__get_pull_request`
    - Missing `pr-files.json` → `mcp__github__get_pull_request_files`
-   - Missing `pr.diff` → `mcp__github__get_pull_request_diff`
+   - Missing `pr.diff` → `mcp__github__get_pull_request_diff` (only if `diff_available` is `true` in the summary; if `false`, the diff exceeds the 300-file API limit — use `pr-files.json` instead and do **not** call the diff API)
    - Missing `adr-prefetch-summary.json` → compute manually from PR files and labels
 3. Do **not** perform broad exploration. Only fetch extra data if a required field is missing from pre-fetched files.
 4. Call exactly one final safe output action (`add-comment`, `push-to-pull-request-branch`, or `noop`) and then stop.
@@ -208,7 +237,7 @@ Use pre-fetched files first:
 Read:
 - `/tmp/gh-aw/agent/pr.json`
 - `/tmp/gh-aw/agent/pr-files.json`
-- `/tmp/gh-aw/agent/pr.diff`
+- `/tmp/gh-aw/agent/pr.diff` (if `diff_available` is `false` in the summary, this file contains only a notice — use `pr-files.json` for file-level analysis instead)
 
 Only if one of these files is missing required fields, make a targeted GitHub tool call for the missing field only.
 
@@ -233,7 +262,10 @@ cat "$(find ${{ github.workspace }}/docs/adr -name "*.md" 2>/dev/null | sort | t
 ```
 
 ### 3c. Check Linked Issues
-If the PR body references issues (e.g., "Fixes #123", "Closes #456"), use the GitHub tools to fetch the linked issue body and look for ADR content there.
+Before making any GitHub issue call, check whether the PR body matches `(?i)\b(fix|fixes|fixed|close|closes|closed|resolve|resolves|resolved)\s+(?:#\d+\b|https://github\.com/[^/\s]+/[^/\s]+/issues/\d+\b)`.
+
+- If there is **no** match, skip linked-issue lookup and continue.
+- If there **is** a match, use at most one GitHub tool call to fetch the linked issue body and look for ADR content there.
 
 ### ADR Detection Criteria
 
@@ -266,49 +298,11 @@ Use this scoped question template before writing the ADR. Answer each item in 1�
 3. **Alternatives**: What are the top 2 realistic alternatives visible from this diff?
 4. **Consequences**: What are 2 positive and 2 negative consequences of the chosen decision?
 
-If any answer cannot be justified from `pr.json` + `pr-files.json` + `pr.diff`, state "Not inferable from current PR evidence" instead of speculating.
+If any answer cannot be justified from `pr.json` + `pr-files.json` + `pr.diff` (or `pr-files.json` alone when `diff_available` is `false`), state "Not inferable from current PR evidence" instead of speculating.
 
 If Question 1 (Decision) is not inferable from current PR evidence, call `missing_data` with a concise explanation of what is missing, then stop.
 
-Generate a draft ADR file following the **Michael Nygard template**:
-
-```markdown
-# ADR-{NNNN}: {Concise Decision Title}
-
-**Date**: {YYYY-MM-DD}
-**Status**: Draft
-
-## Context
-
-{Describe the situation and problem that motivated this decision. What forces are at play? What constraints exist? What is the background that someone reading this in the future would need to understand?}
-
-## Decision
-
-{State the decision clearly. Use active voice: "We will..." or "We decided to...". Explain the rationale.}
-
-## Alternatives Considered
-
-### Alternative 1: {Name}
-{Description and why it was not chosen}
-
-### Alternative 2: {Name}
-{Description and why it was not chosen}
-
-## Consequences
-
-### Positive
-- {List positive outcomes}
-
-### Negative
-- {List trade-offs, technical debt, or costs}
-
-### Neutral
-- {Other effects worth noting}
-
----
-
-*This is a DRAFT ADR generated by the [Design Decision Gate]({run_url}) workflow. The PR author must review, complete, and finalize this document before the PR can merge.*
-```
+Generate a draft ADR file using the imported `adr-writer` template. Fill the Michael Nygard sections (`Context`, `Decision`, `Alternatives Considered`, `Consequences`) with evidence grounded in the PR.
 
 ### Commit the Draft ADR to the PR Branch
 
@@ -328,11 +322,12 @@ Post a comment using `add-comment` explaining the requirement:
 
 This PR {has been labeled `implementation` / makes significant changes to core business logic (>100 new lines)} but does not have a linked Architecture Decision Record (ADR).
 
-**AI has analyzed the PR diff and generated a draft ADR** to help you get started:
+📄 **Draft ADR committed**: `docs/adr/{NNNN}-{title}.md` — review and complete it before merging.
 
-📄 **Draft ADR**: `docs/adr/{NNNN}-{title}.md`
+> 🔒 *This PR cannot merge until an ADR is linked in the PR body.*
 
-### What to do next
+<details>
+<summary>📋 What to do next</summary>
 
 1. **Review the draft ADR** committed to your branch — it was generated from the PR diff
 2. **Complete the missing sections** — add context the AI couldn't infer, refine the decision rationale, and list real alternatives you considered
@@ -342,13 +337,16 @@ This PR {has been labeled `implementation` / makes significant changes to core b
 
 Once an ADR is linked in the PR body, this gate will re-run and verify the implementation matches the decision.
 
-### Why ADRs Matter
+</details>
+
+<details>
+<summary>❓ Why ADRs Matter</summary>
 
 > *"AI made me procrastinate on key design decisions. Because refactoring was cheap, I could always say 'I'll deal with this later.' Deferring decisions corroded my ability to think clearly."*
 
 ADRs create a searchable, permanent record of **why** the codebase looks the way it does. Future contributors (and your future self) will thank you.
 
----
+</details>
 
 <details>
 <summary>📋 Michael Nygard ADR Format Reference</summary>
@@ -363,13 +361,13 @@ An ADR must contain these four sections to be considered complete:
 All ADRs are stored in `docs/adr/` as Markdown files numbered by PR number (e.g., `0042-use-postgresql.md` for PR #42).
 
 </details>
-
-> 🔒 *This PR cannot merge until an ADR is linked in the PR body.*
 ```
 
 ### Report Formatting
 
-- **Report Formatting**: Use h3 (###) or lower for all headers in your report to maintain proper document hierarchy. Wrap long sections in `<details><summary>Section Name</summary>` tags to improve readability and reduce scrolling.
+- Use h3 (###) or lower for all headers in your report to maintain proper document hierarchy.
+- Apply **progressive disclosure**: keep the immediately visible text as brief as possible; wrap all verbose sections (next steps, background, reference material) in `<details><summary>…</summary>` tags.
+- Required structure for blocking comments: headline + one-line status (always visible) → "What to do next" (in `<details>`) → "Why ADRs Matter" (in `<details>`) → ADR format reference (in `<details>`) → blocking notice (always visible)
 
 ## Step 4b: If ADR Found — Verify Implementation Matches
 
@@ -399,14 +397,14 @@ Post an approving comment:
 ```markdown
 ### ✅ Design Decision Gate — ADR Verified
 
-The implementation in this PR aligns with the stated Architecture Decision Record.
+**ADR reviewed**: {ADR title and link} — implementation aligns with the stated decision. Great work! 🏗️
 
-**ADR reviewed**: {ADR title and link}
+<details>
+<summary>📋 Verification Summary</summary>
 
-### Verification Summary
 {Brief summary of how the code matches the ADR decision}
 
-The design decision has been recorded and the implementation follows it. Great work! 🏗️
+</details>
 ```
 
 **If there are DIVERGENCES**:
@@ -415,21 +413,27 @@ Post a comment describing the discrepancies:
 ```markdown
 ### ⚠️ Design Decision Gate — Implementation Diverges from ADR
 
-The implementation in this PR has divergences from the linked Architecture Decision Record.
+**ADR reviewed**: {ADR title and link} — {N} divergence(s) found.
 
-**ADR reviewed**: {ADR title and link}
+> Either update the code to align with the ADR, or update the ADR to reflect the revised decision.
 
-### Divergences Found
+<details>
+<summary>🔍 Divergences Found ({N} items)</summary>
 
 {List each divergence with specific file paths and explanation}
 
-### What to do next
+</details>
+
+<details>
+<summary>📋 What to do next</summary>
 
 Either:
 1. **Update the code** to align with the ADR decision, OR
 2. **Update the ADR** to reflect the revised decision (and document why the approach changed)
 
 The ADR and implementation must be in sync before this PR can merge.
+
+</details>
 ```
 
 ## Important: Always Call a Safe Output
@@ -439,25 +443,3 @@ The ADR and implementation must be in sync before this PR can merge.
 ```json
 {"noop": {"message": "No action needed: [brief explanation of what was found and why no action was required]"}}
 ```
-
-## ADR Quality Standards
-
-When generating or reviewing ADRs, apply these quality standards based on the Michael Nygard template:
-
-- **Immutable once accepted**: ADRs are records of decisions made. Superseded ADRs should be marked "Superseded by ADR-XXXX" rather than deleted.
-- **Concise context**: 3–5 sentences explaining the situation. Avoid excessive background.
-- **Decisive decision**: Use active voice. Say "We will use X because Y" not "X might be used."
-- **Real alternatives**: List at least 2 genuine alternatives that were considered, not strawmen.
-- **Balanced consequences**: Include both positive outcomes and genuine trade-offs.
-- **Numbered by PR**: Filename format: `NNNN-kebab-case-title.md` where `NNNN` is the zero-padded pull request number. This avoids collisions when multiple PRs generate ADRs concurrently. Always include the date.
-
-## Examples of ADR-Worthy Decisions
-
-The following types of changes typically warrant an ADR:
-- Choosing a new database, messaging system, or external service
-- Adopting a new framework or architectural pattern
-- Changing authentication or authorization approach
-- Introducing a new API design convention
-- Major refactoring that changes structural boundaries
-- Adding significant new infrastructure or deployment approach
-- Choosing between competing implementation strategies for a core feature

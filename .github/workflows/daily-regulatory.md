@@ -1,4 +1,6 @@
 ---
+private: true
+emoji: "⚖️"
 description: Daily regulatory workflow that monitors and cross-checks other daily report agents' outputs for data consistency and anomalies
 on:
   schedule: daily
@@ -11,6 +13,7 @@ permissions:
   discussions: read
 strict: true
 tracker-id: daily-regulatory
+max-ai-credits: 1000
 tools:
   cli-proxy: true
   github:
@@ -18,6 +21,9 @@ tools:
   bash:
     - "*"
   edit:
+safe-outputs:
+  close-discussion:
+    required-title-prefix: "[daily regulatory] "
 timeout-minutes: 30
 imports:
   - uses: shared/daily-audit-base.md
@@ -26,7 +32,7 @@ imports:
   - shared/github-queries-mcp-script.md
 
 
-  - shared/observability-otlp.md
+  - shared/otlp.md
 ---
 {{#runtime-import? .github/shared-instructions.md}}
 
@@ -189,9 +195,9 @@ Example parsing approach (for each discussion in your data):
 # For each discussion body extracted from the query results, parse metrics
 
 # Extract numeric patterns from discussion body content
-grep -oE '[0-9,]+\s+(issues|PRs|tokens|runs)' /tmp/report.md
-grep -oE '\$[0-9]+\.[0-9]+' /tmp/report.md  # Cost values
-grep -oE '[0-9]+%' /tmp/report.md  # Percentages
+grep -oE '[0-9,]+\s+(issues|PRs|tokens|runs)' /tmp/gh-aw/agent/report.md
+grep -oE '\$[0-9]+\.[0-9]+' /tmp/gh-aw/agent/report.md  # Cost values
+grep -oE '[0-9]+%' /tmp/gh-aw/agent/report.md  # Percentages
 ```
 
 ## Phase 3: Cross-Check Data Consistency

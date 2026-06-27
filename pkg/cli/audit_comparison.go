@@ -8,10 +8,11 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
-	"sort"
 	"strings"
 
+	"github.com/github/gh-aw/pkg/constants"
 	"github.com/github/gh-aw/pkg/logger"
+	"github.com/github/gh-aw/pkg/sliceutil"
 	"github.com/github/gh-aw/pkg/workflow"
 )
 
@@ -102,18 +103,22 @@ func buildAuditComparisonSnapshot(processedRun ProcessedRun, createdItems []Crea
 }
 
 func loadAuditComparisonSnapshotFromArtifacts(run WorkflowRun, logsPath string, verbose bool) (auditComparisonSnapshot, error) {
+	auditComparisonLog.Printf("Loading baseline snapshot from artifacts: run_id=%d, logs_path=%s", run.DatabaseID, logsPath)
 	metrics, err := extractLogMetrics(logsPath, verbose, run.WorkflowPath)
 	if err != nil {
+		auditComparisonLog.Printf("Baseline metrics extraction failed for run %d: %v", run.DatabaseID, err)
 		return auditComparisonSnapshot{}, fmt.Errorf("failed to extract baseline metrics: %w", err)
 	}
 
 	firewallAnalysis, err := analyzeFirewallLogs(logsPath, verbose)
 	if err != nil {
+		auditComparisonLog.Printf("Baseline firewall analysis failed for run %d: %v", run.DatabaseID, err)
 		return auditComparisonSnapshot{}, fmt.Errorf("failed to analyze baseline firewall logs: %w", err)
 	}
 
 	mcpFailures, err := extractMCPFailuresFromRun(logsPath, run, verbose)
 	if err != nil {
+		auditComparisonLog.Printf("Baseline MCP failure extraction failed for run %d: %v", run.DatabaseID, err)
 		return auditComparisonSnapshot{}, fmt.Errorf("failed to extract baseline MCP failures: %w", err)
 	}
 
@@ -177,7 +182,6 @@ func loadAuditComparisonCandidate(run WorkflowRun, logsPath string, verbose bool
 	metrics, metricsErr := extractLogMetrics(logsPath, verbose, run.WorkflowPath)
 	if metricsErr == nil {
 		processedRun.Run.TokenUsage = metrics.TokenUsage
-		processedRun.Run.EstimatedCost = metrics.EstimatedCost
 		processedRun.Run.Turns = metrics.Turns
 	}
 	if firewallAnalysis, firewallErr := analyzeFirewallLogs(logsPath, verbose); firewallErr == nil {
@@ -246,11 +250,13 @@ func scoreAuditComparisonCandidate(current ProcessedRun, candidate *auditCompari
 	if slices.Contains(matchedOn, "task_domain") || slices.Contains(matchedOn, "execution_style") || slices.Contains(matchedOn, "resource_profile") || slices.Contains(matchedOn, "actuation_style") {
 		candidate.Selection = "cohort_match"
 		candidate.MatchedOn = matchedOn
+		auditComparisonLog.Printf("Candidate %d classified as cohort_match: score=%d, matched=%v", candidate.Run.DatabaseID, score, matchedOn)
 		return
 	}
 
 	candidate.Selection = "latest_success"
 	candidate.MatchedOn = nil
+	auditComparisonLog.Printf("Candidate %d classified as latest_success: score=%d", candidate.Run.DatabaseID, score)
 }
 
 func selectAuditComparisonBaseline(current ProcessedRun, candidates []auditComparisonCandidate) *auditComparisonCandidate {
@@ -263,11 +269,21 @@ func selectAuditComparisonBaseline(current ProcessedRun, candidates []auditCompa
 		scoreAuditComparisonCandidate(current, &candidates[index])
 	}
 
-	sort.SliceStable(candidates, func(left, right int) bool {
-		if candidates[left].Score != candidates[right].Score {
-			return candidates[left].Score > candidates[right].Score
+	slices.SortStableFunc(candidates, func(left, right auditComparisonCandidate) int {
+		if left.Score != right.Score {
+			if left.Score > right.Score {
+				return -1
+			}
+			return 1
 		}
-		return candidates[left].Run.CreatedAt.After(candidates[right].Run.CreatedAt)
+		switch {
+		case left.Run.CreatedAt.After(right.Run.CreatedAt):
+			return -1
+		case right.Run.CreatedAt.After(left.Run.CreatedAt):
+			return 1
+		default:
+			return 0
+		}
 	})
 
 	return &candidates[0]
@@ -450,19 +466,17 @@ func collectMCPFailureServers(failures []MCPFailureReport) []string {
 		serverSet[failure.ServerName] = struct{}{}
 	}
 
-	servers := make([]string, 0, len(serverSet))
-	for server := range serverSet {
-		servers = append(servers, server)
-	}
-	sort.Strings(servers)
+	servers := sliceutil.SortedKeys(serverSet)
 	return servers
 }
 
 func findPreviousSuccessfulWorkflowRuns(ctx context.Context, current WorkflowRun, owner, repo, hostname string) ([]WorkflowRun, error) {
 	workflowID := filepath.Base(current.WorkflowPath)
 	if workflowID == "." || workflowID == "" {
+		auditComparisonLog.Printf("Cannot find previous successful runs: workflow_path empty for run %d", current.DatabaseID)
 		return nil, fmt.Errorf("workflow path unavailable for run %d", current.DatabaseID)
 	}
+	auditComparisonLog.Printf("Searching previous successful runs: workflow=%s, owner=%q, repo=%q, hostname=%q", workflowID, owner, repo, hostname)
 
 	encodedWorkflowID := url.PathEscape(workflowID)
 	var endpoint string
@@ -496,7 +510,7 @@ func findPreviousSuccessfulWorkflowRuns(ctx context.Context, current WorkflowRun
 	}
 
 	for index := range runs {
-		if strings.HasPrefix(runs[index].WorkflowName, ".github/") {
+		if strings.HasPrefix(runs[index].WorkflowName, constants.GithubDir) {
 			if displayName := resolveWorkflowDisplayName(ctx, runs[index].WorkflowPath, owner, repo, hostname); displayName != "" {
 				runs[index].WorkflowName = displayName
 			}

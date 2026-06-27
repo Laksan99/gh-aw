@@ -1,6 +1,12 @@
 ---
+private: true
+emoji: "🧪"
 description: Smoke test workflow that validates Claude engine functionality by reviewing recent PRs twice daily
 on: 
+  slash_command:
+    name: smoke-claude
+    strategy: centralized
+    events: [issues, issue_comment, pull_request, pull_request_comment]
   workflow_dispatch:
   pull_request:
     types: [labeled]
@@ -15,22 +21,17 @@ permissions:
   actions: read
   
 name: Smoke Claude
+max-turns: 100
 engine:
   id: claude
-  max-turns: 100
   bare: true
-strict: false
 inlined-imports: true
 imports:
-  - shared/mcp-pagination.md
   - shared/gh.md
   - shared/mcp/tavily.md
-  - shared/reporting.md
-  - shared/github-queries-mcp-script.md
   - shared/go-make.md
   - shared/github-mcp-app.md
-  - shared/mcp/serena-go.md
-  - shared/observability-otlp.md
+  - shared/otlp.md
 network:
   allowed:
     - defaults
@@ -38,14 +39,17 @@ network:
     - playwright
 sandbox:
   agent:
+    sudo: false
     config:
       filesystem:
         allowWrite:
-          - /tmp
+          - /tmp/gh-aw/agent
 tools:
   agentic-workflows:
+  cli-proxy: true
   cache-memory: true
   github:
+    mode: gh-proxy
     toolsets: [repos, pull_requests]
   playwright:
     mode: cli
@@ -53,10 +57,11 @@ tools:
     - "*"
 runtimes:
   go:
-    version: "1.25"
+    version: "1.26"
 checkout:
   fetch: ["*"]
   fetch-depth: 0
+  force-clean-git-credentials: true
 safe-outputs:
     allowed-domains: [default-safe-outputs]
     add-comment:
@@ -72,6 +77,9 @@ safe-outputs:
       allowed: [smoke-claude]
     create-code-scanning-alert:
       driver: "Smoke Claude"
+    create-check-run:
+      name: "Smoke Claude: Agent Status"
+      max: 1
     update-pull-request:
       title: true
       body: true
@@ -92,7 +100,7 @@ safe-outputs:
     push-to-pull-request-branch:
       staged: true
       target: "*"
-      labels: [smoke-claude]
+      required-labels: [smoke-claude]
       if-no-changes: "warn"
       allowed-files:
         - "smoke-test-files/smoke-claude-push-test.md"
@@ -100,7 +108,7 @@ safe-outputs:
       max: 2
       target: "*"
     messages:
-      footer: "> 💥 *[THE END] — Illustrated by [{workflow_name}]({run_url})*{effective_tokens_suffix}{history_link}"
+      footer: "> 💥 *[THE END] — Illustrated by [{workflow_name}]({run_url})*{ai_credits_suffix}{history_link}"
       run-started: "💥 **WHOOSH!** [{workflow_name}]({run_url}) springs into action on this {event_type}! *[Panel 1 begins...]*"
       run-success: "🎬 **THE END** — [{workflow_name}]({run_url}) **MISSION: ACCOMPLISHED!** The hero saves the day! ✨"
       run-failure: "💫 **TO BE CONTINUED...** [{workflow_name}]({run_url}) {status}! Our hero faces unexpected challenges..."
@@ -124,7 +132,8 @@ safe-outputs:
           core.info(`[FICTITIOUS SLACK] → ${targetChannel}: ${text}`);
           return { success: true, channel: targetChannel, message: text };
 timeout-minutes: 10
-
+features:
+  gh-aw-detection: false
 ---
 
 # Smoke Test: Claude Engine Validation.
@@ -133,35 +142,35 @@ timeout-minutes: 10
 
 ## Test Requirements
 
+For tests below, mark a test as passed only if the required tool call succeeds.
+
 1. **GitHub MCP Testing**: Review the last 2 merged pull requests in ${{ github.repository }}
-2. **MCP Scripts GH CLI Testing**: Use the `mcpscripts-gh` tool to query 2 pull requests from ${{ github.repository }} (use args: "pr list --repo ${{ github.repository }} --limit 2 --json number,title,author")
-3. **Serena MCP Testing**: 
-   - Use the Serena MCP server tool `activate_project` to initialize the workspace at `${{ github.workspace }}` and verify it succeeds (do NOT use bash to run go commands - use Serena's MCP tools or the mcpscripts-go/mcpscripts-make tools from the go-make shared workflow)
-   - After initialization, use the `find_symbol` tool to search for symbols (find which tool to call) and verify that at least 3 symbols are found in the results
-4. **Make Build Testing**: Use the `mcpscripts-make` tool to build the project (use args: "build") and verify it succeeds
-5. **Playwright Testing**: Use playwright-cli to navigate to https://github.com and verify the page title contains "GitHub": run `playwright-cli browser_navigate --url https://github.com` then `playwright-cli browser_snapshot` in bash
-6. **Tavily Web Search Testing**: Use the Tavily MCP server to perform a web search for "GitHub Agentic Workflows" and verify that results are returned with at least one item
-7. **File Writing Testing**: Create a test file `/tmp/gh-aw/agent/smoke-test-claude-${{ github.run_id }}.txt` with content "Smoke test passed for Claude at $(date)" (create the directory if it doesn't exist)
-8. **Bash Tool Testing**: Execute bash commands to verify file creation was successful (use `cat` to read the file back)
-9. **Discussion Interaction Testing**: 
-   - Use the `github-discussion-query` mcp-script tool with params: `limit=1, jq=".[0]"` to get the latest discussion from ${{ github.repository }}
+2. **GH CLI Testing (via `gh-proxy`)**: Use `bash` to run `gh pr list --repo ${{ github.repository }} --limit 2 --json number,title,author`
+3. **Make Build Testing**: Use the `mcpscripts-make` tool to build the project (use args: "build") and verify it succeeds
+4. **Playwright Testing**: Use playwright-cli to navigate to https://github.com and verify the page title contains "GitHub": run `playwright-cli browser_navigate --url https://github.com` then `playwright-cli browser_snapshot` in bash
+5. **Tavily Web Search Testing**: Use the Tavily MCP server to perform a web search for "GitHub Agentic Workflows" and verify that results are returned with at least one item
+6. **File Writing Testing**: Create a test file `/tmp/gh-aw/agent/smoke-test-claude-${{ github.run_id }}.txt` with content "Smoke test passed for Claude at $(date)" (create the directory if it doesn't exist)
+7. **Bash Tool Testing**: Execute bash commands to verify file creation was successful (use `cat` to read the file back)
+8. **Discussion Interaction Testing**: 
+   - Use `gh api repos/${{ github.repository }}/discussions?per_page=1` to get the latest discussion from ${{ github.repository }}
    - Extract the discussion number from the result (e.g., if the result is `{"number": 123, "title": "...", ...}`, extract 123)
    - Use the `add_comment` tool with `discussion_number: <extracted_number>` to add a fun, comic-book style comment stating that the smoke test agent was here
-10. **Agentic Workflows MCP Testing**: 
+9. **Agentic Workflows MCP Testing**: 
    - Call the `agentic-workflows` MCP tool using the `status` method with workflow name `smoke-claude` to query workflow status
    - If the tool returns an error or no results, mark this test as ❌ and note "Tool unavailable or workflow not found" but continue to the Output section
    - If the tool succeeds, extract key information from the response: total runs, success/failure counts, last run timestamp
    - Write a summary of the results to `/tmp/gh-aw/agent/smoke-claude-status-${{ github.run_id }}.txt` (create directory if needed)
    - Use bash to verify the file was created and display its contents
 
-11. **Slack Script Safe Output Testing**: Use the `post_slack_message` safe-output tool to post a fictitious Slack message:
+10. **Slack Script Safe Output Testing**: Use the `post_slack_message` safe-output tool to post a fictitious Slack message:
    - Use `channel: "#smoke-tests"` and `message: "💥 Smoke test ${{ github.run_id }} passed — Claude engine nominal!"`
-   - Verify the tool call succeeds
 
-12. **Code Scanning Alert Safe Output Testing**: Use the `create_code_scanning_alert` safe-output tool to post a dummy warning code scanning alert:
+11. **Code Scanning Alert Safe Output Testing**: Use the `create_code_scanning_alert` safe-output tool to post a dummy warning code scanning alert:
    - Use `level: "warning"`, `message: "Smoke test dummy warning — Run ${{ github.run_id }}"`, `file: "README.md"`, `line: 1`
-   - Verify the tool call succeeds
    - This tests the SARIF artifact upload/download pipeline
+
+12. **Check Run Safe Output Testing**: Use the `create_check_run` safe-output tool to create a check run on the current commit:
+   - Use `conclusion: "success"`, `title: "Smoke Claude - Run ${{ github.run_id }}"`, `summary: "All smoke tests completed."`, and `text: "Detailed results attached."`
 
 ## PR Review Safe Outputs Testing
 
@@ -229,8 +238,8 @@ timeout-minutes: 10
    - Test results for PR review tests #13-19 (✅, ❌, or ⚠️)
    - Overall status: PASS, PARTIAL, or FAIL
 
-3. Use the `add_comment` tool with `item_number` set to the discussion number you extracted in step 9 to add a **fun comic-book style comment** to that discussion - be playful and use comic-book language like "💥 WHOOSH!"
-   - If step 9 failed to extract a discussion number, skip this step
+3. Use the `add_comment` tool with `item_number` set to the discussion number you extracted in step 8 to add a **fun comic-book style comment** to that discussion - be playful and use comic-book language like "💥 WHOOSH!"
+   - If step 8 failed to extract a discussion number, skip this step
 
 If all non-skipped tests pass, use the `add_labels` tool to add the label `smoke-claude` to the pull request (omit the `item_number` parameter to auto-target the triggering PR if this workflow was triggered by a pull_request event).
 

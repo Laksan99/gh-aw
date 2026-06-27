@@ -9,6 +9,14 @@ import (
 
 // generateEngineExecutionSteps generates the GitHub Actions steps for executing the AI engine
 func (c *Compiler) generateEngineExecutionSteps(yaml *strings.Builder, data *WorkflowData, engine CodingAgentEngine, logFile string) {
+	// --use-samples (hidden) replaces the agent step with a deterministic driver
+	// that replays the workflow's safe-outputs `samples` frontmatter entries
+	// through the safe-outputs MCP server. The engine is never invoked.
+	if data.UseSamples {
+		compilerYamlLog.Printf("Replacing engine execution with samples replay driver: engine=%s", engine.GetID())
+		c.generateSamplesReplayStep(yaml, data, logFile)
+		return
+	}
 
 	steps := engine.GetExecutionSteps(data, logFile)
 	compilerYamlLog.Printf("Generating engine execution steps: engine=%s, steps=%d", engine.GetID(), len(steps))
@@ -215,4 +223,24 @@ func (c *Compiler) generateAWFReflectSummary(yaml *strings.Builder, data *Workfl
 	yaml.WriteString("            setupGlobals(core, github, context, exec, io, getOctokit);\n")
 	yaml.WriteString("            const { main } = require('" + SetupActionDestination + "/awf_reflect_summary.cjs');\n")
 	yaml.WriteString("            await main();\n")
+}
+
+// generateDetectAgentErrorsStep emits a host-runner step that runs the engine's error detection
+// script after the AWF container exits. This step must run on the host runner (not inside the
+// container) because GITHUB_OUTPUT is not mounted into the AWF sandbox.
+// The step is only emitted when the engine provides a detection script via GetErrorDetectionScriptId.
+func (c *Compiler) generateDetectAgentErrorsStep(yaml *strings.Builder, data *WorkflowData, engine CodingAgentEngine) {
+	scriptId := engine.GetErrorDetectionScriptId()
+	if scriptId == "" {
+		compilerYamlLog.Printf("Skipping error detection step: engine %s has no detection script", engine.GetID())
+		return
+	}
+
+	compilerYamlLog.Printf("Generating error detection step for engine: %s (script=%s)", engine.GetID(), scriptId)
+
+	yaml.WriteString("      - name: Detect agent errors\n")
+	yaml.WriteString("        if: always()\n")
+	fmt.Fprintf(yaml, "        id: %s\n", constants.DetectAgentErrorsStepID)
+	yaml.WriteString("        continue-on-error: true\n")
+	fmt.Fprintf(yaml, "        run: node \"${RUNNER_TEMP}/gh-aw/actions/%s.cjs\"\n", scriptId)
 }

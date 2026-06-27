@@ -1,19 +1,19 @@
 package cli
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"os"
-	"os/signal"
 	"path/filepath"
 	"runtime"
 	"strings"
 	"sync"
-	"syscall"
 	"time"
 
 	"github.com/fsnotify/fsnotify"
 	"github.com/github/gh-aw/pkg/console"
+	"github.com/github/gh-aw/pkg/constants"
 	"github.com/github/gh-aw/pkg/gitutil"
 	"github.com/github/gh-aw/pkg/logger"
 	"github.com/github/gh-aw/pkg/workflow"
@@ -22,16 +22,16 @@ import (
 var compileWatchLog = logger.New("cli:compile_watch")
 
 // watchAndCompileWorkflows watches for changes to workflow files and recompiles them automatically
-func watchAndCompileWorkflows(markdownFile string, compiler *workflow.Compiler, verbose bool) error {
+func watchAndCompileWorkflows(ctx context.Context, markdownFile string, compiler *workflow.Compiler, verbose bool) error {
 	// Find git root for consistent behavior
 	gitRoot, err := gitutil.FindGitRoot()
 	if err != nil {
 		return fmt.Errorf("watch mode requires being in a git repository: %w", err)
 	}
 
-	workflowsDir := filepath.Join(gitRoot, ".github/workflows")
+	workflowsDir := filepath.Join(gitRoot, constants.GetWorkflowDir())
 	if _, err := os.Stat(workflowsDir); os.IsNotExist(err) {
-		return fmt.Errorf("the .github/workflows directory does not exist in git root (%s)", gitRoot)
+		return fmt.Errorf("the %s directory does not exist in git root (%s)", constants.GetWorkflowDir(), gitRoot)
 	}
 
 	// If a specific file is provided, watch only that file and its directory
@@ -108,11 +108,6 @@ func watchAndCompileWorkflows(markdownFile string, compiler *workflow.Compiler, 
 		fmt.Fprintln(os.Stderr, "Press Ctrl+C to stop watching.")
 	}
 
-	// Set up signal handling for graceful shutdown
-	sigChan := make(chan os.Signal, 1)
-	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
-	defer signal.Stop(sigChan)
-
 	// Debouncing setup
 	const debounceDelay = 300 * time.Millisecond
 	var debounceTimer *time.Timer
@@ -125,13 +120,13 @@ func watchAndCompileWorkflows(markdownFile string, compiler *workflow.Compiler, 
 		if verbose {
 			fmt.Fprintln(os.Stderr, "🔨 Initial compilation of all workflow files...")
 		}
-		stats, err := compileAllWorkflowFiles(compiler, workflowsDir, verbose)
+		stats, err := compileAllWorkflowFiles(ctx, compiler, workflowsDir, verbose)
 		if err != nil {
 			// Always show initial compilation errors, not just in verbose mode
 			fmt.Fprintln(os.Stderr, console.FormatWarningMessage(fmt.Sprintf("Initial compilation failed: %v", err)))
 		}
 		// Print summary instead of just "Recompiled"
-		printCompilationSummary(stats)
+		printCompilationSummary(stats, false)
 	} else {
 		// Reset warning count before compilation
 		compiler.ResetWarningCount()
@@ -145,13 +140,13 @@ func watchAndCompileWorkflows(markdownFile string, compiler *workflow.Compiler, 
 		}
 
 		// Use compileSingleFile to handle both regular workflows and campaign files
-		compileSingleFile(compiler, markdownFile, stats, verbose, false)
+		compileSingleFile(ctx, compiler, markdownFile, stats, verbose, false)
 
 		// Get warning count from compiler
 		stats.Warnings = compiler.GetWarningCount()
 
 		// Print summary instead of just "Recompiled"
-		printCompilationSummary(stats)
+		printCompilationSummary(stats, false)
 	}
 
 	// Main watch loop
@@ -191,27 +186,32 @@ func watchAndCompileWorkflows(markdownFile string, compiler *workflow.Compiler, 
 				depGraph.RemoveWorkflow(event.Name)
 			case event.Has(fsnotify.Write) || event.Has(fsnotify.Create):
 				// Handle file modification or creation - add to debounced compilation
-				debounceMu.Lock()
-				modifiedFiles[event.Name] = struct{}{}
-
-				// Reset debounce timer
-				if debounceTimer != nil {
-					debounceTimer.Stop()
-				}
-				debounceTimer = time.AfterFunc(debounceDelay, func() {
+				func() {
 					debounceMu.Lock()
-					filesToCompile := make([]string, 0, len(modifiedFiles))
-					for file := range modifiedFiles {
-						filesToCompile = append(filesToCompile, file)
-					}
-					// Clear the modifiedFiles map
-					modifiedFiles = make(map[string]struct{})
-					debounceMu.Unlock()
+					defer debounceMu.Unlock()
+					modifiedFiles[event.Name] = struct{}{}
 
-					// Compile the modified files using dependency graph
-					compileModifiedFilesWithDependencies(compiler, depGraph, filesToCompile, verbose)
-				})
-				debounceMu.Unlock()
+					// Reset debounce timer
+					if debounceTimer != nil {
+						debounceTimer.Stop()
+					}
+					debounceTimer = time.AfterFunc(debounceDelay, func() {
+						filesToCompile := func() []string {
+							debounceMu.Lock()
+							defer debounceMu.Unlock()
+							files := make([]string, 0, len(modifiedFiles))
+							for file := range modifiedFiles {
+								files = append(files, file)
+							}
+							// Clear the modifiedFiles map
+							modifiedFiles = make(map[string]struct{})
+							return files
+						}()
+
+						// Compile the modified files using dependency graph
+						compileModifiedFilesWithDependencies(ctx, compiler, depGraph, filesToCompile, verbose)
+					})
+				}()
 			}
 
 		case err, ok := <-watcher.Errors:
@@ -223,7 +223,7 @@ func watchAndCompileWorkflows(markdownFile string, compiler *workflow.Compiler, 
 				fmt.Fprintln(os.Stderr, console.FormatWarningMessage(fmt.Sprintf("Watcher error: %v", err)))
 			}
 
-		case <-sigChan:
+		case <-ctx.Done():
 			if verbose {
 				fmt.Fprintln(os.Stderr, "\n🛑 Stopping watch mode...")
 			}

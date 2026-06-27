@@ -14,12 +14,28 @@ This page describes authentication settings for GitHub Agentic Workflows.
 
 Configure one GitHub Actions secret per engine before running your first workflow:
 
-| Engine | Required secret | Alternative | Notes |
-|--------|----------------|-------------|-------|
-| **Copilot** (default) | [`COPILOT_GITHUB_TOKEN`](#copilot_github_token) | — | Fine-grained PAT with Copilot Requests permission |
-| **Claude** | [`ANTHROPIC_API_KEY`](#anthropic_api_key) | — | API key from Anthropic Console |
-| **Codex** | [`OPENAI_API_KEY`](#openai_api_key) | `CODEX_API_KEY` | Runtime uses `CODEX_API_KEY` if present, otherwise falls back to `OPENAI_API_KEY` |
-| **Gemini** | [`GEMINI_API_KEY`](#gemini_api_key) | — | API key from Google AI Studio |
+### Copilot (default)
+
+- **Recommended:** [`permissions: copilot-requests: write`](#copilot-requests-write-permission) — uses the GitHub Actions token; no PAT required, billing through your org
+- **Alternative:** [`COPILOT_GITHUB_TOKEN`](#copilot_github_token) — fine-grained PAT with Copilot Requests permission
+- **Notes:** When `copilot-requests: write` is set, `COPILOT_GITHUB_TOKEN` is ignored for inference
+
+### Claude
+
+- **Standard:** [`ANTHROPIC_API_KEY`](#anthropic_api_key) — static API key from Anthropic Console
+- **Keyless alternative:** [`engine.auth` Anthropic WIF](#anthropic-workload-identity-federation-wif) — short-lived OIDC token via federation rule; no long-lived secret on the repo
+
+### Codex
+
+- **Required secret:** [`OPENAI_API_KEY`](#openai_api_key)
+- **Alternative:** `CODEX_API_KEY`
+- **Notes:** Runtime uses `CODEX_API_KEY` if present, otherwise falls back to `OPENAI_API_KEY`
+
+### Gemini
+
+- **Required secret:** [`GEMINI_API_KEY`](#gemini_api_key)
+- **Alternative:** None
+- **Notes:** API key from Google AI Studio
 
 Most workflows will run without any additional secrets or additional authentication beyond this one engine secret.
 
@@ -34,7 +50,7 @@ Workflows using the following **read** operations from GitHub require [Additiona
 
 Workflows using the following features of [Safe Outputs](/gh-aw/reference/safe-outputs/) require additional authentication, via either a secret containing a PAT or GitHub App:
 - [**Safe outputs writing cross-repo**](/gh-aw/reference/safe-outputs/#cross-repository-operations)
-- [**Safe outputs assigning Copilot coding agent to issues/PRs**](/gh-aw/reference/assign-to-copilot/)
+- [**Safe outputs assigning Copilot coding agent to issues/PRs**](/gh-aw/reference/copilot-cloud-agent/)
 - [**Safe outputs updating GitHub Projects**](/gh-aw/patterns/project-ops/#project-token-authentication)
 - [**Safe outputs triggering CI on PRs**](/gh-aw/reference/triggering-ci/)
 
@@ -73,7 +89,39 @@ If you're working in Codespaces, use the GitHub UI method below to add secrets.
 
 A reference for all GitHub Actions secrets used by GitHub Agentic Workflows for AI engine authentication:
 
+### `copilot-requests: write` permission
+
+The recommended way to authenticate Copilot inference is to grant the `copilot-requests: write` permission in your workflow. This uses the built-in GitHub Actions token — no PAT or repository secret is required. Billing is handled centrally through your organization's Copilot subscription.
+
+**Setup**:
+
+Add `copilot-requests: write` to the `permissions:` block of your workflow frontmatter:
+
+```aw wrap
+permissions:
+  contents: read
+  copilot-requests: write
+```
+
+When this permission is present, gh-aw automatically uses the GitHub Actions token for Copilot inference. Any value set for `COPILOT_GITHUB_TOKEN` or `GH_AW_GITHUB_TOKEN` is **ignored** for inference — those tokens are not passed to the Copilot engine.
+
+> [!NOTE]
+> `copilot-requests: write` requires that your organization has a Copilot subscription and that centralized billing is enabled. If the Actions token does not have Copilot access, the workflow will fail at the inference step — configure `COPILOT_GITHUB_TOKEN` instead.
+
+**Why this is preferred**:
+
+- No PAT lifecycle management — tokens are minted per-run and automatically revoked.
+- Billing flows through the organization's Copilot plan, not an individual user's quota.
+- Works seamlessly in forked repos and organization workflows without sharing a personal token.
+
+---
+
 ### `COPILOT_GITHUB_TOKEN`
+
+> [!TIP]
+> If your organization has a Copilot subscription, use [`copilot-requests: write`](#copilot-requests-write-permission) instead. It requires no PAT, no secret management, and bills centrally through your org.
+
+Use `COPILOT_GITHUB_TOKEN` when you need to authenticate Copilot inference with a specific user's PAT — for example, in personal repositories or when centralized org billing is not available. When `permissions: copilot-requests: write` is set in your workflow, this secret is ignored for inference.
 
 If using Copilot as your AI engine, you need a GitHub Actions Secret set to a GitHub Personal Access Token (PAT) to authenticate Copilot CLI.
 
@@ -100,13 +148,43 @@ If your workflow fails at the Copilot inference step even with the token set, ve
 
 ---
 
+### `GH_AW_GITHUB_TOKEN`
+
+`GH_AW_GITHUB_TOKEN` is an optional "magic" GitHub Actions secret used as the default fallback token for GitHub operations outside engine inference.
+
+Use it when your workflow needs authenticated GitHub access beyond the default `GITHUB_TOKEN`, for example:
+
+- Safe outputs that write to other repositories
+- Safe outputs that trigger CI on pull requests
+- Safe outputs or tools that need broader repo/API access than the default token provides
+- Fallback when `github-app.ignore-if-missing: true` is used and app secrets are unavailable
+
+Fallback chain:
+
+`custom github-token` → `secrets.GH_AW_GITHUB_TOKEN` → `secrets.GITHUB_TOKEN`
+
+**How to create it**:
+
+1. Create a [fine-grained PAT](https://github.com/settings/personal-access-tokens/new) owned by a user account.
+2. Scope repository access to the minimum set of repositories needed.
+3. Grant only the minimum required permissions for your configured operations (for example, `Issues: write` for issue outputs, `Pull requests: write` for PR outputs, `Contents: write` for commit/branch writes, `Actions: write` for workflow dispatch/rerun operations).
+4. Store it as a repository secret:
+
+   ```bash wrap
+   gh aw secrets set GH_AW_GITHUB_TOKEN --value "<your-github-pat>"
+   ```
+
+`GH_AW_GITHUB_TOKEN` does **not** replace `COPILOT_GITHUB_TOKEN` for Copilot inference authentication.
+
+---
+
 ### `ANTHROPIC_API_KEY`
 
 If using the Claude by Anthropic engine, you need to set a GitHub Actions secret `ANTHROPIC_API_KEY` to be an API key from Anthropic.
 
 **Setup**:
 
-1. Create an API key at https://platform.claude.com/docs/en/get-started
+1. Create an API key at https://console.anthropic.com/settings/keys
 
 2. Add it to your repository secrets, either by CLI or GitHub UI:
 
@@ -120,9 +198,77 @@ To route Claude through a custom Anthropic-compatible endpoint (e.g., an interna
 
 **`CLAUDE_CODE_OAUTH_TOKEN`**:
 
-`CLAUDE_CODE_OAUTH_TOKEN` is not supported by GitHub Agentic Workflows. The only supported authentication method for the Claude engine is `ANTHROPIC_API_KEY`. Provider-based OAuth authentication (such as billing through a Claude Teams or Claude Max subscription) is not supported. If you have set `CLAUDE_CODE_OAUTH_TOKEN` as a repository secret, it will be ignored — configure `ANTHROPIC_API_KEY` instead.
+`CLAUDE_CODE_OAUTH_TOKEN` is not supported by GitHub Agentic Workflows. Provider-based OAuth authentication (such as billing through a Claude Teams or Claude Max subscription) is not supported. If you have set `CLAUDE_CODE_OAUTH_TOKEN` as a repository secret, it will be ignored — configure `ANTHROPIC_API_KEY` instead. For keyless authentication via Workload Identity Federation, see [Anthropic WIF](#anthropic-workload-identity-federation-wif) below.
 
 See also [AI Engines](/gh-aw/reference/engines/#available-coding-agents) for additional configuration needed when using Claude with GitHub MCP.
+
+---
+
+### Anthropic Workload Identity Federation (WIF)
+
+Workload Identity Federation lets workflows authenticate with Anthropic using short-lived
+GitHub OIDC tokens instead of a long-lived `ANTHROPIC_API_KEY` secret. When WIF is active,
+the compiler suppresses the static-key requirement and emits `AWF_AUTH_ANTHROPIC_*` environment
+variables consumed by the AWF firewall api-proxy sidecar.
+
+**Prerequisites:**
+- An Anthropic federation rule configured in your Anthropic workspace (obtain the IDs from your [Anthropic Console](https://platform.claude.com/docs/en/manage-claude/wif-providers/github-actions))
+- `permissions: id-token: write` in the workflow job
+
+**Frontmatter:**
+
+```yaml wrap
+permissions:
+  contents: read
+  id-token: write
+
+engine:
+  id: claude
+  auth:
+    type: github-oidc
+    provider: anthropic
+    federation-rule-id: fdrl_xxxxxxxxxxxx
+    organization-id: org_xxxxxxxxxxxx
+    service-account-id: svac_xxxxxxxxxxxx
+    workspace-id: ws_xxxxxxxxxxxx
+    # Optional: override OIDC audience claim (default: https://api.anthropic.com)
+    # oidc-audience: https://api.anthropic.com
+    # Optional: override token exchange endpoint (default: https://api.anthropic.com/v1/oauth/token)
+    # token-url: https://api.anthropic.com/v1/oauth/token
+```
+
+**Fields:**
+
+| Field | Required | Description |
+|---|---|---|
+| `federation-rule-id` | ✅ | ID of the Anthropic WIF federation rule (prefix `fdrl_`) |
+| `organization-id` | ✅ | Anthropic organization ID (prefix `org_`) |
+| `service-account-id` | ✅ | Anthropic service account ID (prefix `svac_`) |
+| `workspace-id` | ✅ | Anthropic workspace ID (prefix `ws_`) |
+| `oidc-audience` | Optional | Audience claim for GitHub OIDC token (default: `https://api.anthropic.com`) |
+| `token-url` | Optional | Token exchange endpoint override (default: `https://api.anthropic.com/v1/oauth/token`) |
+
+**Emitted environment variables:**
+
+The compiler maps each field to an env var passed to the AWF api-proxy sidecar:
+
+| Field | Env var |
+|---|---|
+| `type: github-oidc` | `AWF_AUTH_TYPE=github-oidc` |
+| `provider: anthropic` | `AWF_AUTH_PROVIDER=anthropic` |
+| `federation-rule-id` | `AWF_AUTH_ANTHROPIC_FEDERATION_RULE_ID` |
+| `organization-id` | `AWF_AUTH_ANTHROPIC_ORGANIZATION_ID` |
+| `service-account-id` | `AWF_AUTH_ANTHROPIC_SERVICE_ACCOUNT_ID` |
+| `workspace-id` | `AWF_AUTH_ANTHROPIC_WORKSPACE_ID` |
+
+Optional fields:
+
+| Field | Env var | Default |
+|---|---|---|
+| `oidc-audience` | `AWF_AUTH_OIDC_AUDIENCE` | `https://api.anthropic.com` |
+| `token-url` | `AWF_AUTH_ANTHROPIC_TOKEN_URL` | `https://api.anthropic.com/v1/oauth/token` |
+
+Available since: v0.79.6 (2026-06-11).
 
 ---
 
@@ -190,6 +336,10 @@ See also [AI Engines](/gh-aw/reference/engines/#available-coding-agents) for add
 
 Common authentication errors and how to resolve them:
 
+**`403 Forbidden` or inference failure with `copilot-requests: write`**
+
+The GitHub Actions token does not have Copilot inference access for this organization. Confirm that your organization has an active Copilot subscription with centralized billing and that the workflow's `permissions:` block includes `copilot-requests: write`. If centralized billing is not available, fall back to [`COPILOT_GITHUB_TOKEN`](#copilot_github_token).
+
 **`403 "Resource not accessible by personal access token"` (Copilot)**
 
 The PAT is missing the required permission. Use a fine-grained PAT with **Account permissions → Copilot Requests: Read**. The resource owner must be your personal account, not an organization. See [`COPILOT_GITHUB_TOKEN`](#copilot_github_token) for the setup link.
@@ -231,7 +381,6 @@ permissions:
 
 tools:
   github:
-    mode: remote
     toolsets: [repos, issues, pull_requests]
     github-app:
       client-id: ${{ vars.APP_ID }}
@@ -268,6 +417,27 @@ For both tool authentication and safe outputs, you can scope the GitHub App toke
 - Omit `repositories` field - Current repository only (default)
 - `repositories: ["*"]` - Org-wide access (all repos in the installation)
 - `repositories: ["repo1", "repo2"]` - Specific repositories only
+
+#### Omitting `owner`
+
+When `owner` is omitted, gh-aw derives the installation owner from the workflow's effective checkout target. For literal `owner/repo` repositories, the owner is emitted directly at compile time; for expression-based repositories, a generated pre-step extracts the owner at runtime before token minting. For `workflow_call` workflows with no explicit `checkout.repository`, derivation falls back to `${{ needs.activation.outputs.target_repo }}`.
+
+This lets multi-org workflows mint App tokens against the effective target without setting `owner:` explicitly. An explicit `owner:` always takes precedence. Owner derivation applies under `checkout[*].github-app`, top-level `safe-outputs.github-app`, and `tools.github.github-app`.
+
+### Gracefully Skip Minting When Keys Are Missing (`ignore-if-missing:`)
+
+By default, jobs fail when `client-id` or `private-key` resolve to empty strings at runtime — for example, on fork pull requests where App secrets are unavailable. Set `ignore-if-missing: true` to skip the token mint step instead and fall back to the standard non-App token chain (`secrets.GH_AW_GITHUB_TOKEN || secrets.GITHUB_TOKEN`):
+
+```yaml wrap
+safe-outputs:
+  github-app:
+    client-id: ${{ vars.APP_ID }}
+    private-key: ${{ secrets.APP_PRIVATE_KEY }}
+    ignore-if-missing: true
+  create-issue:
+```
+
+The same field is accepted under `tools.github.github-app:` and applies consistently to all token mint paths (safe outputs, activation, pre-activation, and checkout). Default behavior (fail when keys are empty) is unchanged when the field is omitted or `false`.
 
 ---
 

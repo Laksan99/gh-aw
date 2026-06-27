@@ -18,6 +18,23 @@ func TestGetWorkflowDir(t *testing.T) {
 	}
 }
 
+func TestGetWorkflowDirEnvOverride(t *testing.T) {
+	t.Setenv("GH_AW_WORKFLOWS_DIR", "/tmp/custom-workflows")
+	result := GetWorkflowDir()
+	if result != "/tmp/custom-workflows" {
+		t.Errorf("GetWorkflowDir() with GH_AW_WORKFLOWS_DIR set = %q, want %q", result, "/tmp/custom-workflows")
+	}
+}
+
+func TestGetWorkflowDirEnvEmpty(t *testing.T) {
+	t.Setenv("GH_AW_WORKFLOWS_DIR", "")
+	expected := filepath.Join(".github", "workflows")
+	result := GetWorkflowDir()
+	if result != expected {
+		t.Errorf("GetWorkflowDir() with empty GH_AW_WORKFLOWS_DIR = %q, want %q", result, expected)
+	}
+}
+
 func TestDefaultAllowedDomains(t *testing.T) {
 	if len(DefaultAllowedDomains) == 0 {
 		t.Error("DefaultAllowedDomains should not be empty")
@@ -84,7 +101,7 @@ func TestAgenticEngines(t *testing.T) {
 		t.Error("AgenticEngines should not be empty")
 	}
 
-	expectedEngines := []string{"claude", "codex", "copilot", "gemini", "opencode", "crush", "pi"}
+	expectedEngines := []string{"claude", "codex", "copilot", "gemini", "antigravity", "opencode", "crush", "pi"}
 	if len(AgenticEngines) != len(expectedEngines) {
 		t.Errorf("AgenticEngines length = %d, want %d", len(AgenticEngines), len(expectedEngines))
 	}
@@ -334,19 +351,25 @@ func TestNumericConstants(t *testing.T) {
 func TestTimeoutConstants(t *testing.T) {
 	// Test new time.Duration-based constants
 	tests := []struct {
-		name     string
-		value    time.Duration
-		minValue time.Duration
+		name       string
+		value      time.Duration
+		minValue   time.Duration
+		checkExact bool
+		exactValue time.Duration
 	}{
-		{"DefaultAgenticWorkflowTimeout", DefaultAgenticWorkflowTimeout, 1 * time.Minute},
-		{"DefaultToolTimeout", DefaultToolTimeout, 1 * time.Second},
-		{"DefaultMCPStartupTimeout", DefaultMCPStartupTimeout, 1 * time.Second},
+		{"DefaultAgenticWorkflowTimeout", DefaultAgenticWorkflowTimeout, 1 * time.Minute, false, 0},
+		{"DefaultToolTimeout", DefaultToolTimeout, 1 * time.Second, false, 0},
+		{"DefaultMCPStartupTimeout", DefaultMCPStartupTimeout, 1 * time.Second, false, 0},
+		{"DefaultHTTPClientTimeout", DefaultHTTPClientTimeout, 1 * time.Second, true, time.Second * 30},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			if tt.value < tt.minValue {
 				t.Errorf("%s = %v, should be >= %v", tt.name, tt.value, tt.minValue)
+			}
+			if tt.checkExact && tt.value != tt.exactValue {
+				t.Errorf("%s = %v, want %v", tt.name, tt.value, tt.exactValue)
 			}
 		})
 	}

@@ -53,8 +53,9 @@ func findGitRootForPath(path string) (string, error) {
 }
 
 // parseGitHubRepoSlugFromURL extracts owner/repo from a GitHub URL
-// Supports both HTTPS (https://github.com/owner/repo) and SSH (git@github.com:owner/repo) formats
-// Also supports GitHub Enterprise URLs
+// Supports HTTPS (https://github.com/owner/repo), SCP-style SSH (git@github.com:owner/repo),
+// and SSH URL scheme (ssh://git@github.com/owner/repo) formats.
+// Also supports GitHub Enterprise URLs.
 func parseGitHubRepoSlugFromURL(url string) string {
 	gitLog.Printf("Parsing GitHub repo slug from URL: %s", url)
 
@@ -71,12 +72,24 @@ func parseGitHubRepoSlugFromURL(url string) string {
 		return slug
 	}
 
-	// Handle SSH URLs: git@github.com:owner/repo or git@enterprise.github.com:owner/repo
+	// Handle SCP-style SSH URLs: git@github.com:owner/repo or git@enterprise.github.com:owner/repo
 	sshPrefix := "git@" + githubHostWithoutScheme + ":"
 	if after, ok := strings.CutPrefix(url, sshPrefix); ok {
 		slug := after
 		gitLog.Printf("Extracted slug from SSH URL: %s", slug)
 		return slug
+	}
+
+	// Handle SSH URL scheme: ssh://git@github.com/owner/repo or ssh://github.com/owner/repo
+	if after, ok := strings.CutPrefix(url, "ssh://"); ok {
+		// Strip optional user info (e.g. "git@")
+		if _, userStripped, hasAt := strings.Cut(after, "@"); hasAt {
+			after = userStripped
+		}
+		if slug, ok := strings.CutPrefix(after, githubHostWithoutScheme+"/"); ok {
+			gitLog.Printf("Extracted slug from SSH URL scheme: %s", slug)
+			return slug
+		}
 	}
 
 	gitLog.Print("Could not extract slug from URL")
@@ -300,14 +313,14 @@ func getRepositorySlugFromRemoteForPath(path string) string {
 func stageWorkflowChanges() {
 	// Find git root and add .github/workflows relative to it
 	if gitRoot, err := gitutil.FindGitRoot(); err == nil {
-		workflowsPath := filepath.Join(gitRoot, ".github/workflows/")
+		workflowsPath := filepath.Join(gitRoot, constants.WorkflowsDirSlash)
 		_ = exec.Command("git", "-C", gitRoot, "add", workflowsPath).Run()
 
 		// Also stage .gitattributes if it was modified
 		_ = stageGitAttributesIfChanged()
 	} else {
 		// Fallback to relative path if git root can't be found
-		_ = exec.Command("git", "add", ".github/workflows/").Run()
+		_ = exec.Command("git", "add", constants.WorkflowsDirSlash).Run()
 		_ = exec.Command("git", "add", ".gitattributes").Run()
 	}
 }
@@ -322,7 +335,7 @@ func ensureGitAttributes() (bool, error) {
 	}
 
 	gitAttributesPath := filepath.Join(gitRoot, ".gitattributes")
-	lockYmlEntry := ".github/workflows/*.lock.yml linguist-generated=true merge=ours"
+	lockYmlEntry := constants.WorkflowsLockYmlGitAttributesEntry
 	requiredEntries := []string{lockYmlEntry}
 
 	// Read existing .gitattributes file if it exists
@@ -344,7 +357,7 @@ func ensureGitAttributes() (bool, error) {
 				break
 			}
 			// Check for old format entries that need updating
-			if strings.HasPrefix(trimmedLine, ".github/workflows/*.lock.yml") && required == lockYmlEntry {
+			if strings.HasPrefix(trimmedLine, constants.WorkflowsLockYmlGlob) && required == lockYmlEntry {
 				gitLog.Print("Updating old .gitattributes entry format")
 				lines[i] = lockYmlEntry
 				found = true
@@ -397,20 +410,19 @@ func ensureLogsGitignore() error {
 		return err // Not in a git repository, skip
 	}
 
-	logsDir := filepath.Join(gitRoot, ".github", "aw", "logs")
-	gitignorePath := filepath.Join(logsDir, ".gitignore")
+	gitignorePath := filepath.Join(gitRoot, ".github", "aw", "logs", ".gitignore")
 
 	// Check if .gitignore already exists
-	if _, err := os.Stat(gitignorePath); err == nil {
-		gitLog.Print(".github/aw/logs/.gitignore already exists")
+	if fileutil.FileExists(gitignorePath) {
+		gitLog.Print(".github/aw/logs/.gitignore already exists") //nolint:hardcodedfilepath
 		return nil
 	}
 
 	gitLog.Print("Creating .github/aw/logs directory and .gitignore")
 	// Create the logs directory if it doesn't exist
-	if err := os.MkdirAll(logsDir, constants.DirPermPublic); err != nil {
-		gitLog.Printf("Failed to create logs directory: %v", err)
-		return fmt.Errorf("failed to create .github/aw/logs directory: %w", err)
+	if err := fileutil.EnsureParentDir(gitignorePath, constants.DirPermPublic); err != nil {
+		gitLog.Printf("Failed to ensure .github/aw/logs/.gitignore parent directory: %v", err)
+		return fmt.Errorf("failed to create parent directory for .github/aw/logs/.gitignore: %w", err)
 	}
 
 	// Write the .gitignore file with owner-only read/write permissions (0600) for security best practices
@@ -497,6 +509,17 @@ func pushBranch(branchName string, verbose bool) error {
 	}
 
 	return nil
+}
+
+// hasPendingChanges reports whether the working directory has any uncommitted
+// changes (staged or unstaged). Returns (false, nil) for a clean tree.
+func hasPendingChanges() (bool, error) {
+	cmd := exec.Command("git", "status", "--porcelain")
+	output, err := cmd.Output()
+	if err != nil {
+		return false, fmt.Errorf("failed to check git status: %w", err)
+	}
+	return len(strings.TrimSpace(string(output))) > 0, nil
 }
 
 // checkCleanWorkingDirectory checks if there are uncommitted changes

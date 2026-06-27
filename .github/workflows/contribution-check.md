@@ -1,8 +1,12 @@
 ---
+private: true
+emoji: "✅"
 name: "Contribution Check"
 on:
   schedule: "every 4 hours"
   workflow_dispatch:
+max-daily-ai-credits: 10000
+timeout-minutes: 30
 
 permissions:
   contents: read
@@ -15,10 +19,13 @@ env:
 engine:
   id: copilot
   agent: contribution-checker
-  max-continuations: 20
+  max-continuations: 25
 
 imports:
-  - shared/observability-otlp.md
+  - shared/otlp.md
+sandbox:
+  agent:
+    sudo: false
 tools:
   cli-proxy: true
   github:
@@ -98,7 +105,17 @@ steps:
         echo "ℹ No CONTRIBUTING.md found in $TARGET_REPOSITORY (checked root, .github/, docs/)"
       fi
 
-
+      full=$(cat "$GITHUB_WORKSPACE/contributing-guidelines.md")
+      if [ ${#full} -le 2000 ]; then
+        cp "$GITHUB_WORKSPACE/contributing-guidelines.md" \
+           "$GITHUB_WORKSPACE/contributing-guidelines-truncated.md"
+      else
+        printf '%s\n...\n%s' "${full:0:1500}" "${full: -500}" \
+          > "$GITHUB_WORKSPACE/contributing-guidelines-truncated.md"
+      fi
+      echo "✓ Wrote contributing-guidelines-truncated.md"
+features:
+  gh-aw-detection: true
 ---
 
 ## Target Repository
@@ -132,30 +149,17 @@ For each PR number in the comma-separated list, delegate evaluation to the **con
 
 ### How to dispatch
 
-Read the contents of `contributing-guidelines.md` from the workspace root. This file was pre-fetched in the `pre-agent` step and contains the target repository's contributing guidelines.
-
-Before injecting into any subagent prompt, **truncate the guidelines to at most 2,000 characters**: keep the first 1,500 characters and the last 500 characters. If the full content is 2,000 characters or shorter, use it as-is. This prevents token bloat when the target repository has a lengthy CONTRIBUTING.md.
-
-To build the truncated guidelines string, apply the following logic (pseudocode):
-
-```
-full = read("contributing-guidelines.md")
-if len(full) <= 2000:
-    guidelines = full
-else:
-    guidelines = full[:1500] + "\n...\n" + full[-500:]
-```
+Read the contents of `contributing-guidelines-truncated.md` from the workspace root. This file is prepared in the `pre-agent` step and already truncated to at most 2,000 characters.
 
 Call the contribution-checker subagent for each PR with this prompt:
 
 ```
-The CONTRIBUTING.md content for this repository is attached below (truncated to 2000 chars).
+The CONTRIBUTING.md content for this repository is attached below (already truncated to 2000 chars by the pre-agent step).
 Skip Step 1 — do not fetch CONTRIBUTING.md again.
+Do not call GitHub Actions APIs (do not list or read workflow runs). Focus exclusively on PR metadata, diff, and contributing guidelines.
 
 <contributing-guidelines>
-{first 1500 chars of contributing-guidelines.md}
-...
-{last 500 chars of contributing-guidelines.md}
+{contents of contributing-guidelines-truncated.md}
 </contributing-guidelines>
 
 Evaluate PR ${{ env.TARGET_REPOSITORY }}#<number> against the contribution guidelines.
@@ -177,18 +181,17 @@ Gather all returned JSON objects. If a subagent call fails, record the PR with v
 
 ### Posting comments
 
-For each PR where the subagent returned a non-empty `comment` field and the quality is NOT `lgtm`, call the `add_comment` safe output tool to post the comment to the PR.
+Use the `comment-dispatcher` agent on the verdict array (the JSON objects returned by the contribution-checker subagent in Step 1) to get the list of comments to post.
 
-- Use `issue_number` (not `pr-number`) for the PR number field — GitHub treats PRs and issues interchangeably by number.
-- You do NOT need to specify the repo — the `add_comment` tool is pre-configured with `target-repo` pointing to the target repository.
-
+For each returned `{issue_number, body}` payload, emit one `add_comment` safe output that includes **both fields verbatim** — `issue_number` is required.
+The safe-output validator rejects `add_comment` items that omit `item_number` / `issue_number` / `pull_request_number` (for example: `Target is "*" but no item_number/...`) and fails the entire `safe_outputs` job.
+When iterating verdict rows, copy `issue_number` directly from the returned payload into the emitted `add_comment` item; do not infer or rename it.
+Never emit `add_comment` without a numeric target field.
 Example:
-
 ```json
-{"type":"add_comment","issue_number":18744,"body":"Thanks for the PR! ..."}
+{"type":"add_comment","issue_number":35304,"body":"Thanks for the PR — here are the next changes to make..."}
 ```
-
-Do NOT post comments to PRs with `lgtm` quality — those are ready for maintainer review and don't need additional feedback.
+Do not specify the repo — `target-repo` is pre-configured.
 
 ## Completion Gate
 
@@ -198,74 +201,7 @@ Keep a running count of actions taken (each tool call or subagent dispatch count
 
 ## Step 2: Compile Report
 
-Create a single issue in THIS repository. Use the `skipped_count` from `pr-filter-results.json`. Build the report tables from the JSON objects returned by the subagent (use `number`, `title`, `author`, `lines`, and `quality` fields).
-
-Follow the **report layout rules** below — they apply to every report this workflow produces.
-
-### Report Layout Rules
-
-Apply these principles to make the report scannable, warm, and actionable:
-
-**Report Formatting**: Use h3 (###) or lower for all headers in the report. Wrap long sections (>10 items) in `<details><summary>Section Name</summary>` tags to improve readability.
-
-1. **Lead with the takeaway.** Open with a single-sentence human-readable summary that tells the maintainer what happened and what needs attention. No jargon, no counts-only headers. Example: *"We looked at 10 new PRs — 6 look great, 3 need a closer look, and 1 doesn't fit the project guidelines."*
-
-2. **Group by action, not by data.** Organize results into clear groups that answer "what should I do?" rather than listing raw rows. Use these groups (omit any group with zero items):
-   - **Ready to review** 🟢 — PRs that passed all checks
-   - **Needs a closer look** 🟡⚠️ — PRs that need discussion or focus work
-   - **Off-guidelines** 🔴 — PRs that don't align with CONTRIBUTING.md
-
-3. **One table per group.** Keep tables short and focused. Columns:
-   - PR (linked), Title (truncated to ~50 chars), Author, Lines changed, Quality signal
-   - Do NOT include boolean checklist columns (on-topic, focused, deps, tests) — those are for the subagent, not the reader. The verdict emoji and quality signal are enough.
-
-4. **Use whitespace generously.** Separate groups with blank lines and horizontal rules (`---`). Let each section breathe.
-
-5. **End with context, not noise.** Close with a small stats line: `Evaluated: {n} · Skipped: {n} · Run: {run_link}`. Keep it quiet — one line, not a table.
-
-6. **Tone: warm and constructive.** These reports help maintainers prioritize, not gatekeep. Use encouraging language for aligned PRs ("looking good", "ready for eyes"). Be matter-of-fact for off-guidelines PRs — no shaming.
-
-### Example Report
-
-```markdown
-### Contribution Check — {date}
-
-We looked at 4 new PRs — 1 looks great, 2 need a closer look, and 1 doesn't fit the contribution guidelines.
-
----
-
-### Ready to review 🟢
-
-| PR | Title | Author | Lines | Quality |
-|----|-------|--------|------:|---------|
-| #4521 | Fix CLI flag parsing for unicode args | @alice | 125 | lgtm ✨ |
-
----
-
-### Needs a closer look 🟡
-
-| PR | Title | Author | Lines | Quality |
-|----|-------|--------|------:|---------|
-| #4515 | Refactor auth + add rate limiting | @bob | 310 | needs-work |
-| #4510 | Add Redis caching layer | @carol | 88 | needs-work |
-
----
-
-### Off-guidelines 🔴
-
-<details>
-<summary>Per-PR Details</summary>
-
-| PR | Title | Author | Lines | Quality |
-|----|-------|--------|------:|---------|
-| #4519 | Add unrelated marketing page | @dave | 42 | spam |
-
-</details>
-
----
-
-Evaluated: 4 · Skipped: 10
-```
+Use the `report-formatter` agent, passing the array of returned subagent JSON objects, the `skipped_count` from `pr-filter-results.json`, and the run URL (constructed as `${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}`), to produce the report body. Then emit a single `create_issue` safe output with that body as `body` and `temporary_id: "aw_summary"`.
 
 ## Step 3: Label the Report Issue
 
@@ -297,4 +233,47 @@ If any subagent call failed (❓), also apply `outdated`.
 - `noop` is global, not per-PR. Emit at most one consolidated noop for the entire workflow run.
 - If you emitted any actionable safe outputs (`create_issue`, `add_comment`, `add_labels`), do **not** emit `noop`.
 
-{{#runtime-import shared/noop-reminder.md}}
+## agent: `report-formatter`
+---
+description: Groups PR verdict JSONs into Ready/Needs-look/Off-guidelines tables and returns the markdown body for the contribution check report issue
+model: small
+---
+You receive a JSON array of PR verdict objects (each with fields: `number`, `title`, `author`, `lines`, `quality`, `comment`) plus a `skipped_count` integer and a `run_url` string.
+
+Produce the markdown body for a contribution check report issue. Follow these rules exactly:
+
+1. **Lead with the takeaway.** Open with a single-sentence human-readable summary: *"We looked at {evaluated} new PRs — {n} look great, {n} need a closer look, and {n} don't fit the project guidelines."*
+
+2. **Group by action.** Organize results into these groups (omit any with zero items):
+   - **Ready to review** 🟢 — PRs where `quality == "lgtm"`
+   - **Needs a closer look** 🟡 — PRs where `quality == "needs-work"`
+   - **Off-guidelines** 🔴 — PRs where `quality == "spam"` or `quality == "outdated"`
+   - **Triage needed** ❓ — PRs where `quality` starts with `"triage"` or is unknown
+
+3. **One table per group.** Columns: PR (linked as `#number`), Title (truncated to ~50 chars), Author (with `@`), Lines changed, Quality signal. Do NOT include boolean checklist columns.
+
+4. **Wrap Off-guidelines in `<details>`** if it has more than 2 items.
+
+5. **End with**: `Evaluated: {n} · Skipped: {skipped_count} · Run: {run_url}`
+
+6. Use h3 (###) or lower for all headers. Use `---` between groups. Tone: warm and constructive.
+
+Return ONLY the markdown body string — no JSON wrapper, no explanation.
+
+## agent: `comment-dispatcher`
+---
+description: Filters PR verdict array to entries needing maintainer comments and returns the comment payloads
+model: small
+---
+You receive a JSON array of PR verdict objects. Each object has at minimum these fields: `number` (integer PR number) and `comment` (string, may be empty) and `quality` (string).
+
+Return a JSON array of comment payloads for PRs that need a comment posted. Include an entry only when ALL of these conditions are true:
+- `comment` is non-empty (not null, not `""`)
+- `quality` is NOT `"lgtm"`
+
+Each entry in the output array must have exactly these fields:
+```json
+{"issue_number": <number>, "body": "<comment>"}
+```
+
+Return an empty array `[]` if no entries qualify. Return ONLY the JSON array — no explanation, no markdown.

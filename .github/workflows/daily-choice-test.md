@@ -1,9 +1,12 @@
 ---
+private: true
+emoji: "🧪"
 description: Daily test workflow using Claude with custom safe-output job containing choice inputs
 on:
   schedule:
     - cron: "daily around 12:00 on weekdays"  # ~12 PM UTC, weekdays only
   workflow_dispatch:
+max-daily-ai-credits: 10000
 permissions:
   contents: read
   issues: read
@@ -17,6 +20,9 @@ network:
   allowed:
     - defaults
 
+sandbox:
+  agent:
+    sudo: false
 tools:
   cli-proxy: true
   github:
@@ -59,10 +65,9 @@ safe-outputs:
               echo "No agent output found"
             fi
 imports:
-  - shared/observability-otlp.md
-
-firewall:
-  effective-token-steering: true
+  - shared/otlp.md
+features:
+  gh-aw-detection: true
 ---
 
 # Daily Choice Type Test

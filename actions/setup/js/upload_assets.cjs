@@ -9,6 +9,10 @@ const { getErrorMessage } = require("./error_helpers.cjs");
 const { ERR_API, ERR_CONFIG, ERR_SYSTEM, ERR_VALIDATION } = require("./error_codes.cjs");
 
 /**
+ * @typedef {{ type: string, fileName: string, sha: string, size: number, targetFileName: string, url?: string }} UploadAssetItem
+ */
+
+/**
  * Normalizes a branch name to be a valid git branch name.
  *
  * IMPORTANT: Keep this function in sync with the normalizeBranchName function in normalize_branch_name.cjs
@@ -75,7 +79,8 @@ async function main() {
   }
 
   // Find all upload-asset items
-  const uploadItems = result.items.filter(/** @param {any} item */ item => item.type === "upload_asset");
+  /** @type {UploadAssetItem[]} */
+  const uploadItems = result.items.filter(item => item.type === "upload_asset");
 
   if (uploadItems.length === 0) {
     core.info("No upload-asset items found in agent output");
@@ -86,7 +91,15 @@ async function main() {
 
   core.info(`Found ${uploadItems.length} upload-asset item(s)`);
 
+  // Read the staged-assets directory directly. The upload_assets job's
+  // download-artifact step writes the safe-outputs assets artifact to this exact
+  // directory, and the Go generator passes the same path via GH_AW_ASSETS_DIR, so
+  // producer and consumer can never disagree on the location. The literal fallback
+  // matches constants.TmpGhAwAssetsDir for robustness if the env var is unset.
+  const assetsDir = process.env.GH_AW_ASSETS_DIR || "/tmp/gh-aw/safeoutputs/assets";
+  core.info(`Reading staged assets from: ${assetsDir}`);
   let uploadCount = 0;
+  let missingAssetCount = 0;
   let hasChanges = false;
 
   try {
@@ -122,11 +135,12 @@ async function main() {
         return;
       }
 
-      // Check if file exists in artifacts
-      const assetSourcePath = path.join("/tmp/gh-aw/safeoutputs/assets", fileName);
+      // Check if file exists in the staged-assets directory
+      const assetSourcePath = path.join(assetsDir, fileName);
       if (!fs.existsSync(assetSourcePath)) {
-        core.setFailed(`${ERR_SYSTEM}: Asset file not found: ${assetSourcePath}`);
-        return;
+        core.warning(`${ERR_SYSTEM}: Asset file not found: ${assetSourcePath} — skipping`);
+        missingAssetCount++;
+        continue;
       }
 
       // Verify SHA matches
@@ -159,6 +173,11 @@ async function main() {
         core.setFailed(`${ERR_API}: Failed to process asset ${fileName}: ${getErrorMessage(error)}`);
         return;
       }
+    }
+
+    if (uploadCount === 0 && missingAssetCount > 0 && missingAssetCount === uploadItems.length) {
+      core.setFailed(`All ${missingAssetCount} declared assets were missing; no assets published.`);
+      return;
     }
 
     // Commit and push if there are changes (skip if staged)

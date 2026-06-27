@@ -57,10 +57,10 @@ type LogsSummary struct {
 	TotalRuns                     int     `json:"total_runs" console:"header:Total Runs"`
 	TotalDuration                 string  `json:"total_duration" console:"header:Total Duration"`
 	TotalTokens                   int     `json:"total_tokens" console:"header:Total Tokens,format:number"`
-	TotalEffectiveTokens          int     `json:"total_effective_tokens" console:"header:Total Effective Tokens,format:number"`
-	TotalCost                     float64 `json:"total_cost" console:"header:Total Cost,format:cost"`
+	TotalAIC                      float64 `json:"total_aic,omitempty"`
 	TotalActionMinutes            float64 `json:"total_action_minutes" console:"header:Total Action Minutes"`
 	TotalTurns                    int     `json:"total_turns" console:"header:Total Turns"`
+	TotalSteeringEvents           int     `json:"total_steering_events,omitempty" console:"header:Total Steering Events,format:number,omitempty"`
 	TotalErrors                   int     `json:"total_errors" console:"header:Total Errors"`
 	TotalWarnings                 int     `json:"total_warnings" console:"header:Total Warnings"`
 	TotalMissingTools             int     `json:"total_missing_tools" console:"header:Total Missing Tools"`
@@ -84,14 +84,13 @@ type LogsSummary struct {
 	EngineCounts map[string]int `json:"engine_counts,omitempty" console:"-"`
 
 	// Outcome metrics (populated when outcome evaluation is enabled)
-	OutcomeAccepted        int     `json:"outcome_accepted,omitempty" console:"-"`
-	OutcomeRejected        int     `json:"outcome_rejected,omitempty" console:"-"`
-	OutcomeIgnored         int     `json:"outcome_ignored,omitempty" console:"-"`
-	OutcomePending         int     `json:"outcome_pending,omitempty" console:"-"`
-	OutcomeAcceptanceRate  float64 `json:"outcome_acceptance_rate,omitempty" console:"-"`
-	OutcomeWasteRate       float64 `json:"outcome_waste_rate,omitempty" console:"-"`
-	OutcomeZeroTouchRate   float64 `json:"outcome_zero_touch_rate,omitempty" console:"-"`
-	OutcomeCostPerAccepted float64 `json:"outcome_cost_per_accepted,omitempty" console:"-"`
+	OutcomeAccepted       int     `json:"outcome_accepted,omitempty" console:"-"`
+	OutcomeRejected       int     `json:"outcome_rejected,omitempty" console:"-"`
+	OutcomeIgnored        int     `json:"outcome_ignored,omitempty" console:"-"`
+	OutcomePending        int     `json:"outcome_pending,omitempty" console:"-"`
+	OutcomeAcceptanceRate float64 `json:"outcome_acceptance_rate,omitempty" console:"-"`
+	OutcomeWasteRate      float64 `json:"outcome_waste_rate,omitempty" console:"-"`
+	OutcomeZeroTouchRate  float64 `json:"outcome_zero_touch_rate,omitempty" console:"-"`
 }
 
 // RunData contains information about a single workflow run
@@ -109,14 +108,13 @@ type RunData struct {
 	Duration                   string                 `json:"duration,omitempty" console:"header:Duration,omitempty"`
 	ActionMinutes              float64                `json:"action_minutes,omitempty" console:"header:Action Minutes,omitempty"`
 	TokenUsage                 int                    `json:"token_usage,omitempty" console:"header:Tokens,format:number,omitempty"`
-	EffectiveTokens            int                    `json:"effective_tokens,omitempty" console:"header:Effective Tokens,format:number,omitempty"`
+	AIC                        float64                `json:"aic,omitempty"`
 	AmbientContext             *AmbientContextMetrics `json:"ambient_context,omitempty" console:"-"`
-	EstimatedCost              float64                `json:"estimated_cost,omitempty" console:"header:Cost ($),format:cost,omitempty"`
 	Turns                      int                    `json:"turns,omitempty" console:"header:Turns,omitempty"`
-	ErrorCount                 int                    `json:"error_count" console:"header:Errors"`
-	WarningCount               int                    `json:"warning_count" console:"header:Warnings"`
-	MissingToolCount           int                    `json:"missing_tool_count" console:"header:Missing Tools"`
-	MissingDataCount           int                    `json:"missing_data_count" console:"header:Missing Data"`
+	ErrorCount                 int                    `json:"error_count,omitempty" console:"header:Errors"`
+	WarningCount               int                    `json:"warning_count,omitempty" console:"header:Warnings"`
+	MissingToolCount           int                    `json:"missing_tool_count,omitempty" console:"header:Missing Tools"`
+	MissingDataCount           int                    `json:"missing_data_count,omitempty" console:"header:Missing Data"`
 	SafeItemsCount             int                    `json:"safe_items_count,omitempty" console:"header:Safe Items,omitempty"`
 	ManifestEntryCount         int                    `json:"manifest_entry_count,omitempty" console:"-"`
 	TemporaryIDMapStatus       string                 `json:"temporary_id_map_status,omitempty" console:"-"`
@@ -160,10 +158,10 @@ func buildLogsData(processedRuns []ProcessedRun, outputDir string, continuation 
 	// Build summary
 	var totalDuration time.Duration
 	var totalTokens int
-	var totalEffectiveTokens int
-	var totalCost float64
+	var totalAIC float64
 	var totalActionMinutes float64
 	var totalTurns int
+	var totalSteeringEvents int
 	var totalErrors int
 	var totalWarnings int
 	var totalMissingTools int
@@ -194,10 +192,14 @@ func buildLogsData(processedRuns []ProcessedRun, outputDir string, continuation 
 			totalDuration += run.Duration
 		}
 		totalTokens += run.TokenUsage
-		totalEffectiveTokens += run.EffectiveTokens
-		totalCost += run.EstimatedCost
+		if pr.TokenUsage != nil {
+			totalAIC += pr.TokenUsage.TotalAIC
+		}
 		totalActionMinutes += run.ActionMinutes
 		totalTurns += run.Turns
+		if pr.TokenUsage != nil {
+			totalSteeringEvents += pr.TokenUsage.TotalSteeringEvents
+		}
 		totalErrors += run.ErrorCount
 		totalWarnings += run.WarningCount
 		totalMissingTools += run.MissingToolCount
@@ -271,9 +273,8 @@ func buildLogsData(processedRuns []ProcessedRun, outputDir string, continuation 
 			Conclusion:                 run.Conclusion,
 			Classification:             deriveRunClassification(comparison),
 			TokenUsage:                 run.TokenUsage,
-			EffectiveTokens:            run.EffectiveTokens,
+			AIC:                        0,
 			AmbientContext:             ambientContext,
-			EstimatedCost:              run.EstimatedCost,
 			ActionMinutes:              run.ActionMinutes,
 			Turns:                      run.Turns,
 			ErrorCount:                 run.ErrorCount,
@@ -319,9 +320,20 @@ func buildLogsData(processedRuns []ProcessedRun, outputDir string, continuation 
 			runData.RunAttempt = awInfo.RunAttempt
 			runData.TargetRepo = awInfo.TargetRepo
 			runData.EventName = awInfo.EventName
+			// Fall back to inferring the workflow path from the display name when the
+			// GitHub API returned an empty path (e.g. for scheduled agentic runs).
+			// This handles both fresh runs and old cached RunSummary entries whose
+			// run.WorkflowPath was persisted as empty before the fix in
+			// logs_run_processor.go was applied.
+			if runData.WorkflowPath == "" && awInfo.WorkflowName != "" {
+				runData.WorkflowPath = inferWorkflowPathFromDisplayName(awInfo.WorkflowName)
+			}
 		}
 		if run.Duration > 0 {
 			runData.Duration = timeutil.FormatDuration(run.Duration)
+		}
+		if pr.TokenUsage != nil && pr.TokenUsage.TotalAIC > 0 {
+			runData.AIC = pr.TokenUsage.TotalAIC
 		}
 		// Compute average TBT from metrics when available; fall back to wall-time / (turns - 1).
 		if run.AvgTimeBetweenTurns > 0 {
@@ -336,10 +348,10 @@ func buildLogsData(processedRuns []ProcessedRun, outputDir string, continuation 
 		TotalRuns:                     len(processedRuns),
 		TotalDuration:                 timeutil.FormatDuration(totalDuration),
 		TotalTokens:                   totalTokens,
-		TotalEffectiveTokens:          totalEffectiveTokens,
-		TotalCost:                     totalCost,
+		TotalAIC:                      totalAIC,
 		TotalActionMinutes:            totalActionMinutes,
 		TotalTurns:                    totalTurns,
+		TotalSteeringEvents:           totalSteeringEvents,
 		TotalErrors:                   totalErrors,
 		TotalWarnings:                 totalWarnings,
 		TotalMissingTools:             totalMissingTools,
@@ -443,12 +455,51 @@ func deriveRunClassification(comparison *AuditComparisonData) string {
 	return "normal"
 }
 
-// renderLogsJSON outputs the logs data as JSON
-func renderLogsJSON(data LogsData) error {
-	reportLog.Printf("Rendering logs data as JSON: %d runs", data.Summary.TotalRuns)
+// renderLogsJSON outputs the logs data as JSON.
+// When verbose is false, audit-heavy fields are stripped for compact agentic consumption.
+func renderLogsJSON(data LogsData, verbose bool) error {
+	reportLog.Printf("Rendering logs data as JSON: %d runs, verbose=%v", data.Summary.TotalRuns, verbose)
+
+	if !verbose {
+		data = compactLogsData(data)
+	}
+
 	encoder := json.NewEncoder(os.Stdout)
 	encoder.SetIndent("", "  ")
 	return encoder.Encode(data)
+}
+
+// compactLogsData strips audit-heavy fields from LogsData for token-efficient agentic output.
+// Removes: comparison, behavior_fingerprint, task_domain, agentic_assessments,
+// token_usage_summary, experiments, ambient_context from each run.
+// Omits episodes when all are standalone (single-run episodes add no information).
+func compactLogsData(data LogsData) LogsData {
+	// Strip audit-heavy fields from runs
+	for i := range data.Runs {
+		data.Runs[i].Comparison = nil
+		data.Runs[i].BehaviorFingerprint = nil
+		data.Runs[i].TaskDomain = nil
+		data.Runs[i].AgenticAssessments = nil
+		data.Runs[i].TokenUsageSummary = nil
+		data.Runs[i].Experiments = nil
+		data.Runs[i].AmbientContext = nil
+		data.Runs[i].AwContext = nil
+	}
+
+	// Omit episodes when all are standalone (no multi-run episodes)
+	allStandalone := true
+	for _, ep := range data.Episodes {
+		if ep.TotalRuns > 1 {
+			allStandalone = false
+			break
+		}
+	}
+	if allStandalone {
+		data.Episodes = nil
+		data.Edges = nil
+	}
+
+	return data
 }
 
 // writeSummaryFile writes the logs data to a JSON file

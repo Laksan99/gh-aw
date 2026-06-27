@@ -7,6 +7,7 @@ const { generateWorkflowOverview } = require("./generate_workflow_overview.cjs")
 const { logStagedPreviewInfo } = require("./staged_preview.cjs");
 const { validateContextVariables } = require("./validate_context_variables.cjs");
 const validateLockdownRequirements = require("./validate_lockdown_requirements.cjs");
+const { writeMergedModelsJSON } = require("./merge_frontmatter_models.cjs");
 
 /**
  * Generate aw_info.json with workflow run metadata.
@@ -80,6 +81,21 @@ async function main(core, ctx) {
     created_at: new Date().toISOString(),
   };
 
+  const frontmatterSource = process.env.GH_AW_INFO_FRONTMATTER_SOURCE || "";
+  if (frontmatterSource) {
+    awInfo.frontmatter_source = frontmatterSource;
+  }
+
+  const frontmatterEmoji = process.env.GH_AW_INFO_FRONTMATTER_EMOJI || "";
+  if (frontmatterEmoji) {
+    awInfo.frontmatter_emoji = frontmatterEmoji;
+  }
+
+  const bodyModified = process.env.GH_AW_INFO_BODY_MODIFIED;
+  if (bodyModified === "true" || bodyModified === "false") {
+    awInfo.body_modified = bodyModified === "true";
+  }
+
   // Include cli_version only when set (released builds only)
   const cliVersion = process.env.GH_AW_INFO_CLI_VERSION;
   if (cliVersion) {
@@ -102,22 +118,9 @@ async function main(core, ctx) {
     awInfo.workflow_run_conclusion = workflowRunConclusion;
   }
 
-  // Include custom token weights when set (engine.token-weights in workflow frontmatter).
-  // Deep structure validation is intentionally minimal here: the JSON schema and Go parser
-  // already validate the structure at compile time. We only verify the top-level type to
-  // guard against unexpected env-var values at runtime.
-  const tokenWeightsEnv = process.env.GH_AW_INFO_TOKEN_WEIGHTS;
-  if (tokenWeightsEnv) {
-    try {
-      const tokenWeights = JSON.parse(tokenWeightsEnv);
-      if (tokenWeights !== null && typeof tokenWeights === "object" && !Array.isArray(tokenWeights)) {
-        awInfo.token_weights = tokenWeights;
-      } else {
-        core.warning(`GH_AW_INFO_TOKEN_WEIGHTS must be a JSON object, ignoring`);
-      }
-    } catch {
-      core.warning(`Failed to parse GH_AW_INFO_TOKEN_WEIGHTS: ${tokenWeightsEnv}`);
-    }
+  const tokenWeights = parseTokenWeightsFromEnv(core);
+  if (tokenWeights) {
+    awInfo.token_weights = tokenWeights;
   }
 
   // Include aw_context when the workflow was triggered by a caller that relayed
@@ -156,11 +159,35 @@ async function main(core, ctx) {
 
   // Write to /tmp/gh-aw directory to avoid inclusion in PR
   fs.mkdirSync(TMP_GH_AW_PATH, { recursive: true });
+  writeMergedModelsJSON(core);
   const tmpPath = TMP_GH_AW_PATH + "/aw_info.json";
   fs.writeFileSync(tmpPath, JSON.stringify(awInfo, null, 2));
 
   if (awInfo.staged) {
     logStagedPreviewInfo("Generating workflow info in staged mode — no changes applied");
+  }
+
+  /**
+   * Parse optional custom token weights from GH_AW_INFO_TOKEN_WEIGHTS.
+   * @param {typeof import('@actions/core')} core
+   * @returns {Record<string, unknown> | null}
+   */
+  function parseTokenWeightsFromEnv(core) {
+    const tokenWeightsEnv = process.env.GH_AW_INFO_TOKEN_WEIGHTS;
+    if (!tokenWeightsEnv) {
+      return null;
+    }
+    try {
+      const tokenWeights = JSON.parse(tokenWeightsEnv);
+      if (tokenWeights !== null && typeof tokenWeights === "object" && !Array.isArray(tokenWeights)) {
+        return tokenWeights;
+      }
+      core.warning(`GH_AW_INFO_TOKEN_WEIGHTS must be a JSON object, ignoring`);
+      return null;
+    } catch {
+      core.warning(`Failed to parse GH_AW_INFO_TOKEN_WEIGHTS: ${tokenWeightsEnv}`);
+      return null;
+    }
   }
 
   core.info("Generated aw_info.json at: " + tmpPath);

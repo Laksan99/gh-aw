@@ -95,6 +95,29 @@ describe("safe_output_helpers", () => {
         expect(result.contextType).toBe("issue");
       });
 
+      it("should resolve workflow_dispatch issue context from aw_context", () => {
+        const result = helpers.resolveTarget({
+          ...baseParams,
+          context: {
+            eventName: "workflow_dispatch",
+            repo: { owner: "test-owner", repo: "test-repo" },
+            payload: {
+              inputs: {
+                aw_context: JSON.stringify({
+                  event_type: "issue_comment",
+                  item_type: "issue",
+                  item_number: 321,
+                  repo: "test-owner/test-repo",
+                }),
+              },
+            },
+          },
+        });
+        expect(result.success).toBe(true);
+        expect(result.number).toBe(321);
+        expect(result.contextType).toBe("issue");
+      });
+
       it("should resolve triggering PR context", () => {
         const result = helpers.resolveTarget({
           ...baseParams,
@@ -346,6 +369,17 @@ describe("safe_output_helpers", () => {
         expect(result.contextType).toBe("pull request");
       });
 
+      it("should resolve wildcard with pull_number alias", () => {
+        const result = helpers.resolveTarget({
+          ...baseParams,
+          targetConfig: "*",
+          item: { pull_number: 792 },
+        });
+        expect(result.success).toBe(true);
+        expect(result.number).toBe(792);
+        expect(result.contextType).toBe("pull request");
+      });
+
       it("should fail wildcard without pull_request_number", () => {
         const result = helpers.resolveTarget({
           ...baseParams,
@@ -444,6 +478,29 @@ describe("safe_output_helpers", () => {
         const result = helpers.resolveTarget(baseParams);
         expect(result.success).toBe(true);
         expect(result.number).toBe(123);
+        expect(result.contextType).toBe("issue");
+      });
+
+      it("should resolve workflow_dispatch issue context from aw_context", () => {
+        const result = helpers.resolveTarget({
+          ...baseParams,
+          context: {
+            eventName: "workflow_dispatch",
+            repo: { owner: "test-owner", repo: "test-repo" },
+            payload: {
+              inputs: {
+                aw_context: JSON.stringify({
+                  event_type: "issue_comment",
+                  item_type: "issue",
+                  item_number: 654,
+                  repo: "test-owner/test-repo",
+                }),
+              },
+            },
+          },
+        });
+        expect(result.success).toBe(true);
+        expect(result.number).toBe(654);
         expect(result.contextType).toBe("issue");
       });
 

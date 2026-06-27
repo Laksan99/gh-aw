@@ -4,6 +4,7 @@ import (
 	"fmt"
 
 	"github.com/github/gh-aw/pkg/logger"
+	"github.com/github/gh-aw/pkg/setutil"
 )
 
 var gitConfigStepsLog = logger.New("workflow:git_configuration_steps")
@@ -37,19 +38,12 @@ func (c *Compiler) generateGitConfigurationStepsWithToken(token string, targetRe
 	return []string{
 		"      - name: Configure Git credentials\n",
 		"        env:\n",
-		fmt.Sprintf("          REPO_NAME: %s\n", repoNameValue),
-		"          SERVER_URL: ${{ github.server_url }}\n",
+		fmt.Sprintf("          GITHUB_REPOSITORY: %s\n", repoNameValue),
+		"          GITHUB_SERVER_URL: ${{ github.server_url }}\n",
 		// SECURITY: token moved to env mapping so the shell treats it as data,
 		// not syntax. Prevents shell injection if token value contains metacharacters.
 		fmt.Sprintf("          GITHUB_TOKEN: %s\n", token),
-		"        run: |\n",
-		"          git config --global user.email \"github-actions[bot]@users.noreply.github.com\"\n",
-		"          git config --global user.name \"github-actions[bot]\"\n",
-		"          git config --global am.keepcr true\n",
-		"          # Re-authenticate git with GitHub token\n",
-		"          SERVER_URL_STRIPPED=\"${SERVER_URL#https://}\"\n",
-		"          git remote set-url origin \"https://x-access-token:${GITHUB_TOKEN}@${SERVER_URL_STRIPPED}/${REPO_NAME}.git\"\n",
-		"          echo \"Git configured with standard GitHub Actions identity\"\n",
+		"        run: bash \"${RUNNER_TEMP}/gh-aw/actions/configure_git_credentials.sh\"\n",
 	}
 }
 
@@ -79,7 +73,7 @@ func getGitIdentityEnvVars() map[string]string {
 //
 // The step always uses continue-on-error to remain resilient when no .git directory
 // exists (e.g. checkout: false) or when git is not installed.
-func (c *Compiler) generateCredentialsCleanerStep(envVars map[string]bool) []string {
+func (c *Compiler) generateCredentialsCleanerStep(envVars map[string]struct{}) []string {
 	lines := []string{
 		"      - name: Clean credentials\n",
 		"        continue-on-error: true\n",
@@ -89,7 +83,7 @@ func (c *Compiler) generateCredentialsCleanerStep(envVars map[string]bool) []str
 		lines = append(lines, "        env:\n")
 		// Emit env vars in a stable, deterministic order (knownCredentialLeakingActions order)
 		for _, known := range knownCredentialLeakingActions {
-			if envVars[known.envVar] {
+			if setutil.Contains(envVars, known.envVar) {
 				lines = append(lines, fmt.Sprintf("          %s: \"true\"\n", known.envVar))
 			}
 		}

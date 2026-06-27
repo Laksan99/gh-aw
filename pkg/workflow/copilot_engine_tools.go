@@ -30,6 +30,7 @@ import (
 	"github.com/github/gh-aw/pkg/console"
 	"github.com/github/gh-aw/pkg/constants"
 	"github.com/github/gh-aw/pkg/logger"
+	"github.com/github/gh-aw/pkg/setutil"
 )
 
 var copilotEngineToolsLog = logger.New("workflow:copilot_engine_tools")
@@ -168,17 +169,18 @@ func (e *CopilotEngine) computeCopilotToolArguments(tools map[string]any, safeOu
 	// Built-in tool names that should be skipped when processing MCP servers
 	// Note: GitHub is NOT included here because it needs MCP configuration in CLI mode
 	// Note: web-fetch is NOT included here because it needs explicit --allow-tool argument
-	builtInTools := map[string]bool{
-		"bash":       true,
-		"edit":       true,
-		"web-search": true,
-		"playwright": true,
+	builtInTools := map[string]struct {
+	}{
+		"bash":       {},
+		"edit":       {},
+		"web-search": {},
+		"playwright": {},
 	}
 
 	// Handle MCP server tools
 	for toolName, toolConfig := range tools {
 		// Skip built-in tools we've already handled
-		if builtInTools[toolName] {
+		if setutil.Contains(builtInTools, toolName) {
 			continue
 		}
 

@@ -109,6 +109,7 @@ func TestHasTool(t *testing.T) {
 	toolsMap := map[string]any{
 		"github":    nil,
 		"bash":      []any{"echo"},
+		"edit":      false,
 		"my-custom": map[string]any{"command": "node"},
 	}
 
@@ -122,7 +123,7 @@ func TestHasTool(t *testing.T) {
 		{"github exists", "github", true},
 		{"bash exists", "bash", true},
 		{"custom exists", "my-custom", true},
-		{"edit doesn't exist", "edit", false},
+		{"edit explicitly false", "edit", false},
 		{"web-fetch doesn't exist", "web-fetch", false},
 		{"unknown doesn't exist", "unknown", false},
 	}
@@ -169,23 +170,19 @@ func TestGetToolNames(t *testing.T) {
 		}
 
 		// Check that all expected names are present
-		expectedNames := map[string]bool{
-			"github":    false,
-			"bash":      false,
-			"edit":      false,
-			"my-custom": false,
+		expectedNames := map[string]struct{}{
+			"github":    {},
+			"bash":      {},
+			"edit":      {},
+			"my-custom": {},
 		}
 
 		for _, name := range names {
-			if _, ok := expectedNames[name]; ok {
-				expectedNames[name] = true
-			}
+			delete(expectedNames, name)
 		}
 
-		for name, found := range expectedNames {
-			if !found {
-				t.Errorf("expected to find tool %q in names list", name)
-			}
+		for name := range expectedNames {
+			t.Errorf("expected to find tool %q in names list", name)
 		}
 	})
 

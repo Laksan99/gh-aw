@@ -10,7 +10,7 @@ const fs = require("fs");
 const path = require("path");
 
 const { getErrorMessage } = require("./error_helpers.cjs");
-const { execGitSync, getGitAuthEnv } = require("./git_helpers.cjs");
+const { ensureOriginRemoteTrackingRef, execGitSync } = require("./git_helpers.cjs");
 const { ERR_SYSTEM } = require("./error_codes.cjs");
 
 /**
@@ -54,7 +54,7 @@ function sanitizeBranchNameForBundle(branchName) {
  * @param {string} branchName - The branch name
  * @returns {string} The full bundle file path
  */
-function getBundlePath(branchName) {
+function getBundlePathForBranch(branchName) {
   const sanitized = sanitizeBranchNameForBundle(branchName);
   return `/tmp/gh-aw/aw-${sanitized}.bundle`;
 }
@@ -75,7 +75,7 @@ function sanitizeRepoSlugForBundle(repoSlug) {
  * @param {string} repoSlug - The repository slug (owner/repo)
  * @returns {string} The full bundle file path including repo disambiguation
  */
-function getBundlePathForRepo(branchName, repoSlug) {
+function getBundlePathForBranchInRepo(branchName, repoSlug) {
   const sanitizedBranch = sanitizeBranchNameForBundle(branchName);
   const sanitizedRepo = sanitizeRepoSlugForBundle(repoSlug);
   return `/tmp/gh-aw/aw-${sanitizedRepo}-${sanitizedBranch}.bundle`;
@@ -106,7 +106,7 @@ async function generateGitBundle(branchName, baseBranch, options = {}) {
   // Support custom cwd for multi-repo scenarios
   const cwd = options.cwd || process.env.GITHUB_WORKSPACE || process.cwd();
 
-  const bundlePath = options.repoSlug ? getBundlePathForRepo(branchName, options.repoSlug) : getBundlePath(branchName);
+  const bundlePath = options.repoSlug ? getBundlePathForBranchInRepo(branchName, options.repoSlug) : getBundlePathForBranch(branchName);
 
   // Validate baseBranch early to avoid confusing git errors (e.g., origin/undefined)
   if (typeof baseBranch !== "string" || baseBranch.trim() === "") {
@@ -149,28 +149,30 @@ async function generateGitBundle(branchName, baseBranch, options = {}) {
         if (mode === "incremental") {
           // INCREMENTAL MODE (for push_to_pull_request_branch):
           // Only include commits that are new since origin/branchName.
-          debugLog(`Strategy 1 (incremental): Fetching origin/${branchName}`);
-          const fetchEnv = { ...process.env, ...getGitAuthEnv(options.token) };
-
-          try {
-            execGitSync(["fetch", "origin", "--", `${branchName}:refs/remotes/origin/${branchName}`], { cwd, env: fetchEnv });
+          // Tries a local-only check first, then a single network fetch attempt.
+          // The fetch will succeed for public repos (no credentials needed) and
+          // fail fast for private repos without credentials (execGitSync runs
+          // git with GIT_TERMINAL_PROMPT=0 and a 60s timeout).
+          debugLog(`Strategy 1 (incremental): Resolving origin/${branchName}`);
+          const incrementalRefResult = ensureOriginRemoteTrackingRef(branchName, { cwd, token: options.token, suppressLogs: true });
+          if (incrementalRefResult.exists) {
             baseRef = `origin/${branchName}`;
-            debugLog(`Strategy 1 (incremental): Successfully fetched, baseRef=${baseRef}`);
-          } catch (fetchError) {
-            debugLog(`Strategy 1 (incremental): Fetch failed - ${getErrorMessage(fetchError)}, checking for existing remote tracking ref`);
-            try {
-              execGitSync(["show-ref", "--verify", "--quiet", `refs/remotes/origin/${branchName}`], { cwd });
-              baseRef = `origin/${branchName}`;
-              debugLog(`Strategy 1 (incremental): Using existing remote tracking ref as fallback, baseRef=${baseRef}`);
-            } catch (refCheckError) {
-              debugLog(`Strategy 1 (incremental): No existing remote tracking ref found (${getErrorMessage(refCheckError)}), failing`);
-              errorMessage = `Cannot generate incremental bundle: failed to fetch origin/${branchName} and no existing remote tracking ref found. Fetch error: ${getErrorMessage(fetchError)}`;
-              return {
-                success: false,
-                error: errorMessage,
-                bundlePath,
-              };
+            if (incrementalRefResult.fetched) {
+              debugLog(`Strategy 1 (incremental): Fetched origin/${branchName} from remote, baseRef=${baseRef}`);
+            } else {
+              debugLog(`Strategy 1 (incremental): Using existing remote tracking ref, baseRef=${baseRef}`);
             }
+          } else {
+            debugLog(`Strategy 1 (incremental): origin/${branchName} not present locally and remote fetch failed (${incrementalRefResult.fetchError ? getErrorMessage(incrementalRefResult.fetchError) : "no error"}), failing`);
+            errorMessage =
+              `Cannot generate incremental bundle: refs/remotes/origin/${branchName} is not present in checkout '${cwd}' and could not be fetched ` +
+              `(the safe-outputs MCP server has no credentials for private repositories). ` +
+              `Add ${JSON.stringify(branchName)} to the workflow's checkout.fetch list so the branch is fetched during setup.`;
+            return {
+              success: false,
+              error: errorMessage,
+              bundlePath,
+            };
           }
         } else {
           // FULL MODE (for create_pull_request):
@@ -182,21 +184,18 @@ async function generateGitBundle(branchName, baseBranch, options = {}) {
             debugLog(`Strategy 1 (full): Using existing origin/${branchName} as baseRef`);
           } catch {
             debugLog(`Strategy 1 (full): origin/${branchName} not found, trying merge-base with ${defaultBranch}`);
-            let hasLocalDefaultBranch = false;
-            try {
-              execGitSync(["show-ref", "--verify", "--quiet", `refs/remotes/origin/${defaultBranch}`], { cwd });
-              hasLocalDefaultBranch = true;
-              debugLog(`Strategy 1 (full): origin/${defaultBranch} exists locally`);
-            } catch {
-              debugLog(`Strategy 1 (full): origin/${defaultBranch} not found locally, attempting fetch`);
-              try {
-                const fullFetchEnv = { ...process.env, ...getGitAuthEnv(options.token) };
-                execGitSync(["fetch", "origin", "--", defaultBranch], { cwd, env: fullFetchEnv });
-                hasLocalDefaultBranch = true;
-                debugLog(`Strategy 1 (full): Successfully fetched origin/${defaultBranch}`);
-              } catch (fetchErr) {
-                debugLog(`Strategy 1 (full): Fetch failed - ${getErrorMessage(fetchErr)} (will try other strategies)`);
+            const defaultBranchRefResult = ensureOriginRemoteTrackingRef(defaultBranch, { cwd, token: options.token, suppressLogs: true });
+            const hasLocalDefaultBranch = defaultBranchRefResult.exists;
+            if (hasLocalDefaultBranch) {
+              if (defaultBranchRefResult.fetched) {
+                debugLog(`Strategy 1 (full): fetched origin/${defaultBranch} from remote`);
+              } else {
+                debugLog(`Strategy 1 (full): origin/${defaultBranch} exists locally`);
               }
+            } else {
+              debugLog(
+                `Strategy 1 (full): origin/${defaultBranch} not present locally and remote fetch failed (likely private repo without credentials in MCP server). Add ${JSON.stringify(defaultBranch)} to checkout.fetch to enable this strategy. Falling through to Strategy 2.`
+              );
             }
 
             if (hasLocalDefaultBranch) {
@@ -219,8 +218,27 @@ async function generateGitBundle(branchName, baseBranch, options = {}) {
 
         if (commitCount > 0) {
           // Generate bundle from the determined base to the branch
-          // git bundle create <file> <range> creates a bundle with the commit range
-          execGitSync(["bundle", "create", bundlePath, `${baseRef}..${branchName}`], { cwd });
+          // git bundle create <file> <range> creates a bundle with the commit range.
+          // In incremental mode, also exclude origin/<defaultBranch> when present so
+          // a "merge base branch into PR branch" workflow does not re-embed upstream
+          // commits that the remote already has.
+          const bundleCreateArgs = ["bundle", "create", bundlePath, `${baseRef}..${branchName}`];
+          if (mode === "incremental") {
+            const defaultBranchRefResult = ensureOriginRemoteTrackingRef(defaultBranch, {
+              cwd,
+              token: options.token,
+              suppressLogs: true,
+            });
+            if (defaultBranchRefResult.exists) {
+              bundleCreateArgs.push(`^origin/${defaultBranch}`);
+              debugLog(`Strategy 1 (incremental): excluding origin/${defaultBranch} from bundle prerequisites`);
+            } else {
+              const warningMessage = `Strategy 1 (incremental): origin/${defaultBranch} not present locally and remote fetch failed (likely private repo without credentials in MCP server); bundle will include base-branch history. Add ${JSON.stringify(defaultBranch)} to checkout.fetch to enable this optimisation.`;
+              debugLog(warningMessage);
+              core.warning(warningMessage);
+            }
+          }
+          execGitSync(bundleCreateArgs, { cwd });
 
           if (fs.existsSync(bundlePath)) {
             const stat = fs.statSync(bundlePath);
@@ -244,7 +262,11 @@ async function generateGitBundle(branchName, baseBranch, options = {}) {
         if (mode === "incremental") {
           return {
             success: false,
-            error: `Branch ${branchName} does not exist locally. Cannot generate incremental bundle.`,
+            error:
+              `Branch ${branchName} does not exist locally in checkout '${cwd}'. ` +
+              "Cannot generate incremental bundle. Possible causes: " +
+              `(1) you have not checked out '${branchName}' yet (for example: git checkout -b ${branchName} --track origin/${branchName}); ` +
+              "(2) the tool is running in the wrong repository checkout. Ensure GITHUB_WORKSPACE points to the repository that contains this pull request branch.",
             bundlePath,
           };
         }
@@ -288,15 +310,34 @@ async function generateGitBundle(branchName, baseBranch, options = {}) {
               // refs/heads/<branchName> — required by create_pull_request.cjs when applying the bundle.
               let rangeEnd = "HEAD";
               if (branchName) {
+                // Check whether the current branch already IS branchName.
+                // `git branch -f` refuses to update the currently checked-out branch
+                // ("cannot force update the branch used by worktree"), which would cause
+                // rangeEnd to fall back to "HEAD" and produce a bundle with only a HEAD
+                // ref instead of refs/heads/<branchName>.  This is the common case when
+                // a worker agent checks out the new branch, commits on it, and then calls
+                // create_pull_request — HEAD is already pointing to branchName.
+                let currentBranch = "";
                 try {
-                  // Use -f (force) to overwrite any stale local branch from previous runs,
-                  // since Strategy 1 verified the named branch does not exist as a proper local ref.
-                  // Use -- so a branch name beginning with "-" is not parsed as another option.
-                  execGitSync(["branch", "-f", "--", branchName, "HEAD"], { cwd });
+                  currentBranch = execGitSync(["rev-parse", "--abbrev-ref", "HEAD"], { cwd }).trim();
+                } catch {
+                  // Unable to determine current branch; fall through to git branch -f attempt.
+                }
+
+                if (currentBranch === branchName) {
                   rangeEnd = branchName;
-                  debugLog(`Strategy 2: Created local branch '${branchName}' pointing to HEAD for bundle ref`);
-                } catch (branchErr) {
-                  debugLog(`Strategy 2: Could not create branch '${branchName}': ${getErrorMessage(branchErr)}, using HEAD`);
+                  debugLog(`Strategy 2: HEAD is already on '${branchName}', using as range end directly`);
+                } else {
+                  try {
+                    // Use -f (force) to overwrite any stale local branch from previous runs,
+                    // since Strategy 1 verified the named branch does not exist as a proper local ref.
+                    // Use -- so a branch name beginning with "-" is not parsed as another option.
+                    execGitSync(["branch", "-f", "--", branchName, "HEAD"], { cwd });
+                    rangeEnd = branchName;
+                    debugLog(`Strategy 2: Created local branch '${branchName}' pointing to HEAD for bundle ref`);
+                  } catch (branchErr) {
+                    debugLog(`Strategy 2: Could not create branch '${branchName}': ${getErrorMessage(branchErr)}, using HEAD`);
+                  }
                 }
               }
               execGitSync(["bundle", "create", bundlePath, `${githubSha}..${rangeEnd}`], { cwd });
@@ -409,8 +450,8 @@ async function generateGitBundle(branchName, baseBranch, options = {}) {
 
 module.exports = {
   generateGitBundle,
-  getBundlePath,
-  getBundlePathForRepo,
+  getBundlePathForBranch,
+  getBundlePathForBranchInRepo,
   sanitizeBranchNameForBundle,
   sanitizeRepoSlugForBundle,
 };

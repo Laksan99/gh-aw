@@ -6,6 +6,8 @@ import (
 	"path/filepath"
 	"strings"
 
+	"github.com/github/gh-aw/pkg/fileutil"
+	"github.com/github/gh-aw/pkg/setutil"
 	"github.com/github/gh-aw/pkg/stringutil"
 
 	"github.com/github/gh-aw/pkg/console"
@@ -106,7 +108,7 @@ func RemoveWorkflows(pattern string, keepOrphans bool, workflowDir string) error
 
 		// Also check for corresponding .lock.yml file in .github/workflows
 		lockFile := stringutil.MarkdownToLockFile(file)
-		if _, err := os.Stat(lockFile); err == nil {
+		if fileutil.FileExists(lockFile) {
 			fmt.Fprintf(os.Stderr, "  %s (compiled workflow)\n", filepath.Base(lockFile))
 		}
 	}
@@ -145,7 +147,7 @@ func RemoveWorkflows(pattern string, keepOrphans bool, workflowDir string) error
 
 		// Also remove corresponding .lock.yml file
 		lockFile := stringutil.MarkdownToLockFile(file)
-		if _, err := os.Stat(lockFile); err == nil {
+		if fileutil.FileExists(lockFile) {
 			if err := os.Remove(lockFile); err != nil {
 				fmt.Fprintln(os.Stderr, console.FormatWarningMessage(fmt.Sprintf("Failed to remove %s: %v", lockFile, err)))
 			} else {
@@ -184,7 +186,8 @@ func cleanupOrphanedIncludes(verbose bool) error {
 	}
 
 	// Collect all include dependencies from remaining workflows
-	usedIncludes := make(map[string]bool)
+	usedIncludes := make(map[string]struct {
+	})
 
 	for _, mdFile := range mdFiles {
 		content, err := os.ReadFile(mdFile)
@@ -205,14 +208,15 @@ func cleanupOrphanedIncludes(verbose bool) error {
 		}
 
 		for _, include := range includes {
-			usedIncludes[include] = true
+			usedIncludes[include] = struct {
+			}{}
 		}
 	}
 
-	// Find all include files in .github/workflows
+	// Find all include files in the workflows directory
 	// Only consider files in subdirectories (like shared/) as potential include files
 	// Root-level .md files are workflow files, not include files
-	workflowsDir := ".github/workflows"
+	workflowsDir := constants.GetWorkflowDir()
 	var allIncludes []string
 
 	err = filepath.Walk(workflowsDir, func(path string, info os.FileInfo, err error) error {
@@ -242,7 +246,7 @@ func cleanupOrphanedIncludes(verbose bool) error {
 
 	// Remove unused includes
 	for _, include := range allIncludes {
-		if !usedIncludes[include] {
+		if !setutil.Contains(usedIncludes, include) {
 			includePath := filepath.Join(workflowsDir, include)
 			if err := os.Remove(includePath); err != nil {
 				if verbose {
@@ -266,15 +270,17 @@ func previewOrphanedIncludes(filesToRemove []string, verbose bool) ([]string, er
 	}
 
 	// Create a map of files to remove for quick lookup
-	removeMap := make(map[string]bool)
+	removeMap := make(map[string]struct {
+	})
 	for _, file := range filesToRemove {
-		removeMap[file] = true
+		removeMap[file] = struct {
+		}{}
 	}
 
 	// Get the files that would remain after removal
 	var remainingFiles []string
 	for _, file := range allMdFiles {
-		if !removeMap[file] {
+		if !setutil.Contains(removeMap, file) {
 			remainingFiles = append(remainingFiles, file)
 		}
 	}
@@ -285,7 +291,8 @@ func previewOrphanedIncludes(filesToRemove []string, verbose bool) ([]string, er
 	}
 
 	// Collect all include dependencies from remaining workflows
-	usedIncludes := make(map[string]bool)
+	usedIncludes := make(map[string]struct {
+	})
 
 	for _, mdFile := range remainingFiles {
 		content, err := os.ReadFile(mdFile)
@@ -306,7 +313,8 @@ func previewOrphanedIncludes(filesToRemove []string, verbose bool) ([]string, er
 		}
 
 		for _, include := range includes {
-			usedIncludes[include] = true
+			usedIncludes[include] = struct {
+			}{}
 		}
 	}
 
@@ -318,7 +326,7 @@ func previewOrphanedIncludes(filesToRemove []string, verbose bool) ([]string, er
 
 	var orphanedIncludes []string
 	for _, include := range allIncludes {
-		if !usedIncludes[include] {
+		if !setutil.Contains(usedIncludes, include) {
 			orphanedIncludes = append(orphanedIncludes, include)
 		}
 	}
@@ -328,7 +336,7 @@ func previewOrphanedIncludes(filesToRemove []string, verbose bool) ([]string, er
 
 // getAllIncludeFiles returns all include files in .github/workflows subdirectories
 func getAllIncludeFiles() ([]string, error) {
-	workflowsDir := ".github/workflows"
+	workflowsDir := constants.GetWorkflowDir()
 	var allIncludes []string
 
 	err := filepath.Walk(workflowsDir, func(path string, info os.FileInfo, err error) error {
@@ -357,7 +365,7 @@ func getAllIncludeFiles() ([]string, error) {
 
 // cleanupAllIncludes removes all include files when no workflows remain
 func cleanupAllIncludes(verbose bool) error {
-	workflowsDir := ".github/workflows"
+	workflowsDir := constants.GetWorkflowDir()
 
 	err := filepath.Walk(workflowsDir, func(path string, info os.FileInfo, err error) error {
 		if err != nil {
@@ -386,41 +394,8 @@ func cleanupAllIncludes(verbose bool) error {
 	return err
 }
 
-// hasDirectiveMarker reports whether content contains any @include, @import, or {{#import
-// directive marker using a single forward scan of the content.
-func hasDirectiveMarker(content string) bool {
-	for i := 0; i < len(content); {
-		// A single IndexAny call locates the next '@' or '{' in one pass, so
-		// the content is traversed at most once regardless of which byte appears first.
-		idx := strings.IndexAny(content[i:], "@{")
-		if idx < 0 {
-			return false
-		}
-		pos := i + idx
-		rest := content[pos:]
-		switch rest[0] {
-		case '@':
-			if strings.HasPrefix(rest, "@include") || strings.HasPrefix(rest, "@import") {
-				return true
-			}
-		case '{':
-			if strings.HasPrefix(rest, "{{#import") {
-				return true
-			}
-		}
-		i = pos + 1
-	}
-	return false
-}
-
 // findIncludesInContent finds all import references in content
 func findIncludesInContent(content string) ([]string, error) {
-
-	// Fast path: skip the line scan entirely when no directive markers are present.
-	if !hasDirectiveMarker(content) {
-		return []string{}, nil
-	}
-
 	var includes []string
 	// Manual index-based scan avoids the iter.Seq yield overhead of strings.Lines.
 	for remaining := content; remaining != ""; {
@@ -433,10 +408,16 @@ func findIncludesInContent(content string) ([]string, error) {
 			remaining = ""
 		}
 		if path := parseIncludePath(line); path != "" {
+			if includes == nil {
+				includes = make([]string, 0, 4)
+			}
 			includes = append(includes, path)
 		}
 	}
 
+	if includes == nil {
+		return []string{}, nil
+	}
 	return includes, nil
 }
 
@@ -446,7 +427,7 @@ func findIncludesInContent(content string) ([]string, error) {
 // Section references (e.g. file.md#Section) are stripped from the returned path.
 func parseIncludePath(line string) string {
 	trimmed := strings.TrimSpace(line)
-	if len(trimmed) == 0 {
+	if trimmed == "" {
 		return ""
 	}
 
@@ -498,7 +479,7 @@ func parseIncludePath(line string) string {
 		rest = rest[1:]
 	}
 	// Require at least one whitespace character after the directive keyword
-	if len(rest) == 0 || (rest[0] != ' ' && rest[0] != '\t') {
+	if rest == "" || (rest[0] != ' ' && rest[0] != '\t') {
 		return ""
 	}
 	path := strings.TrimSpace(rest)

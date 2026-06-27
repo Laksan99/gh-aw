@@ -5,21 +5,20 @@ import (
 	"fmt"
 	"maps"
 	"net/url"
-	"sort"
+	"regexp"
 	"strings"
 
 	"github.com/github/gh-aw/pkg/constants"
 	"github.com/github/gh-aw/pkg/logger"
+	"github.com/github/gh-aw/pkg/sliceutil"
 )
 
 var otlpLog = logger.New("workflow:observability_otlp")
 
-// normalizeOTLPHeaders converts the headers field value (which may be a string or a map)
-// into the comma-separated key=value format required by OTEL_EXPORTER_OTLP_HEADERS.
-//
-// String form: "Authorization=Bearer tok,X-Tenant=acme"
-// Map form:    map[string]any{"Authorization": "Bearer tok", "X-Tenant": "acme"}
-func normalizeOTLPHeaders(raw any) string {
+var sentryEndpointExpressionPattern = regexp.MustCompile(`(?i)^\$\{\{\s*secrets\.` + regexp.QuoteMeta(constants.OTELSentryEndpointSecretName) + `\s*\}\}$`)
+var otlpResourceAttributeSecretRefPattern = regexp.MustCompile(`\$\{\{\s*(secrets|vars)\.`)
+
+func normalizeOTLPHeadersForEndpoint(raw any, endpoint string) string {
 	if raw == nil {
 		return ""
 	}
@@ -28,17 +27,13 @@ func normalizeOTLPHeaders(raw any) string {
 		if v == "" {
 			return ""
 		}
-		return v
+		return rewriteOTLPHeaderPairsForEndpoint(v, endpoint)
 	case map[string]any:
 		if len(v) == 0 {
 			return ""
 		}
 		// Sort keys for deterministic output
-		keys := make([]string, 0, len(v))
-		for k := range v {
-			keys = append(keys, k)
-		}
-		sort.Strings(keys)
+		keys := sliceutil.SortedKeys(v)
 		var parts []string
 		for _, k := range keys {
 			val, ok := v[k].(string)
@@ -46,13 +41,69 @@ func normalizeOTLPHeaders(raw any) string {
 				otlpLog.Printf("OTLP headers map: value for key %q is not a string (got %T), skipping", k, v[k])
 				continue
 			}
-			parts = append(parts, k+"="+val)
+			parts = append(parts, normalizeOTLPHeaderNameForEndpoint(k, endpoint)+"="+val)
 		}
 		return strings.Join(parts, ",")
 	default:
 		otlpLog.Printf("Unexpected type for OTLP headers: %T", raw)
 		return ""
 	}
+}
+
+func rewriteOTLPHeaderPairsForEndpoint(raw string, endpoint string) string {
+	if !shouldRewriteAuthorizationForSentry(endpoint) || !strings.Contains(raw, "=") {
+		return raw
+	}
+	if strings.Contains(raw, "Authorization=Sentry sentry_version=") && strings.Contains(raw, ", sentry_key=") {
+		otlpLog.Printf("Detected Sentry auth value with commas in string form - this may cause parsing errors. Use map form for headers instead: map[string]any{\"Authorization\": \"...\"}")
+	}
+
+	pairs := strings.Split(raw, ",")
+	for i, pair := range pairs {
+		key, value, found := strings.Cut(pair, "=")
+		if !found {
+			continue
+		}
+		pairs[i] = normalizeOTLPHeaderNameForEndpoint(strings.TrimSpace(key), endpoint) + "=" + value
+	}
+
+	return strings.Join(pairs, ",")
+}
+
+func normalizeOTLPHeaderNameForEndpoint(name string, endpoint string) string {
+	if shouldRewriteAuthorizationForSentry(endpoint) && strings.EqualFold(strings.TrimSpace(name), "Authorization") {
+		return "x-sentry-auth"
+	}
+
+	return name
+}
+
+func shouldRewriteAuthorizationForSentry(endpoint string) bool {
+	trimmed := strings.TrimSpace(endpoint)
+	if trimmed == "" {
+		return false
+	}
+	lowerTrimmed := strings.ToLower(trimmed)
+
+	if parsed, err := url.Parse(trimmed); err == nil {
+		if host := strings.ToLower(parsed.Hostname()); host != "" { //nolint:tolowerequalfold
+			return strings.Contains(host, "sentry")
+		}
+	}
+
+	if isGitHubActionsExpression(trimmed) {
+		return sentryEndpointExpressionPattern.MatchString(trimmed)
+	}
+
+	return strings.Contains(lowerTrimmed, "sentry")
+}
+
+// isGitHubActionsExpression returns true when the value is wrapped in GitHub
+// Actions expression delimiters like `${{ ... }}` after trimming surrounding
+// whitespace.
+func isGitHubActionsExpression(value string) bool {
+	trimmed := strings.TrimSpace(value)
+	return strings.HasPrefix(trimmed, "${{") && strings.HasSuffix(trimmed, "}}")
 }
 
 // extractOTLPEndpointDomain parses an OTLP endpoint URL and returns its hostname.
@@ -99,6 +150,130 @@ func getOTLPEndpointEnvValue(config *FrontmatterConfig) string {
 	return ""
 }
 
+func getOTLPGitHubApp(config *FrontmatterConfig, frontmatter map[string]any) *OTLPGitHubAppConfig {
+	if config != nil && config.Observability != nil && config.Observability.OTLP != nil && config.Observability.OTLP.GitHubApp != nil {
+		return config.Observability.OTLP.GitHubApp
+	}
+	if frontmatter == nil {
+		return nil
+	}
+	obsAny, ok := frontmatter["observability"]
+	if !ok {
+		return nil
+	}
+	obsMap, ok := obsAny.(map[string]any)
+	if !ok {
+		return nil
+	}
+	otlpAny, ok := obsMap["otlp"]
+	if !ok {
+		return nil
+	}
+	otlpMap, ok := otlpAny.(map[string]any)
+	if !ok {
+		return nil
+	}
+	authAny, ok := otlpMap["github-app"]
+	if !ok {
+		return nil
+	}
+	authMap, ok := authAny.(map[string]any)
+	if !ok {
+		return nil
+	}
+	audience, _ := authMap["audience"].(string)
+	return &OTLPGitHubAppConfig{
+		Audience: audience,
+	}
+}
+
+func getOTLPGitHubAppTokenConfig(frontmatter map[string]any) *GitHubAppConfig {
+	if frontmatter == nil {
+		return nil
+	}
+
+	obsAny, ok := frontmatter["observability"]
+	if !ok {
+		return nil
+	}
+
+	obsMap, ok := obsAny.(map[string]any)
+	if !ok {
+		return nil
+	}
+
+	githubAppMap := extractRawOTLPGitHubAppMap(obsMap)
+	if githubAppMap == nil {
+		return nil
+	}
+
+	app := parseAppConfig(githubAppMap)
+	if !app.hasRequiredCredentials() {
+		return nil
+	}
+
+	return app
+}
+
+func hasOTLPGitHubOIDCAuth(config *FrontmatterConfig, frontmatter map[string]any) bool {
+	if getOTLPGitHubAppTokenConfig(frontmatter) != nil {
+		return false
+	}
+
+	return getOTLPGitHubApp(config, frontmatter) != nil
+}
+
+// normalizeOTLPIfMissingMode returns a validated if-missing mode.
+// Empty string means "unset/default (error)".
+func normalizeOTLPIfMissingMode(mode string) string {
+	switch strings.ToLower(strings.TrimSpace(mode)) {
+	case "":
+		return ""
+	case "error", "warn", "ignore":
+		return strings.ToLower(strings.TrimSpace(mode))
+	default:
+		return ""
+	}
+}
+
+// getOTLPIfMissingMode returns observability.otlp.if-missing mode.
+// Returns empty string when unset or invalid.
+func getOTLPIfMissingMode(config *FrontmatterConfig, frontmatter map[string]any) string {
+	if config != nil && config.Observability != nil && config.Observability.OTLP != nil {
+		if mode := normalizeOTLPIfMissingMode(config.Observability.OTLP.IfMissing); mode != "" {
+			return mode
+		}
+	}
+	if frontmatter == nil {
+		return ""
+	}
+	obsAny, ok := frontmatter["observability"]
+	if !ok {
+		return ""
+	}
+	obsMap, ok := obsAny.(map[string]any)
+	if !ok {
+		return ""
+	}
+	otlpAny, ok := obsMap["otlp"]
+	if !ok {
+		return ""
+	}
+	otlpMap, ok := otlpAny.(map[string]any)
+	if !ok {
+		return ""
+	}
+	if v, ok := otlpMap["if-missing"].(string); ok {
+		if mode := normalizeOTLPIfMissingMode(v); mode != "" {
+			return mode
+		}
+		if strings.TrimSpace(v) != "" {
+			otlpLog.Printf("Ignoring invalid observability.otlp.if-missing value %q (expected one of: error, warn, ignore)", v)
+		}
+	}
+	return ""
+}
+
 // isOTLPHeadersPresent returns true when OTEL_EXPORTER_OTLP_HEADERS or
 // GH_AW_OTLP_ALL_HEADERS has been injected into the workflow-level env block.
 // This indicates that header masking is needed so that authentication tokens in
@@ -135,12 +310,179 @@ func generateOTLPHeadersMaskStep() string {
 	return sb.String()
 }
 
+// isOTLPAttributesPresent returns true when GH_AW_OTLP_ATTRIBUTES has been
+// injected into the workflow-level env block.  This indicates that attribute
+// value masking is needed so that user-supplied values do not leak into
+// GitHub Actions runner logs.
+func isOTLPAttributesPresent(data *WorkflowData) bool {
+	if data == nil {
+		return false
+	}
+	return strings.Contains(data.Env, "GH_AW_OTLP_ATTRIBUTES")
+}
+
+func getOTLPResourceAttributes(workflowData *WorkflowData) map[string]string {
+	if workflowData == nil {
+		return nil
+	}
+	resourceAttrs := collectOTLPResourceAttributes(workflowData.RawFrontmatter)
+	if len(resourceAttrs) == 0 &&
+		workflowData.ParsedFrontmatter != nil &&
+		workflowData.ParsedFrontmatter.Observability != nil &&
+		workflowData.ParsedFrontmatter.Observability.OTLP != nil {
+		resourceAttrs = workflowData.ParsedFrontmatter.Observability.OTLP.ResourceAttributes
+	}
+	return resourceAttrs
+}
+
+func validateOTLPResourceAttributes(workflowData *WorkflowData) error {
+	for key, value := range getOTLPResourceAttributes(workflowData) {
+		if otlpResourceAttributeSecretRefPattern.MatchString(value) {
+			return fmt.Errorf(
+				"observability.otlp.resource-attributes.%s must not reference secrets.* or vars.*; OTEL resource attributes are exported to tracing backends and are not treated as secret values",
+				key,
+			)
+		}
+	}
+	return nil
+}
+
+// generateOTLPAttributesMaskStep returns a GitHub Actions step that runs
+// mask_otlp_attributes.sh to issue the ::add-mask:: workflow command for every
+// value in the GH_AW_OTLP_ATTRIBUTES JSON object.  Masking the values prevents
+// user-supplied custom span attribute values (e.g. session IDs, user IDs) from
+// appearing in plaintext in GitHub Actions runner logs.
+func generateOTLPAttributesMaskStep() string {
+	var sb strings.Builder
+	sb.WriteString("      - name: Mask OTLP custom attribute values\n")
+	sb.WriteString("        run: bash \"${RUNNER_TEMP}/gh-aw/actions/mask_otlp_attributes.sh\"\n")
+	return sb.String()
+}
+
 // otlpEndpointEntry is the wire format used when encoding the GH_AW_OTLP_ENDPOINTS
 // environment variable as a JSON array.  Each entry carries the endpoint URL and
 // its optional normalized (comma-separated key=value) headers string.
 type otlpEndpointEntry struct {
 	URL     string `json:"url"`
 	Headers string `json:"headers,omitempty"`
+}
+
+// collectOTLPCustomAttributes reads the `observability.otlp.attributes` map from
+// a raw frontmatter map and returns it as a map[string]string. Only string values
+// are accepted; non-string values are silently ignored. Returns nil when the
+// field is absent or empty.
+func collectOTLPCustomAttributes(frontmatter map[string]any) map[string]string {
+	if frontmatter == nil {
+		return nil
+	}
+	obsAny, ok := frontmatter["observability"]
+	if !ok {
+		return nil
+	}
+	obsMap, ok := obsAny.(map[string]any)
+	if !ok {
+		return nil
+	}
+	return extractOTLPStringMapFromObsMap(obsMap, "attributes")
+}
+
+// collectOTLPResourceAttributes reads the
+// `observability.otlp.resource-attributes` map from a raw frontmatter map and
+// returns it as a map[string]string. Only string values are accepted; non-string
+// values are silently ignored. Returns nil when the field is absent or empty.
+func collectOTLPResourceAttributes(frontmatter map[string]any) map[string]string {
+	if frontmatter == nil {
+		return nil
+	}
+	obsAny, ok := frontmatter["observability"]
+	if !ok {
+		return nil
+	}
+	obsMap, ok := obsAny.(map[string]any)
+	if !ok {
+		return nil
+	}
+	return extractOTLPStringMapFromObsMap(obsMap, "resource-attributes")
+}
+
+// extractOTLPStringMapFromObsMap reads an `otlp.<fieldName>` string map from a
+// raw observability section map (i.e. the value of the "observability" key in
+// the frontmatter) and returns it as a map[string]string. Only string values are
+// accepted; non-string values are silently ignored. Returns nil when the field is
+// absent or empty.
+func extractOTLPStringMapFromObsMap(obsMap map[string]any, fieldName string) map[string]string {
+	if obsMap == nil {
+		return nil
+	}
+	otlpAny, ok := obsMap["otlp"]
+	if !ok {
+		return nil
+	}
+	otlpMap, ok := otlpAny.(map[string]any)
+	if !ok {
+		return nil
+	}
+	attrsAny, ok := otlpMap[fieldName]
+	if !ok {
+		return nil
+	}
+	attrsMap, ok := attrsAny.(map[string]any)
+	if !ok {
+		return nil
+	}
+	result := make(map[string]string, len(attrsMap))
+	for k, v := range attrsMap {
+		if s, ok := v.(string); ok && k != "" {
+			result[k] = s
+		}
+	}
+	if len(result) == 0 {
+		return nil
+	}
+	return result
+}
+
+// extractOTLPCustomAttributesFromObsMap reads the `otlp.attributes` map from a
+// raw observability section map and returns it as a map[string]string.
+func extractOTLPCustomAttributesFromObsMap(obsMap map[string]any) map[string]string {
+	return extractOTLPStringMapFromObsMap(obsMap, "attributes")
+}
+
+// extractOTLPResourceAttributesFromObsMap reads the
+// `otlp.resource-attributes` map from a raw observability section map and
+// returns it as a map[string]string.
+func extractOTLPResourceAttributesFromObsMap(obsMap map[string]any) map[string]string {
+	return extractOTLPStringMapFromObsMap(obsMap, "resource-attributes")
+}
+
+// encodeOTLPCustomAttributes serialises a map[string]string of custom OTLP span
+// attributes to a compact JSON string suitable for use as the GH_AW_OTLP_ATTRIBUTES
+// environment variable.  Returns an empty string when the map is nil/empty or
+// serialisation fails.
+func encodeOTLPCustomAttributes(attrs map[string]string) string {
+	if len(attrs) == 0 {
+		return ""
+	}
+	b, err := json.Marshal(attrs)
+	if err != nil {
+		otlpLog.Printf("Failed to encode OTLP custom attributes: %v", err)
+		return ""
+	}
+	return string(b)
+}
+
+// mergeOTLPStringMaps merges two string maps; values in base take precedence over
+// values in override when the same key is present in both. Returns nil when both
+// inputs are empty.
+func mergeOTLPStringMaps(base, override map[string]string) map[string]string {
+	if len(base) == 0 && len(override) == 0 {
+		return nil
+	}
+	merged := make(map[string]string, safeAllocationCapacity(len(base), len(override)))
+	maps.Copy(merged, override)
+	// base takes precedence
+	maps.Copy(merged, base)
+	return merged
 }
 
 // collectAllOTLPEndpoints reads the `observability.otlp.endpoint` field from the raw
@@ -178,7 +520,7 @@ func collectAllOTLPEndpoints(frontmatter map[string]any) []otlpEndpointEntry {
 	case string:
 		// Backward-compat string form: endpoint: "https://..."
 		if ep != "" {
-			headers := normalizeOTLPHeaders(topHeadersRaw)
+			headers := normalizeOTLPHeadersForEndpoint(topHeadersRaw, ep)
 			entries = append(entries, otlpEndpointEntry{URL: ep, Headers: headers})
 		}
 	case map[string]any:
@@ -186,7 +528,7 @@ func collectAllOTLPEndpoints(frontmatter map[string]any) []otlpEndpointEntry {
 		if url, _ := ep["url"].(string); url != "" {
 			headers := ""
 			if h, hasH := ep["headers"]; hasH {
-				headers = normalizeOTLPHeaders(h)
+				headers = normalizeOTLPHeadersForEndpoint(h, url)
 			}
 			entries = append(entries, otlpEndpointEntry{URL: url, Headers: headers})
 		}
@@ -203,7 +545,7 @@ func collectAllOTLPEndpoints(frontmatter map[string]any) []otlpEndpointEntry {
 			}
 			headers := ""
 			if h, hasH := itemMap["headers"]; hasH {
-				headers = normalizeOTLPHeaders(h)
+				headers = normalizeOTLPHeadersForEndpoint(h, url)
 			}
 			entries = append(entries, otlpEndpointEntry{URL: url, Headers: headers})
 		}
@@ -285,6 +627,33 @@ func extractRawOTLPEndpointMaps(obs map[string]any) []map[string]any {
 	return result
 }
 
+// extractRawOTLPGitHubAppMap returns observability.otlp.github-app as a
+// shallow-copied map when present and valid.
+func extractRawOTLPGitHubAppMap(obs map[string]any) map[string]any {
+	if obs == nil {
+		return nil
+	}
+	otlpAny, ok := obs["otlp"]
+	if !ok {
+		return nil
+	}
+	otlpMap, ok := otlpAny.(map[string]any)
+	if !ok {
+		return nil
+	}
+	githubAppAny, ok := otlpMap["github-app"]
+	if !ok {
+		return nil
+	}
+	githubAppMap, ok := githubAppAny.(map[string]any)
+	if !ok {
+		return nil
+	}
+	copied := make(map[string]any, len(githubAppMap))
+	maps.Copy(copied, githubAppMap)
+	return copied
+}
+
 // endpoint entry.  Duplicate pairs are included as-is; the result is used only
 // for secret-masking and contains no sensitive data itself after runtime
 // expression substitution by GitHub Actions.
@@ -313,6 +682,13 @@ func allOTLPHeaders(entries []otlpEndpointEntry) string {
 //     injected for the first endpoint (backward compat) and GH_AW_OTLP_ALL_HEADERS
 //     is injected with all headers across every endpoint (for secret masking).
 //
+//  5. OTEL_RESOURCE_ATTRIBUTES is injected with gh-aw/GitHub run context so child
+//     OTel SDKs (Copilot CLI, MCP gateway) inherit correlation attributes.
+//
+//  6. When observability.otlp.attributes is configured, GH_AW_OTLP_ATTRIBUTES is
+//     injected as a JSON-encoded map so that span-emitting scripts can append custom
+//     attributes (including Langfuse session/user IDs) to every span.
+//
 // When no OTLP endpoint is configured the function is a no-op.
 func (c *Compiler) injectOTLPConfig(workflowData *WorkflowData) {
 	// Collect all endpoint entries from the endpoint field (string, object, or array).
@@ -324,7 +700,7 @@ func (c *Compiler) injectOTLPConfig(workflowData *WorkflowData) {
 			var h string
 			if workflowData.ParsedFrontmatter.Observability != nil &&
 				workflowData.ParsedFrontmatter.Observability.OTLP != nil {
-				h = normalizeOTLPHeaders(workflowData.ParsedFrontmatter.Observability.OTLP.Headers)
+				h = normalizeOTLPHeadersForEndpoint(workflowData.ParsedFrontmatter.Observability.OTLP.Headers, ep)
 			}
 			entries = []otlpEndpointEntry{{URL: ep, Headers: h}}
 		}
@@ -349,12 +725,15 @@ func (c *Compiler) injectOTLPConfig(workflowData *WorkflowData) {
 
 	firstEndpoint := entries[0].URL
 	firstHeaders := entries[0].Headers
+	serviceName := otelServiceName(workflowData)
+	ifMissingMode := getOTLPIfMissingMode(workflowData.ParsedFrontmatter, workflowData.RawFrontmatter)
 
 	// 2. Inject OTEL env vars into the workflow-level env: block.
-	//    OTEL_EXPORTER_OTLP_ENDPOINT and OTEL_SERVICE_NAME are set to the first
-	//    endpoint for backward compatibility (MCP gateway, legacy scripts).
-	otlpEnvLines := fmt.Sprintf("  OTEL_EXPORTER_OTLP_ENDPOINT: %s\n  OTEL_SERVICE_NAME: gh-aw", firstEndpoint)
-	otlpEnvLines += "\n  COPILOT_OTEL_FILE_EXPORTER_PATH: /tmp/gh-aw/" + constants.CopilotOtelJsonlFilename
+	//    OTEL_EXPORTER_OTLP_ENDPOINT is set to the first endpoint for backward
+	//    compatibility (MCP gateway, legacy scripts). OTEL_SERVICE_NAME is
+	//    workflow-specific when WorkflowID is available.
+	otlpEnvLines := fmt.Sprintf("  OTEL_EXPORTER_OTLP_ENDPOINT: %s\n  OTEL_SERVICE_NAME: %s", firstEndpoint, serviceName)
+	otlpEnvLines += "\n  OTEL_RESOURCE_ATTRIBUTES: '" + escapeYAMLSingleQuoted(otelResourceAttributes(workflowData)) + "'"
 
 	// 3. Inject per-endpoint headers env vars.
 	//    OTEL_EXPORTER_OTLP_HEADERS = first endpoint headers (backward compat).
@@ -372,9 +751,32 @@ func (c *Compiler) injectOTLPConfig(workflowData *WorkflowData) {
 	// The value is single-quoted to prevent YAML parsers from interpreting the
 	// leading '[' as a YAML sequence node rather than a plain string.
 	if encoded := encodeOTLPEndpoints(entries); encoded != "" {
-		escapedEncoded := strings.ReplaceAll(encoded, "'", "''")
+		escapedEncoded := escapeYAMLSingleQuoted(encoded)
 		otlpEnvLines += "\n  GH_AW_OTLP_ENDPOINTS: '" + escapedEncoded + "'"
 		otlpLog.Printf("Injected GH_AW_OTLP_ENDPOINTS env var")
+	}
+	if ifMissingMode == "warn" || ifMissingMode == "ignore" {
+		otlpEnvLines += "\n  GH_AW_OTLP_IF_MISSING: " + ifMissingMode
+		otlpLog.Printf("Injected GH_AW_OTLP_IF_MISSING env var (%s)", ifMissingMode)
+	}
+
+	// 5. Inject OTEL_RESOURCE_ATTRIBUTES so child OTel SDKs (Copilot CLI, MCP
+	//    gateway) inherit gh-aw/GitHub workflow context in their resource block.
+	//
+	// 6. Inject GH_AW_OTLP_ATTRIBUTES (JSON object) for custom per-span attributes.
+	//    Attributes from RawFrontmatter take precedence; ParsedFrontmatter is the
+	//    fallback for workflows that were parsed but whose RawFrontmatter was later
+	//    modified (e.g. during observability merge in the orchestrator).
+	customAttrs := collectOTLPCustomAttributes(workflowData.RawFrontmatter)
+	if len(customAttrs) == 0 && workflowData.ParsedFrontmatter != nil &&
+		workflowData.ParsedFrontmatter.Observability != nil &&
+		workflowData.ParsedFrontmatter.Observability.OTLP != nil {
+		customAttrs = workflowData.ParsedFrontmatter.Observability.OTLP.Attributes
+	}
+	if encoded := encodeOTLPCustomAttributes(customAttrs); encoded != "" {
+		escapedEncoded := escapeYAMLSingleQuoted(encoded)
+		otlpEnvLines += "\n  GH_AW_OTLP_ATTRIBUTES: '" + escapedEncoded + "'"
+		otlpLog.Printf("Injected GH_AW_OTLP_ATTRIBUTES env var (%d custom attributes)", len(customAttrs))
 	}
 
 	if workflowData.Env == "" {
@@ -389,4 +791,71 @@ func (c *Compiler) injectOTLPConfig(workflowData *WorkflowData) {
 	workflowData.OTLPEndpoint = firstEndpoint
 	workflowData.OTLPHeaders = firstHeaders
 	workflowData.OTLPEndpoints = encodeOTLPEndpoints(entries)
+}
+
+func otelServiceName(workflowData *WorkflowData) string {
+	const defaultServiceName = "gh-aw"
+	if workflowData == nil {
+		return defaultServiceName
+	}
+
+	// Prefer the file-based WorkflowID to avoid collisions across workflows that
+	// may share display names; fall back to workflow Name when WorkflowID is
+	// unavailable (for workflow_call-only contexts).
+	workflowIDOrName := strings.TrimSpace(workflowData.WorkflowID)
+	if workflowIDOrName == "" {
+		workflowIDOrName = workflowData.Name
+	}
+
+	// SanitizeWorkflowName lowercases the workflow identifier and converts
+	// separators/special characters (spaces, slashes, etc.) to hyphens so the
+	// service suffix is stable and backend-friendly.
+	sanitizedWorkflowName := SanitizeWorkflowName(workflowIDOrName)
+	if sanitizedWorkflowName == "" {
+		return defaultServiceName
+	}
+
+	return defaultServiceName + "." + sanitizedWorkflowName
+}
+
+// encodeOTELResourceAttributeValue applies RFC 3986 percent-encoding to the
+// UTF-8 bytes used in OTEL_RESOURCE_ATTRIBUTES keys/values.
+func encodeOTELResourceAttributeValue(value string) string {
+	return strings.ReplaceAll(url.QueryEscape(value), "+", "%20")
+}
+
+func formatOTELResourceAttribute(key, value string) string {
+	trimmedKey := strings.TrimSpace(key)
+	trimmedValue := strings.TrimSpace(value)
+	if strings.Contains(trimmedValue, "${{") {
+		return encodeOTELResourceAttributeValue(trimmedKey) + "=" + trimmedValue
+	}
+	return encodeOTELResourceAttributeValue(trimmedKey) + "=" + encodeOTELResourceAttributeValue(trimmedValue)
+}
+
+func otelResourceAttributes(workflowData *WorkflowData) string {
+	workflowNameAttrValue := "unknown"
+	if workflowData != nil {
+		if workflowName := strings.TrimSpace(workflowData.Name); workflowName != "" {
+			workflowNameAttrValue = workflowName
+		}
+	}
+
+	attrs := []string{
+		formatOTELResourceAttribute("gh-aw.workflow.name", workflowNameAttrValue),
+		formatOTELResourceAttribute("gh-aw.repository", "${{ github.repository }}"),
+		formatOTELResourceAttribute("gh-aw.run.id", "${{ github.run_id }}"),
+		formatOTELResourceAttribute("github.run_id", "${{ github.run_id }}"),
+	}
+	if engineID := ResolveEngineID(workflowData); engineID != "" {
+		attrs = append(attrs, formatOTELResourceAttribute("gh-aw.engine.id", engineID))
+	}
+	resourceAttrs := getOTLPResourceAttributes(workflowData)
+	if len(resourceAttrs) > 0 {
+		keys := sliceutil.SortedKeys(resourceAttrs)
+		for _, key := range keys {
+			attrs = append(attrs, formatOTELResourceAttribute(key, resourceAttrs[key]))
+		}
+	}
+	return strings.Join(attrs, ",")
 }

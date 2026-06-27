@@ -9,9 +9,32 @@ import (
 
 	"github.com/github/gh-aw/pkg/constants"
 	"github.com/github/gh-aw/pkg/logger"
+	"github.com/github/gh-aw/pkg/sliceutil"
 )
 
 var jobLog = logger.New("workflow:jobs")
+
+const runtimeFeaturesEnvVarName = "GH_AW_RUNTIME_FEATURES"
+const runtimeFeaturesEnvVarExpression = "${{ vars.GH_AW_RUNTIME_FEATURES }}"
+
+const pushExperimentsStateJobName = "push_experiments_state"
+const pushRepoMemoryJobName = "push_repo_memory"
+const updateCacheMemoryJobName = "update_cache_memory"
+
+var runtimeFeaturesBuiltInJobNames = map[string]struct{}{
+	string(constants.AgentJobName):              {},
+	string(constants.ActivationJobName):         {},
+	string(constants.PreActivationJobName):      {},
+	string(constants.DetectionJobName):          {},
+	string(constants.SafeOutputsJobName):        {},
+	string(constants.UploadAssetsJobName):       {},
+	string(constants.UploadCodeScanningJobName): {},
+	string(constants.ConclusionJobName):         {},
+	string(constants.UnlockJobName):             {},
+	pushExperimentsStateJobName:                 {},
+	pushRepoMemoryJobName:                       {},
+	updateCacheMemoryJobName:                    {},
+}
 
 // Job represents a GitHub Actions job with all its properties
 type Job struct {
@@ -20,8 +43,10 @@ type Job struct {
 	RunsOn                     string
 	If                         string
 	HasWorkflowRunSafetyChecks bool // If true, the job's if condition includes workflow_run safety checks
+	PermissionsComment         string
 	Permissions                string
 	TimeoutMinutes             int
+	TimeoutMinutesExpression   string
 	Concurrency                string            // Job-level concurrency configuration
 	Environment                string            // Job environment configuration
 	Strategy                   string            // Job strategy configuration (matrix strategy)
@@ -55,6 +80,10 @@ func NewJobManager() *JobManager {
 
 // AddJob adds a job to the manager
 func (jm *JobManager) AddJob(job *Job) error {
+	if err := validateJobDefinition(job); err != nil {
+		return err
+	}
+
 	if job.Name == "" {
 		return errors.New("job name cannot be empty")
 	}
@@ -265,6 +294,11 @@ func (jm *JobManager) renderJobTo(b *strings.Builder, job *Job) {
 	}
 
 	// Add permissions section
+	if job.PermissionsComment != "" {
+		for line := range strings.SplitSeq(strings.TrimRight(job.PermissionsComment, "\n"), "\n") {
+			fmt.Fprintf(b, "    %s\n", line)
+		}
+	}
 	if job.Permissions != "" {
 		fmt.Fprintf(b, "    %s\n", job.Permissions)
 	}
@@ -275,7 +309,10 @@ func (jm *JobManager) renderJobTo(b *strings.Builder, job *Job) {
 	}
 
 	// Add timeout-minutes if specified
-	if job.TimeoutMinutes > 0 {
+	if job.TimeoutMinutesExpression != "" {
+		// TimeoutMinutesExpression is validated when parsed from frontmatter in compiler_jobs.go.
+		fmt.Fprintf(b, "    timeout-minutes: %s\n", job.TimeoutMinutesExpression)
+	} else if job.TimeoutMinutes > 0 {
 		fmt.Fprintf(b, "    timeout-minutes: %d\n", job.TimeoutMinutes)
 	}
 
@@ -285,17 +322,14 @@ func (jm *JobManager) renderJobTo(b *strings.Builder, job *Job) {
 	}
 
 	// Add environment variables section
-	if len(job.Env) > 0 {
+	env := buildRenderedJobEnv(job)
+	if len(env) > 0 {
 		b.WriteString("    env:\n")
 		// Sort environment variable keys for consistent output
-		envKeys := make([]string, 0, len(job.Env))
-		for key := range job.Env {
-			envKeys = append(envKeys, key)
-		}
-		sort.Strings(envKeys)
+		envKeys := sliceutil.SortedKeys(env)
 
 		for _, key := range envKeys {
-			fmt.Fprintf(b, "      %s: %s\n", key, job.Env[key])
+			fmt.Fprintf(b, "      %s: %s\n", key, env[key])
 		}
 	}
 
@@ -303,11 +337,7 @@ func (jm *JobManager) renderJobTo(b *strings.Builder, job *Job) {
 	if len(job.Outputs) > 0 {
 		b.WriteString("    outputs:\n")
 		// Sort output keys for consistent output
-		outputKeys := make([]string, 0, len(job.Outputs))
-		for key := range job.Outputs {
-			outputKeys = append(outputKeys, key)
-		}
-		sort.Strings(outputKeys)
+		outputKeys := sliceutil.SortedKeys(job.Outputs)
 
 		for _, key := range outputKeys {
 			fmt.Fprintf(b, "      %s: %s\n", key, job.Outputs[key])
@@ -324,11 +354,7 @@ func (jm *JobManager) renderJobTo(b *strings.Builder, job *Job) {
 		if len(job.With) > 0 {
 			b.WriteString("    with:\n")
 			// Sort keys for consistent output
-			withKeys := make([]string, 0, len(job.With))
-			for key := range job.With {
-				withKeys = append(withKeys, key)
-			}
-			sort.Strings(withKeys)
+			withKeys := sliceutil.SortedKeys(job.With)
 
 			for _, key := range withKeys {
 				value := job.With[key]
@@ -352,11 +378,7 @@ func (jm *JobManager) renderJobTo(b *strings.Builder, job *Job) {
 		} else if len(job.Secrets) > 0 {
 			b.WriteString("    secrets:\n")
 			// Sort secret keys for consistent output
-			secretKeys := make([]string, 0, len(job.Secrets))
-			for key := range job.Secrets {
-				secretKeys = append(secretKeys, key)
-			}
-			sort.Strings(secretKeys)
+			secretKeys := sliceutil.SortedKeys(job.Secrets)
 
 			for _, key := range secretKeys {
 				fmt.Fprintf(b, "      %s: %s\n", key, job.Secrets[key])
@@ -375,4 +397,28 @@ func (jm *JobManager) renderJobTo(b *strings.Builder, job *Job) {
 
 	// Add newline after each job for proper formatting
 	b.WriteString("\n")
+}
+
+func buildRenderedJobEnv(job *Job) map[string]string {
+	if job == nil {
+		return nil
+	}
+	env := maps.Clone(job.Env)
+	if shouldInjectRuntimeFeaturesEnv(job) {
+		if env == nil {
+			env = make(map[string]string)
+		}
+		if _, exists := env[runtimeFeaturesEnvVarName]; !exists {
+			env[runtimeFeaturesEnvVarName] = runtimeFeaturesEnvVarExpression
+		}
+	}
+	return env
+}
+
+func shouldInjectRuntimeFeaturesEnv(job *Job) bool {
+	if job == nil || job.Uses != "" {
+		return false
+	}
+	_, ok := runtimeFeaturesBuiltInJobNames[job.Name]
+	return ok
 }

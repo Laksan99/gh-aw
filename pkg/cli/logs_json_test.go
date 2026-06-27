@@ -28,7 +28,6 @@ func TestBuildLogsData(t *testing.T) {
 				Conclusion:       "success",
 				Duration:         5 * time.Minute,
 				TokenUsage:       1000,
-				EstimatedCost:    0.05,
 				Turns:            3,
 				ErrorCount:       0,
 				WarningCount:     1,
@@ -70,7 +69,6 @@ func TestBuildLogsData(t *testing.T) {
 				Conclusion:       "failure",
 				Duration:         3 * time.Minute,
 				TokenUsage:       500,
-				EstimatedCost:    0.025,
 				Turns:            2,
 				ErrorCount:       1,
 				WarningCount:     0,
@@ -94,10 +92,12 @@ func TestBuildLogsData(t *testing.T) {
 			},
 			MissingTools: []MissingToolReport{
 				{
-					Tool:         "github_search",
-					Reason:       "Not allowed",
-					WorkflowName: "Test Workflow",
-					RunID:        12346,
+					Tool:   "github_search",
+					Reason: "Not allowed",
+					ReportProvenance: ReportProvenance{
+						WorkflowName: "Test Workflow",
+						RunID:        12346,
+					},
 				},
 			},
 			MCPFailures: []MCPFailureReport{},
@@ -113,10 +113,6 @@ func TestBuildLogsData(t *testing.T) {
 	}
 	if logsData.Summary.TotalTokens != 1500 {
 		t.Errorf("Expected TotalTokens to be 1500, got %d", logsData.Summary.TotalTokens)
-	}
-	// Use approximate comparison for float
-	if logsData.Summary.TotalCost < 0.074 || logsData.Summary.TotalCost > 0.076 {
-		t.Errorf("Expected TotalCost to be ~0.075, got %f", logsData.Summary.TotalCost)
 	}
 	if logsData.Summary.TotalTurns != 5 {
 		t.Errorf("Expected TotalTurns to be 5, got %d", logsData.Summary.TotalTurns)
@@ -200,7 +196,6 @@ func TestRenderLogsJSON(t *testing.T) {
 			TotalRuns:              2,
 			TotalDuration:          "8m0s",
 			TotalTokens:            1500,
-			TotalCost:              0.075,
 			TotalTurns:             5,
 			TotalErrors:            1,
 			TotalWarnings:          1,
@@ -210,22 +205,21 @@ func TestRenderLogsJSON(t *testing.T) {
 		},
 		Runs: []RunData{
 			{
-				RunID:         12345,
-				Number:        1,
-				WorkflowName:  "Test Workflow",
-				Status:        "completed",
-				Conclusion:    "success",
-				Duration:      "5m0s",
-				TokenUsage:    1000,
-				EstimatedCost: 0.05,
-				Turns:         3,
-				ErrorCount:    0,
-				WarningCount:  1,
-				CreatedAt:     time.Date(2024, 1, 1, 12, 0, 0, 0, time.UTC),
-				URL:           "https://github.com/test/repo/actions/runs/12345",
-				LogsPath:      filepath.Join(tmpDir, "run-12345"),
-				Event:         "push",
-				Branch:        "main",
+				RunID:        12345,
+				Number:       1,
+				WorkflowName: "Test Workflow",
+				Status:       "completed",
+				Conclusion:   "success",
+				Duration:     "5m0s",
+				TokenUsage:   1000,
+				Turns:        3,
+				ErrorCount:   0,
+				WarningCount: 1,
+				CreatedAt:    time.Date(2024, 1, 1, 12, 0, 0, 0, time.UTC),
+				URL:          "https://github.com/test/repo/actions/runs/12345",
+				LogsPath:     filepath.Join(tmpDir, "run-12345"),
+				Event:        "push",
+				Branch:       "main",
 				Comparison: &AuditComparisonData{
 					BaselineFound: true,
 					Baseline: &AuditComparisonBaseline{
@@ -238,16 +232,15 @@ func TestRenderLogsJSON(t *testing.T) {
 		},
 		Episodes: []EpisodeData{
 			{
-				EpisodeID:          "standalone:12345",
-				Kind:               "standalone",
-				Confidence:         "high",
-				RunIDs:             []int64{12345},
-				WorkflowNames:      []string{"Test Workflow"},
-				PrimaryWorkflow:    "Test Workflow",
-				TotalRuns:          1,
-				TotalTokens:        1000,
-				TotalEstimatedCost: 0.05,
-				SuggestedRoute:     "workflow:Test Workflow",
+				EpisodeID:       "standalone:12345",
+				Kind:            "standalone",
+				Confidence:      "high",
+				RunIDs:          []int64{12345},
+				WorkflowNames:   []string{"Test Workflow"},
+				PrimaryWorkflow: "Test Workflow",
+				TotalRuns:       1,
+				TotalTokens:     1000,
+				SuggestedRoute:  "workflow:Test Workflow",
 			},
 		},
 		Edges:        []EpisodeEdge{},
@@ -260,7 +253,7 @@ func TestRenderLogsJSON(t *testing.T) {
 	os.Stdout = w
 
 	// Render JSON
-	err := renderLogsJSON(logsData)
+	err := renderLogsJSON(logsData, true)
 	if err != nil {
 		t.Fatalf("Failed to render JSON: %v", err)
 	}
@@ -319,18 +312,17 @@ func TestBuildLogsDataAggregatesDispatchEpisode(t *testing.T) {
 	processedRuns := []ProcessedRun{
 		{
 			Run: WorkflowRun{
-				DatabaseID:    2001,
-				WorkflowName:  "orchestrator",
-				WorkflowPath:  ".github/workflows/orchestrator.yml",
-				Status:        "completed",
-				Conclusion:    "success",
-				Duration:      2 * time.Minute,
-				TokenUsage:    300,
-				EstimatedCost: 0.01,
-				CreatedAt:     time.Date(2024, 2, 1, 12, 0, 0, 0, time.UTC),
-				StartedAt:     time.Date(2024, 2, 1, 12, 0, 0, 0, time.UTC),
-				UpdatedAt:     time.Date(2024, 2, 1, 12, 2, 0, 0, time.UTC),
-				LogsPath:      filepath.Join(tmpDir, "run-2001"),
+				DatabaseID:   2001,
+				WorkflowName: "orchestrator",
+				WorkflowPath: ".github/workflows/orchestrator.yml",
+				Status:       "completed",
+				Conclusion:   "success",
+				Duration:     2 * time.Minute,
+				TokenUsage:   300,
+				CreatedAt:    time.Date(2024, 2, 1, 12, 0, 0, 0, time.UTC),
+				StartedAt:    time.Date(2024, 2, 1, 12, 0, 0, 0, time.UTC),
+				UpdatedAt:    time.Date(2024, 2, 1, 12, 2, 0, 0, time.UTC),
+				LogsPath:     filepath.Join(tmpDir, "run-2001"),
 			},
 			AgenticAssessments: []AgenticAssessment{{Kind: "resource_heavy_for_domain", Severity: "medium"}},
 		},
@@ -343,7 +335,6 @@ func TestBuildLogsDataAggregatesDispatchEpisode(t *testing.T) {
 				Conclusion:       "success",
 				Duration:         4 * time.Minute,
 				TokenUsage:       700,
-				EstimatedCost:    0.03,
 				MissingToolCount: 1,
 				CreatedAt:        time.Date(2024, 2, 1, 12, 3, 0, 0, time.UTC),
 				StartedAt:        time.Date(2024, 2, 1, 12, 3, 0, 0, time.UTC),
@@ -579,10 +570,12 @@ func TestBuildMissingToolsSummary(t *testing.T) {
 			},
 			MissingTools: []MissingToolReport{
 				{
-					Tool:         "github_search",
-					Reason:       "Not allowed",
-					WorkflowName: "Workflow A",
-					RunID:        1,
+					Tool:   "github_search",
+					Reason: "Not allowed",
+					ReportProvenance: ReportProvenance{
+						WorkflowName: "Workflow A",
+						RunID:        1,
+					},
 				},
 			},
 		},
@@ -593,16 +586,20 @@ func TestBuildMissingToolsSummary(t *testing.T) {
 			},
 			MissingTools: []MissingToolReport{
 				{
-					Tool:         "github_search",
-					Reason:       "Permission denied",
-					WorkflowName: "Workflow B",
-					RunID:        2,
+					Tool:   "github_search",
+					Reason: "Permission denied",
+					ReportProvenance: ReportProvenance{
+						WorkflowName: "Workflow B",
+						RunID:        2,
+					},
 				},
 				{
-					Tool:         "web_fetch",
-					Reason:       "Not configured",
-					WorkflowName: "Workflow B",
-					RunID:        2,
+					Tool:   "web_fetch",
+					Reason: "Not configured",
+					ReportProvenance: ReportProvenance{
+						WorkflowName: "Workflow B",
+						RunID:        2,
+					},
 				},
 			},
 		},
@@ -775,10 +772,12 @@ func TestBuildMCPFailuresSummary(t *testing.T) {
 			},
 			MCPFailures: []MCPFailureReport{
 				{
-					ServerName:   "playwright",
-					Status:       "failed",
-					WorkflowName: "Workflow A",
-					RunID:        1,
+					ServerName: "playwright",
+					Status:     "failed",
+					ReportProvenance: ReportProvenance{
+						WorkflowName: "Workflow A",
+						RunID:        1,
+					},
 				},
 			},
 		},
@@ -789,10 +788,12 @@ func TestBuildMCPFailuresSummary(t *testing.T) {
 			},
 			MCPFailures: []MCPFailureReport{
 				{
-					ServerName:   "playwright",
-					Status:       "failed",
-					WorkflowName: "Workflow B",
-					RunID:        2,
+					ServerName: "playwright",
+					Status:     "failed",
+					ReportProvenance: ReportProvenance{
+						WorkflowName: "Workflow B",
+						RunID:        2,
+					},
 				},
 			},
 		},
@@ -913,5 +914,145 @@ func TestBuildLogsDataOrganizationEmptyWhenNoRepository(t *testing.T) {
 	}
 	if episode.Organization != "" {
 		t.Errorf("Expected empty episode.Organization, got %q", episode.Organization)
+	}
+}
+
+// TestInferWorkflowPathFromDisplayName verifies that display names are correctly
+// slugified into conventional lock-file paths.
+func TestInferWorkflowPathFromDisplayName(t *testing.T) {
+	tests := []struct {
+		name        string
+		displayName string
+		want        string
+	}{
+		{
+			name:        "simple display name with spaces",
+			displayName: "Auto-Triage Issues",
+			want:        ".github/workflows/auto-triage-issues.lock.yml",
+		},
+		{
+			name:        "display name with mixed case and spaces",
+			displayName: "CI Failure Doctor",
+			want:        ".github/workflows/ci-failure-doctor.lock.yml",
+		},
+		{
+			name:        "already kebab-case slug",
+			displayName: "weekly-research",
+			want:        ".github/workflows/weekly-research.lock.yml",
+		},
+		{
+			name:        "display name with slash",
+			displayName: "CI/CD Pipeline",
+			want:        ".github/workflows/ci-cd-pipeline.lock.yml",
+		},
+		{
+			name:        "display name with colon",
+			displayName: "Deploy: Production",
+			want:        ".github/workflows/deploy-production.lock.yml",
+		},
+		{
+			name:        "empty display name",
+			displayName: "",
+			want:        "",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := inferWorkflowPathFromDisplayName(tt.displayName)
+			if got != tt.want {
+				t.Errorf("inferWorkflowPathFromDisplayName(%q) = %q, want %q", tt.displayName, got, tt.want)
+			}
+		})
+	}
+}
+
+// TestBuildLogsDataInfersWorkflowPathFromAwInfo verifies that buildLogsData falls back
+// to inferring workflow_path from aw_info.json when the GitHub API returned an empty path.
+func TestBuildLogsDataInfersWorkflowPathFromAwInfo(t *testing.T) {
+	tmpDir := testutil.TempDir(t, "test-infer-workflow-path-*")
+
+	// Create a run with an empty WorkflowPath (simulating what the GitHub API returns
+	// for scheduled/agentic workflow runs).
+	processedRun := ProcessedRun{
+		Run: WorkflowRun{
+			DatabaseID:   99901,
+			WorkflowName: "Auto-Triage Issues",
+			WorkflowPath: "", // empty — the bug scenario
+			Status:       "completed",
+			Conclusion:   "success",
+			LogsPath:     tmpDir,
+		},
+	}
+
+	// Write an aw_info.json that contains the workflow display name.
+	awInfoPath := filepath.Join(tmpDir, "aw_info.json")
+	awInfoData := map[string]any{
+		"engine_id":     "copilot",
+		"engine_name":   "GitHub Copilot CLI",
+		"workflow_name": "Auto-Triage Issues",
+	}
+	awInfoBytes, err := json.Marshal(awInfoData)
+	if err != nil {
+		t.Fatalf("Failed to marshal aw_info: %v", err)
+	}
+	if err := os.WriteFile(awInfoPath, awInfoBytes, 0644); err != nil {
+		t.Fatalf("Failed to write aw_info.json: %v", err)
+	}
+
+	logsData := buildLogsData([]ProcessedRun{processedRun}, tmpDir, nil)
+
+	if len(logsData.Runs) != 1 {
+		t.Fatalf("Expected 1 run, got %d", len(logsData.Runs))
+	}
+
+	got := logsData.Runs[0].WorkflowPath
+	want := ".github/workflows/auto-triage-issues.lock.yml"
+	if got != want {
+		t.Errorf("WorkflowPath = %q, want %q", got, want)
+	}
+}
+
+// TestBuildLogsDataPreservesExplicitWorkflowPath verifies that an explicit WorkflowPath
+// set by the GitHub API is never overwritten by the inference fallback.
+func TestBuildLogsDataPreservesExplicitWorkflowPath(t *testing.T) {
+	tmpDir := testutil.TempDir(t, "test-preserve-workflow-path-*")
+
+	explicitPath := ".github/workflows/custom-path.lock.yml"
+	processedRun := ProcessedRun{
+		Run: WorkflowRun{
+			DatabaseID:   99902,
+			WorkflowName: "Auto-Triage Issues",
+			WorkflowPath: explicitPath,
+			Status:       "completed",
+			Conclusion:   "success",
+			LogsPath:     tmpDir,
+		},
+	}
+
+	// Write an aw_info.json with a different workflow_name to ensure it does not
+	// overwrite the explicit path that came from the GitHub API.
+	awInfoPath := filepath.Join(tmpDir, "aw_info.json")
+	awInfoData := map[string]any{
+		"engine_id":     "copilot",
+		"workflow_name": "Different Name",
+	}
+	awInfoBytes, err := json.Marshal(awInfoData)
+	if err != nil {
+		t.Fatalf("Failed to marshal aw_info.json content: %v", err)
+	}
+	if err := os.WriteFile(awInfoPath, awInfoBytes, 0644); err != nil {
+		t.Fatalf("Failed to write aw_info.json: %v", err)
+	}
+
+	logsData := buildLogsData([]ProcessedRun{processedRun}, tmpDir, nil)
+
+	if len(logsData.Runs) != 1 {
+		t.Fatalf("Expected 1 run, got %d", len(logsData.Runs))
+	}
+
+	got := logsData.Runs[0].WorkflowPath
+	if got != explicitPath {
+		t.Errorf("WorkflowPath = %q, want %q (explicit path must not be overwritten)", got, explicitPath)
 	}
 }

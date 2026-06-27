@@ -1,4 +1,6 @@
 ---
+private: true
+emoji: "🔧"
 name: Update Astro
 description: Daily workflow to update Astro and related npm packages in the docs folder, review migration guides, ensure the docs build, and create a pull request with changes
 on:
@@ -23,7 +25,7 @@ network:
     - node
 
 imports:
-  - shared/observability-otlp.md
+  - shared/otlp.md
 tools:
   cli-proxy: true
   bash:
@@ -50,7 +52,7 @@ jobs:
       updates_summary: ${{ steps.check.outputs.updates_summary }}
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v6.0.2
+        uses: actions/checkout@v7.0.0
         with:
           persist-credentials: false
       - name: Setup Node.js
@@ -61,18 +63,21 @@ jobs:
         id: check
         working-directory: ./docs
         run: |
-          npx --yes npm-check-updates --jsonUpgraded 2>/dev/null > /tmp/ncu-output.json || true
+          ncu_output="$(mktemp)"
+          npx --yes npm-check-updates --jsonUpgraded >"$ncu_output" 2>/dev/null || true
 
-          if [ -s /tmp/ncu-output.json ] && [ "$(cat /tmp/ncu-output.json | tr -d '[:space:]')" != "{}" ]; then
+          if [ -s "$ncu_output" ] && [ "$(tr -d '[:space:]' <"$ncu_output")" != "{}" ]; then
             echo "has_updates=true" >> "$GITHUB_OUTPUT"
             echo "Updates available:"
-            cat /tmp/ncu-output.json
-            SUMMARY=$(jq -r 'to_entries | map(.key + ": " + .value) | join(", ")' /tmp/ncu-output.json)
+            cat "$ncu_output"
+            SUMMARY=$(jq -r 'to_entries | map(.key + ": " + .value) | join(", ")' "$ncu_output")
             echo "updates_summary=$SUMMARY" >> "$GITHUB_OUTPUT"
           else
             echo "has_updates=false" >> "$GITHUB_OUTPUT"
             echo "No npm updates available in docs folder, skipping agent job"
           fi
+
+          rm -f "$ncu_output"
 
 ---
 

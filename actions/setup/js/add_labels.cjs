@@ -8,7 +8,14 @@
  */
 
 /**
- * @typedef {{ item_number?: number|string, labels?: string[], repo?: string }} AddLabelsMessage
+ * @typedef {{
+ *   item_number?: number|string,
+ *   issue_number?: number|string,
+ *   pr_number?: number|string,
+ *   pull_number?: number|string,
+ *   labels?: Array<string|{name: string, rationale?: string, confidence?: "LOW"|"MEDIUM"|"HIGH", suggest?: boolean}>,
+ *   repo?: string
+ * }} AddLabelsMessage
  */
 
 /** @type {string} Safe output type handled by this module */
@@ -20,10 +27,13 @@ const { resolveTargetRepoConfig, resolveAndValidateRepo } = require("./repo_help
 const { tryEnforceArrayLimit } = require("./limit_enforcement_helpers.cjs");
 const { logStagedPreviewInfo } = require("./staged_preview.cjs");
 const { createAuthenticatedGitHubClient } = require("./handler_auth.cjs");
-const { resolveRepoIssueTarget, loadTemporaryIdMapFromResolved } = require("./temporary_id.cjs");
+const { resolveSafeOutputIssueTarget } = require("./temporary_id.cjs");
+const { attachExecutionState, fetchIssueState, normalizeLabelNames } = require("./safe_output_execution_metadata.cjs");
 const { MAX_LABELS } = require("./constants.cjs");
 const { createCountGatedHandler } = require("./handler_scaffold.cjs");
 const { withRetry, RATE_LIMIT_RETRY_CONFIG } = require("./error_recovery.cjs");
+const { resolveInvocationContext } = require("./invocation_context_helpers.cjs");
+const { hasIssueIntentsRuntimeFeature, normalizeIssueIntentLabelNames, normalizeIssueIntentLabelSpecs } = require("./issue_intents.cjs");
 
 /**
  * Main handler factory for add_labels
@@ -34,12 +44,16 @@ const main = createCountGatedHandler({
   handlerType: HANDLER_TYPE,
   setup: async (config, maxCount, isStaged) => {
     const { allowed: allowedLabels = [], blocked: blockedPatterns = [] } = config;
+    const requiredLabels = Array.isArray(config.required_labels) ? config.required_labels : [];
+    const requiredTitlePrefix = config.required_title_prefix || "";
     const { defaultTargetRepo, allowedRepos } = resolveTargetRepoConfig(config);
     const githubClient = await createAuthenticatedGitHubClient(config);
 
     core.info(`Add labels configuration: max=${maxCount}`);
     if (allowedLabels.length > 0) core.info(`Allowed labels: ${allowedLabels.join(", ")}`);
     if (blockedPatterns.length > 0) core.info(`Blocked patterns: ${blockedPatterns.join(", ")}`);
+    if (requiredLabels.length > 0) core.info(`Required labels (all): ${requiredLabels.join(", ")}`);
+    if (requiredTitlePrefix) core.info(`Required title prefix: ${requiredTitlePrefix}`);
     core.info(`Default target repo: ${defaultTargetRepo}`);
     if (allowedRepos.size > 0) core.info(`Allowed repos: ${[...allowedRepos].join(", ")}`);
 
@@ -63,46 +77,66 @@ const main = createCountGatedHandler({
       core.info(`Target repository: ${itemRepo}`);
 
       // Determine target issue/PR number
-      let itemNumber;
-      if (message.item_number !== undefined) {
-        // Resolve temporary IDs if present
-        const tempIdMap = loadTemporaryIdMapFromResolved(resolvedTemporaryIds);
-        const resolvedTarget = resolveRepoIssueTarget(message.item_number, tempIdMap, repoParts.owner, repoParts.repo);
+      // Accept common aliases: issue_number, pr_number, and pull_number are normalised to item_number
+      const targetResult = resolveSafeOutputIssueTarget({ message, resolvedTemporaryIds, repoParts, handlerType: HANDLER_TYPE });
+      if (!targetResult.success) return targetResult;
+      const effectiveContext = resolveInvocationContext(context);
+      const itemNumber = targetResult.number ?? effectiveContext.eventPayload?.issue?.number ?? effectiveContext.eventPayload?.pull_request?.number;
 
-        // Check if this is an unresolved temporary ID
-        if (resolvedTarget.wasTemporaryId && !resolvedTarget.resolved) {
-          core.info(`Deferring add_labels: unresolved temporary ID (${message.item_number})`);
-          return {
-            success: false,
-            deferred: true,
-            error: resolvedTarget.errorMessage || `Unresolved temporary ID: ${message.item_number}`,
-          };
-        }
-
-        // Check for other resolution errors
-        if (resolvedTarget.errorMessage || !resolvedTarget.resolved) {
-          const error = `Invalid item number: ${message.item_number}`;
-          core.warning(error);
-          return { success: false, error };
-        }
-
-        itemNumber = resolvedTarget.resolved.number;
-      } else {
-        itemNumber = context.payload?.issue?.number ?? context.payload?.pull_request?.number;
-      }
-
-      if (!itemNumber || isNaN(itemNumber)) {
+      if (!itemNumber || Number.isNaN(Number(itemNumber))) {
         const error = "No issue/PR number available";
         core.warning(error);
         return { success: false, error };
       }
 
-      const contextType = context.payload?.pull_request ? "pull request" : "issue";
+      const contextType = effectiveContext.eventPayload?.pull_request ? "pull request" : "issue";
       const requestedLabels = message.labels ?? [];
       core.info(`Requested labels: ${JSON.stringify(requestedLabels)}`);
+      const issueIntentsEnabled = hasIssueIntentsRuntimeFeature();
+      /** @type {Map<string, {name: string, rationale?: string, confidence?: "LOW"|"MEDIUM"|"HIGH", suggest?: boolean}>} */
+      const requestedLabelSpecByLowerName = new Map();
+      let requestedLabelNames;
+      try {
+        if (issueIntentsEnabled) {
+          const requestedLabelSpecs = normalizeIssueIntentLabelSpecs(requestedLabels);
+          for (const labelSpec of requestedLabelSpecs) {
+            const key = labelSpec.name.toLowerCase();
+            if (!requestedLabelSpecByLowerName.has(key)) {
+              requestedLabelSpecByLowerName.set(key, labelSpec);
+            }
+          }
+          requestedLabelNames = requestedLabelSpecs.map(labelSpec => labelSpec.name);
+        } else {
+          requestedLabelNames = normalizeIssueIntentLabelNames(requestedLabels);
+        }
+      } catch (error) {
+        const errorMessage = getErrorMessage(error);
+        core.warning(`Invalid add_labels payload: ${errorMessage}`);
+        return { success: false, error: errorMessage };
+      }
+
+      // Apply required-labels and required-title-prefix filters
+      if (requiredLabels.length > 0 || requiredTitlePrefix) {
+        const { data: item } = await githubClient.rest.issues.get({
+          owner: repoParts.owner,
+          repo: repoParts.repo,
+          issue_number: itemNumber,
+        });
+        if (requiredLabels.length > 0) {
+          const itemLabels = (item.labels || []).map(/** @param {any} l */ l => (typeof l === "string" ? l : l.name || ""));
+          if (!requiredLabels.every(r => itemLabels.includes(r))) {
+            core.info(`Skipping add_labels for ${contextType} #${itemNumber}: does not match required-labels filter (${requiredLabels.join(", ")})`);
+            return { success: false, skipped: true, error: `Item does not match required-labels filter` };
+          }
+        }
+        if (requiredTitlePrefix && !item.title?.startsWith(requiredTitlePrefix)) {
+          core.info(`Skipping add_labels for ${contextType} #${itemNumber}: title does not start with required prefix "${requiredTitlePrefix}"`);
+          return { success: false, skipped: true, error: `Item title does not start with required prefix` };
+        }
+      }
 
       // If no labels provided, return a helpful message with allowed labels if configured
-      if (requestedLabels.length === 0) {
+      if (requestedLabelNames.length === 0) {
         const labelSource = allowedLabels.length > 0 ? `the allowed list: ${JSON.stringify(allowedLabels)}` : "the repository's available labels";
         const error = `No labels provided. Please provide at least one label from ${labelSource}`;
         core.info(error);
@@ -110,14 +144,15 @@ const main = createCountGatedHandler({
       }
 
       // Enforce max limits on labels before validation
-      const limitResult = tryEnforceArrayLimit(requestedLabels, MAX_LABELS, "labels");
+      const limitResult = tryEnforceArrayLimit(requestedLabelNames, MAX_LABELS, "labels");
       if (!limitResult.success) {
         core.warning(`Label limit exceeded: ${limitResult.error}`);
         return { success: false, error: limitResult.error };
       }
 
       // Use validation helper to sanitize and validate labels
-      const labelsResult = validateLabels(requestedLabels, allowedLabels, maxCount, blockedPatterns);
+      const labelsResult = validateLabels(requestedLabelNames, allowedLabels, maxCount, blockedPatterns);
+
       if (!labelsResult.valid) {
         // If no valid labels, log info and return gracefully
         if (labelsResult.error?.includes("No valid labels")) {
@@ -129,6 +164,7 @@ const main = createCountGatedHandler({
             message: "No valid labels found",
           };
         }
+
         // For other validation errors, return error
         core.warning(`Label validation failed: ${labelsResult.error}`);
         return {
@@ -150,7 +186,9 @@ const main = createCountGatedHandler({
         };
       }
 
-      core.info(`Adding ${uniqueLabels.length} labels to ${contextType} #${itemNumber} in ${itemRepo}: ${JSON.stringify(uniqueLabels)}`);
+      const labelsRequestPayload = issueIntentsEnabled ? uniqueLabels.map(name => requestedLabelSpecByLowerName.get(name.toLowerCase()) ?? { name }) : uniqueLabels;
+
+      core.info(`Adding ${uniqueLabels.length} labels to ${contextType} #${itemNumber} in ${itemRepo}: ${JSON.stringify(labelsRequestPayload)}`);
 
       // If in staged mode, preview the labels without adding them
       if (isStaged) {
@@ -168,25 +206,34 @@ const main = createCountGatedHandler({
       }
 
       try {
-        await withRetry(
+        const beforeState = await fetchIssueState(githubClient, repoParts, itemNumber);
+        const { data: labels } = await withRetry(
           () =>
             githubClient.rest.issues.addLabels({
               owner: repoParts.owner,
               repo: repoParts.repo,
               issue_number: itemNumber,
-              labels: uniqueLabels,
+              labels: labelsRequestPayload,
             }),
           RATE_LIMIT_RETRY_CONFIG,
           `add_labels to ${contextType} #${itemNumber} in ${itemRepo}`
         );
 
         core.info(`Successfully added ${uniqueLabels.length} labels to ${contextType} #${itemNumber} in ${itemRepo}`);
-        return {
-          success: true,
-          number: itemNumber,
-          labelsAdded: uniqueLabels,
-          contextType,
-        };
+        return attachExecutionState(
+          {
+            success: true,
+            number: itemNumber,
+            repo: itemRepo,
+            labelsAdded: uniqueLabels,
+            contextType,
+          },
+          beforeState,
+          {
+            ...beforeState,
+            labels: normalizeLabelNames(labels),
+          }
+        );
       } catch (error) {
         const errorMessage = getErrorMessage(error);
         core.error(`Failed to add labels: ${errorMessage}`);

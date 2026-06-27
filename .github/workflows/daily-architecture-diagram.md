@@ -1,15 +1,21 @@
 ---
+private: true
+emoji: "🏗️"
 description: Generates a weekly high-level ASCII architecture diagram of the repository, using cache-memory to focus only on what changed since the last run.
 on:
   schedule: weekly on Monday around 08:00
   workflow_dispatch:
 
+max-daily-ai-credits: 10000
 permissions:
   contents: read
   issues: read
   pull-requests: read
 
-engine: copilot
+  copilot-requests: write
+engine:
+  id: copilot
+  copilot-sdk: true
 
 experiments:
   detail_level:
@@ -28,6 +34,9 @@ experiments:
     tags: [output-format, cost, latency]
     issue: 31926
 
+sandbox:
+  agent:
+    sudo: false
 tools:
   cli-proxy: true
   edit:
@@ -54,14 +63,11 @@ imports:
       title-prefix: "[architecture-diagram] "
       expires: 3d
 
-  - shared/observability-otlp.md
+  - shared/otlp.md
 timeout-minutes: 20
 strict: true
 features:
-  copilot-requests: true
-
-firewall:
-  effective-token-steering: true
+  gh-aw-detection: true
 ---
 
 # Architecture Diagram Generator

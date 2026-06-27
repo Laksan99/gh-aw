@@ -258,7 +258,7 @@ func TestAddSchemaDefault(t *testing.T) {
 		}
 	})
 
-	t.Run("handles non-existent property gracefully", func(t *testing.T) {
+	t.Run("returns an error for non-existent property", func(t *testing.T) {
 		type TestStruct struct {
 			Name string `json:"name" jsonschema:"Name field"`
 		}
@@ -268,9 +268,12 @@ func TestAddSchemaDefault(t *testing.T) {
 			t.Fatalf("GenerateSchema failed: %v", err)
 		}
 
-		// Try to add default to non-existent property - should not error
-		if err := AddSchemaDefault(schema, "nonexistent", "value"); err != nil {
-			t.Errorf("AddSchemaDefault should not error on non-existent property: %v", err)
+		err = AddSchemaDefault(schema, "nonexistent", "value")
+		if err == nil {
+			t.Fatal("AddSchemaDefault should error on non-existent property")
+		}
+		if err.Error() != `schema property "nonexistent" not found` {
+			t.Fatalf("unexpected error: %v", err)
 		}
 	})
 
@@ -380,21 +383,19 @@ func TestGeneratedSchemasValidateRealOutput(t *testing.T) {
 				TotalRuns:     5,
 				TotalDuration: "10m30s",
 				TotalTokens:   15000,
-				TotalCost:     0.45,
 				TotalTurns:    25,
 			},
 			Runs: []RunData{
 				{
-					RunID:         123456,
-					Number:        1,
-					WorkflowName:  "test-workflow",
-					Agent:         "copilot",
-					Status:        "completed",
-					Conclusion:    "success",
-					Duration:      "2m5s",
-					TokenUsage:    3000,
-					EstimatedCost: 0.09,
-					Turns:         5,
+					RunID:        123456,
+					Number:       1,
+					WorkflowName: "test-workflow",
+					Agent:        "copilot",
+					Status:       "completed",
+					Conclusion:   "success",
+					Duration:     "2m5s",
+					TokenUsage:   3000,
+					Turns:        5,
 				},
 			},
 			LogsLocation: "/path/to/logs",
@@ -441,11 +442,10 @@ func TestGeneratedSchemasValidateRealOutput(t *testing.T) {
 				CreatedAt:    time.Now(),
 			},
 			Metrics: MetricsData{
-				TokenUsage:    5000,
-				EstimatedCost: 0.15,
-				Turns:         10,
-				ErrorCount:    0,
-				WarningCount:  2,
+				TokenUsage:   5000,
+				Turns:        10,
+				ErrorCount:   0,
+				WarningCount: 2,
 			},
 			DownloadedFiles: []FileInfo{
 				{
@@ -489,13 +489,15 @@ func TestGeneratedSchemasValidateRealOutput(t *testing.T) {
 
 		// Create realistic test data
 		data := WorkflowStatus{
-			Workflow:      "status-workflow",
-			EngineID:      "copilot",
-			Compiled:      "true",
+			WorkflowListItem: WorkflowListItem{
+				Workflow: "status-workflow",
+				EngineID: "copilot",
+				Compiled: "true",
+				Labels:   []string{"production", "automated"},
+				On:       "push",
+			},
 			Status:        "active",
 			TimeRemaining: "5m30s",
-			Labels:        []string{"production", "automated"},
-			On:            "push",
 			RunStatus:     "completed",
 			RunConclusion: "success",
 		}

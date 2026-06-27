@@ -8,10 +8,11 @@
 const { getErrorMessage } = require("./error_helpers.cjs");
 const { resolveTargetRepoConfig, resolveAndValidateRepo } = require("./repo_helpers.cjs");
 const { logStagedPreviewInfo } = require("./staged_preview.cjs");
-const { isStagedMode } = require("./safe_output_helpers.cjs");
+const { isStagedMode, checkRequiredFilter } = require("./safe_output_helpers.cjs");
 const { createAuthenticatedGitHubClient } = require("./handler_auth.cjs");
 const { parseAllowedIssueFields, validateAllowedIssueFieldName } = require("./allowed_issue_fields.cjs");
-const { loadTemporaryIdMapFromResolved, resolveRepoIssueTarget } = require("./temporary_id.cjs");
+const { resolveSafeOutputIssueTarget } = require("./temporary_id.cjs");
+const { hasIssueIntentsRuntimeFeature, normalizeIssueIntentMetadata } = require("./issue_intents.cjs");
 
 /** @type {string} Safe output type handled by this module */
 const HANDLER_TYPE = "set_issue_field";
@@ -41,74 +42,48 @@ async function getIssueNodeId(githubClient, owner, repo, issueNumber) {
  * @returns {Promise<Array<{id: string, name: string, __typename?: string, options?: Array<{id: string, name: string}>}>>}
  */
 async function fetchIssueFields(githubClient, owner, repo) {
-  try {
-    const result = await githubClient.graphql(
-      `query($owner: String!, $repo: String!) {
-        repository(owner: $owner, name: $repo) {
-          issueFields(first: 100) {
-            nodes {
-              __typename
-              id
-              name
-              ... on IssueFieldSingleSelect {
-                options {
-                  id
-                  name
-                }
-              }
-            }
-          }
-          owner {
+  const result = await githubClient.graphql(
+    `query($owner: String!, $repo: String!) {
+      repository(owner: $owner, name: $repo) {
+        issueFields(first: 100) {
+          nodes {
             __typename
-            ... on Organization {
-              issueFields(first: 100) {
-                nodes {
-                  __typename
-                  id
-                  name
-                  ... on IssueFieldSingleSelect {
-                    options {
-                      id
-                      name
-                    }
-                  }
-                }
-              }
-            }
-            ... on User {
-              issueFields(first: 100) {
-                nodes {
-                  __typename
-                  id
-                  name
-                  ... on IssueFieldSingleSelect {
-                    options {
-                      id
-                      name
-                    }
-                  }
-                }
+            ... on IssueFieldText { id name }
+            ... on IssueFieldNumber { id name }
+            ... on IssueFieldDate { id name }
+            ... on IssueFieldSingleSelect { id name options { id name } }
+            ... on IssueFieldMultiSelect { id name options { id name } }
+          }
+        }
+        owner {
+          __typename
+          ... on Organization {
+            issueFields(first: 100) {
+              nodes {
+                __typename
+                ... on IssueFieldText { id name }
+                ... on IssueFieldNumber { id name }
+                ... on IssueFieldDate { id name }
+                ... on IssueFieldSingleSelect { id name options { id name } }
+                ... on IssueFieldMultiSelect { id name options { id name } }
               }
             }
           }
         }
-      }`,
-      { owner, repo }
-    );
+      }
+    }`,
+    { owner, repo }
+  );
 
-    const repoFields = result?.repository?.issueFields?.nodes ?? [];
-    if (repoFields.length > 0) {
-      return repoFields;
-    }
+  const isValidNode = node => typeof node?.id === "string" && typeof node?.name === "string";
 
-    const ownerFields = result?.repository?.owner?.issueFields?.nodes ?? [];
-    return ownerFields;
-  } catch (error) {
-    if (typeof core !== "undefined") {
-      core.debug(`Could not fetch issue fields (may not be enabled): ${error instanceof Error ? error.message : String(error)}`);
-    }
-    return [];
+  const repoFields = (result?.repository?.issueFields?.nodes ?? []).filter(isValidNode);
+  if (repoFields.length > 0) {
+    return repoFields;
   }
+
+  const ownerFields = (result?.repository?.owner?.issueFields?.nodes ?? []).filter(isValidNode);
+  return ownerFields;
 }
 
 /**
@@ -181,10 +156,19 @@ function buildFieldUpdatePayload(field, rawValue) {
  * Sets one issue field via GraphQL mutation.
  * @param {Object} githubClient - Authenticated GitHub client
  * @param {string} issueNodeId - GraphQL node ID of the issue
- * @param {{fieldId: string, singleSelectOptionId?: string, numberValue?: number, dateValue?: string, textValue?: string}} fieldUpdate
+ * @param {{fieldId: string, singleSelectOptionId?: string, numberValue?: number, dateValue?: string, textValue?: string, rationale?: string, confidence?: "LOW"|"MEDIUM"|"HIGH", suggest?: boolean}} fieldUpdate
+ * @param {boolean} [useIntentHeader] - When true, includes the GraphQL-Features header to expose intent input types
  * @returns {Promise<void>}
  */
-async function setIssueFieldValue(githubClient, issueNodeId, fieldUpdate) {
+async function setIssueFieldValue(githubClient, issueNodeId, fieldUpdate, useIntentHeader) {
+  /** @type {Record<string, unknown>} */
+  const variables = {
+    issueId: issueNodeId,
+    issueFields: [fieldUpdate],
+  };
+  if (useIntentHeader) {
+    variables.headers = { "GraphQL-Features": "update_issue_suggestions" };
+  }
   await githubClient.graphql(
     `mutation($issueId: ID!, $issueFields: [IssueFieldCreateOrUpdateInput!]!) {
       setIssueFieldValue(input: { issueId: $issueId, issueFields: $issueFields }) {
@@ -193,10 +177,7 @@ async function setIssueFieldValue(githubClient, issueNodeId, fieldUpdate) {
         }
       }
     }`,
-    {
-      issueId: issueNodeId,
-      issueFields: [fieldUpdate],
-    }
+    variables
   );
 }
 
@@ -212,6 +193,10 @@ async function main(config = {}) {
   const isStaged = isStagedMode(config);
 
   core.info(`Set issue field configuration: max=${maxCount}`);
+  const requiredLabels = Array.isArray(config.required_labels) ? config.required_labels : [];
+  const requiredTitlePrefix = config.required_title_prefix || "";
+  if (requiredLabels.length > 0) core.info(`Required labels (all): ${requiredLabels.join(", ")}`);
+  if (requiredTitlePrefix) core.info(`Required title prefix: ${requiredTitlePrefix}`);
   core.info(`Default target repo: ${defaultTargetRepo}`);
   if (allowedRepos.size > 0) {
     core.info(`Allowed repos: ${Array.from(allowedRepos).join(", ")}`);
@@ -234,7 +219,6 @@ async function main(config = {}) {
     processedCount++;
 
     const item = message;
-    const temporaryIdMap = loadTemporaryIdMapFromResolved(resolvedTemporaryIds);
 
     const repoResult = resolveAndValidateRepo(item, defaultTargetRepo, allowedRepos, "issue");
     if (!repoResult.success) {
@@ -247,28 +231,11 @@ async function main(config = {}) {
     const { repo: itemRepo, repoParts } = repoResult;
     core.info(`Target repository: ${itemRepo}`);
 
+    const targetResult = resolveSafeOutputIssueTarget({ message: item, resolvedTemporaryIds, repoParts, handlerType: "set_issue_field", aliases: ["issue_number"] });
+    if (!targetResult.success) return targetResult;
     let issueNumber;
-    if (item.issue_number !== undefined && item.issue_number !== null) {
-      const resolvedTarget = resolveRepoIssueTarget(item.issue_number, temporaryIdMap, repoParts.owner, repoParts.repo);
-
-      if (resolvedTarget.wasTemporaryId && !resolvedTarget.resolved) {
-        core.info(`Deferring set_issue_field: unresolved temporary ID (${item.issue_number})`);
-        return {
-          success: false,
-          deferred: true,
-          error: resolvedTarget.errorMessage || `Unresolved temporary ID: ${item.issue_number}`,
-        };
-      }
-
-      if (resolvedTarget.errorMessage || !resolvedTarget.resolved) {
-        core.warning(`Invalid issue_number: ${item.issue_number}`);
-        return {
-          success: false,
-          error: `Invalid issue_number: ${item.issue_number}`,
-        };
-      }
-
-      issueNumber = resolvedTarget.resolved.number;
+    if (targetResult.number !== null) {
+      issueNumber = targetResult.number;
       core.info(`Resolved issue number: #${issueNumber}`);
     } else {
       const contextIssueNumber = context.payload?.issue?.number;
@@ -281,6 +248,9 @@ async function main(config = {}) {
       }
       issueNumber = contextIssueNumber;
     }
+
+    const filterResult = await checkRequiredFilter(githubClient, repoParts, issueNumber, requiredLabels, requiredTitlePrefix, "set_issue_field");
+    if (filterResult) return filterResult;
 
     if (item.value === undefined || item.value === null) {
       return {
@@ -385,7 +355,13 @@ async function main(config = {}) {
         ...fieldUpdateResult.update,
       };
 
-      await setIssueFieldValue(githubClient, issueNodeId, fieldUpdate);
+      const useIntentHeader = hasIssueIntentsRuntimeFeature();
+      if (useIntentHeader) {
+        Object.assign(fieldUpdate, normalizeIssueIntentMetadata(item));
+        core.info(`Using GraphQL-Features header for issue field mutation (issue_intents runtime feature enabled)`);
+      }
+
+      await setIssueFieldValue(githubClient, issueNodeId, fieldUpdate, useIntentHeader);
 
       core.info(`Successfully set issue field ${JSON.stringify(fieldName || fieldNodeId)} to ${JSON.stringify(value)} on issue #${issueNumber}`);
 

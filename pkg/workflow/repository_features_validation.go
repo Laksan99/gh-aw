@@ -49,9 +49,19 @@ import (
 	"github.com/cli/go-gh/v2/pkg/api"
 	"github.com/cli/go-gh/v2/pkg/repository"
 	"github.com/github/gh-aw/pkg/console"
+	"github.com/github/gh-aw/pkg/syncutil"
 )
 
 var repositoryFeaturesLog = newValidationLogger("repository_features")
+
+// checkRepositoryHasDiscussionsQuery is a hardcoded static GraphQL query template used to check
+// if discussions are enabled for a repository. Declared as a named constant to make clear
+// it is not user-controlled input (CWE-89 / workflow-graphql-static-concat).
+const checkRepositoryHasDiscussionsQuery = `query($owner: String!, $name: String!) {
+	repository(owner: $owner, name: $name) {
+		hasDiscussionsEnabled
+	}
+}`
 
 // RepositoryFeatures holds cached information about repository capabilities
 type RepositoryFeatures struct {
@@ -59,22 +69,11 @@ type RepositoryFeatures struct {
 	HasIssues      bool
 }
 
-// currentRepositoryCacheState holds the cached current repository and protects it
-// with a mutex. Using a mutex-guarded struct instead of sync.Once avoids the data
-// race that arises when resetting sync.Once via struct assignment (= sync.Once{})
-// after first use.
-type currentRepositoryCacheState struct {
-	mu     sync.Mutex
-	result string
-	err    error
-	done   bool
-}
-
 // Global cache for repository features and current repository info
 var (
 	repositoryFeaturesCache       = sync.Map{} // sync.Map is thread-safe and efficient for read-heavy workloads
 	repositoryFeaturesLoggedCache = sync.Map{} // Tracks which repositories have had their success messages logged
-	currentRepositoryCache        currentRepositoryCacheState
+	currentRepositoryCache        syncutil.OnceLoader[string]
 )
 
 // validateRepositoryFeatures validates that required repository features are enabled
@@ -157,14 +156,7 @@ func (c *Compiler) validateRepositoryFeatures(workflowData *WorkflowData) error 
 
 // getCurrentRepository gets the current repository from git context (with caching)
 func getCurrentRepository() (string, error) {
-	currentRepositoryCache.mu.Lock()
-	if !currentRepositoryCache.done {
-		currentRepositoryCache.result, currentRepositoryCache.err = getCurrentRepositoryUncached()
-		currentRepositoryCache.done = true
-	}
-	result := currentRepositoryCache.result
-	err := currentRepositoryCache.err
-	currentRepositoryCache.mu.Unlock()
+	result, err := currentRepositoryCache.Get(getCurrentRepositoryUncached)
 
 	if err != nil {
 		return "", err
@@ -199,7 +191,11 @@ func getCurrentRepositoryUncached() (string, error) {
 func getRepositoryFeatures(repo string, verbose bool) (*RepositoryFeatures, error) {
 	// Check cache first using sync.Map
 	if cached, exists := repositoryFeaturesCache.Load(repo); exists {
-		features := cached.(*RepositoryFeatures)
+		features, ok := cached.(*RepositoryFeatures)
+		if !ok {
+			repositoryFeaturesCache.Delete(repo)
+			return nil, fmt.Errorf("invalid repository feature cache entry for %s: expected *RepositoryFeatures, got %T", repo, cached)
+		}
 		repositoryFeaturesLog.Printf("Using cached repository features for: %s", repo)
 		return features, nil
 	}
@@ -226,7 +222,11 @@ func getRepositoryFeatures(repo string, verbose bool) (*RepositoryFeatures, erro
 	// Cache the result using sync.Map's LoadOrStore for atomic caching
 	// This handles the race condition where multiple goroutines might fetch the same repo
 	actual, loaded := repositoryFeaturesCache.LoadOrStore(repo, features)
-	actualFeatures := actual.(*RepositoryFeatures)
+	actualFeatures, ok := actual.(*RepositoryFeatures)
+	if !ok {
+		repositoryFeaturesCache.Delete(repo)
+		return nil, fmt.Errorf("invalid repository feature cache entry for %s: expected *RepositoryFeatures, got %T", repo, actual)
+	}
 
 	repositoryFeaturesLog.Printf("Cached repository features for: %s (discussions: %v, issues: %v)", repo, actualFeatures.HasDiscussions, actualFeatures.HasIssues)
 
@@ -261,14 +261,6 @@ func checkRepositoryHasDiscussions(repo string, verbose bool) (bool, error) {
 
 // checkRepositoryHasDiscussionsUncached checks if a repository has discussions enabled (no caching)
 func checkRepositoryHasDiscussionsUncached(repo string) (bool, error) {
-	// Use GitHub GraphQL API to check if discussions are enabled
-	// The hasDiscussionsEnabled field is the canonical way to check this
-	query := `query($owner: String!, $name: String!) {
-		repository(owner: $owner, name: $name) {
-			hasDiscussionsEnabled
-		}
-	}`
-
 	// Split repo into owner and name
 	parts := strings.SplitN(repo, "/", 2)
 	if len(parts) != 2 || parts[0] == "" || parts[1] == "" {
@@ -276,7 +268,8 @@ func checkRepositoryHasDiscussionsUncached(repo string) (bool, error) {
 	}
 	owner, name := parts[0], parts[1]
 
-	// Execute GraphQL query using gh CLI
+	// Execute GraphQL query using gh CLI.
+	// checkRepositoryHasDiscussionsQuery is a package-level constant — not user-controlled.
 	type GraphQLResponse struct {
 		Data struct {
 			Repository struct {
@@ -285,7 +278,7 @@ func checkRepositoryHasDiscussionsUncached(repo string) (bool, error) {
 		} `json:"data"`
 	}
 
-	stdOut, _, err := gh.Exec("api", "graphql", "-f", "query="+query,
+	stdOut, _, err := gh.Exec("api", "graphql", "-f", "query="+checkRepositoryHasDiscussionsQuery,
 		"-f", "owner="+owner, "-f", "name="+name)
 	if err != nil {
 		return false, fmt.Errorf("failed to query discussions status: %w", err)

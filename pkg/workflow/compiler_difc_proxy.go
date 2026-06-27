@@ -27,10 +27,11 @@ package workflow
 // Proxy lifecycle within the main job:
 //  1. Start proxy — after "Configure gh CLI" step, before custom steps
 //  2. Custom steps run with step-level env blocks containing GH_HOST, GH_REPO,
-//     GITHUB_API_URL, GITHUB_GRAPHQL_URL, and NODE_EXTRA_CA_CERTS. These are
-//     injected by the compiler as step-level env (not via $GITHUB_ENV), so they
-//     take precedence over job-level env without mutating global state. GHE host
-//     values set by configure_gh_for_ghe.sh are preserved for non-proxied steps.
+//     GITHUB_API_URL, GITHUB_GRAPHQL_URL, and NODE_EXTRA_CA_CERTS. GH_HOST is
+//     set to the identity host from configure_gh_for_ghe.sh (github.com on
+//     public GitHub, the real GHES/GHEC hostname on enterprise deployments) so
+//     the gh CLI skips spurious version checks against the proxy.  API traffic
+//     always routes through the proxy via GITHUB_API_URL / GITHUB_GRAPHQL_URL.
 //  3. Stop proxy — before MCP gateway starts (generateMCPSetup); always runs
 //     even if earlier steps failed (if: always(), continue-on-error: true)
 //
@@ -82,7 +83,8 @@ func hasDIFCGuardsConfigured(data *WorkflowData) bool {
 	if !hasGitHub || githubTool == false {
 		return false
 	}
-	return len(getGitHubGuardPolicies(githubTool)) > 0
+	toolConfig, _ := githubTool.(map[string]any)
+	return len(getGitHubGuardPolicies(toolConfig)) > 0
 }
 
 // isIntegrityProxyEnabled returns true unless the user has explicitly disabled the DIFC proxy
@@ -166,27 +168,22 @@ func hasPreAgentStepsWithGHToken(data *WorkflowData) bool {
 // endorser-min-integrity) are also included in the proxy policy.
 //
 // Returns an empty string if no guard policy fields are found.
-func getDIFCProxyPolicyJSON(githubTool any, data *WorkflowData, gatewayConfig *MCPGatewayRuntimeConfig) string {
-	toolConfig, ok := githubTool.(map[string]any)
-	if !ok {
-		return ""
-	}
-
+func getDIFCProxyPolicyJSON(githubTool map[string]any, data *WorkflowData, gatewayConfig *MCPGatewayRuntimeConfig) string {
 	policy := make(map[string]any)
 
 	// Support both 'allowed-repos' (preferred) and deprecated 'repos'
-	repos, hasRepos := toolConfig["allowed-repos"]
+	repos, hasRepos := githubTool["allowed-repos"]
 	if !hasRepos {
-		repos, hasRepos = toolConfig["repos"]
+		repos, hasRepos = githubTool["repos"]
 	}
-	integrity, hasIntegrity := toolConfig["min-integrity"]
+	integrity, hasIntegrity := githubTool["min-integrity"]
 
 	if !hasRepos && !hasIntegrity {
 		return ""
 	}
 
 	if hasRepos {
-		policy["repos"] = repos
+		policy["repos"] = normalizeGitHubRepositoryInReposScope(repos)
 	} else {
 		// Default repos to "all" when min-integrity is specified without repos
 		policy["repos"] = "all"
@@ -197,7 +194,7 @@ func getDIFCProxyPolicyJSON(githubTool any, data *WorkflowData, gatewayConfig *M
 	}
 
 	// Inject reaction fields when the feature flag is enabled and MCPG supports it.
-	injectIntegrityReactionFields(policy, toolConfig, data, gatewayConfig)
+	injectIntegrityReactionFields(policy, githubTool, data, gatewayConfig)
 
 	guardPolicy := map[string]any{
 		"allow-only": policy,
@@ -228,16 +225,16 @@ func resolveProxyContainerImage(gatewayConfig *MCPGatewayRuntimeConfig) string {
 func (c *Compiler) buildStartDIFCProxyStepYAML(data *WorkflowData) string {
 	difcProxyLog.Print("Building Start DIFC proxy step YAML")
 
-	githubTool := data.Tools["github"]
+	githubToolConfig, _ := data.Tools["github"].(map[string]any)
 
 	// Get MCP server token (same token the gateway uses for the GitHub MCP server)
-	customGitHubToken := getGitHubToken(githubTool)
+	customGitHubToken := getGitHubToken(githubToolConfig)
 	effectiveToken := getEffectiveGitHubToken(customGitHubToken)
 
 	// Build the simplified guard policy JSON (static fields only)
 	// (plus reaction fields when integrity-reactions feature flag is enabled)
 	ensureDefaultMCPGatewayConfig(data)
-	policyJSON := getDIFCProxyPolicyJSON(githubTool, data, data.SandboxConfig.MCP)
+	policyJSON := getDIFCProxyPolicyJSON(githubToolConfig, data, data.SandboxConfig.MCP)
 	if policyJSON == "" {
 		difcProxyLog.Print("Could not build DIFC proxy policy JSON, skipping proxy start")
 		return ""
@@ -252,6 +249,9 @@ func (c *Compiler) buildStartDIFCProxyStepYAML(data *WorkflowData) string {
 	sb.WriteString("        env:\n")
 	fmt.Fprintf(&sb, "          GH_TOKEN: %s\n", effectiveToken)
 	sb.WriteString("          GITHUB_SERVER_URL: ${{ github.server_url }}\n")
+	if isAWFNetworkIsolationEnabled(data) {
+		sb.WriteString("          GH_AW_NETWORK_ISOLATION: 'true'\n")
+	}
 	// Store policy and image in env vars to avoid shell-quoting issues with
 	// inline JSON arguments and to keep the run: command clean.
 	fmt.Fprintf(&sb, "          DIFC_PROXY_POLICY: '%s'\n", policyJSON)
@@ -280,16 +280,46 @@ func (c *Compiler) generateStartDIFCProxyStep(yaml *strings.Builder, data *Workf
 // proxyEnvVars returns the env vars to inject as step-level env on each custom step
 // when the DIFC proxy is running.
 //
-// These override $GITHUB_ENV values (such as GH_HOST=myorg.ghe.com on GHE runners)
-// without mutating global state. Steps that do not need the proxy (e.g., after
-// stop_difc_proxy.sh) continue to see the original job-level env values.
+// # GH_HOST value rationale
+//
+// GH_HOST must NOT be set to the proxy address (localhost:18443) because the gh
+// CLI treats any host that is not github.com or *.ghe.com as GitHub Enterprise
+// Server (GHES) and performs a version check by calling GET /api/v3/meta before
+// every API request made with --repo. The DIFC proxy does not return the
+// installed_version field that GHES instances include in /meta; the upstream
+// github.com /meta response omits it, so gh rejects the response as
+// "malformed version: " and aborts — crashing every gh --repo call in
+// user-defined steps.
+//
+// The correct value for GH_HOST depends on the GitHub deployment type:
+//
+//   - github.com (public GitHub): configure_gh_for_ghe.sh either leaves GH_HOST
+//     unset or sets it to "github.com".  gh treats "github.com" as public GitHub
+//     and skips the GHES version check entirely.  All API traffic is still routed
+//     through the proxy via GITHUB_API_URL.
+//
+//   - GHEC (*.ghe.com): configure_gh_for_ghe.sh sets GH_HOST to the tenant
+//     hostname (e.g. myorg.ghe.com).  gh treats *.ghe.com the same as github.com
+//     (no GHES version check), so the same "no broken version check" property
+//     holds.
+//
+//   - GHES (any other hostname): configure_gh_for_ghe.sh sets GH_HOST to the real
+//     GHES hostname (e.g. ghes.example.com).  gh performs the GHES version check
+//     using GITHUB_API_URL (the proxy), which forwards GET /meta to the real GHES
+//     upstream.  The real GHES returns installed_version, so the check passes.
+//
+// Using `${{ env.GH_HOST || 'github.com' }}` therefore selects the correct
+// identity host for every deployment type while keeping all API traffic flowing
+// through the proxy via GITHUB_API_URL / GITHUB_GRAPHQL_URL.
 func proxyEnvVars() map[string]string {
 	return map[string]string{
-		"GH_HOST":             "localhost:18443",
+		// Identity host from configure_gh_for_ghe.sh, not the proxy address.
+		// See function-level comment for full rationale.
+		"GH_HOST":             "${{ env.GH_HOST || 'github.com' }}",
 		"GH_REPO":             "${{ github.repository }}",
 		"GITHUB_API_URL":      "https://localhost:18443/api/v3",
 		"GITHUB_GRAPHQL_URL":  "https://localhost:18443/api/graphql",
-		"NODE_EXTRA_CA_CERTS": "/tmp/gh-aw/proxy-logs/proxy-tls/ca.crt",
+		"NODE_EXTRA_CA_CERTS": constants.TmpProxyTLSCACert,
 	}
 }
 
@@ -299,11 +329,14 @@ func proxyEnvVars() map[string]string {
 // configure_gh_for_ghe.sh are preserved for steps that do not need the proxy.
 //
 // The proxy env vars injected are:
-//   - GH_HOST=localhost:18443
+//   - GH_HOST=${{ env.GH_HOST || 'github.com' }}  (correct identity host, not proxy addr)
 //   - GH_REPO=${{ github.repository }}
 //   - GITHUB_API_URL=https://localhost:18443/api/v3
 //   - GITHUB_GRAPHQL_URL=https://localhost:18443/api/graphql
 //   - NODE_EXTRA_CA_CERTS=/tmp/gh-aw/proxy-logs/proxy-tls/ca.crt
+//
+// GH_HOST is intentionally NOT set to the proxy address; see proxyEnvVars() for
+// the full rationale.
 //
 // If a step already has an env: block, the proxy vars are merged into it (existing
 // vars like GH_TOKEN are preserved). If parsing or serialization fails, the original
@@ -464,10 +497,10 @@ const defaultCliProxyPolicyJSON = `{"allow-only":{"repos":"all","min-integrity":
 func (c *Compiler) buildStartCliProxyStepYAML(data *WorkflowData) string {
 	difcProxyLog.Print("Building Start CLI proxy step YAML")
 
-	githubTool := data.Tools["github"]
+	githubToolConfig, _ := data.Tools["github"].(map[string]any)
 
 	// Get token for the proxy
-	customGitHubToken := getGitHubToken(githubTool)
+	customGitHubToken := getGitHubToken(githubToolConfig)
 	effectiveToken := getEffectiveGitHubToken(customGitHubToken)
 
 	// Build the guard policy JSON (static fields only, plus reaction fields when enabled).
@@ -475,7 +508,7 @@ func (c *Compiler) buildStartCliProxyStepYAML(data *WorkflowData) string {
 	// calls return HTTP 503 ("proxy enforcement not configured"). Use the default
 	// permissive policy when no guard policy is configured in the frontmatter.
 	ensureDefaultMCPGatewayConfig(data)
-	policyJSON := getDIFCProxyPolicyJSON(githubTool, data, data.SandboxConfig.MCP)
+	policyJSON := getDIFCProxyPolicyJSON(githubToolConfig, data, data.SandboxConfig.MCP)
 	if policyJSON == "" {
 		policyJSON = defaultCliProxyPolicyJSON
 		difcProxyLog.Print("No guard policy configured, using default CLI proxy policy")
@@ -489,6 +522,9 @@ func (c *Compiler) buildStartCliProxyStepYAML(data *WorkflowData) string {
 	sb.WriteString("        env:\n")
 	fmt.Fprintf(&sb, "          GH_TOKEN: %s\n", effectiveToken)
 	sb.WriteString("          GITHUB_SERVER_URL: ${{ github.server_url }}\n")
+	if isAWFNetworkIsolationEnabled(data) {
+		sb.WriteString("          GH_AW_NETWORK_ISOLATION: 'true'\n")
+	}
 	fmt.Fprintf(&sb, "          CLI_PROXY_POLICY: '%s'\n", policyJSON)
 	fmt.Fprintf(&sb, "          CLI_PROXY_IMAGE: '%s'\n", containerImage)
 	sb.WriteString("        run: |\n")
@@ -528,7 +564,7 @@ func difcProxyLogPaths(data *WorkflowData) []string {
 	// Exclude proxy-tls/ to avoid uploading TLS material (mcp-logs/ is already
 	// collected as part of standard MCP logging).
 	return []string{
-		"/tmp/gh-aw/proxy-logs/",
-		"!/tmp/gh-aw/proxy-logs/proxy-tls/",
+		constants.TmpProxyLogsDir,
+		"!" + constants.TmpProxyTLSDir,
 	}
 }

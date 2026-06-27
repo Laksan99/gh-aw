@@ -5,7 +5,21 @@ const fs = require("fs");
 const path = require("path");
 const os = require("os");
 
-const { main, getReadableTokenUsagePaths, extractRequestId, readDedupedTokenUsage, TOKEN_USAGE_AUDIT_PATH, TOKEN_USAGE_PATH, TOKEN_USAGE_PATHS, AGENT_USAGE_PATH } = require("./parse_token_usage.cjs");
+const {
+  main,
+  getReadableTokenUsagePaths,
+  extractRequestId,
+  readDedupedTokenUsage,
+  getSummaryTitle,
+  buildStepSummarySection,
+  renderTokenTableAsPlainText,
+  TOKEN_USAGE_AUDIT_PATH,
+  TOKEN_USAGE_PATH,
+  TOKEN_USAGE_AWF_AUDIT_PATH,
+  TOKEN_USAGE_PATHS,
+  AGENT_USAGE_PATH,
+  DEFAULT_SUMMARY_TITLE,
+} = require("./parse_token_usage.cjs");
 
 describe("parse_token_usage", () => {
   const singleEntry = JSON.stringify({
@@ -32,18 +46,27 @@ describe("parse_token_usage", () => {
       expect(TOKEN_USAGE_PATH).toBe("/tmp/gh-aw/sandbox/firewall/logs/api-proxy-logs/token-usage.jsonl");
     });
 
-    test("TOKEN_USAGE_PATHS includes audit and legacy paths", () => {
-      expect(TOKEN_USAGE_PATHS).toEqual([TOKEN_USAGE_AUDIT_PATH, TOKEN_USAGE_PATH]);
+    test("TOKEN_USAGE_AWF_AUDIT_PATH points to firewall AWF audit log file", () => {
+      expect(TOKEN_USAGE_AWF_AUDIT_PATH).toBe("/tmp/gh-aw/sandbox/firewall/audit/api-proxy-logs/token-usage.jsonl");
+    });
+
+    test("TOKEN_USAGE_PATHS includes legacy, AWF audit, and proxy log paths", () => {
+      expect(TOKEN_USAGE_PATHS).toEqual([TOKEN_USAGE_AUDIT_PATH, TOKEN_USAGE_AWF_AUDIT_PATH, TOKEN_USAGE_PATH]);
     });
 
     test("AGENT_USAGE_PATH points to agent_usage.json", () => {
       expect(AGENT_USAGE_PATH).toBe("/tmp/gh-aw/agent_usage.json");
+    });
+
+    test("DEFAULT_SUMMARY_TITLE points to Token Usage", () => {
+      expect(DEFAULT_SUMMARY_TITLE).toBe("Token Usage");
     });
   });
 
   describe("main function", () => {
     let tmpDir;
     let mockCore;
+    let originalAppendFileSync;
     let originalExistsSync;
     let originalStatSync;
     let originalReadFileSync;
@@ -51,6 +74,8 @@ describe("parse_token_usage", () => {
 
     beforeEach(() => {
       tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "parse-token-usage-test-"));
+      delete process.env.GH_AW_TOKEN_USAGE_SUMMARY_TITLE;
+      process.env.GITHUB_STEP_SUMMARY = "";
 
       mockCore = {
         info: vi.fn(),
@@ -69,6 +94,7 @@ describe("parse_token_usage", () => {
 
       global.core = mockCore;
 
+      originalAppendFileSync = fs.appendFileSync;
       originalExistsSync = fs.existsSync;
       originalStatSync = fs.statSync;
       originalReadFileSync = fs.readFileSync;
@@ -89,6 +115,7 @@ describe("parse_token_usage", () => {
     });
 
     afterEach(() => {
+      fs.appendFileSync = originalAppendFileSync;
       fs.existsSync = originalExistsSync;
       fs.statSync = originalStatSync;
       fs.readFileSync = originalReadFileSync;
@@ -96,6 +123,21 @@ describe("parse_token_usage", () => {
       delete global.core;
       fs.rmSync(tmpDir, { recursive: true, force: true });
     });
+
+    /**
+     * @param {string} summaryText
+     * @param {Array<[string, string, string]>} rows [alias, input, output]
+     */
+    function expectTokenUsageTableRows(summaryText, rows) {
+      const escapeRegex = value => value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+      expect(summaryText).toContain("| # | Alias | Input | Output |");
+      for (const [alias, input, output] of rows) {
+        const aliasPattern = escapeRegex(alias);
+        const inputPattern = escapeRegex(input);
+        const outputPattern = escapeRegex(output);
+        expect(summaryText).toMatch(new RegExp(`\\|\\s*\\d+\\s*\\|\\s*${aliasPattern}\\s*\\|\\s*${inputPattern}\\s*\\|\\s*${outputPattern}\\s*\\|`));
+      }
+    }
 
     test("skips summary when token usage file does not exist", async () => {
       await main();
@@ -154,12 +196,72 @@ describe("parse_token_usage", () => {
 
       await main();
 
-      expect(mockCore.summary.addDetails).toHaveBeenCalledWith("Token Usage", expect.stringContaining("| Model |"));
+      expect(mockCore.summary.addRaw).toHaveBeenCalledWith(expect.stringContaining("### Token Usage"), true);
+      expect(mockCore.summary.addRaw).toHaveBeenCalledWith(expect.stringContaining("| Alias |"), true);
       expect(mockCore.summary.write).toHaveBeenCalled();
       expect(mockCore.info).toHaveBeenCalledWith(expect.stringContaining("Token usage summary appended"));
+      // Token table should also be rendered to core.info
+      expect(mockCore.info).toHaveBeenCalledWith(expect.stringContaining("Token Usage"));
+      expect(mockCore.info).toHaveBeenCalledWith(expect.stringContaining("Alias"));
     });
 
-    test("writes agent_usage.json with aggregated token totals including effective_tokens", async () => {
+    test("uses custom summary title when configured", async () => {
+      process.env.GH_AW_TOKEN_USAGE_SUMMARY_TITLE = "Threat Detection Token Usage";
+
+      fs.existsSync = vi.fn(p => {
+        if (p === TOKEN_USAGE_PATH) return true;
+        if (p === TOKEN_USAGE_AUDIT_PATH) return false;
+        return originalExistsSync(p);
+      });
+      fs.statSync = vi.fn(p => {
+        if (p === TOKEN_USAGE_PATH) return { size: singleEntry.length };
+        if (p === TOKEN_USAGE_AUDIT_PATH) return { size: 0 };
+        return originalStatSync(p);
+      });
+      fs.readFileSync = vi.fn((p, enc) => {
+        if (p === TOKEN_USAGE_PATH) return singleEntry;
+        if (p === TOKEN_USAGE_AUDIT_PATH) return "";
+        return originalReadFileSync(p, enc);
+      });
+
+      await main();
+
+      expect(mockCore.summary.addRaw).toHaveBeenCalledWith(expect.stringContaining("### Threat Detection Token Usage"), true);
+    });
+
+    test("appends token usage section to GITHUB_STEP_SUMMARY when configured", async () => {
+      const stepSummaryPath = path.join(tmpDir, "step-summary.md");
+      process.env.GITHUB_STEP_SUMMARY = stepSummaryPath;
+      fs.appendFileSync = vi.fn((...args) => originalAppendFileSync(...args));
+
+      fs.existsSync = vi.fn(p => {
+        if (p === TOKEN_USAGE_PATH) return true;
+        if (p === TOKEN_USAGE_AUDIT_PATH) return false;
+        return originalExistsSync(p);
+      });
+      fs.statSync = vi.fn(p => {
+        if (p === TOKEN_USAGE_PATH) return { size: singleEntry.length };
+        if (p === TOKEN_USAGE_AUDIT_PATH) return { size: 0 };
+        return originalStatSync(p);
+      });
+      fs.readFileSync = vi.fn((p, enc) => {
+        if (p === TOKEN_USAGE_PATH) return singleEntry;
+        if (p === TOKEN_USAGE_AUDIT_PATH) return "";
+        return originalReadFileSync(p, enc);
+      });
+
+      await main();
+
+      const stepSummary = originalReadFileSync(stepSummaryPath, "utf8");
+      expect(stepSummary).toContain("### Token Usage");
+      expect(stepSummary).toContain("<summary>Per-request AI credits and token totals</summary>");
+      expect(stepSummary).toContain("| ΔAI Credits | AI Credits |");
+      expect(fs.appendFileSync).toHaveBeenCalledWith(stepSummaryPath, expect.any(String), "utf8");
+      expect(mockCore.summary.addRaw).not.toHaveBeenCalled();
+      expect(mockCore.summary.write).not.toHaveBeenCalled();
+    });
+
+    test("writes agent_usage.json with aggregated token totals and primary_model", async () => {
       const agentUsageFile = path.join(tmpDir, "agent_usage.json");
 
       fs.existsSync = vi.fn(p => {
@@ -193,39 +295,10 @@ describe("parse_token_usage", () => {
       expect(agentUsage.output_tokens).toBe(200);
       expect(agentUsage.cache_read_tokens).toBe(5000);
       expect(agentUsage.cache_write_tokens).toBe(3000);
-      expect(typeof agentUsage.effective_tokens).toBe("number");
-    });
-
-    test("exports effective_tokens as step output and env var when non-zero", async () => {
-      const agentUsageFile = path.join(tmpDir, "agent_usage.json");
-
-      fs.existsSync = vi.fn(p => {
-        if (p === TOKEN_USAGE_PATH) return true;
-        if (p === TOKEN_USAGE_AUDIT_PATH) return false;
-        return originalExistsSync(p);
-      });
-      fs.statSync = vi.fn(p => {
-        if (p === TOKEN_USAGE_PATH) return { size: singleEntry.length };
-        if (p === TOKEN_USAGE_AUDIT_PATH) return { size: 0 };
-        return originalStatSync(p);
-      });
-      fs.readFileSync = vi.fn((p, enc) => {
-        if (p === TOKEN_USAGE_PATH) return singleEntry;
-        if (p === TOKEN_USAGE_AUDIT_PATH) return "";
-        return originalReadFileSync(p, enc);
-      });
-      fs.writeFileSync = vi.fn((p, data) => {
-        if (p === AGENT_USAGE_PATH) originalWriteFileSync(agentUsageFile, data);
-        else originalWriteFileSync(p, data);
-      });
-
-      await main();
-
-      const agentUsage = JSON.parse(fs.readFileSync(agentUsageFile, "utf8"));
-      if (agentUsage.effective_tokens > 0) {
-        expect(mockCore.setOutput).toHaveBeenCalledWith("effective_tokens", String(agentUsage.effective_tokens));
-        expect(mockCore.exportVariable).toHaveBeenCalledWith("GH_AW_EFFECTIVE_TOKENS", String(agentUsage.effective_tokens));
-      }
+      expect(agentUsage.ambient_context).toBe(900);
+      expect(typeof agentUsage.ai_credits).toBe("number");
+      // primary_model is the actual model from token-usage data (not a user alias)
+      expect(agentUsage.primary_model).toBe("claude-sonnet-4-6");
     });
 
     test("handles multiple model entries", async () => {
@@ -256,11 +329,13 @@ describe("parse_token_usage", () => {
 
       await main();
 
-      const detailsCall = mockCore.summary.addDetails.mock.calls[0];
-      expect(detailsCall[0]).toBe("Token Usage");
-      expect(detailsCall[1]).toContain("claude-sonnet-4-6");
-      expect(detailsCall[1]).toContain("gpt-4o");
-      expect(detailsCall[1]).toContain("**Total**");
+      const summaryCall = mockCore.summary.addRaw.mock.calls[0];
+      expect(summaryCall[0]).toContain("### Token Usage");
+      expectTokenUsageTableRows(summaryCall[0], [
+        ["sonnet46", "100", "200"],
+        ["gpt40", "50", "80"],
+      ]);
+      expect(summaryCall[0]).toContain("**Total**");
 
       const agentUsage = JSON.parse(fs.readFileSync(agentUsageFile, "utf8"));
       expect(agentUsage.input_tokens).toBe(150);
@@ -295,9 +370,11 @@ describe("parse_token_usage", () => {
 
       await main();
 
-      const detailsCall = mockCore.summary.addDetails.mock.calls[0];
-      expect(detailsCall[1]).toContain("claude-sonnet-4-6");
-      expect(detailsCall[1]).toContain("gpt-4o");
+      const summaryCall = mockCore.summary.addRaw.mock.calls[0];
+      expectTokenUsageTableRows(summaryCall[0], [
+        ["sonnet46", "100", "200"],
+        ["gpt40", "50", "80"],
+      ]);
 
       const agentUsage = JSON.parse(fs.readFileSync(agentUsageFile, "utf8"));
       expect(agentUsage.input_tokens).toBe(150);
@@ -361,10 +438,12 @@ describe("parse_token_usage", () => {
 
       await main();
 
-      const detailsCall = mockCore.summary.addDetails.mock.calls[0];
-      expect(detailsCall[1]).toContain("claude-sonnet-4-6");
-      expect(detailsCall[1]).toContain("claude-haiku-4-5");
-      expect(detailsCall[1]).toContain("gpt-4o");
+      const summaryCall = mockCore.summary.addRaw.mock.calls[0];
+      expectTokenUsageTableRows(summaryCall[0], [
+        ["sonnet46", "100", "200"],
+        ["haiku45", "50", "75"],
+        ["gpt40", "20", "30"],
+      ]);
 
       const agentUsage = JSON.parse(fs.readFileSync(agentUsageFile, "utf8"));
       expect(agentUsage.input_tokens).toBe(170);
@@ -448,6 +527,48 @@ describe("parse_token_usage", () => {
       expect(deduped).toContain('"request_id":"req-2"');
       expect(deduped).toContain('"request_id":"req-3"');
       expect(deduped.match(/"request_id":"req-1"/g)).toHaveLength(1);
+    });
+
+    test("getSummaryTitle returns trimmed env title", () => {
+      process.env.GH_AW_TOKEN_USAGE_SUMMARY_TITLE = "  Threat Detection Token Usage  ";
+      expect(getSummaryTitle()).toBe("Threat Detection Token Usage");
+    });
+
+    test("getSummaryTitle falls back to default title", () => {
+      delete process.env.GH_AW_TOKEN_USAGE_SUMMARY_TITLE;
+      expect(getSummaryTitle()).toBe("Token Usage");
+    });
+
+    test("buildStepSummarySection wraps markdown in a heading and details block", () => {
+      const section = buildStepSummarySection("Token Usage", "| Alias |\n| --- |");
+      expect(section).toContain("### Token Usage");
+      expect(section).toContain("<details>");
+      expect(section).toContain("<summary>Per-request AI credits and token totals</summary>");
+    });
+
+    test("renderTokenTableAsPlainText strips table separator lines and pipes", () => {
+      const markdown = ["| # | Alias | Input | Output |", "|--:|-------|------:|-------:|", "| 1 | sonnet46 | 100 | 200 |", "| **Total** | | **100** | **200** |", "", "Legend: `Alias` is the model shorthand.", ""].join("\n");
+
+      const result = renderTokenTableAsPlainText("Token Usage", markdown);
+
+      expect(result).toContain("Token Usage");
+      // separator line is removed (no dash sequences that leak from separator rows)
+      expect(result).not.toMatch(/---/);
+      // leading/trailing pipes are stripped
+      expect(result).not.toMatch(/^\|/m);
+      expect(result).not.toMatch(/\|$/m);
+      // bold markers are removed
+      expect(result).not.toContain("**");
+      // data is preserved
+      expect(result).toContain("sonnet46");
+      expect(result).toContain("100");
+      expect(result).toContain("200");
+      expect(result).toContain("Legend:");
+    });
+
+    test("renderTokenTableAsPlainText prefixes output with title", () => {
+      const result = renderTokenTableAsPlainText("My Token Usage", "| A |\n|---|\n| 1 |");
+      expect(result.startsWith("My Token Usage")).toBe(true);
     });
   });
 });

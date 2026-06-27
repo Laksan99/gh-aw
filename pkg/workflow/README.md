@@ -10,7 +10,7 @@ The package is organized around three major subsystems:
 
 1. **Compiler** (`compiler*.go`, `compiler_types.go`): The `Compiler` struct drives the main compilation pipeline. It accepts a markdown file path (or pre-parsed `WorkflowData`), builds the full GitHub Actions workflow YAML, and writes the `.lock.yml` file only when the content has changed.
 
-2. **Engine registry** (`agentic_engine.go`, `*_engine.go`): A pluggable engine architecture where each AI engine (`copilot`, `claude`, `codex`, `gemini`, `crush`, `custom`) implements a set of focused interfaces (`Engine`, `CapabilityProvider`, `WorkflowExecutor`, `MCPConfigProvider`, etc.). Engines are registered in a global `EngineRegistry` and looked up by name at compile time.
+2. **Engine registry** (`agentic_engine.go`, `*_engine.go`): A pluggable engine architecture where each AI engine (`copilot`, `claude`, `codex`, `gemini`, `crush`, `opencode`, `pi`, `antigravity`, `custom`) implements a set of focused interfaces (`Engine`, `CapabilityProvider`, `WorkflowExecutor`, `MCPConfigProvider`, etc.). Engines are registered in a global `EngineRegistry` and looked up by name at compile time.
 
 3. **Validation** (`validation.go`, `strict_mode_*.go`, `*_validation.go`): A layered validation system organized by domain. Each validator is a focused file under 300 lines. Validation runs both at compile time and optionally in strict mode for production deployments.
 
@@ -61,6 +61,7 @@ The package is intentionally large (~320 source files) because it encodes all Gi
 | `AgentFileProvider` | interface | Custom agent file support |
 | `ConfigRenderer` | interface | Configuration file rendering |
 | `DriverProvider` | interface | Driver-level execution configuration |
+| `HarnessProvider` | interface | Harness script configuration — returns the Node.js harness filename or empty string |
 | `CodingAgentEngine` | interface | Composite interface combining all engine capabilities |
 | `BaseEngine` | struct | Base implementation shared by all engines |
 | `EngineRegistry` | struct | Global registry mapping engine names to implementations |
@@ -70,6 +71,8 @@ The package is intentionally large (~320 source files) because it encodes all Gi
 | `GeminiEngine` | struct | Google Gemini CLI coding agent engine |
 | `CrushEngine` | struct | Crush coding agent engine |
 | `OpenCodeEngine` | struct | OpenCode coding agent engine |
+| `PiEngine` | struct | Pi coding agent engine |
+| `AntigravityEngine` | struct | Antigravity coding agent engine |
 | `UniversalLLMBackend` | string alias | Universal LLM backend identifier (`claude`, `codex`) |
 | `UniversalLLMConsumerEngine` | struct | Shared implementation for universal LLM backends |
 | `EngineCatalog` | struct | Catalog of engine definitions with lookup and resolution helpers |
@@ -86,6 +89,8 @@ The package is intentionally large (~320 source files) because it encodes all Gi
 | `NewGeminiEngine` | `func() *GeminiEngine` | Creates the Gemini engine |
 | `NewCrushEngine` | `func() *CrushEngine` | Creates the Crush engine |
 | `NewOpenCodeEngine` | `func() *OpenCodeEngine` | Creates the OpenCode engine |
+| `NewPiEngine` | `func() *PiEngine` | Creates the Pi engine |
+| `NewAntigravityEngine` | `func() *AntigravityEngine` | Creates the Antigravity engine |
 | `NewEngineCatalog` | `func(registry *EngineRegistry) *EngineCatalog` | Creates an engine catalog from an engine registry |
 
 ### Frontmatter Configuration Types
@@ -101,6 +106,44 @@ The package is intentionally large (~320 source files) because it encodes all Gi
 | `ObservabilityConfig` | struct | OTLP/observability configuration |
 | `RateLimitConfig` | struct | Rate limit settings |
 | `OTLPConfig` | struct | OpenTelemetry protocol configuration |
+| `EngineConfig` | struct | Parsed `engine:` frontmatter block — see [Engine Configuration Fields](#engine-configuration-fields) |
+| `EngineAuthConfig` | struct | Engine-level auth config (`engine.auth.*` → `AWF_AUTH_*` env vars for API proxy) |
+| `NetworkPermissions` | struct | Parsed `network:` frontmatter block; controls allowed/blocked domain lists |
+| `EngineNetworkConfig` | struct | Combines `*EngineConfig` and `*NetworkPermissions` for engine helpers that need both |
+
+#### Engine Configuration Fields
+
+`EngineConfig` is populated by `ExtractEngineConfig` from the `engine:` frontmatter key. It is stored on `EngineNetworkConfig.Engine` and forwarded to each engine's `GetExecutionSteps` / `GetInstallationSteps` implementations.
+
+| Field | Type | YAML key | Description |
+|-------|------|----------|-------------|
+| `ID` | `string` | `engine` | Engine identifier (e.g. `"copilot"`, `"claude"`, `"codex"`) |
+| `Version` | `string` | `engine.version` | Pinned engine/CLI version |
+| `Model` | `string` | `engine.model` | LLM model name |
+| `PermissionMode` | `string` | `engine.permission-mode` | Agent permission mode |
+| `MaxTurns` | `string` | `engine.max-turns` | Maximum agent turns |
+| `MaxToolDenials` | `string` | `engine.max-tool-denials` | Max repeated tool denials before stopping (Copilot SDK mode only) |
+| `MaxRuns` | `int` | `engine.max-runs` | Maximum LLM invocations per run (AWF `apiProxy.maxRuns`) |
+| `MaxContinuations` | `int` | `engine.max-continuations` | Maximum autopilot continuations (copilot engine; `> 1` enables `--autopilot`) |
+| `MaxAICredits` | `int64` | `engine.max-ai-credits` | Maximum AI credits per run for AWF API-proxy firewall enforcement |
+| `Concurrency` | `string` | `engine.concurrency` | Agent job-level concurrency YAML |
+| `UserAgent` | `string` | `engine.user-agent` | Custom user-agent string |
+| `Command` | `string` | `engine.command` | Custom executable path; skips installation steps when set |
+| `HarnessScript` | `string` | `engine.harness-script` | Custom Node.js harness script filename (replaces engine default) |
+| `CopilotSDK` | `bool` | `engine.copilot-sdk` | **(Experimental)** Enables GitHub Copilot SDK integration. When `true`, the compiler starts a headless Copilot CLI sidecar and sets `COPILOT_SDK_URI` on child processes so the SDK can connect to it. Implied when `CopilotSDKDriver` is non-empty. |
+| `CopilotSDKDriver` | `string` | `engine.copilot-sdk-driver` | **(Experimental)** Custom Copilot SDK driver script filename or command. Supports `.js`/`.cjs`/`.mjs` (Node.js), `.py` (Python), `.ts`/`.mts` (TypeScript), `.rb` (Ruby), or a bare command name for an arbitrary executable on `PATH`. Setting this field implies `copilot-sdk: true`. |
+| `Env` | `map[string]string` | `engine.env` | Extra environment variables injected into the agent job |
+| `Auth` | `*EngineAuthConfig` | `engine.auth` | Engine-level auth config for the API proxy sidecar |
+| `Config` | `string` | `engine.config` | Inline engine configuration JSON/YAML string |
+| `Args` | `[]string` | `engine.args` | Extra CLI arguments passed to the engine |
+| `Agent` | `string` | `engine.agent` | Agent identifier for `copilot --agent` flag (copilot engine only) |
+| `APITarget` | `string` | `engine.api-target` | Custom API endpoint hostname |
+| `Bare` | `bool` | `engine.bare` | Disables automatic loading of context/instructions |
+| `TokenWeights` | `*types.TokenWeights` | `engine.token-weights` | Custom model cost data for AI Credits cost ratios |
+| `IsInlineDefinition` | `bool` | _(internal)_ | `true` when engine is defined inline via `engine.runtime` |
+| `MCPSessionTimeout` | `string` | `engine.mcp.session-timeout` | Go duration for MCP gateway sessions (e.g. `"4h"`) |
+| `MCPToolTimeout` | `string` | `engine.mcp.tool-timeout` | Go duration for individual MCP tool calls (e.g. `"2m"`) |
+| `Extensions` | `[]string` | `engine.extensions` | Engine-specific plugin names to install before launching (Pi engine) |
 
 ### Permissions System
 
@@ -149,6 +192,8 @@ The package is intentionally large (~320 source files) because it encodes all Gi
 | `EditToolConfig` | struct | File edit tool config |
 | `AgenticWorkflowsToolConfig` | struct | Nested agentic workflows tool config |
 | `CacheMemoryToolConfig` | struct | Cache-memory persistence tool config |
+| `CommentMemoryToolConfig` | struct | Comment-memory tool config wrapper (raw value dispatched to `comment_memory.go`) |
+| `RepoMemoryToolConfig` | struct | Repository-memory tool config wrapper (raw value dispatched to `repo_memory.go`) |
 | `MCPServerConfig` | struct | Generic MCP server configuration |
 | `MCPGatewayRuntimeConfig` | struct | MCP Gateway runtime configuration |
 | `GitHubToolName` | string alias | Named GitHub MCP tool (e.g., `"issue_read"`) |
@@ -185,6 +230,73 @@ The package is intentionally large (~320 source files) because it encodes all Gi
 | `ParseTargetConfig` | `func(map[string]any) (SafeOutputTargetConfig, bool)` | Parses a target configuration block |
 | `ParseFilterConfig` | `func(map[string]any) SafeOutputFilterConfig` | Parses a filter configuration block |
 | `SafeOutputsConfigFromKeys` | `func([]string) *SafeOutputsConfig` | Creates a config from a list of type keys |
+
+#### Safe Output Tool Configuration Types
+
+Each safe-output tool type has its own configuration struct parsed from the `safe-outputs:` frontmatter block. All embed `BaseSafeOutputConfig` (which provides the `max` field) and many also embed `SafeOutputTargetConfig` or `SafeOutputFilterConfig`.
+
+| Type | Kind | Description |
+|------|------|-------------|
+| `AddCommentsConfig` | struct | Configuration for creating issue/PR/discussion comments |
+| `AddCommentConfig` | type alias | Deprecated alias for `AddCommentsConfig` |
+| `AddLabelsConfig` | struct | Configuration for adding labels to issues/PRs |
+| `AddReviewerConfig` | struct | Configuration for adding reviewers to PRs |
+| `AssignMilestoneConfig` | struct | Configuration for assigning milestones to issues |
+| `AssignToAgentConfig` | struct | Configuration for assigning Copilot coding agents to issues |
+| `AssignToUserConfig` | struct | Configuration for assigning users to issues |
+| `AutofixCodeScanningAlertConfig` | struct | Configuration for adding autofixes to code scanning alerts |
+| `CloseEntityType` | string alias | Identifies the entity type to close (`issue`, `pull_request`, `discussion`) |
+| `CloseEntityConfig` | struct | Shared configuration for close-entity operations |
+| `CloseEntityJobParams` | struct | Internal job parameters for close-entity operations |
+| `CloseIssuesConfig` | type alias | `= CloseEntityConfig` — close issues |
+| `ClosePullRequestsConfig` | type alias | `= CloseEntityConfig` — close pull requests |
+| `CloseDiscussionsConfig` | type alias | `= CloseEntityConfig` — close discussions |
+| `CommentMemoryConfig` | struct | Configuration for the `comment_memory` safe output (persistent comment-based memory) |
+| `CreateAgentSessionConfig` | struct | Configuration for creating GitHub Copilot coding agent sessions |
+| `CreateCheckRunOutputConfig` | struct | Static defaults for check run output fields (title, summary, text) |
+| `CreateCheckRunConfig` | struct | Configuration for creating GitHub check runs |
+| `CreateDiscussionsConfig` | struct | Configuration for creating GitHub discussions |
+| `CreateIssuesConfig` | struct | Configuration for creating GitHub issues |
+| `CreatePullRequestReviewCommentsConfig` | struct | Configuration for creating PR review comments |
+| `CreateProjectsConfig` | struct | Configuration for creating GitHub Projects v2 |
+| `CreateProjectStatusUpdateConfig` | struct | Configuration for creating GitHub project status updates |
+| `CreatePullRequestsConfig` | struct | Configuration for creating GitHub pull requests |
+| `DispatchRepositoryToolConfig` | struct | Single named tool within a `dispatch_repository` configuration |
+| `DispatchRepositoryConfig` | struct | Configuration for dispatching `repository_dispatch` events |
+| `DispatchWorkflowConfig` | struct | Configuration for dispatching GitHub Actions workflows |
+| `HideCommentConfig` | struct | Configuration for hiding/minimizing GitHub comments |
+| `IssueReportingConfig` | struct | Shared configuration base for `missing_data`, `missing_tool`, and `report_incomplete` safe outputs |
+| `MissingDataConfig` | type alias | `= IssueReportingConfig` for the `missing_data` safe output |
+| `MissingToolConfig` | type alias | `= IssueReportingConfig` for the `missing_tool` safe output |
+| `ReportIncompleteConfig` | type alias | `= IssueReportingConfig` for the `report_incomplete` safe output |
+| `LinkSubIssueConfig` | struct | Configuration for linking issues as sub-issues |
+| `MarkPullRequestAsReadyForReviewConfig` | struct | Configuration for marking draft PRs as ready for review |
+| `MergePullRequestConfig` | struct | Configuration for merging pull requests |
+| `PushToPullRequestBranchConfig` | struct | Configuration for pushing agent-generated changes to a PR branch |
+| `RemoveLabelsConfig` | struct | Configuration for removing labels from issues/PRs |
+| `ReplyToPullRequestReviewCommentConfig` | struct | Configuration for replying to PR review comments |
+| `RepoMemoryConfig` | struct | Configuration for the `repo_memory` safe output (repository-scoped persistent memory) |
+| `RepoMemoryEntry` | struct | A single key/value entry in repository memory |
+| `ResolvePullRequestReviewThreadConfig` | struct | Configuration for resolving PR review threads |
+| `SetIssueFieldConfig` | struct | Configuration for setting a single issue field |
+| `SetIssueTypeConfig` | struct | Configuration for setting an issue's type |
+| `SubmitPullRequestReviewConfig` | struct | Configuration for submitting PR reviews (approve, request changes, comment) |
+| `UnassignFromUserConfig` | struct | Configuration for removing assignees from issues |
+| `UpdateDiscussionsConfig` | struct | Configuration for updating GitHub discussions |
+| `UpdateIssuesConfig` | struct | Configuration for updating GitHub issues |
+| `ProjectView` | struct | GitHub Projects v2 view configuration |
+| `ProjectFieldDefinition` | struct | A field definition for a GitHub Projects v2 board |
+| `UpdateProjectConfig` | struct | Configuration for updating GitHub Projects v2 boards |
+| `UpdatePullRequestsConfig` | struct | Configuration for updating GitHub pull requests |
+| `UpdateReleaseConfig` | struct | Configuration for updating GitHub releases |
+| `UploadArtifactConfig` | struct | Configuration for uploading GitHub Actions artifacts from agent output |
+| `ArtifactFiltersConfig` | struct | Include/exclude glob patterns for artifact file selection |
+| `ArtifactDefaultsConfig` | struct | Default request settings applied when the model omits a field (e.g. `if-no-files`) |
+| `UploadAssetsConfig` | struct | Configuration for publishing assets to an orphaned git branch |
+| `CreateCodeScanningAlertsConfig` | struct | Configuration for creating repository code scanning alerts (SARIF format) |
+| `ReplaceLabelConfig` | struct | Configuration for replacing one label with another on issues/PRs |
+| `LabelTransition` | struct | An allowed label state transition (`from` → `to` pair) |
+| `SafeScriptConfig` | struct | A custom safe-output handler script that runs inside the consolidated safe-outputs job |
 
 ### Sandbox Configuration
 
@@ -294,11 +406,19 @@ The MCP Scripts subsystem provides inline custom tool definitions (JavaScript, s
 | `ActionCache` | struct | Cache for resolved action SHAs |
 | `ActionResolver` | struct | Resolves action SHAs from GitHub |
 
+#### `ActionResolver` Methods
+
+| Method | Signature | Description |
+|--------|-----------|-------------|
+| `NewActionResolver` | `func(cache *ActionCache) *ActionResolver` | Creates a new `ActionResolver` backed by the given cache |
+| `ResolveSHA` | `func(ctx context.Context, repo, version string) (string, error)` | Resolves a GitHub Action repo+version to its full commit SHA; serves cache hits first |
+
 | Function | Signature | Description |
 |----------|-----------|-------------|
 | `GetActionPin` | `func(actionRepo string) string` | Returns the pinned SHA for an action |
 | `DetectActionMode` | `func(version string) ActionMode` | Detects the action reference mode |
 | `ParseTagRefTSV` | `func(line string) (sha, objType string, err error)` | Parses tab-separated tag ref output into SHA and object type |
+| `ResolveGhAwRef` | `func(ctx context.Context, ref string) (string, error)` | Resolves a branch, tag, or SHA ref in `github/gh-aw` to its full 40-character commit SHA; passes full SHAs through unchanged |
 | `ExtractActionsFromLockFile` | `func(lockFilePath string) ([]ActionUsage, error)` | Extracts action usages from a lock file |
 | `CheckActionSHAUpdates` | `func(actions []ActionUsage, resolver *ActionResolver) []ActionUpdateCheck` | Checks whether action SHAs need updates |
 | `ApplyActionPinsToTypedSteps` | `func([]*WorkflowStep, *WorkflowData) []*WorkflowStep` | Applies pins to all steps |
@@ -314,7 +434,7 @@ The MCP Scripts subsystem provides inline custom tool definitions (JavaScript, s
 | `SanitizeWorkflowIDForCacheKey` | `func(string) string` | Sanitizes a workflow ID for use as a cache key |
 | `PrettifyToolName` | `func(string) string` | Returns a human-readable tool name |
 | `ShortenCommand` | `func(string) string` | Shortens a long command for display |
-| `GenerateHeredocDelimiterFromSeed` | `func(name, seed string) string` | Generates a stable heredoc delimiter |
+| `GenerateHeredocDelimiterFromContent` | `func(name, content string) string` | Generates a stable heredoc delimiter |
 | `ValidateHeredocContent` | `func(content, delimiter string) error` | Validates heredoc content safety |
 | `ValidateHeredocDelimiter` | `func(string) error` | Validates a heredoc delimiter |
 
@@ -516,12 +636,16 @@ pkg/workflow ── FrontmatterConfig (typed structs)
 - `github.com/github/gh-aw/pkg/semverutil` — semantic version helpers
 - `github.com/github/gh-aw/pkg/typeutil` — safe type conversions
 - `github.com/github/gh-aw/pkg/tty` — terminal capability detection
+- `github.com/github/gh-aw/pkg/workflow/compilerenv` — enterprise compiler-default and model-override helpers
 - `github.com/github/gh-aw/pkg/stringutil`, `github.com/github/gh-aw/pkg/fileutil`, `github.com/github/gh-aw/pkg/gitutil`, `github.com/github/gh-aw/pkg/sliceutil` — utilities
+- `github.com/github/gh-aw/pkg/syncutil` — thread-safe one-shot caching (used for repository feature cache)
 - `github.com/github/gh-aw/pkg/types` — shared MCP types
+
+**Test-only**:
+- `github.com/github/gh-aw/pkg/testutil` — shared test fixtures and assertion helpers used by workflow package tests
 
 **External**:
 - `github.com/goccy/go-yaml` — YAML 1.1/1.2 compatible marshaling
-- `go.yaml.in/yaml/v3` — standard YAML marshaling for non-Actions YAML
 - `github.com/cli/go-gh/v2` — GitHub CLI API and repository integration
 - `github.com/santhosh-tekuri/jsonschema/v6` — JSON schema validation
 

@@ -1,4 +1,6 @@
 ---
+private: true
+emoji: "🦛"
 name: Daily Hippo Learn
 description: Runs hippo-memory's learn and sleep commands daily to extract lessons from git commits, consolidate the memory store, and suggest actionable improvements to the team
 on:
@@ -6,15 +8,18 @@ on:
     - cron: "daily around 7:00"
   workflow_dispatch:
 
+max-daily-ai-credits: 10000
 permissions:
   contents: read
   issues: read
   pull-requests: read
   discussions: read
 
+  copilot-requests: write
 tracker-id: daily-hippo-learn
 engine:
-  id: copilot
+  id: pi
+  model: copilot/gpt-5.4
   bare: true
 
 timeout-minutes: 30
@@ -29,7 +34,9 @@ network:
     - node
 
 sandbox:
-  agent: awf
+  agent:
+    id: awf
+    sudo: false
 
 tools:
   cli-proxy: true
@@ -50,14 +57,9 @@ safe-outputs:
 imports:
   - shared/hippo-memory.md
   - shared/reporting.md
-  - shared/otel.md
-
-  - shared/observability-otlp.md
+  - shared/otlp.md
 features:
-  copilot-requests: true
-
-firewall:
-  effective-token-steering: true
+  gh-aw-detection: true
 ---
 
 {{#runtime-import? .github/shared-instructions.md}}

@@ -6,6 +6,7 @@ import (
 
 	"github.com/github/gh-aw/pkg/constants"
 	"github.com/github/gh-aw/pkg/logger"
+	"github.com/github/gh-aw/pkg/workflow/compilerenv"
 )
 
 var openCodeLog = logger.New("workflow:opencode_engine")
@@ -27,7 +28,7 @@ func NewOpenCodeEngine() *OpenCodeEngine {
 				experimental: true,
 				capabilities: EngineCapabilities{
 					ToolsAllowlist: false,
-					MaxTurns:       false,
+					MaxTurns:       true,
 					WebSearch:      false,
 				},
 			},
@@ -43,11 +44,23 @@ func (e *OpenCodeEngine) GetModelEnvVarName() string {
 
 // GetRequiredSecretNames returns the list of secrets required by the OpenCode engine.
 // By default, OpenCode routes through the Copilot API using COPILOT_GITHUB_TOKEN
-// (or ${{ github.token }} when copilot-requests feature is enabled).
+// (or ${{ github.token }} when permissions.copilot-requests is set to write).
 // Additional provider API keys can be added via engine.env overrides.
 func (e *OpenCodeEngine) GetRequiredSecretNames(workflowData *WorkflowData) []string {
 	openCodeLog.Print("Collecting required secrets for OpenCode engine")
 	return e.GetUniversalRequiredSecretNames(workflowData)
+}
+
+// GetSupportedEnvVarKeys returns the engine.env variable names that the OpenCode engine
+// supports as defined in the AWF specification. OpenCode is a multi-provider engine so all
+// provider API keys are valid engine.env overrides.
+func (e *OpenCodeEngine) GetSupportedEnvVarKeys() []string {
+	return []string{
+		constants.CopilotGitHubToken,
+		constants.AnthropicAPIKey,
+		constants.CodexAPIKey,
+		constants.OpenAIAPIKey,
+	}
 }
 
 // GetInstallationSteps returns the GitHub Actions steps needed to install OpenCode CLI
@@ -70,7 +83,7 @@ func (e *OpenCodeEngine) GetInstallationSteps(workflowData *WorkflowData) []GitH
 }
 
 // GetSecretValidationStep returns the secret validation step for the OpenCode engine.
-// Returns an empty step if copilot-requests feature is enabled (uses GitHub Actions token).
+// Returns an empty step if permissions.copilot-requests is write (uses GitHub Actions token).
 func (e *OpenCodeEngine) GetSecretValidationStep(workflowData *WorkflowData) GitHubActionStep {
 	return e.GetUniversalSecretValidationStep(
 		workflowData,
@@ -106,13 +119,14 @@ func (e *OpenCodeEngine) GetExecutionSteps(workflowData *WorkflowData, logFile s
 	modelConfigured := workflowData.EngineConfig != nil && workflowData.EngineConfig.Model != ""
 
 	openCodeArgs = append(openCodeArgs, "--print-logs", "--log-level", "DEBUG")
-	promptArg := "\"$(cat /tmp/gh-aw/aw-prompts/prompt.txt)\""
+	promptArg := fmt.Sprintf("\"$(cat %s)\"", constants.AwPromptsFile)
 
 	commandName := "opencode"
 	if workflowData.EngineConfig != nil && workflowData.EngineConfig.Command != "" {
 		commandName = workflowData.EngineConfig.Command
 	}
 	openCodeCommand := fmt.Sprintf("%s run %s %s", commandName, shellJoinArgs(openCodeArgs), promptArg)
+	openCodeCommand = getWorkspaceCommandPrefixFor(workflowData.EngineConfig) + openCodeCommand
 
 	firewallEnabled := isFirewallEnabled(workflowData)
 	var command string
@@ -159,10 +173,12 @@ func (e *OpenCodeEngine) GetExecutionSteps(workflowData *WorkflowData, logFile s
 	}
 
 	env := map[string]string{
-		"GH_AW_PROMPT":     "/tmp/gh-aw/aw-prompts/prompt.txt",
+		"GH_AW_PROMPT":     constants.AwPromptsFile,
 		"GITHUB_WORKSPACE": "${{ github.workspace }}",
+		"RUNNER_TEMP":      "${{ runner.temp }}",
 		"NO_PROXY":         "localhost,127.0.0.1",
 	}
+	injectWorkflowCallNetworkAllowedEnv(env, workflowData)
 	e.ApplyUniversalProviderEnv(env, workflowData, firewallEnabled)
 
 	if HasMCPServers(workflowData) {
@@ -171,12 +187,22 @@ func (e *OpenCodeEngine) GetExecutionSteps(workflowData *WorkflowData, logFile s
 
 	applySafeOutputEnvToMap(env, workflowData)
 
+	// Propagate W3C trace context so engine spans nest under the gh-aw.agent.setup span.
+	applyTraceContextEnvToMap(env)
+
+	if workflowData.EngineConfig != nil && workflowData.EngineConfig.MaxTurns != "" {
+		env["GH_AW_MAX_TURNS"] = workflowData.EngineConfig.MaxTurns
+	} else {
+		env["GH_AW_MAX_TURNS"] = compilerenv.BuildDefaultMaxTurnsExpression()
+	}
+
 	if modelConfigured {
 		openCodeLog.Printf("Setting %s env var for model: %s",
 			constants.OpenCodeCLIModelEnvVar, workflowData.EngineConfig.Model)
 		env[constants.OpenCodeCLIModelEnvVar] = workflowData.EngineConfig.Model
 	}
 
+	applyEngineCwdEnv(env, workflowData)
 	if workflowData.EngineConfig != nil && len(workflowData.EngineConfig.Env) > 0 {
 		maps.Copy(env, workflowData.EngineConfig.Env)
 	}

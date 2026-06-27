@@ -11,6 +11,7 @@ import (
 	"strings"
 
 	"github.com/github/gh-aw/pkg/constants"
+	"github.com/github/gh-aw/pkg/fileutil"
 
 	"github.com/github/gh-aw/pkg/console"
 	"github.com/github/gh-aw/pkg/logger"
@@ -145,8 +146,8 @@ func installBashCompletion(verbose bool, cmd *cobra.Command) error {
 		brewPrefix := os.Getenv("HOMEBREW_PREFIX")
 		if brewPrefix == "" {
 			// Try common locations
-			for _, prefix := range []string{"/opt/homebrew", "/usr/local"} {
-				if _, err := os.Stat(filepath.Join(prefix, "etc", "bash_completion.d")); err == nil {
+			for _, prefix := range []string{constants.HomebrewPrefix, constants.UsrLocalPrefix} {
+				if fileutil.DirExists(filepath.Join(prefix, "etc", "bash_completion.d")) {
 					brewPrefix = prefix
 					break
 				}
@@ -159,8 +160,8 @@ func installBashCompletion(verbose bool, cmd *cobra.Command) error {
 		}
 	} else {
 		// Linux
-		if _, err := os.Stat("/etc/bash_completion.d"); err == nil {
-			completionPath = "/etc/bash_completion.d/gh-aw"
+		if fileutil.DirExists(constants.BashCompletionDir) {
+			completionPath = constants.BashCompletionGhAwPath
 		} else {
 			completionPath = filepath.Join(homeDir, ".bash_completion.d", "gh-aw")
 		}
@@ -426,8 +427,8 @@ func uninstallBashCompletion(verbose bool) error {
 	if runtime.GOOS == "darwin" {
 		brewPrefix := os.Getenv("HOMEBREW_PREFIX")
 		if brewPrefix == "" {
-			for _, prefix := range []string{"/opt/homebrew", "/usr/local"} {
-				if _, err := os.Stat(filepath.Join(prefix, "etc", "bash_completion.d")); err == nil {
+			for _, prefix := range []string{constants.HomebrewPrefix, constants.UsrLocalPrefix} {
+				if fileutil.DirExists(filepath.Join(prefix, "etc", "bash_completion.d")) {
 					possiblePaths = append(possiblePaths, filepath.Join(prefix, "etc", "bash_completion.d", "gh-aw"))
 				}
 			}
@@ -438,14 +439,14 @@ func uninstallBashCompletion(verbose bool) error {
 
 	// System-wide installations (Linux)
 	if runtime.GOOS == "linux" {
-		possiblePaths = append(possiblePaths, "/etc/bash_completion.d/gh-aw")
+		possiblePaths = append(possiblePaths, constants.BashCompletionGhAwPath)
 	}
 
 	removed := false
 	var lastErr error
 
 	for _, path := range possiblePaths {
-		if _, err := os.Stat(path); err == nil {
+		if fileutil.FileExists(path) {
 			shellCompletionLog.Printf("Found completion file at: %s", path)
 			if err := os.Remove(path); err != nil {
 				shellCompletionLog.Printf("Failed to remove %s: %v", path, err)

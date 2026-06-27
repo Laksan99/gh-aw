@@ -1,10 +1,14 @@
 # types Package
 
-The `types` package provides shared type definitions used across multiple `gh-aw` packages to avoid circular dependencies.
+> Shared type definitions for MCP server configuration, token weights, and workflow input parameters — used across multiple `gh-aw` packages to avoid circular imports.
 
 ## Overview
 
-This package defines common data structures that are shared between the `parser` and `workflow` packages. Centralizing these types here allows both packages to reference the same definitions without creating import cycles.
+This package defines common data structures shared between the `parser` and `workflow` packages. Centralizing these types in a dedicated package allows both to reference the same definitions without creating import cycles.
+
+The primary types are `BaseMCPServerConfig` (the foundation for all MCP server configurations), `MCPAuthConfig` (OIDC authentication for HTTP MCP servers), `TokenWeights` with `TokenClassWeights` (AI Credits cost ratio configuration), and `InputDefinition` (workflow dispatch input parameters following the GitHub Actions schema).
+
+All struct fields carry both `json` and `yaml` struct tags, ensuring types can be round-tripped through both serialization formats. `BaseMCPServerConfig` is designed to be embedded rather than used directly — consumer packages (`parser`, `workflow`) add domain-specific fields and validation on top of the shared base.
 
 ## Public API
 
@@ -76,7 +80,7 @@ auth := &types.MCPAuthConfig{
 
 ### `TokenWeights`
 
-Defines custom model cost information for effective token computation. Specified under `engine.token-weights` in workflow frontmatter and stored in `aw_info.json` at runtime.
+Defines custom model cost information for AI Credits cost ratios. Specified under `engine.token-weights` in workflow frontmatter and stored in `aw_info.json` at runtime.
 
 ```go
 weights := types.TokenWeights{
@@ -92,7 +96,7 @@ weights := types.TokenWeights{
 
 ### `TokenClassWeights`
 
-Per-token-class weights for effective token computation. Each field corresponds to one token class; a zero value means "use the default weight".
+Per-token-class weights for cost computation. Each field corresponds to one token class; a zero value means "use the default weight".
 
 | Field | Token class |
 |-------|-------------|
@@ -101,6 +105,34 @@ Per-token-class weights for effective token computation. Each field corresponds 
 | `Output` | Generated output tokens |
 | `Reasoning` | Internal reasoning tokens |
 | `CacheWrite` | Cache-write tokens |
+
+### `InputDefinition`
+
+Defines an input parameter for workflows, safe-jobs, and imported workflows. The structure follows the [`workflow_dispatch` input schema](https://docs.github.com/en/actions/using-workflows/workflow-syntax-for-github-actions#onworkflow_dispatchinputs) from GitHub Actions.
+
+```go
+input := types.InputDefinition{
+    Description: "The environment to deploy to",
+    Required:    true,
+    Default:     "staging",
+    Type:        "choice",
+    Options:     []string{"staging", "production"},
+}
+```
+
+#### Fields
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `Description` | `string` | Human-readable description of the input parameter |
+| `Required` | `bool` | Whether the input is required; defaults to `false` |
+| `Default` | `any` | Default value; can be `string`, `number`, or `boolean` |
+| `Type` | `string` | Input type: `"string"`, `"choice"`, `"boolean"`, `"number"`, or `"environment"` |
+| `Options` | `[]string` | Valid options for `choice` type inputs |
+
+#### Method: `GetDefaultAsString() string`
+
+Returns the `Default` field as a string, regardless of its underlying type. Handles `string`, `bool`, `int`, `int64`, and `float64` inputs. Integer-valued `float64` defaults (e.g. `1.0`) are formatted without a decimal point. Returns `""` when `Default` is `nil`.
 
 ## Usage Examples
 
@@ -131,9 +163,14 @@ weights := types.TokenWeights{
 }
 ```
 
+## Dependencies
+
+**Internal**:
+- `github.com/github/gh-aw/pkg/logger` — package-scoped debug logging for input-definition fallback coercion
+
 ## Design Notes
 
-- This package has no dependencies on other `gh-aw` packages, making it safe to import from anywhere.
+- This package keeps internal dependencies minimal and currently only imports `pkg/logger` for debug logging. This minimal dependency footprint keeps it safe to import broadly without introducing package cycles.
 - All struct fields use both `json` and `yaml` struct tags so they can be round-tripped through both serialization formats.
 - `BaseMCPServerConfig` is designed to be embedded — packages add domain-specific fields and validation on top of the shared base.
 

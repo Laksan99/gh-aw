@@ -1,6 +1,7 @@
 package cli
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"os"
@@ -9,6 +10,7 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/github/gh-aw/pkg/setutil"
 	"github.com/github/gh-aw/pkg/stringutil"
 
 	"github.com/github/gh-aw/pkg/console"
@@ -20,19 +22,19 @@ import (
 var enableLog = logger.New("cli:enable")
 
 // EnableWorkflowsByNames enables workflows by specific names, or all if no names provided
-func EnableWorkflowsByNames(workflowNames []string, repoOverride string) error {
+func EnableWorkflowsByNames(ctx context.Context, workflowNames []string, repoOverride string) error {
 	enableLog.Printf("EnableWorkflowsByNames called: workflow_count=%d, repo=%s", len(workflowNames), repoOverride)
-	return toggleWorkflowsByNames(workflowNames, true, repoOverride)
+	return toggleWorkflowsByNames(ctx, workflowNames, true, repoOverride)
 }
 
 // DisableWorkflowsByNames disables workflows by specific names, or all if no names provided
-func DisableWorkflowsByNames(workflowNames []string, repoOverride string) error {
+func DisableWorkflowsByNames(ctx context.Context, workflowNames []string, repoOverride string) error {
 	enableLog.Printf("DisableWorkflowsByNames called: workflow_count=%d, repo=%s", len(workflowNames), repoOverride)
-	return toggleWorkflowsByNames(workflowNames, false, repoOverride)
+	return toggleWorkflowsByNames(ctx, workflowNames, false, repoOverride)
 }
 
 // toggleWorkflowsByNames toggles workflows by specific names, or all if no names provided
-func toggleWorkflowsByNames(workflowNames []string, enable bool, repoOverride string) error {
+func toggleWorkflowsByNames(ctx context.Context, workflowNames []string, enable bool, repoOverride string) error {
 	action := "enable"
 	if !enable {
 		action = "disable"
@@ -63,7 +65,7 @@ func toggleWorkflowsByNames(workflowNames []string, enable bool, repoOverride st
 		}
 
 		// Recursively call with all workflow names
-		return toggleWorkflowsByNames(allWorkflowNames, enable, repoOverride)
+		return toggleWorkflowsByNames(ctx, allWorkflowNames, enable, repoOverride)
 	}
 
 	// Check if gh CLI is available
@@ -119,7 +121,7 @@ func toggleWorkflowsByNames(workflowNames []string, enable bool, repoOverride st
 				// If enabling and lock file doesn't exist locally, try to compile it
 				if enable {
 					if _, err := os.Stat(lockFile); os.IsNotExist(err) {
-						if err := compileWorkflow(file, false, false, ""); err != nil {
+						if err := compileWorkflow(ctx, file, false, false, ""); err != nil {
 							fmt.Fprintln(os.Stderr, console.FormatWarningMessage(fmt.Sprintf("Failed to compile workflow %s to create lock file: %v", name, err)))
 							// If we can't compile and there's no GitHub entry, skip because we can't address it
 							if !exists {
@@ -277,7 +279,7 @@ func toggleWorkflowsByNames(workflowNames []string, enable bool, repoOverride st
 // Typically used to disable all workflows except the one being trialled
 func DisableAllWorkflowsExcept(repoSlug string, exceptWorkflows []string, verbose bool) error {
 	enableLog.Printf("Disabling all workflows except: count=%d, repo=%s", len(exceptWorkflows), repoSlug)
-	workflowsDir := ".github/workflows"
+	workflowsDir := constants.GetWorkflowDir()
 
 	// Check if workflows directory exists
 	if _, err := os.Stat(workflowsDir); os.IsNotExist(err) {
@@ -301,12 +303,16 @@ func DisableAllWorkflowsExcept(repoSlug string, exceptWorkflows []string, verbos
 	}
 
 	// Create a set of workflows to keep enabled
-	keepEnabled := make(map[string]bool)
+	keepEnabled := make(map[string]struct {
+	})
 	for _, workflowName := range exceptWorkflows {
 		// Add both .md and .lock.yml variants
-		keepEnabled[workflowName+".md"] = true
-		keepEnabled[workflowName+".lock.yml"] = true
-		keepEnabled[workflowName] = true // In case the full filename is provided
+		keepEnabled[workflowName+".md"] = struct {
+		}{}
+		keepEnabled[workflowName+".lock.yml"] = struct {
+		}{}
+		keepEnabled[workflowName] = struct { // In case the full filename is provided
+		}{}
 	}
 
 	// Filter to find workflows to disable
@@ -316,7 +322,7 @@ func DisableAllWorkflowsExcept(repoSlug string, exceptWorkflows []string, verbos
 		base := filepath.Base(yamlFile)
 
 		// Skip if it's in the keep-enabled set
-		if keepEnabled[base] {
+		if setutil.Contains(keepEnabled, base) {
 			if verbose {
 				fmt.Fprintf(os.Stderr, "Keeping enabled: %s\n", base)
 			}
@@ -325,7 +331,7 @@ func DisableAllWorkflowsExcept(repoSlug string, exceptWorkflows []string, verbos
 
 		// Check if the base name without extension matches
 		nameWithoutExt := strings.TrimSuffix(base, filepath.Ext(base))
-		if keepEnabled[nameWithoutExt] {
+		if setutil.Contains(keepEnabled, nameWithoutExt) {
 			if verbose {
 				fmt.Fprintf(os.Stderr, "Keeping enabled: %s\n", base)
 			}

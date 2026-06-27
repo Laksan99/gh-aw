@@ -149,7 +149,7 @@ When a core team member implements your plan, the coding agent they use will:
 - **Follow code organization patterns** (see [scratchpad/code-organization.md](scratchpad/code-organization.md))
 - **Implement validation** following the architecture in [scratchpad/validation-architecture.md](scratchpad/validation-architecture.md)
 - **Use console formatting** from `pkg/console` for CLI output
-- **Write error messages** following the [Error Message Style Guide](.github/instructions/error-messages.instructions.md)
+- **Write error messages** following the [Error Message Style Guide](.github/skills/error-messages/SKILL.md) and [docs guide](docs/src/content/docs/contributing/error-messages.md)
 - **Run all quality checks**: `make agent-finish` (build, test, recompile, format, lint)
 - **Update documentation** for new features
 - **Create tests** for new functionality
@@ -172,7 +172,7 @@ For workflow failures, use this prompt with your agent:
 Please debug this workflow failure:
 https://github.com/owner/repo/actions/runs/RUN_ID
 
-Load [https://github.com/github/gh-aw/.github/agents/agentic-workflows.agent.md and](https://github.com/github/gh-aw/blob/main/.github/agents/agentic-workflows.agent.md) investigate:
+Load [https://github.com/github/gh-aw/.github/skills/agentic-workflows/SKILL.md](https://github.com/github/gh-aw/blob/main/.github/skills/agentic-workflows/SKILL.md) and investigate:
 - Why the workflow failed
 - What tools were missing
 - How to fix the configuration
@@ -342,6 +342,16 @@ All community-sourced pull requests are created and managed by core team members
    - Provide feedback as comments
    - Agent-assisted revisions are made as needed
    - Once approved, PR is merged
+
+### PR Lifecycle Tip (Core Team)
+
+When implementing community contributions using an agent:
+
+- Create the pull request as **draft**.
+- Move it to **Ready for review** and approve required CI workflows.
+- Run the `pr-finisher` skill (automates final review/check/mergeability hardening) to get to green.
+- For features that deeply impact the engine, add the `smoke` label and approve workflows.
+- If no smoke run is queued after setting `smoke`, or additional changes require another smoke run, toggle the `smoke` label (remove and re-add) and approve workflows again.
 
 **Remember: As a community contributor, you don't create the PR yourself.** You create an issue with a detailed plan, discuss it with the team, and a core team member creates the PR using agents.
 
@@ -545,9 +555,9 @@ This project follows the GitHub Community Guidelines. Please be respectful and i
 
 Releases are defined in `.github/workflows/release.md` and triggered from the compiled GitHub Actions workflow.
 
-The team follows semantic versioning on a best-effort basis.
+The team follows a **weekly or bi-weekly minor release cadence**, similar to VS Code's release practices. Version numbers increment the minor component on each release cycle — not on the basis of change scope. Patch releases are reserved for urgent fixes between cycles; major releases are used for significant breaking changes only.
 
-> **Note:** The release workflow publishes the new version as a **prerelease** on GitHub with `latest=false`. Prereleases are floated for a few days. On Monday, maintainers promote the last known good prerelease to stable so `latest` resolves to that release.
+> **Note:** The release workflow publishes the new version as a **prerelease** on GitHub with `latest=false`. Prereleases are floated for a few days. On Monday, maintainers promote the last known good prerelease to stable so `latest` resolves to that release. Immediately after promotion, a new minor pre-release is kicked off to start the next cycle.
 
 ### Steps
 
@@ -579,10 +589,17 @@ The team follows semantic versioning on a best-effort basis.
 
    Users who install with `version: latest` (the default) will now receive the new release.
 
+5. **Start the next release cycle** _(immediately after promotion)_
+
+   Following the weekly/bi-weekly cadence, kick off a new `minor` release right after promoting the previous one to stable. Repeat steps 1–3 to publish it as a prerelease. This prerelease then floats until the next Monday, when it becomes the new stable release.
+
+   > [!TIP]
+   > Always select `minor` when starting a new cycle. Use `patch` only for urgent fixes within a cycle, and `major` only for significant breaking changes.
+
 ### Summary
 
 ```
-Launch release action
+Launch release action (minor)
         │
         ▼
 Workflow pushes tag & pauses
@@ -599,11 +616,14 @@ Approve the gh-aw-actions-release environment gate
         ▼
 Release published as prerelease 🎉
         │
-        ▼  (manual)
+        ▼  (Monday — manual)
 Promote prerelease → full release on GitHub Releases page
         │
         ▼
 'latest' now resolves to the new version ✅
+        │
+        ▼  (same day — start next cycle)
+Launch next minor release action → new prerelease published
 ```
 
 ## 🎯 Why This Contribution Model?

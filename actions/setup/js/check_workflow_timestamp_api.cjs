@@ -18,7 +18,7 @@
 const fs = require("fs");
 const path = require("path");
 const { getErrorMessage } = require("./error_helpers.cjs");
-const { extractHashFromLockFile, computeFrontmatterHash, createGitHubFileReader } = require("./frontmatter_hash_pure.cjs");
+const { extractHashFromLockFile, extractBodyHashFromLockFile, computeFrontmatterHash, computeBodyHash, createGitHubFileReader } = require("./frontmatter_hash_pure.cjs");
 const { getFileContent } = require("./github_api_helpers.cjs");
 const { ERR_CONFIG } = require("./error_codes.cjs");
 
@@ -34,12 +34,15 @@ async function main() {
     return;
   }
 
+  // Determine if full stale check mode is enabled (checks both frontmatter and body hashes).
+  const fullCheckMode = process.env.GH_AW_STALE_CHECK_FULL === "true";
+
   // Construct file paths
   const workflowBasename = workflowFile.replace(".lock.yml", "");
   const workflowMdPath = `.github/workflows/${workflowBasename}.md`;
   const lockFilePath = `.github/workflows/${workflowFile}`;
 
-  core.info(`Checking for stale lock file using frontmatter hash:`);
+  core.info(`Checking for stale lock file using ${fullCheckMode ? "frontmatter + body" : "frontmatter"} hash:`);
   core.info(`  Source: ${workflowMdPath}`);
   core.info(`  Lock file: ${lockFilePath}`);
 
@@ -179,6 +182,34 @@ async function main() {
   // The activation job's "Checkout .github and .agents folders" step always runs before
   // this check and places the workflow source files in $GITHUB_WORKSPACE, so the local
   // files are always available at this point.
+
+  /**
+   * Compares the stored body hash in the lock file content against the body hash
+   * recomputed from the workflow source. Returns true if they match (or if the lock
+   * file predates body hash support), false if they differ.
+   * @param {string} lockFileContent - Content of the .lock.yml file
+   * @param {string} mdPath - Path to the .md file to compute the body hash from
+   * @param {Object} [options] - Options forwarded to computeBodyHash
+   * @param {Function} [options.fileReader] - Custom file reader (defaults to local filesystem)
+   * @param {string} [label] - Optional label appended to log lines for context (e.g. "local filesystem fallback")
+   * @returns {Promise<boolean>} true if match or no body hash present, false if mismatch
+   */
+  async function compareBodyHashes(lockFileContent, mdPath, { fileReader } = {}, label) {
+    const suffix = label ? ` (${label})` : "";
+    const storedBodyHash = extractBodyHashFromLockFile(lockFileContent);
+    if (!storedBodyHash) {
+      core.info(`No body hash found in lock file; skipping body hash check${suffix} (lock file may predate body hash support)`);
+      return true;
+    }
+    const recomputedBodyHash = await computeBodyHash(mdPath, { fileReader });
+    const match = storedBodyHash === recomputedBodyHash;
+    core.info(`Body hash comparison${suffix}:`);
+    core.info(`  Lock file body hash:    ${storedBodyHash}`);
+    core.info(`  Recomputed body hash:   ${recomputedBodyHash}`);
+    core.info(`  Status: ${match ? "✅ Body hashes match" : "⚠️  Body hashes differ"}`);
+    return match;
+  }
+
   async function compareFrontmatterHashesFromLocalFiles() {
     const workspace = process.env.GITHUB_WORKSPACE;
     if (!workspace) {
@@ -227,12 +258,17 @@ async function main() {
       // computeFrontmatterHash uses the local filesystem reader by default
       const recomputedHash = await computeFrontmatterHash(localMdFilePath);
 
-      const match = storedHash === recomputedHash;
+      let match = storedHash === recomputedHash;
 
       core.info(`Frontmatter hash comparison (local filesystem fallback):`);
       core.info(`  Lock file hash:    ${storedHash}`);
       core.info(`  Recomputed hash:   ${recomputedHash}`);
       core.info(`  Status: ${match ? "✅ Hashes match" : "⚠️  Hashes differ"}`);
+
+      // When full check mode is enabled, also compare body hashes.
+      if (match && fullCheckMode) {
+        match = await compareBodyHashes(localLockContent, localMdFilePath, undefined, "local filesystem fallback");
+      }
 
       return { match, storedHash, recomputedHash };
     } catch (error) {
@@ -243,19 +279,36 @@ async function main() {
 
   // Primary: compare frontmatter hashes using the GitHub API.
   // Falls back to local filesystem if the API is inaccessible.
+  // Returns { result, crossRepoAuthFailure } where:
+  //   result             — { match, storedHash, recomputedHash } | null
+  //   crossRepoAuthFailure — { status, repo } when a cross-repo 401/403/404 was the root cause, else null
   async function compareFrontmatterHashes() {
     try {
-      // Fetch lock file content to extract stored hash
-      const lockFileContent = await getFileContent(github, owner, repo, lockFilePath, ref);
+      // Fetch lock file content to extract stored hash.
+      // errorStatus is populated when the API call fails so we can detect cross-repo auth
+      // failures: the caller's GITHUB_TOKEN is repo-scoped and cannot read from a private
+      // callee repo, returning 404/401/403.
+      const { content: lockFileContent, errorStatus } = await getFileContent(github, owner, repo, lockFilePath, ref);
+
+      // When the callee is a private repo, the caller's GITHUB_TOKEN (which is scoped to the
+      // caller repo) will receive a 404/401/403 from the callee's Contents API.  Record this so
+      // that the final error message can give actionable remediation guidance instead of
+      // directing the user to re-run `gh aw compile`.
+      let crossRepoAuthFailure = null;
+      if (!lockFileContent && workflowRepo !== currentRepo && (errorStatus === 401 || errorStatus === 403 || errorStatus === 404)) {
+        crossRepoAuthFailure = { status: errorStatus, repo: workflowRepo };
+        core.info(`Cross-repo API access failed (HTTP ${errorStatus}): GITHUB_TOKEN is scoped to the caller repo and cannot read from '${workflowRepo}'. Configure GH_AW_GITHUB_TOKEN with read access to '${workflowRepo}' to resolve this.`);
+      }
+
       if (!lockFileContent) {
         core.info("Unable to fetch lock file content for hash comparison via API, trying local filesystem fallback");
-        return await compareFrontmatterHashesFromLocalFiles();
+        return { result: await compareFrontmatterHashesFromLocalFiles(), crossRepoAuthFailure };
       }
 
       const storedHash = extractHashFromLockFile(lockFileContent);
       if (!storedHash) {
         core.info("No frontmatter hash found in lock file");
-        return null;
+        return { result: null, crossRepoAuthFailure: null };
       }
 
       // Compute hash using pure JavaScript implementation
@@ -263,7 +316,7 @@ async function main() {
       const fileReader = createGitHubFileReader(github, owner, repo, ref);
       const recomputedHash = await computeFrontmatterHash(workflowMdPath, { fileReader });
 
-      const match = storedHash === recomputedHash;
+      let match = storedHash === recomputedHash;
 
       // Log hash comparison
       core.info(`Frontmatter hash comparison:`);
@@ -271,13 +324,18 @@ async function main() {
       core.info(`  Recomputed hash:   ${recomputedHash}`);
       core.info(`  Status: ${match ? "✅ Hashes match" : "⚠️  Hashes differ"}`);
 
-      return { match, storedHash, recomputedHash };
+      // When full check mode is enabled, also compare body hashes.
+      if (match && fullCheckMode) {
+        match = await compareBodyHashes(lockFileContent, workflowMdPath, { fileReader });
+      }
+
+      return { result: { match, storedHash, recomputedHash }, crossRepoAuthFailure: null };
     } catch (error) {
       const errorMessage = getErrorMessage(error);
       core.info(`Could not compute frontmatter hash via API: ${errorMessage}`);
       // Fall back to local filesystem when API is unavailable
       // (e.g., cross-org reusable workflow where caller token lacks source repo access)
-      return await compareFrontmatterHashesFromLocalFiles();
+      return { result: await compareFrontmatterHashesFromLocalFiles(), crossRepoAuthFailure: null };
     }
   }
 
@@ -296,7 +354,7 @@ async function main() {
       // Try API first (same strategy as compareFrontmatterHashes)
       let fileReader;
       try {
-        const testContent = await getFileContent(github, owner, repo, workflowMdPath, ref);
+        const { content: testContent } = await getFileContent(github, owner, repo, workflowMdPath, ref);
         if (testContent) {
           fileReader = createGitHubFileReader(github, owner, repo, ref);
           core.info("  Using GitHub API file reader for debug pass");
@@ -333,14 +391,25 @@ async function main() {
     core.info("═══ End of debug hash recomputation ═══");
   }
 
-  const hashComparison = await compareFrontmatterHashes();
+  const { result: hashComparison, crossRepoAuthFailure } = await compareFrontmatterHashes();
 
   if (!hashComparison) {
     // Could not compute hash - run verbose pass for debugging then fail
     core.warning("Could not compare frontmatter hashes - assuming lock file is outdated");
     await recomputeHashWithDebugLogging();
 
-    const warningMessage = `Lock file '${lockFilePath}' is outdated or unverifiable! Could not verify frontmatter hash for '${workflowMdPath}'. Run 'gh aw compile' to regenerate the lock file.`;
+    let warningMessage;
+    let actionRequiredText;
+
+    if (crossRepoAuthFailure) {
+      // The root cause is an auth gap, not a stale lock file. Direct the user to fix the token,
+      // not to re-run `gh aw compile` (which would not resolve the issue).
+      warningMessage = `Lock file '${lockFilePath}' could not be verified: GITHUB_TOKEN cannot access the callee repo '${crossRepoAuthFailure.repo}' (HTTP ${crossRepoAuthFailure.status}). Configure GH_AW_GITHUB_TOKEN with read access to '${crossRepoAuthFailure.repo}'.`;
+      actionRequiredText = `**Root cause:** \`GITHUB_TOKEN\` is scoped to the caller repo and cannot read from the private callee repo \`${crossRepoAuthFailure.repo}\`.\n\n**Action Required:** Configure \`GH_AW_GITHUB_TOKEN\` with \`contents: read\` access to \`${crossRepoAuthFailure.repo}\`.\n\n`;
+    } else {
+      warningMessage = `Lock file '${lockFilePath}' is outdated or unverifiable! Could not verify frontmatter hash for '${workflowMdPath}'. Run 'gh aw compile' to regenerate the lock file.`;
+      actionRequiredText = "**Action Required:** Run `gh aw compile` to regenerate the lock file.\n\n";
+    }
 
     let summary = core.summary
       .addRaw("### ⚠️ Workflow Lock File Warning\n\n")
@@ -348,7 +417,7 @@ async function main() {
       .addRaw("**Files:**\n")
       .addRaw(`- Source: \`${workflowMdPath}\`\n`)
       .addRaw(`- Lock: \`${lockFilePath}\`\n\n`)
-      .addRaw("**Action Required:** Run `gh aw compile` to regenerate the lock file.\n\n");
+      .addRaw(actionRequiredText);
 
     await summary.write();
 

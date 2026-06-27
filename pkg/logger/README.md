@@ -187,7 +187,7 @@ The package includes a bridge to Go's standard `log/slog` library for libraries 
 
 ### `SlogHandler`
 
-`SlogHandler` implements `slog.Handler` by delegating to an existing `Logger`. It respects the logger's enabled state, formats attributes as `key=value` pairs, and prefixes each message with the slog level (`[DEBUG]`, `[INFO]`, `[WARN]`, `[ERROR]`).
+`SlogHandler` implements `slog.Handler` by delegating to an existing `Logger`. It respects the logger's enabled state, formats attributes as `key=value` pairs, and prefixes each message with compact terminal-friendly glyphs (`·` for debug/info, `⚠` for warning, `✗` for error).
 
 ### `NewSlogHandler(logger *Logger) *SlogHandler`
 
@@ -219,11 +219,17 @@ slogLogger.Warn("something unusual happened", "count", 42)
 - **Groups and persistent attributes**: `WithAttrs` and `WithGroup` return the handler unchanged — attributes are not persisted across calls. This keeps the adapter lightweight.
 - **Output destination**: All output goes to `stderr` via the underlying `Logger`.
 
+## Thread Safety
+
+`Logger` instances are safe for concurrent use from multiple goroutines. The `Printf` and `Print` methods acquire a `sync.Mutex` before updating the `lastLog` timestamp, so concurrent callers receive accurate time-diff values without data races. The `Enabled` method is read-only and requires no lock.
+
+`SlogHandler` instances are safe for concurrent use when the underlying `Logger` is safe for concurrent use.
+
 ## Dependencies
 
 **Internal**:
 - `github.com/github/gh-aw/pkg/timeutil` — time-diff formatting for log output
-- `github.com/github/gh-aw/pkg/tty` — terminal detection for color support
+- `github.com/github/gh-aw/pkg/styles` — shared terminal style constants and color helpers
 
 ## Implementation Notes
 

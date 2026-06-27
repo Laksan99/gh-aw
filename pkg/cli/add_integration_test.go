@@ -930,9 +930,8 @@ func TestAddPublicWorkflowUnauthenticated(t *testing.T) {
 	require.NoError(t, err, "downloaded workflow file should exist at %s", workflowFile)
 }
 
-// TestAddRemoteWorkflowRedirect verifies that gh aw add follows frontmatter
-// redirects for remote workflows and writes source metadata for the redirected
-// upstream location.
+// TestAddRemoteWorkflowRedirect verifies that gh aw add fetches the canonical
+// APM shared workflow from microsoft/apm and writes correct source metadata.
 func TestAddRemoteWorkflowRedirect(t *testing.T) {
 	setup := setupAddIntegrationTest(t)
 	defer setup.cleanup()
@@ -952,9 +951,8 @@ func TestAddRemoteWorkflowRedirect(t *testing.T) {
 		}
 	}
 
-	// This workflow in github/gh-aw contains redirect frontmatter pointing to
-	// microsoft/apm/.github/workflows/shared/apm.md.
-	workflowSpec := "github/gh-aw/.github/workflows/shared/apm.md@main"
+	// The canonical APM shared workflow lives in microsoft/apm.
+	workflowSpec := "microsoft/apm/.github/workflows/shared/apm.md@main"
 
 	cmd := exec.Command(setup.binaryPath, "add", workflowSpec, "--verbose")
 	cmd.Dir = setup.tempDir
@@ -964,16 +962,14 @@ func TestAddRemoteWorkflowRedirect(t *testing.T) {
 
 	t.Logf("Command output:\n%s", outputStr)
 
-	require.NoError(t, err, "gh aw add should succeed for redirected public workflow: %s", outputStr)
-	assert.Contains(t, outputStr, "Workflow redirect:", "verbose output should indicate redirect resolution")
+	require.NoError(t, err, "gh aw add should succeed for canonical APM workflow: %s", outputStr)
 
 	workflowFile := filepath.Join(setup.tempDir, ".github", "workflows", "apm.md")
 	content, err := os.ReadFile(workflowFile)
-	require.NoError(t, err, "redirect target workflow should be written")
+	require.NoError(t, err, "canonical APM workflow should be written")
 	contentStr := string(content)
 
-	assert.Contains(t, contentStr, "source: microsoft/apm/.github/workflows/shared/apm.md@", "source should be pinned to redirected upstream workflow")
-	assert.NotContains(t, contentStr, "source: github/gh-aw/.github/workflows/shared/apm.md@", "source should not remain pinned to pre-redirect location")
+	assert.Contains(t, contentStr, "source: microsoft/apm/.github/workflows/shared/apm.md@", "source should be pinned to canonical upstream workflow")
 }
 
 // TestAddWorkflowWithDispatchWorkflowDependency tests that when a remote workflow is added
@@ -1001,8 +997,9 @@ func TestAddWorkflowWithDispatchWorkflowDependency(t *testing.T) {
 	defer setup.cleanup()
 
 	// Add test-dispatcher.md which has a dispatch-workflow dependency on test-workflow.
-	// Use an explicit path spec so the file resolves unambiguously from the main branch.
-	workflowSpec := "github/gh-aw/.github/workflows/test-dispatcher.md@main"
+	// Pin to the last public revision (6d18ddf01e820eca81031fe9c95bad265c940015)
+	// before private: true was added in e8ca23ae1d.
+	workflowSpec := "github/gh-aw/.github/workflows/test-dispatcher.md@6d18ddf01e820eca81031fe9c95bad265c940015"
 
 	cmd := exec.Command(setup.binaryPath, "add", workflowSpec, "--verbose")
 	cmd.Dir = setup.tempDir
@@ -1118,7 +1115,7 @@ func TestAddWorkflowWithDispatchWorkflowFromSharedImport(t *testing.T) {
 //	├── shared/daily-audit-base.md (direct)
 //	│   ├── shared/daily-audit-discussion.md (nested level 2)
 //	│   ├── shared/reporting.md              (nested level 2)
-//	│   └── shared/observability-otlp.md     (nested level 2)
+//	│   └── shared/otlp.md     (nested level 2)
 //	└── shared/go-source-analysis.md (direct)
 //	    ├── shared/mcp/serena-go.md          (nested level 2)
 //	    │   └── shared/mcp/serena.md         (nested level 3, via "./serena.md")
@@ -1167,7 +1164,7 @@ func TestAddWorkflowWithRecursiveSharedImports(t *testing.T) {
 	assert.FileExists(t, filepath.Join(workflowsDir, "shared", "reporting.md"),
 		"transitive import shared/reporting.md (via daily-audit-base) should be fetched")
 	assert.FileExists(t, filepath.Join(workflowsDir, "shared", "observability-otlp.md"),
-		"transitive import shared/observability-otlp.md (via daily-audit-base) should be fetched")
+		"transitive import shared/otlp.md (via daily-audit-base) should be fetched")
 
 	// 4. Transitive imports via shared/go-source-analysis.md must be present.
 	assert.FileExists(t, filepath.Join(workflowsDir, "shared", "mcp", "serena-go.md"),

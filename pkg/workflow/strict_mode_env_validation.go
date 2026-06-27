@@ -11,6 +11,7 @@ import (
 	"strings"
 
 	"github.com/github/gh-aw/pkg/console"
+	"github.com/github/gh-aw/pkg/setutil"
 )
 
 // validateEnvSecrets detects secrets in the top-level env section and the engine.env section,
@@ -49,9 +50,10 @@ func (c *Compiler) validateEnvSecrets(frontmatter map[string]any) error {
 }
 
 // getEngineBaseEnvVarKeys returns the set of env var key names that the named engine
-// requires by default (using a minimal WorkflowData with no tools/MCP configured).
-// These keys are allowed to carry secrets in engine.env overrides.
-func (c *Compiler) getEngineBaseEnvVarKeys(engineID string) map[string]bool {
+// supports as defined in the AWF specification. These keys are allowed to carry secrets
+// in engine.env overrides.
+func (c *Compiler) getEngineBaseEnvVarKeys(engineID string) map[string]struct {
+} {
 	if engineID == "" {
 		return nil
 	}
@@ -60,18 +62,11 @@ func (c *Compiler) getEngineBaseEnvVarKeys(engineID string) map[string]bool {
 		strictModeValidationLog.Printf("Could not look up engine '%s' for env-key allowlist: %v", engineID, err)
 		return nil
 	}
-	// Use a minimal WorkflowData so we get only the engine's unconditional secrets.
-	// GetRequiredSecretNames only adds extra secrets when non-nil MCP tools (ParsedTools.GitHub,
-	// ParsedTools.Playwright, etc.) are set, or when MCPScripts is populated. By passing empty
-	// Tools/ParsedTools and no MCPScripts we get just the base engine secrets (e.g.
-	// COPILOT_GITHUB_TOKEN, ANTHROPIC_API_KEY) without any optional/conditional ones.
-	minimalData := &WorkflowData{
-		Tools:       map[string]any{},
-		ParsedTools: &ToolsConfig{},
-	}
-	keys := make(map[string]bool)
-	for _, name := range engine.GetRequiredSecretNames(minimalData) {
-		keys[name] = true
+	keys := make(map[string]struct {
+	})
+	for _, name := range engine.GetSupportedEnvVarKeys() {
+		keys[name] = struct {
+		}{}
 	}
 
 	// Also include secrets declared in the AuthDefinition for inline engine definitions.
@@ -80,7 +75,8 @@ func (c *Compiler) getEngineBaseEnvVarKeys(engineID string) map[string]bool {
 	if def := c.engineCatalog.Get(engineID); def != nil && def.Provider.Auth != nil {
 		for _, name := range def.Provider.Auth.RequiredSecretNames() {
 			strictModeValidationLog.Printf("Adding auth-definition secret key to allowlist: %s", name)
-			keys[name] = true
+			keys[name] = struct {
+			}{}
 		}
 	}
 
@@ -91,7 +87,8 @@ func (c *Compiler) getEngineBaseEnvVarKeys(engineID string) map[string]bool {
 // sectionName is used in log and error messages (e.g. "env" or "engine.env").
 // allowedEnvVarKeys is an optional set of env var key names whose secret values are
 // permitted (used for engine.env to allow overriding engine env vars).
-func (c *Compiler) validateEnvSecretsSection(config map[string]any, sectionName string, allowedEnvVarKeys map[string]bool) error {
+func (c *Compiler) validateEnvSecretsSection(config map[string]any, sectionName string, allowedEnvVarKeys map[string]struct {
+}) error {
 	envValue, exists := config["env"]
 	if !exists {
 		strictModeValidationLog.Printf("No %s section found, validation passed", sectionName)
@@ -109,7 +106,7 @@ func (c *Compiler) validateEnvSecretsSection(config map[string]any, sectionName 
 	// are explicitly allowed (e.g. engine env var overrides in engine.env).
 	envStrings := make(map[string]string)
 	for key, value := range envMap {
-		if allowedEnvVarKeys != nil && allowedEnvVarKeys[key] {
+		if allowedEnvVarKeys != nil && setutil.Contains(allowedEnvVarKeys, key) {
 			strictModeValidationLog.Printf("Skipping allowed engine env var key in %s: %s", sectionName, key)
 			continue
 		}

@@ -45,6 +45,10 @@ const {
   fetchAWFReflect,
   fetchModelsFromUrl,
 } = require("./awf_reflect.cjs");
+const { emitMissingToolPermissionIssue, hasExpectedSafeOutputs, hasNoopInSafeOutputs } = require("./safeoutputs_cli.cjs");
+const { countPermissionDeniedIssues, hasNumerousPermissionDeniedIssues, extractDeniedCommands, buildMissingToolPermissionIssuePayload } = require("./permission_denied_helpers.cjs");
+const { detectNonRetryableHarnessGuard } = require("./harness_retry_guard.cjs");
+const { MODEL_NOT_SUPPORTED_PATTERN: INVALID_MODEL_ERROR_PATTERN } = require("./detect_agent_errors.cjs");
 
 // Maximum number of retry attempts after the initial run
 const MAX_RETRIES = 3;
@@ -66,6 +70,7 @@ const OVERLOADED_ERROR_PATTERN = /overloaded_error|"overloaded"/i;
 //   - embedded stream-json result fields (e.g. "api_error_status":429)
 //   - human-readable message text ("rate limit")
 const RATE_LIMIT_ERROR_PATTERN = /rate_limit_error|429 Too Many Requests|"api_error_status"\s*:\s*429|request rejected \(429\)|rate limit/i;
+const AUTHENTICATION_FAILED_PATTERN = /Authentication failed(?:\s*\(Request ID:[^)]+\))?/i;
 
 // Pattern to detect a clean max-turns exit from Claude Code.
 // Claude Code emits a JSON result object with "subtype":"error_max_turns" when the
@@ -80,8 +85,6 @@ const MAX_TURNS_EXIT_PATTERN = /"subtype"\s*:\s*"error_max_turns"/;
 // this path must not be retried via --continue (fall back to a fresh run if budget remains).
 const NO_DEFERRED_MARKER_PATTERN = /No deferred tool marker found/i;
 const SIGNAL_TERMINATION_EXIT_CODES = new Set([137, 143]);
-const PERMISSION_DENIED_PATTERN = /\b(?:permission denied|permissions denied|EACCES|EPERM)\b/gi;
-const NUMEROUS_PERMISSION_DENIED_THRESHOLD = 3;
 
 /**
  * Emit a timestamped diagnostic log line to stderr.
@@ -113,6 +116,15 @@ function isRateLimitError(output) {
 }
 
 /**
+ * Determines if the collected output contains an authentication failed error.
+ * @param {string} output - Collected stdout+stderr from the process
+ * @returns {boolean}
+ */
+function isAuthenticationFailedError(output) {
+  return AUTHENTICATION_FAILED_PATTERN.test(output);
+}
+
+/**
  * Determines if the collected output signals a clean max-turns exit.
  * When Claude Code hits its turn limit it emits a result object with
  * "subtype":"error_max_turns".  This is not a transient error — retrying
@@ -138,6 +150,15 @@ function isNoDeferredMarkerError(output) {
 }
 
 /**
+ * Determines if the collected output indicates an invalid or unavailable model name.
+ * @param {string} output - Collected stdout+stderr from the process
+ * @returns {boolean}
+ */
+function isInvalidModelError(output) {
+  return INVALID_MODEL_ERROR_PATTERN.test(output);
+}
+
+/**
  * Determines whether the exit code corresponds to signal-style termination
  * (SIGKILL=137 / SIGTERM=143), typically from timeout/cancellation.
  * @param {number} exitCode
@@ -145,65 +166,6 @@ function isNoDeferredMarkerError(output) {
  */
 function isSignalTerminationExitCode(exitCode) {
   return SIGNAL_TERMINATION_EXIT_CODES.has(exitCode);
-}
-
-/**
- * Count permission-denied indicators in process output.
- * @param {string} output
- * @returns {number}
- */
-function countPermissionDeniedIssues(output) {
-  if (!output) return 0;
-  const matches = output.match(PERMISSION_DENIED_PATTERN);
-  return matches ? matches.length : 0;
-}
-
-/**
- * Detect whether output contains numerous permission-denied issues.
- * @param {string} output
- * @returns {boolean}
- */
-function hasNumerousPermissionDeniedIssues(output) {
-  return countPermissionDeniedIssues(output) >= NUMEROUS_PERMISSION_DENIED_THRESHOLD;
-}
-
-/**
- * Build a structured missing_tool payload for repeated permission-denied failures.
- * @returns {string}
- */
-function buildMissingToolPermissionIssuePayload() {
-  return JSON.stringify({
-    type: "missing_tool",
-    tool: "tool/permission",
-    reason: "missing tool/permission issue: numerous permission denied errors detected",
-    alternatives: "Verify token scopes, repository permissions, and MCP/tool access configuration.",
-  });
-}
-
-/**
- * Emit a structured missing_tool signal for repeated permission-denied failures.
- * @param {{
- *   safeOutputsPath?: string,
- *   appendFileSync?: (path: import('node:fs').PathOrFileDescriptor, data: string, options?: import('node:fs').WriteFileOptions) => void,
- *   logger?: (message: string) => void
- * }=} options
- */
-function emitMissingToolPermissionIssue(options) {
-  const safeOutputsPath = options && typeof options.safeOutputsPath === "string" ? options.safeOutputsPath : process.env.GH_AW_SAFE_OUTPUTS || "";
-  const appendFileSync = options && options.appendFileSync ? options.appendFileSync : fs.appendFileSync;
-  const logger = options && options.logger ? options.logger : log;
-
-  if (!safeOutputsPath) {
-    logger("missing_tool skipped: GH_AW_SAFE_OUTPUTS is not set");
-    return;
-  }
-  try {
-    appendFileSync(safeOutputsPath, buildMissingToolPermissionIssuePayload() + "\n", { encoding: "utf8" });
-    logger(`missing_tool emitted for permission issues: ${safeOutputsPath}`);
-  } catch (error) {
-    const err = /** @type {Error} */ error;
-    logger(`missing_tool emission failed: ${err.message}`);
-  }
 }
 
 /**
@@ -233,14 +195,20 @@ function shouldRetryWithContinue({ attempt, maxRetries, exitCode, hasOutput, isN
 
 /**
  * Resolve --prompt-file arguments for the initial Claude run.
- * Strips the --prompt-file <path> pair from args and appends the file content
- * as the last positional argument, which is where Claude Code expects the prompt.
+ * Strips the --prompt-file <path> pair from args and appends -- followed by
+ * the file content as the last positional argument.
+ *
+ * The end-of-options marker (--) is essential: Claude Code 2.x treats any
+ * non-flag argument that follows --mcp-config as an additional config file
+ * path (variadic flag).  Without --, a long prompt appended after
+ * --mcp-config <path> would be used as a file path, producing an
+ * ENAMETOOLONG error when the prompt exceeds PATH_MAX (~4096 bytes).
  *
  * For --continue retries the prompt should be omitted entirely (Claude resumes
  * from its on-disk session state).  Call this function only for the initial run.
  *
  * @param {string[]} args
- * @returns {string[]} Args with --prompt-file resolved to inline prompt content
+ * @returns {string[]} Args with --prompt-file resolved to ["--", <content>]
  */
 function resolveClaudePromptFileArgs(args) {
   /** @type {string[]} */
@@ -275,8 +243,13 @@ function resolveClaudePromptFileArgs(args) {
     i++; // Skip the prompt-file path argument
   }
 
-  // Append the prompt content as the last positional argument (Claude Code convention).
+  // Append an end-of-options marker followed by the prompt content.
+  // The '--' prevents Claude Code from treating the prompt text as an additional
+  // --mcp-config value (Claude Code 2.x accepts that flag variadically, so any
+  // non-flag positional argument that follows --mcp-config <path> would otherwise
+  // be tried as a second config file path, causing ENAMETOOLONG for long prompts).
   if (promptContent !== null) {
+    filteredArgs.push("--");
     filteredArgs.push(promptContent);
   }
 
@@ -346,15 +319,25 @@ async function main() {
   // initialArgs carries prompt text as its last positional arg.
   const hadPromptFile = args.includes("--prompt-file");
 
-  // Safe arg list for logging: when --prompt-file was present, the last element of
-  // initialArgs is the resolved prompt content. Replace it with a placeholder so that
-  // task instructions are never written to stderr or captured in agent logs.
-  const safeInitialArgs = hadPromptFile && initialArgs.length > 0 ? [...initialArgs.slice(0, -1), "<prompt omitted>"] : initialArgs;
-  const safeFreshRetryArgs = hadPromptFile && freshRetryArgs.length > 0 ? [...freshRetryArgs.slice(0, -1), "<prompt omitted>"] : freshRetryArgs;
+  // Safe arg list for logging: when --prompt-file was present, the last two elements of
+  // initialArgs are the -- end-of-options marker and the resolved prompt content.
+  // Strip both and replace with a placeholder so task instructions are never written
+  // to stderr or captured in agent logs.
+  const safeInitialArgs = hadPromptFile && initialArgs.length > 0 ? [...initialArgs.slice(0, -2), "<prompt omitted>"] : initialArgs;
+  const safeFreshRetryArgs = hadPromptFile && freshRetryArgs.length > 0 ? [...freshRetryArgs.slice(0, -2), "<prompt omitted>"] : freshRetryArgs;
 
   // Fetch AWF API proxy reflection data before running the agent to capture initial proxy state.
   // This is best-effort: failures are logged but do not affect the agent run.
   await fetchAWFReflect({ logger: log });
+
+  // Pre-flight: skip the agent entirely when a noop has already been written by a prior step.
+  // A noop indicates the work is complete or there is nothing to do — starting the agent
+  // would be wasteful and potentially harmful.
+  const safeOutputsPath = process.env.GH_AW_SAFE_OUTPUTS || "";
+  if (safeOutputsPath && hasNoopInSafeOutputs(safeOutputsPath, { logger: log })) {
+    log("pre-flight: noop message found in safe-outputs — skipping agent (work is already complete or no work needed)");
+    process.exit(0);
+  }
 
   let delay = INITIAL_DELAY_MS;
   let lastExitCode = 1;
@@ -396,8 +379,10 @@ async function main() {
 
     const isOverloaded = isOverloadedError(result.output);
     const isRateLimit = isRateLimitError(result.output);
+    const isAuthenticationFailed = isAuthenticationFailedError(result.output);
     const isMaxTurns = isMaxTurnsExit(result.output);
     const isNoDeferredMarker = isNoDeferredMarkerError(result.output);
+    const isInvalidModel = isInvalidModelError(result.output);
     const permissionDeniedCount = countPermissionDeniedIssues(result.output);
     const hasNumerousPermissionDenied = hasNumerousPermissionDeniedIssues(result.output);
     log(
@@ -405,16 +390,56 @@ async function main() {
         ` exitCode=${result.exitCode}` +
         ` isOverloadedError=${isOverloaded}` +
         ` isRateLimitError=${isRateLimit}` +
+        ` isAuthenticationFailedError=${isAuthenticationFailed}` +
         ` isMaxTurnsExit=${isMaxTurns}` +
         ` isNoDeferredMarkerError=${isNoDeferredMarker}` +
+        ` isInvalidModelError=${isInvalidModel}` +
         ` permissionDeniedCount=${permissionDeniedCount}` +
         ` hasNumerousPermissionDenied=${hasNumerousPermissionDenied}` +
         ` hasOutput=${result.hasOutput}` +
         ` retriesRemaining=${MAX_RETRIES - attempt}`
     );
 
+    // If a noop was written to safe-outputs during the failed run, the agent determined
+    // there was nothing to do (or the user indicated so before the agent ran).  Retrying
+    // would not produce different results and could waste resources.
+    if (safeOutputsPath && hasNoopInSafeOutputs(safeOutputsPath, { logger: log })) {
+      log(`attempt ${attempt + 1}: noop message found in safe-outputs — not retrying (work is already complete or no work needed)`);
+      lastExitCode = 0;
+      break;
+    }
+
+    const nonRetryableGuard = detectNonRetryableHarnessGuard(result.output);
+    if (nonRetryableGuard.aiCreditsExceeded || nonRetryableGuard.awfAPIProxyBlockingRequests || nonRetryableGuard.maxRunsExceeded) {
+      const reasons = [];
+      if (nonRetryableGuard.aiCreditsExceeded) reasons.push("AI credits budget exceeded");
+      if (nonRetryableGuard.awfAPIProxyBlockingRequests) reasons.push("AWF API proxy is blocking requests");
+      if (nonRetryableGuard.maxRunsExceeded) reasons.push("maximum LLM invocations exceeded");
+      log(`attempt ${attempt + 1}: ${reasons.join(" and ")} — not retrying (non-retryable guard condition)`);
+      break;
+    }
+
+    if (attempt === 0 && isAuthenticationFailed) {
+      log(`attempt ${attempt + 1}: authentication failed — not retrying (first-attempt auth failure is non-retryable)`);
+      break;
+    }
+
+    if (isInvalidModel) {
+      log(`attempt ${attempt + 1}: invalid/unsupported model configuration — not retrying (specify a valid engine model name in workflow frontmatter)`);
+      break;
+    }
+
     if (hasNumerousPermissionDenied) {
-      emitMissingToolPermissionIssue();
+      // If the agent already produced expected safe-outputs, the permission-denied
+      // signals are from optional/exploratory commands — not from the core task work.
+      // Suppress the terminal verdict and exit 0 to avoid a false-red run.
+      if (safeOutputsPath && hasExpectedSafeOutputs(safeOutputsPath, { logger: log })) {
+        log(`attempt ${attempt + 1}: detected numerous permission-denied issues but safe-outputs already contain expected output — suppressing terminal verdict (false-red: core work succeeded)`);
+        lastExitCode = 0;
+        break;
+      }
+      const deniedCommands = extractDeniedCommands(result.output);
+      emitMissingToolPermissionIssue({ deniedCommands, logger: log });
       log(`attempt ${attempt + 1}: detected numerous permission-denied issues — not retrying (classified as missing tool/permission issue)`);
       break;
     }
@@ -492,14 +517,19 @@ if (typeof module !== "undefined" && module.exports) {
     resolveClaudePromptFileArgs,
     stripPromptFileArgs,
     isRateLimitError,
+    isAuthenticationFailedError,
     isMaxTurnsExit,
     isNoDeferredMarkerError,
+    isInvalidModelError,
     isSignalTerminationExitCode,
     shouldRetryWithContinue,
     countPermissionDeniedIssues,
     hasNumerousPermissionDeniedIssues,
+    extractDeniedCommands,
     buildMissingToolPermissionIssuePayload,
     emitMissingToolPermissionIssue,
+    hasNoopInSafeOutputs,
+    hasExpectedSafeOutputs,
   };
 }
 

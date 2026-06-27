@@ -34,6 +34,7 @@ const fs = require("fs");
 const http = require("http");
 const path = require("path");
 const { withRetry } = require("./error_recovery.cjs");
+const { lstatGuard } = require("./symlink_guard.cjs");
 
 // ---------------------------------------------------------------------------
 // Timing helpers
@@ -62,6 +63,95 @@ function printTiming(startMs, label) {
  */
 function sleep(ms) {
   return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+/**
+ * Normalizes GH_AW_OTLP_IF_MISSING to a supported mode.
+ * @param {string | undefined} value
+ * @returns {"error" | "warn" | "ignore"}
+ */
+function getOTLPIfMissingMode(value) {
+  const normalized = (value || "").trim().toLowerCase();
+  if (normalized === "warn" || normalized === "ignore") {
+    return normalized;
+  }
+  return "error";
+}
+
+/**
+ * Returns true when GH_AW_OTLP_IF_MISSING is set to "ignore".
+ * @param {string | undefined} value
+ * @returns {boolean}
+ */
+function isOTLPIfMissingIgnore(value) {
+  return getOTLPIfMissingMode(value) === "ignore";
+}
+
+/**
+ * Returns true when OTLP headers contain at least one non-empty value.
+ * NOTE: Unexpected primitive values are treated as non-empty so they are
+ * preserved for downstream validation/error handling.
+ * @param {unknown} headers
+ * @returns {boolean}
+ */
+function hasNonEmptyOTLPHeaders(headers) {
+  if (headers == null) {
+    return false;
+  }
+  if (typeof headers === "string") {
+    return headers.trim() !== "";
+  }
+  if (Array.isArray(headers)) {
+    return headers.some(item => hasNonEmptyOTLPHeaders(item));
+  }
+  if (typeof headers === "object") {
+    return Object.values(headers).some(value => hasNonEmptyOTLPHeaders(value));
+  }
+  // For unexpected primitive types, keep headers
+  // intact so downstream validation can fail explicitly rather than silently
+  // treating them as "missing".
+  return true;
+}
+
+/**
+ * Apply observability.otlp.if-missing: ignore behavior to gateway OTLP config.
+ * When enabled, missing endpoint values are downgraded to warnings and OTLP
+ * gateway configuration is skipped instead of hard-failing the workflow.
+ *
+ * @param {Record<string, unknown>} configObj
+ */
+function applyOTLPIgnoreIfMissing(configObj) {
+  const mode = getOTLPIfMissingMode(process.env.GH_AW_OTLP_IF_MISSING);
+  const shouldDowngradeMissing = mode === "warn" || mode === "ignore";
+  const shouldWarn = mode === "warn";
+  if (!shouldDowngradeMissing) {
+    return;
+  }
+  const gw = configObj.gateway;
+  if (!gw || typeof gw !== "object" || Array.isArray(gw)) {
+    return;
+  }
+  const gateway = /** @type {Record<string, unknown>} */ gw;
+  const otel = gateway["opentelemetry"];
+  if (!otel || typeof otel !== "object" || Array.isArray(otel)) {
+    return;
+  }
+  const otelConfig = /** @type {Record<string, unknown>} */ otel;
+  const endpoint = typeof otelConfig["endpoint"] === "string" ? otelConfig["endpoint"].trim() : "";
+  if (!endpoint) {
+    delete gateway["opentelemetry"];
+    if (shouldWarn) {
+      core.warning("OTLP endpoint is missing/empty and GH_AW_OTLP_IF_MISSING=warn; skipping MCP gateway OTLP configuration.");
+    }
+    return;
+  }
+  const headers = otelConfig["headers"];
+  if ("headers" in otelConfig && !hasNonEmptyOTLPHeaders(headers)) {
+    delete otelConfig["headers"];
+    if (shouldWarn) {
+      core.warning("OTLP headers are missing/empty and GH_AW_OTLP_IF_MISSING=warn; continuing without MCP gateway OTLP headers.");
+    }
+  }
 }
 
 /**
@@ -109,14 +199,65 @@ function httpGet(url, timeoutMs) {
  */
 function assertNotSymlink(p) {
   try {
-    const stat = fs.lstatSync(p);
-    if (stat.isSymbolicLink()) {
+    if (lstatGuard(p) === null) {
       core.error(`ERROR: ${p} is a symlink — possible symlink attack, aborting`);
       process.exit(1);
     }
   } catch {
     // Path does not exist yet – that's fine.
   }
+}
+
+/**
+ * Resolves the Copilot CLI config directory and the MCP config file path from
+ * the runtime $HOME. The Copilot CLI uses ~/.copilot, which is
+ * /home/runner/.copilot on standard GitHub-hosted runners (HOME=/home/runner)
+ * but may differ on self-hosted or containerized runners. HOME is a standard
+ * POSIX environment variable inherited from the runner's parent process and
+ * passed through to shell steps; other generators (copilot_mcp.go,
+ * copilot_engine_execution.go) rely on it the same way.
+ *
+ * Exported for testability; throws Error rather than exiting so tests can
+ * exercise the missing-HOME branch.
+ *
+ * @returns {{ dir: string, file: string }}
+ */
+function resolveCopilotConfigPaths() {
+  const home = process.env.HOME;
+  if (!home) {
+    throw new Error("HOME environment variable is not set; cannot locate Copilot CLI config directory");
+  }
+  const dir = path.join(home, ".copilot");
+  return { dir, file: path.join(dir, "mcp-config.json") };
+}
+
+/**
+ * Determines which engine-specific MCP config converter to use.
+ * Copilot auto-detection consults HOME only when HOME is available so
+ * explicit non-Copilot engines do not fail just because HOME is unset.
+ *
+ * @param {string} configDir
+ * @param {NodeJS.ProcessEnv} [env]
+ * @param {(p: string) => boolean} [existsSync]
+ * @returns {string}
+ */
+function detectEngineType(configDir, env = process.env, existsSync = fs.existsSync) {
+  if (env.GH_AW_ENGINE) {
+    return env.GH_AW_ENGINE;
+  }
+  if (env.GITHUB_COPILOT_CLI_MODE) {
+    return "copilot";
+  }
+  if (env.HOME && existsSync(path.join(env.HOME, ".copilot"))) {
+    return "copilot";
+  }
+  if (existsSync(path.join(configDir, "config.toml"))) {
+    return "codex";
+  }
+  if (existsSync(path.join(configDir, "mcp-servers.json"))) {
+    return "claude";
+  }
+  return "unknown";
 }
 
 // ---------------------------------------------------------------------------
@@ -258,6 +399,8 @@ async function main() {
     process.exit(1);
   }
 
+  applyOTLPIgnoreIfMissing(configObj);
+
   core.info("Configuration validated successfully");
   printTiming(configValidationStart, "Configuration validation");
   core.info("");
@@ -268,6 +411,21 @@ async function main() {
   const logDir = "/tmp/gh-aw/mcp-logs/";
   const outputPath = path.join(configDir, "gateway-output.json");
   const stderrLogPath = "/tmp/gh-aw/mcp-logs/stderr.log";
+
+  // Clean up any stale gateway container from a previous run on this runner.
+  // On persistent self-hosted runners a prior job's gateway container may still
+  // be running and holding the host port, causing "bind: address already in use"
+  // when we try to start the new one.  Force-removing by the well-known container
+  // name is idempotent: docker rm -f exits non-zero when the container doesn't
+  // exist, but the trailing || true (and 2>/dev/null) make the command succeed.
+  core.info("Cleaning up any stale awmg-mcpg container from a previous run...");
+  try {
+    execSync("docker rm -f awmg-mcpg 2>/dev/null && echo 'Removed stale awmg-mcpg container' || true", { stdio: "inherit" });
+  } catch {
+    // Non-fatal: proceed even if the cleanup command itself fails
+    core.info("Could not remove stale awmg-mcpg container (may not exist)");
+  }
+  core.info("");
 
   core.info(`Starting gateway with container: ${dockerCommand}`);
   core.info(`Full docker command: ${dockerCommand}`);
@@ -297,7 +455,7 @@ async function main() {
     core.error("ERROR: Gateway process stdin is not available");
     process.exit(1);
   }
-  child.stdin.write(mcpConfig);
+  child.stdin.write(JSON.stringify(configObj));
   child.stdin.end();
 
   // Allow the child to run independently
@@ -580,18 +738,7 @@ async function main() {
   }
 
   // Determine engine type
-  let engineType = process.env.GH_AW_ENGINE || "";
-  if (!engineType) {
-    if (fs.existsSync("/home/runner/.copilot") || process.env.GITHUB_COPILOT_CLI_MODE) {
-      engineType = "copilot";
-    } else if (fs.existsSync(path.join(configDir, "config.toml"))) {
-      engineType = "codex";
-    } else if (fs.existsSync(path.join(configDir, "mcp-servers.json"))) {
-      engineType = "claude";
-    } else {
-      engineType = "unknown";
-    }
-  }
+  const engineType = detectEngineType(configDir);
 
   core.info(`Detected engine type: ${engineType}`);
 
@@ -608,10 +755,17 @@ async function main() {
     const converterPath = path.join(runnerTemp || "", "gh-aw/actions", converterFile);
     execSync(`node "${converterPath}"`, { stdio: "inherit", env: process.env });
   } else {
+    let copilotConfigDir, copilotConfigFile;
+    try {
+      ({ dir: copilotConfigDir, file: copilotConfigFile } = resolveCopilotConfigPaths());
+    } catch (err) {
+      core.error(`ERROR: ${err.message}`);
+      process.exit(1);
+    }
     core.info(`No agent-specific converter found for engine: ${engineType}`);
     core.info("Using gateway output directly");
     // Default fallback – copy to most common location, filtering CLI-mounted servers
-    fs.mkdirSync("/home/runner/.copilot", { recursive: true });
+    fs.mkdirSync(copilotConfigDir, { recursive: true });
     const cliServersRaw = process.env.GH_AW_MCP_CLI_SERVERS;
     if (cliServersRaw) {
       try {
@@ -625,16 +779,16 @@ async function main() {
             }
           }
         }
-        fs.writeFileSync("/home/runner/.copilot/mcp-config.json", JSON.stringify(filtered, null, 2), { mode: 0o600 });
+        fs.writeFileSync(copilotConfigFile, JSON.stringify(filtered, null, 2), { mode: 0o600 });
       } catch {
         core.error("ERROR: Failed to filter CLI-mounted servers from agent MCP config");
         core.info("Falling back to unfiltered config");
-        fs.copyFileSync(outputPath, "/home/runner/.copilot/mcp-config.json");
+        fs.copyFileSync(outputPath, copilotConfigFile);
       }
     } else {
-      fs.copyFileSync(outputPath, "/home/runner/.copilot/mcp-config.json");
+      fs.copyFileSync(outputPath, copilotConfigFile);
     }
-    core.info(fs.readFileSync("/home/runner/.copilot/mcp-config.json", "utf8"));
+    core.info(fs.readFileSync(copilotConfigFile, "utf8"));
   }
   printTiming(configConvertStart, "Configuration conversion");
   core.info("");
@@ -740,11 +894,20 @@ async function main() {
   }
 }
 
-main().catch(err => {
-  const message = err instanceof Error ? err.message : String(err);
-  const stack = err instanceof Error ? err.stack : undefined;
-  if (stack) core.error(stack);
-  core.setFailed(`FATAL: ${message}`);
-});
+if (require.main === module) {
+  main().catch(err => {
+    const message = err instanceof Error ? err.message : String(err);
+    const stack = err instanceof Error ? err.stack : undefined;
+    if (stack) core.error(stack);
+    core.setFailed(`FATAL: ${message}`);
+  });
+}
 
-module.exports = {};
+module.exports = {
+  applyOTLPIgnoreIfMissing,
+  detectEngineType,
+  getOTLPIfMissingMode,
+  hasNonEmptyOTLPHeaders,
+  isOTLPIfMissingIgnore,
+  resolveCopilotConfigPaths,
+};

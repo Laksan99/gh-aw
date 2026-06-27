@@ -13,15 +13,15 @@ jobs:
       - name: Download agent output artifact
         id: download-agent
         continue-on-error: true
-        uses: actions/download-artifact@v8
+        uses: actions/download-artifact@v8.0.1
         with:
           name: agent
-          path: /tmp/gh-aw
+          path: /tmp/gh-aw/agent
 
       - name: Download cache-memory artifact
         id: download-cache-memory
         continue-on-error: true
-        uses: actions/download-artifact@v8
+        uses: actions/download-artifact@v8.0.1
         with:
           name: cache-memory
           path: /tmp/gh-aw/cache-memory
@@ -29,7 +29,7 @@ jobs:
       - name: Download repo-memory artifact
         id: download-repo-memory
         continue-on-error: true
-        uses: actions/download-artifact@v8
+        uses: actions/download-artifact@v8.0.1
         with:
           name: repo-memory-default
           path: /tmp/gh-aw/repo-memory/default
@@ -47,16 +47,16 @@ jobs:
         id: scan-agent-output
         continue-on-error: true
         run: |
-          mkdir -p /tmp/gh-aw/trufflehog
-          SCAN_DIR="/tmp/gh-aw"
-          OUTPUT_FILE="/tmp/gh-aw/trufflehog/agent-output-results.jsonl"
+          mkdir -p /tmp/gh-aw/agent/trufflehog
+          SCAN_DIR="/tmp/gh-aw/agent"
+          OUTPUT_FILE="/tmp/gh-aw/agent/trufflehog/agent-output-results.jsonl"
           if [ -d "$SCAN_DIR" ] && find "$SCAN_DIR" -mindepth 1 -maxdepth 1 -quit 2>/dev/null | grep -q .; then
             echo "Scanning agent output in $SCAN_DIR"
             trufflehog filesystem "$SCAN_DIR" \
               --json --no-update --fail \
               --exclude-paths /tmp/gh-aw/cache-memory \
               --exclude-paths /tmp/gh-aw/repo-memory \
-              --exclude-paths /tmp/gh-aw/trufflehog \
+              --exclude-paths /tmp/gh-aw/agent/trufflehog \
               2>/dev/null | tee "$OUTPUT_FILE" || SCAN_EXIT=${PIPESTATUS[0]}
             SCAN_EXIT=${SCAN_EXIT:-0}
           else
@@ -71,9 +71,9 @@ jobs:
         id: scan-cache-memory
         continue-on-error: true
         run: |
-          mkdir -p /tmp/gh-aw/trufflehog
+          mkdir -p /tmp/gh-aw/agent/trufflehog
           SCAN_DIR="/tmp/gh-aw/cache-memory"
-          OUTPUT_FILE="/tmp/gh-aw/trufflehog/cache-memory-results.jsonl"
+          OUTPUT_FILE="/tmp/gh-aw/agent/trufflehog/cache-memory-results.jsonl"
           if [ -d "$SCAN_DIR" ] && find "$SCAN_DIR" -mindepth 1 -maxdepth 1 -quit 2>/dev/null | grep -q .; then
             echo "Scanning cache-memory in $SCAN_DIR"
             trufflehog filesystem "$SCAN_DIR" --json --no-update --fail 2>/dev/null | tee "$OUTPUT_FILE" || SCAN_EXIT=${PIPESTATUS[0]}
@@ -90,9 +90,9 @@ jobs:
         id: scan-repo-memory
         continue-on-error: true
         run: |
-          mkdir -p /tmp/gh-aw/trufflehog
+          mkdir -p /tmp/gh-aw/agent/trufflehog
           SCAN_DIR="/tmp/gh-aw/repo-memory"
-          OUTPUT_FILE="/tmp/gh-aw/trufflehog/repo-memory-results.jsonl"
+          OUTPUT_FILE="/tmp/gh-aw/agent/trufflehog/repo-memory-results.jsonl"
           if [ -d "$SCAN_DIR" ] && find "$SCAN_DIR" -mindepth 1 -maxdepth 1 -quit 2>/dev/null | grep -q .; then
             echo "Scanning repo-memory in $SCAN_DIR"
             trufflehog filesystem "$SCAN_DIR" --json --no-update --fail 2>/dev/null | tee "$OUTPUT_FILE" || SCAN_EXIT=${PIPESTATUS[0]}
@@ -141,7 +141,7 @@ jobs:
         uses: actions/upload-artifact@v7.0.1
         with:
           name: trufflehog-scan-results
-          path: /tmp/gh-aw/trufflehog/
+          path: /tmp/gh-aw/agent/trufflehog/
           if-no-files-found: ignore
 
   conclusion:
@@ -149,7 +149,7 @@ jobs:
       - name: Report TruffleHog secret scan failure
         if: always() && needs.trufflehog_scan.result == 'failure' && needs.trufflehog_scan.outputs.secrets_found == 'true'
         continue-on-error: true
-        uses: actions/github-script@v9
+        uses: actions/github-script@v9.0.0
         env:
           GH_AW_TRUFFLEHOG_SECRETS_LOCATIONS: ${{ needs.trufflehog_scan.outputs.secrets_locations }}
           GH_AW_RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
@@ -189,7 +189,7 @@ cache-memory, and repo-memory for accidentally leaked secrets (API keys, tokens,
 1. **Separate job** — `trufflehog_scan` runs after the `detection` job completes
 2. **Download artifacts** — fetches `agent`, `cache-memory`, and `repo-memory` artifacts (continue-on-error)
 3. **Install TruffleHog** — pinned to a specific version
-4. **Scan agent output** — scans `/tmp/gh-aw/` (agent output and code patches)
+4. **Scan agent output** — scans `/tmp/gh-aw/agent/` (agent output and code patches)
 5. **Scan cache-memory** — scans `/tmp/gh-aw/cache-memory/`
 6. **Scan repo-memory** — scans `/tmp/gh-aw/repo-memory/`
 7. **Evaluate** — aggregates results; sets `secrets_found=true` output and fails the job if secrets detected
@@ -220,4 +220,3 @@ imports:
 ---
 ```
 -->
-

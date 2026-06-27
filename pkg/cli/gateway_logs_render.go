@@ -7,13 +7,14 @@ package cli
 import (
 	"fmt"
 	"os"
-	"sort"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
 
 	"github.com/github/gh-aw/pkg/console"
 	"github.com/github/gh-aw/pkg/sliceutil"
+	"github.com/github/gh-aw/pkg/stringutil"
 )
 
 // renderGatewayMetricsTable renders gateway metrics as a console table
@@ -98,10 +99,7 @@ func renderGatewayMetricsTable(metrics *GatewayMetrics, verbose bool) string {
 		output.WriteString("\n")
 		filteredRows := make([][]string, 0, len(metrics.FilteredEvents))
 		for _, fe := range metrics.FilteredEvents {
-			reason := fe.Reason
-			if len(reason) > 80 {
-				reason = reason[:77] + "..."
-			}
+			reason := stringutil.Truncate(fe.Reason, 80)
 			filteredRows = append(filteredRows, []string{
 				fe.ServerID,
 				fe.ToolName,
@@ -121,10 +119,7 @@ func renderGatewayMetricsTable(metrics *GatewayMetrics, verbose bool) string {
 		output.WriteString("\n")
 		guardRows := make([][]string, 0, len(metrics.GuardPolicyEvents))
 		for _, gpe := range metrics.GuardPolicyEvents {
-			message := gpe.Message
-			if len(message) > 60 {
-				message = message[:57] + "..."
-			}
+			message := stringutil.Truncate(gpe.Message, 60)
 			repo := gpe.Repository
 			if repo == "" {
 				repo = "-"
@@ -157,8 +152,14 @@ func renderGatewayMetricsTable(metrics *GatewayMetrics, verbose bool) string {
 
 			// Sort tools by call count
 			toolNames := sliceutil.MapKeys(server.Tools)
-			sort.Slice(toolNames, func(i, j int) bool {
-				return server.Tools[toolNames[i]].CallCount > server.Tools[toolNames[j]].CallCount
+			slices.SortFunc(toolNames, func(a, b string) int {
+				if server.Tools[a].CallCount > server.Tools[b].CallCount {
+					return -1
+				}
+				if server.Tools[a].CallCount < server.Tools[b].CallCount {
+					return 1
+				}
+				return 0
 			})
 
 			toolRows := make([][]string, 0, len(toolNames))
@@ -187,8 +188,14 @@ func renderGatewayMetricsTable(metrics *GatewayMetrics, verbose bool) string {
 // getSortedServerNames returns server names sorted by request count
 func getSortedServerNames(metrics *GatewayMetrics) []string {
 	names := sliceutil.MapKeys(metrics.Servers)
-	sort.Slice(names, func(i, j int) bool {
-		return metrics.Servers[names[i]].RequestCount > metrics.Servers[names[j]].RequestCount
+	slices.SortFunc(names, func(a, b string) int {
+		if metrics.Servers[a].RequestCount > metrics.Servers[b].RequestCount {
+			return -1
+		}
+		if metrics.Servers[a].RequestCount < metrics.Servers[b].RequestCount {
+			return 1
+		}
+		return 0
 	})
 	return names
 }

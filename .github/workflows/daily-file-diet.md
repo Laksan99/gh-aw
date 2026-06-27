@@ -1,49 +1,53 @@
 ---
-name: Daily File Diet
-description: Analyzes the largest Go source file daily and creates an issue to refactor it into smaller files if it exceeds the healthy size threshold
 on:
-  workflow_dispatch:
   schedule:
-    - cron: "daily around 13:00 on weekdays"  # ~Weekdays at 1 PM UTC (scattered)
-
+  - cron: daily around 13:00 on weekdays
+  workflow_dispatch: null
+max-daily-ai-credits: 10000
 permissions:
   contents: read
   issues: read
   pull-requests: read
-
-tracker-id: daily-file-diet
-engine:
-  id: copilot
-  agent: "developer.instructions"
-
+  copilot-requests: write
 imports:
-  - uses: shared/skip-if-issue-open.md
-    with:
-      title-prefix: "[file-diet]"
-  - uses: shared/daily-issue-base.md
-    with:
-      title-prefix: "[file-diet] "
-      expires: "2d"
-      labels: [refactoring, code-health, automated-analysis, cookie]
-  - shared/go-source-analysis.md
-  - shared/safe-output-app.md
-  - shared/observability-otlp.md
-
+- uses: shared/skip-if-issue-open.md
+  with:
+    title-prefix: "[file-diet]"
+- uses: shared/daily-issue-base.md
+  with:
+    expires: 2d
+    labels:
+    - refactoring
+    - code-health
+    - automated-analysis
+    - cookie
+    title-prefix: "[file-diet] "
+- shared/go-source-analysis.md
+- shared/safe-output-app.md
+- shared/otlp.md
+description: Analyzes the largest Go source file daily and creates an issue to refactor it into smaller files if it exceeds the healthy size threshold
+emoji: 🧹
+engine:
+  agent: developer.instructions
+  id: copilot
+name: Daily File Diet
+strict: true
+timeout-minutes: 20
 tools:
+  bash:
+  - "find pkg -name \"*.go\" ! -name \"*_test.go\" -type f -exec wc -l {} \\; | sort -rn"
   cli-proxy: true
+  edit: null
   github:
     mode: gh-proxy
-    toolsets: [default]
-  edit:
-  bash:
-    - "find pkg -name '*.go' ! -name '*_test.go' -type f -exec wc -l {} \\; | sort -rn"
-
-timeout-minutes: 20
-strict: true
+    toolsets:
+    - default
+tracker-id: daily-file-diet
 features:
-  copilot-requests: true
-firewall:
-  effective-token-steering: true
+  gh-aw-detection: true
+sandbox:
+  agent:
+    sudo: false
 ---
 
 {{#runtime-import? .github/shared-instructions.md}}

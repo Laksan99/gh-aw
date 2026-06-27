@@ -5,13 +5,14 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"sort"
 	"strings"
 
 	"github.com/github/gh-aw/pkg/constants"
 	"github.com/github/gh-aw/pkg/logger"
 	"github.com/github/gh-aw/pkg/parser"
+	"github.com/github/gh-aw/pkg/sliceutil"
 	"github.com/github/gh-aw/pkg/stringutil"
+	"github.com/github/gh-aw/pkg/workflow/compilerenv"
 )
 
 var compilerYamlLog = logger.New("workflow:compiler_yaml")
@@ -80,7 +81,7 @@ func (c *Compiler) buildJobsAndValidate(data *WorkflowData, markdownPath string)
 // for description, source, imports/includes, frontmatter-hash, stop-time, and manual-approval.
 // All ANSI escape codes are stripped from the output.
 // The gh-aw-metadata line is placed first for easy machine parsing.
-func (c *Compiler) generateWorkflowHeader(yaml *strings.Builder, data *WorkflowData, frontmatterHash string, secrets []string, actions []string) {
+func (c *Compiler) generateWorkflowHeader(yaml *strings.Builder, data *WorkflowData, frontmatterHash string, bodyHash string, secrets []string, actions []string) {
 	// Skip the ASCII art banner in wasm/editor mode — it takes up too much space
 	if c.skipHeader {
 		return
@@ -105,7 +106,12 @@ func (c *Compiler) generateWorkflowHeader(yaml *strings.Builder, data *WorkflowD
 			agentInfo.DetectionAgentID = data.SafeOutputs.ThreatDetection.EngineConfig.ID
 			agentInfo.DetectionAgentModel = data.SafeOutputs.ThreatDetection.EngineConfig.Model
 		}
-		metadata := GenerateLockMetadata(frontmatterHash, data.StopTime, c.effectiveStrictMode(data.RawFrontmatter), agentInfo)
+		agentInfo.EngineVersions = collectEngineVersionsForMetadata(data)
+		agentInfo.AgentImageRunner = resolveAgentImageRunnerIdentifier(data.RawFrontmatter)
+		metadata := GenerateLockMetadata(LockHashInfo{FrontmatterHash: frontmatterHash, BodyHash: bodyHash}, data.StopTime, c.effectiveStrictMode(data.RawFrontmatter), agentInfo)
+		if metadata.CompilerVersion == "" && c.GetActionTag() != "" {
+			metadata.CompilerVersion = c.GetVersion()
+		}
 		metadataJSON, err := metadata.ToJSON()
 		if err != nil {
 			// Fallback to legacy format if JSON serialization fails
@@ -199,11 +205,7 @@ func (c *Compiler) generateWorkflowHeader(yaml *strings.Builder, data *WorkflowD
 		yaml.WriteString("#\n")
 		yaml.WriteString("# Frontmatter env variables:\n")
 		// Sort keys for deterministic output
-		keys := make([]string, 0, len(data.EnvSources))
-		for k := range data.EnvSources {
-			keys = append(keys, k)
-		}
-		sort.Strings(keys)
+		keys := sliceutil.SortedKeys(data.EnvSources)
 		for _, k := range keys {
 			fmt.Fprintf(yaml, "#   - %s: %s\n", k, data.EnvSources[k])
 		}
@@ -268,6 +270,8 @@ func (c *Compiler) generateWorkflowBody(yaml *strings.Builder, data *WorkflowDat
 	// can receive caller metadata (repo, run_id, actor, etc.) from dispatch_workflow.
 	// String-based injection preserves existing YAML comments and formatting.
 	onSection = injectAwContextIntoOnYAML(onSection)
+	onSection = injectNetworkAllowedIntoOnYAML(onSection, data.NetworkPermissions)
+	onSection = UnquoteYAMLTopLevelKey(onSection, "on")
 	yaml.WriteString(onSection)
 	yaml.WriteString("\n\n")
 
@@ -307,25 +311,55 @@ func (c *Compiler) generateYAML(data *WorkflowData, markdownPath string) (string
 	// Using the hex-encoded SHA-256 frontmatter hash string as an HMAC key keeps
 	// the compiled lock file identical across repeated compilations of the same workflow.
 	var frontmatterHash string
+	var bodyHash string
 	if markdownPath != "" {
 		baseDir := filepath.Dir(markdownPath)
 		cache := parser.NewImportCache(baseDir)
-		var hash string
-		var err error
-		if data.RawMarkdown != "" {
-			// Fast path: use pre-parsed content from WorkflowData to avoid re-reading the file.
-			hash, err = parser.ComputeFrontmatterHashFromParsedContent(data.FrontmatterYAML, data.RawMarkdown, data.RawFrontmatter, baseDir, cache, parser.DefaultFileReader)
-		} else {
-			// Fallback: read file from disk (used when WorkflowData was constructed without RawMarkdown,
-			// e.g. via CompileWorkflowData called directly with externally constructed WorkflowData).
+
+		// computeWorkflowHash calls the parsed-content path when RawMarkdown is
+		// available (fast path), falling back to a disk read otherwise.
+		computeWorkflowHash := func(
+			fromParsed func() (string, error),
+			fromFile func() (string, error),
+		) (string, error) {
+			if data.RawMarkdown != "" {
+				return fromParsed()
+			}
 			compilerYamlLog.Printf("RawMarkdown not set; falling back to reading file from disk: %s", markdownPath)
-			hash, err = parser.ComputeFrontmatterHashFromFileWithParsedFrontmatter(markdownPath, data.RawFrontmatter, cache, parser.DefaultFileReader)
+			return fromFile()
 		}
+
+		hash, err := computeWorkflowHash(
+			func() (string, error) {
+				return parser.ComputeFrontmatterHashFromParsedContent(data.FrontmatterYAML, data.RawMarkdown, data.RawFrontmatter, baseDir, cache, parser.DefaultFileReader)
+			},
+			func() (string, error) {
+				return parser.ComputeFrontmatterHashFromFileWithParsedFrontmatter(markdownPath, data.RawFrontmatter, cache, parser.DefaultFileReader)
+			},
+		)
 		if err != nil {
 			return "", nil, nil, fmt.Errorf("failed to generate workflow YAML: could not compute stable frontmatter hash for %q: %w", markdownPath, err)
 		}
 		frontmatterHash = hash
 		compilerYamlLog.Printf("Computed frontmatter hash: %s", hash)
+
+		// Compute body hash to cover changes to the markdown body that are not captured
+		// by the frontmatter hash. This enables stale-check: full detection.
+		bHash, bErr := computeWorkflowHash(
+			func() (string, error) {
+				return parser.ComputeBodyHashFromParsedContent(data.RawMarkdown, data.FrontmatterYAML, baseDir, parser.DefaultFileReader)
+			},
+			func() (string, error) {
+				return parser.ComputeBodyHashFromFile(markdownPath)
+			},
+		)
+		if bErr != nil {
+			compilerYamlLog.Printf("Warning: could not compute body hash for %q: %v", markdownPath, bErr)
+			// Non-fatal: continue without body hash
+		} else {
+			bodyHash = bHash
+			compilerYamlLog.Printf("Computed body hash: %s", bodyHash)
+		}
 	}
 	// Store hash on WorkflowData so job-building helpers (MCP renderers, prompt
 	// step generators, etc.) can derive stable heredoc delimiters from it.
@@ -376,7 +410,7 @@ func (c *Compiler) generateYAML(data *WorkflowData, markdownPath string) (string
 	}
 
 	// Generate workflow header comments (including metadata as first line, plus secrets/actions lists)
-	c.generateWorkflowHeader(&yaml, data, frontmatterHash, secrets, actions)
+	c.generateWorkflowHeader(&yaml, data, frontmatterHash, bodyHash, secrets, actions)
 
 	// Append the workflow body
 	yaml.WriteString(bodyContent)
@@ -450,36 +484,35 @@ func (c *Compiler) generatePrompt(yaml *strings.Builder, data *WorkflowData, pre
 	var userPromptChunks []string
 	var expressionMappings []*ExpressionMapping
 
-	// Step 1a: Process and inline imported markdown with inputs (if any)
-	// Imports with inputs MUST be inlined because substitution happens at compile time
-	if data.ImportedMarkdown != "" {
-		compilerYamlLog.Printf("Processing imported markdown (%d bytes)", len(data.ImportedMarkdown))
-
-		// Clean, substitute, and post-process imported markdown
-		cleaned := removeXMLComments(data.ImportedMarkdown)
-		if len(data.ImportInputs) > 0 {
-			compilerYamlLog.Printf("Substituting %d import input values", len(data.ImportInputs))
-			cleaned = SubstituteImportInputs(cleaned, data.ImportInputs)
-		}
-		chunks, exprMaps := extractPromptChunksFromMarkdown(cleaned)
-		userPromptChunks = append(userPromptChunks, chunks...)
-		expressionMappings = exprMaps
-		compilerYamlLog.Printf("Inlined imported markdown with inputs in %d chunks", len(chunks))
-	}
-
-	// Step 1b: For imports without inputs:
-	// - inlinedImports mode (inlined-imports: true frontmatter): read and inline content at compile time
-	// - normal mode: generate runtime-import macros (loaded at runtime)
-	if len(data.ImportPaths) > 0 {
+	// Step 1a/1b: Process imports in declaration order, interleaving:
+	// - compile-time inlined markdown (imports with inputs)
+	// - runtime-import macros (imports without inputs)
+	// In older workflow data (without PromptImports), fall back to legacy grouped handling.
+	if len(data.PromptImports) > 0 {
+		compilerYamlLog.Printf("Processing %d ordered prompt import entries", len(data.PromptImports))
+		workspaceRoot := ""
+		hasImportInputs := len(data.ImportInputs) > 0
 		if data.InlinedImports && c.markdownPath != "" {
-			// inlinedImports mode: read import file content from disk and embed directly
-			compilerYamlLog.Printf("Inlining %d imports without inputs at compile time", len(data.ImportPaths))
-			workspaceRoot := resolveWorkspaceRoot(c.markdownPath)
-			for _, importPath := range data.ImportPaths {
-				importPath = filepath.ToSlash(importPath)
+			workspaceRoot = resolveWorkspaceRoot(c.markdownPath)
+		}
+		for _, entry := range data.PromptImports {
+			if entry.Markdown != "" {
+				cleaned := removeXMLComments(entry.Markdown)
+				if hasImportInputs {
+					cleaned = SubstituteImportInputs(cleaned, data.ImportInputs)
+				}
+				chunks, exprMaps := extractPromptChunksFromMarkdown(cleaned)
+				userPromptChunks = append(userPromptChunks, chunks...)
+				expressionMappings = append(expressionMappings, exprMaps...)
+				continue
+			}
+			if entry.ImportPath == "" {
+				continue
+			}
+			importPath := filepath.ToSlash(entry.ImportPath)
+			if workspaceRoot != "" {
 				rawContent, err := os.ReadFile(filepath.Join(workspaceRoot, importPath))
 				if err != nil {
-					// Fall back to runtime-import macro if file cannot be read
 					compilerYamlLog.Printf("Warning: failed to read import file %s (%v), falling back to runtime-import", importPath, err)
 					userPromptChunks = append(userPromptChunks, fmt.Sprintf("{{#runtime-import %s}}", importPath))
 					continue
@@ -491,15 +524,62 @@ func (c *Compiler) generatePrompt(yaml *strings.Builder, data *WorkflowData, pre
 				chunks, exprMaps := extractPromptChunksFromMarkdown(importedBody)
 				userPromptChunks = append(userPromptChunks, chunks...)
 				expressionMappings = append(expressionMappings, exprMaps...)
-				compilerYamlLog.Printf("Inlined import without inputs: %s", importPath)
+				continue
 			}
-		} else {
-			// Normal mode: generate runtime-import macros (loaded at workflow runtime)
-			compilerYamlLog.Printf("Generating runtime-import macros for %d imports without inputs", len(data.ImportPaths))
-			for _, importPath := range data.ImportPaths {
-				importPath = filepath.ToSlash(importPath)
-				userPromptChunks = append(userPromptChunks, fmt.Sprintf("{{#runtime-import %s}}", importPath))
-				compilerYamlLog.Printf("Added runtime-import macro for: %s", importPath)
+			userPromptChunks = append(userPromptChunks, fmt.Sprintf("{{#runtime-import %s}}", importPath))
+		}
+	} else {
+		// Step 1a: Process and inline imported markdown with inputs (if any)
+		// Imports with inputs MUST be inlined because substitution happens at compile time
+		if data.ImportedMarkdown != "" {
+			compilerYamlLog.Printf("Processing imported markdown (%d bytes)", len(data.ImportedMarkdown))
+
+			// Clean, substitute, and post-process imported markdown
+			cleaned := removeXMLComments(data.ImportedMarkdown)
+			if len(data.ImportInputs) > 0 {
+				compilerYamlLog.Printf("Substituting %d import input values", len(data.ImportInputs))
+				cleaned = SubstituteImportInputs(cleaned, data.ImportInputs)
+			}
+			chunks, exprMaps := extractPromptChunksFromMarkdown(cleaned)
+			userPromptChunks = append(userPromptChunks, chunks...)
+			expressionMappings = append(expressionMappings, exprMaps...)
+			compilerYamlLog.Printf("Inlined imported markdown with inputs in %d chunks", len(chunks))
+		}
+
+		// Step 1b: For imports without inputs:
+		// - inlinedImports mode (inlined-imports: true frontmatter): read and inline content at compile time
+		// - normal mode: generate runtime-import macros (loaded at runtime)
+		if len(data.ImportPaths) > 0 {
+			if data.InlinedImports && c.markdownPath != "" {
+				// inlinedImports mode: read import file content from disk and embed directly
+				compilerYamlLog.Printf("Inlining %d imports without inputs at compile time", len(data.ImportPaths))
+				workspaceRoot := resolveWorkspaceRoot(c.markdownPath)
+				for _, importPath := range data.ImportPaths {
+					importPath = filepath.ToSlash(importPath)
+					rawContent, err := os.ReadFile(filepath.Join(workspaceRoot, importPath))
+					if err != nil {
+						// Fall back to runtime-import macro if file cannot be read
+						compilerYamlLog.Printf("Warning: failed to read import file %s (%v), falling back to runtime-import", importPath, err)
+						userPromptChunks = append(userPromptChunks, fmt.Sprintf("{{#runtime-import %s}}", importPath))
+						continue
+					}
+					importedBody, extractErr := parser.ExtractMarkdownContent(string(rawContent))
+					if extractErr != nil {
+						importedBody = string(rawContent)
+					}
+					chunks, exprMaps := extractPromptChunksFromMarkdown(importedBody)
+					userPromptChunks = append(userPromptChunks, chunks...)
+					expressionMappings = append(expressionMappings, exprMaps...)
+					compilerYamlLog.Printf("Inlined import without inputs: %s", importPath)
+				}
+			} else {
+				// Normal mode: generate runtime-import macros (loaded at workflow runtime)
+				compilerYamlLog.Printf("Generating runtime-import macros for %d imports without inputs", len(data.ImportPaths))
+				for _, importPath := range data.ImportPaths {
+					importPath = filepath.ToSlash(importPath)
+					userPromptChunks = append(userPromptChunks, fmt.Sprintf("{{#runtime-import %s}}", importPath))
+					compilerYamlLog.Printf("Added runtime-import macro for: %s", importPath)
+				}
 			}
 		}
 	}
@@ -588,7 +668,7 @@ func (c *Compiler) generatePrompt(yaml *strings.Builder, data *WorkflowData, pre
 			// Extract everything from ".github/" onwards (inclusive)
 			// +1 to skip the leading slash, so we get ".github/workflows/..." not "/.github/workflows/..."
 			workflowFilePath = normalizedPath[githubIndex+1:]
-		} else if strings.HasPrefix(normalizedPath, ".github/") {
+		} else if strings.HasPrefix(normalizedPath, constants.GithubDir) {
 			// Relative path already starting with ".github/" — use as-is.
 			// This can happen when the compiler is invoked with a relative markdown path
 			// (e.g. ".github/workflows/test.md") rather than an absolute one.
@@ -640,11 +720,7 @@ func (c *Compiler) generatePrompt(yaml *strings.Builder, data *WorkflowData, pre
 		// Convert back to slice in sorted order (by environment variable name) for deterministic output
 		allExpressionMappings = make([]*ExpressionMapping, 0, len(expressionMap))
 		// Get all keys and sort them
-		envVarNames := make([]string, 0, len(expressionMap))
-		for envVar := range expressionMap {
-			envVarNames = append(envVarNames, envVar)
-		}
-		sort.Strings(envVarNames)
+		envVarNames := sliceutil.SortedKeys(expressionMap)
 		// Add mappings in sorted order
 		for _, envVar := range envVarNames {
 			allExpressionMappings = append(allExpressionMappings, expressionMap[envVar])
@@ -756,8 +832,8 @@ func (c *Compiler) generateCreateAwInfo(yaml *strings.Builder, data *WorkflowDat
 
 	// Staged value from safe-outputs configuration
 	stagedValue := "false"
-	if data.SafeOutputs != nil && data.SafeOutputs.Staged {
-		stagedValue = "true"
+	if data.SafeOutputs != nil && data.SafeOutputs.Staged != nil {
+		stagedValue = data.SafeOutputs.Staged.String()
 	}
 
 	// Network configuration
@@ -778,7 +854,7 @@ func (c *Compiler) generateCreateAwInfo(yaml *strings.Builder, data *WorkflowDat
 	// Allowed domains as JSON array string
 	domainsJSON := "[]"
 	if len(allowedDomains) > 0 {
-		b, _ := json.Marshal(allowedDomains)
+		b, _ := json.Marshal(allowedDomains) //nolint:jsonmarshalignoredeerror // marshaling a string slice cannot fail
 		domainsJSON = string(b)
 	}
 
@@ -803,10 +879,15 @@ func (c *Compiler) generateCreateAwInfo(yaml *strings.Builder, data *WorkflowDat
 		fmt.Fprintf(yaml, "          GH_AW_INFO_MODEL: \"%s\"\n", data.EngineConfig.Model)
 	} else {
 		// Use the engine's default model as fallback when neither explicit model nor
-		// model variable is configured, so the run details show "auto" rather than "(none)".
+		// model variable is configured, so the run details show "agent" rather than "(none)".
 		defaultModel := getDefaultAgentModel(engineID)
-		if defaultModel != "" {
+		defaultModelOverrideVar := getDefaultModelOverrideVar(engineID)
+		if defaultModel != "" && defaultModelOverrideVar != "" {
+			fmt.Fprintf(yaml, "          GH_AW_INFO_MODEL: %s\n", compilerenv.BuildModelOverrideExpression(modelEnvVar, defaultModelOverrideVar, defaultModel))
+		} else if defaultModel != "" {
 			fmt.Fprintf(yaml, "          GH_AW_INFO_MODEL: ${{ vars.%s || '%s' }}\n", modelEnvVar, defaultModel)
+		} else if defaultModelOverrideVar != "" {
+			fmt.Fprintf(yaml, "          GH_AW_INFO_MODEL: %s\n", compilerenv.BuildModelOverrideExpressionEmptyFallback(modelEnvVar, defaultModelOverrideVar))
 		} else {
 			fmt.Fprintf(yaml, "          GH_AW_INFO_MODEL: ${{ vars.%s || '' }}\n", modelEnvVar)
 		}
@@ -826,6 +907,15 @@ func (c *Compiler) generateCreateAwInfo(yaml *strings.Builder, data *WorkflowDat
 	fmt.Fprintf(yaml, "          GH_AW_INFO_AWF_VERSION: \"%s\"\n", firewallVersion)
 	fmt.Fprintf(yaml, "          GH_AW_INFO_AWMG_VERSION: \"%s\"\n", mcpGatewayVersion)
 	fmt.Fprintf(yaml, "          GH_AW_INFO_FIREWALL_TYPE: \"%s\"\n", firewallType)
+	if data.Source != "" {
+		fmt.Fprintf(yaml, "          GH_AW_INFO_FRONTMATTER_SOURCE: %q\n", data.Source)
+		// Body-modified defaults to false at compile time; update flows may override this
+		// signal when source/body drift is detected before execution.
+		yaml.WriteString("          GH_AW_INFO_BODY_MODIFIED: \"false\"\n")
+	}
+	if data.FrontmatterEmoji != "" {
+		fmt.Fprintf(yaml, "          GH_AW_INFO_FRONTMATTER_EMOJI: %q\n", data.FrontmatterEmoji)
+	}
 	// Always include strict mode flag for lockdown validation.
 	// validateLockdownRequirements uses this to enforce strict: true for public repositories.
 	// Use effectiveStrictMode to infer strictness from the source (frontmatter), not just the CLI flag.
@@ -838,20 +928,34 @@ func (c *Compiler) generateCreateAwInfo(yaml *strings.Builder, data *WorkflowDat
 	// Include lockdown validation env vars when lockdown is explicitly enabled.
 	// validateLockdownRequirements is called from generate_aw_info.cjs and uses these vars.
 	githubTool, hasGitHub := data.Tools["github"]
-	if hasGitHub && githubTool != false && hasGitHubLockdownExplicitlySet(githubTool) && getGitHubLockdown(githubTool) {
-		yaml.WriteString("          GITHUB_MCP_LOCKDOWN_EXPLICIT: \"true\"\n")
-		yaml.WriteString("          GH_AW_GITHUB_TOKEN: ${{ secrets.GH_AW_GITHUB_TOKEN }}\n")
-		yaml.WriteString("          GH_AW_GITHUB_MCP_SERVER_TOKEN: ${{ secrets.GH_AW_GITHUB_MCP_SERVER_TOKEN }}\n")
-		if customToken := getGitHubToken(githubTool); customToken != "" {
-			fmt.Fprintf(yaml, "          CUSTOM_GITHUB_TOKEN: %s\n", customToken)
+	if hasGitHub && githubTool != false {
+		toolConfig, _ := githubTool.(map[string]any)
+		if hasGitHubLockdownExplicitlySet(toolConfig) && getGitHubLockdown(toolConfig) {
+			yaml.WriteString("          GITHUB_MCP_LOCKDOWN_EXPLICIT: \"true\"\n")
+			yaml.WriteString("          GH_AW_GITHUB_TOKEN: ${{ secrets.GH_AW_GITHUB_TOKEN }}\n")
+			yaml.WriteString("          GH_AW_GITHUB_MCP_SERVER_TOKEN: ${{ secrets.GH_AW_GITHUB_MCP_SERVER_TOKEN }}\n")
+			if customToken := getGitHubToken(toolConfig); customToken != "" {
+				fmt.Fprintf(yaml, "          CUSTOM_GITHUB_TOKEN: %s\n", customToken)
+			}
 		}
 	}
-	// Embed custom token weights when specified in engine.token-weights
-	if data.EngineConfig != nil && data.EngineConfig.TokenWeights != nil {
+	// Embed custom token weights only when custom model multipliers are configured.
+	// This avoids emitting large model payload env values when workflows only customize
+	// token-class weights.
+	if data.EngineConfig != nil && data.EngineConfig.TokenWeights != nil && len(data.EngineConfig.TokenWeights.Multipliers) > 0 {
 		if tokenWeightsJSON, err := json.Marshal(data.EngineConfig.TokenWeights); err == nil {
 			// Escape single quotes for YAML single-quoted scalar safety
 			escapedTokenWeightsJSON := strings.ReplaceAll(string(tokenWeightsJSON), "'", "''")
 			fmt.Fprintf(yaml, "          GH_AW_INFO_TOKEN_WEIGHTS: '%s'\n", escapedTokenWeightsJSON)
+		}
+	}
+	// Embed the `models` overlay from frontmatter so the activation job can merge it with
+	// the built-in models.json and write the combined catalog to /tmp/gh-aw/models.json.
+	if len(data.ModelCosts) > 0 {
+		if modelCostsJSON, err := json.Marshal(data.ModelCosts); err == nil {
+			// Escape single quotes for YAML single-quoted scalar safety
+			escapedModelCostsJSON := strings.ReplaceAll(string(modelCostsJSON), "'", "''")
+			fmt.Fprintf(yaml, "          GH_AW_INFO_MODEL_COSTS: '%s'\n", escapedModelCostsJSON)
 		}
 	}
 	fmt.Fprintf(yaml, "        uses: %s\n", getCachedActionPin("actions/github-script", data))
@@ -906,6 +1010,9 @@ func (c *Compiler) generateOutputCollectionStep(yaml *strings.Builder, data *Wor
 	if domainsStr != "" {
 		fmt.Fprintf(yaml, "          GH_AW_ALLOWED_DOMAINS: %q\n", domainsStr)
 	}
+	if data.SafeOutputs != nil && data.SafeOutputs.URLs != "" {
+		fmt.Fprintf(yaml, "          GH_AW_SAFE_OUTPUTS_URLS: %q\n", data.SafeOutputs.URLs)
+	}
 
 	// Add allowed GitHub references configuration for reference escaping
 	if data.SafeOutputs != nil && data.SafeOutputs.AllowGitHubReferences != nil {
@@ -918,10 +1025,14 @@ func (c *Compiler) generateOutputCollectionStep(yaml *strings.Builder, data *Wor
 	yaml.WriteString("          GITHUB_SERVER_URL: ${{ github.server_url }}\n")
 	yaml.WriteString("          GITHUB_API_URL: ${{ github.api_url }}\n")
 
-	// Add command name for command trigger prevention in safe outputs
+	// Add command names for command trigger prevention in safe outputs
 	if len(data.Command) > 0 {
-		// Pass first command for backward compatibility
-		fmt.Fprintf(yaml, "          GH_AW_COMMAND: %s\n", data.Command[0])
+		if commandsJSON, err := json.Marshal(data.Command); err == nil {
+			fmt.Fprintf(yaml, "          GH_AW_COMMANDS: %q\n", string(commandsJSON))
+		}
+		if data.CommandPlaceholder != "" {
+			fmt.Fprintf(yaml, "          GH_AW_COMMAND_PLACEHOLDER: %q\n", data.CommandPlaceholder)
+		}
 	}
 
 	yaml.WriteString("        with:\n")
@@ -961,7 +1072,7 @@ func resolveWorkspaceRoot(markdownPath string) string {
 		// Absolute or non-root-relative path: strip everything from "/.github/" onward.
 		return filepath.FromSlash(before)
 	}
-	if strings.HasPrefix(normalized, ".github/") {
+	if strings.HasPrefix(normalized, constants.GithubDir) {
 		// Path already starts at the workspace root.
 		return "."
 	}

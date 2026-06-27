@@ -9,9 +9,11 @@ import (
 	"strings"
 
 	"github.com/github/gh-aw/pkg/console"
+	"github.com/github/gh-aw/pkg/constants"
 	"github.com/github/gh-aw/pkg/logger"
 	"github.com/github/gh-aw/pkg/parser"
 	"github.com/github/gh-aw/pkg/sliceutil"
+	"github.com/github/gh-aw/pkg/stringutil"
 	"github.com/spf13/cobra"
 )
 
@@ -21,7 +23,7 @@ var mcpListLog = logger.New("cli:mcp_list")
 func ListWorkflowMCP(workflowFile string, verbose bool) error {
 	mcpListLog.Printf("Listing MCP servers: workflow=%s, verbose=%t", workflowFile, verbose)
 	// Determine the workflow directory and file
-	workflowsDir := ".github/workflows"
+	workflowsDir := constants.GetWorkflowDir()
 	var workflowPath string
 
 	if workflowFile != "" {
@@ -75,9 +77,7 @@ func ListWorkflowMCP(workflowFile string, verbose bool) error {
 				commandOrURL = config.Container
 			}
 			// Truncate if too long
-			if len(commandOrURL) > 40 {
-				commandOrURL = commandOrURL[:37] + "..."
-			}
+			commandOrURL = stringutil.Truncate(commandOrURL, 40)
 
 			rows = append(rows, []string{
 				config.Name,
@@ -184,9 +184,7 @@ func listWorkflowsWithMCPServers(workflowsDir string, verbose bool) error {
 		for _, workflow := range workflowData {
 			serverList := strings.Join(workflow.serverNames, ", ")
 			// Truncate if too long
-			if len(serverList) > 50 {
-				serverList = serverList[:47] + "..."
-			}
+			serverList = stringutil.Truncate(serverList, 50)
 
 			rows = append(rows, []string{
 				workflow.name,
@@ -240,9 +238,7 @@ func showInteractiveMCPWorkflowSelection(workflows []struct {
 	for i, wf := range workflows {
 		description := fmt.Sprintf("%d server(s): %s", wf.serverCount, strings.Join(wf.serverNames, ", "))
 		// Truncate description if too long
-		if len(description) > 80 {
-			description = description[:77] + "..."
-		}
+		description = stringutil.Truncate(description, 80)
 		items[i] = console.NewListItem(wf.name, description, wf.name)
 	}
 
@@ -333,18 +329,17 @@ The workflow-id-or-file can be:
 - A workflow ID (basename without .md extension, e.g., "weekly-research")
 - A file path (e.g., "weekly-research.md" or ".github/workflows/weekly-research.md")
 
-Examples:
-  gh aw mcp list                     # List all workflows with MCP servers
-  gh aw mcp list weekly-research     # List MCP servers in weekly-research.md
-  gh aw mcp list weekly-research -v  # List with detailed information
-  gh aw mcp list --verbose           # List all workflows with detailed MCP server info
-
 The command displays:
 - Server Name: MCP server identifier
 - Status: Configuration status (✓ Ready or ⚠ Incomplete)
 - Tools Count: Number of allowed tools or "All tools"
 - Network Access: Whether network permissions are configured (✓ Enabled or ✗ Disabled)
 - In verbose mode: Also shows Type and Command/URL`,
+		Example: `  gh aw mcp list                     # List all workflows with MCP servers
+  gh aw mcp list weekly-research     # List MCP servers in weekly-research.md
+  gh aw mcp list weekly-research -v  # List with detailed information
+  gh aw mcp list --verbose           # List all workflows with detailed MCP server info
+`,
 		Args: cobra.MaximumNArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			var workflowFile string

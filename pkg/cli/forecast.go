@@ -1,30 +1,35 @@
 package cli
 
 // This file implements the `forecast` command, which samples a workflow's recent
-// GitHub Actions run history and projects forward effective token usage and yield
-// on a per-week or per-month basis.
+// GitHub Actions run history and projects forward AI Credit (AIC) usage (including
+// Monte Carlo probability distributions) on a per-week or per-month basis.
 //
 // Workflow metadata (trigger types, concurrency, experiments) is read from the
 // workflow's Markdown frontmatter so that projections account for how often the
 // workflow is actually expected to fire and how many concurrent runs it supports.
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"math"
 	"math/rand"
 	"os"
+	"os/signal"
 	"path/filepath"
+	"slices"
 	"sort"
-	"strconv"
 	"strings"
 	"time"
 
 	"github.com/github/gh-aw/pkg/console"
 	"github.com/github/gh-aw/pkg/constants"
+	"github.com/github/gh-aw/pkg/fileutil"
 	"github.com/github/gh-aw/pkg/gitutil"
 	"github.com/github/gh-aw/pkg/logger"
 	"github.com/github/gh-aw/pkg/parser"
+	"github.com/github/gh-aw/pkg/sliceutil"
 	"github.com/github/gh-aw/pkg/workflow"
 )
 
@@ -44,34 +49,48 @@ const (
 var (
 	forecastFetchGitHubWorkflows      = fetchGitHubWorkflows
 	forecastListWorkflowRunsPaginated = listWorkflowRunsWithPagination
-	forecastRateLimitSleep            = time.Sleep
+	forecastLoadCachedRunAIC          = loadCachedRunAIC
+	// forecastDownloadRunArtifacts uses a forecast-specific implementation that downloads
+	// only the usage artifact and skips workflow run log downloads (not needed for AIC computation).
+	forecastDownloadRunArtifacts = forecastDownloadUsageArtifact
+	// Forecast only needs TotalAIC; avoid effective-token computation/logging in this path.
+	forecastAnalyzeTokenUsage = analyzeTokenUsageAICOnly
+	forecastRateLimitSleep    = func(ctx context.Context, delay time.Duration) error {
+		timer := time.NewTimer(delay)
+		defer timer.Stop()
+
+		select {
+		case <-timer.C:
+			return nil
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
 )
 
-// ForecastEpisodeSummary contains episode-level aggregate metrics derived from
-// run history without downloading artifacts.  Episodes are reconstructed from the
-// fields available in the GitHub Actions run list (event type, head SHA, branch).
-// Dispatch and workflow_call linkages that require aw_info.json are not available
-// in this lightweight analysis, so the episode count is a lower-bound estimate.
-type ForecastEpisodeSummary struct {
-	// SampledEpisodes is the number of distinct episodes detected in the sampled
-	// run history.  Each "episode" represents one logical task execution, which may
-	// span multiple runs when a workflow dispatches sub-workflows.
-	SampledEpisodes int `json:"sampled_episodes"`
-	// RunsPerEpisode is the average number of runs per episode (SampledRuns /
-	// SampledEpisodes).  Values > 1 indicate orchestrator-style workflows that
-	// dispatch multiple sub-workflows per task.
-	RunsPerEpisode float64 `json:"runs_per_episode"`
-	// AvgEffectiveTokensPerEpisode is the mean effective-token count per episode.
-	AvgEffectiveTokensPerEpisode int `json:"avg_effective_tokens_per_episode"`
-	// ObservedEpisodesPerPeriod is the projected number of episodes in the forecast
-	// period, scaled from the observed episode frequency.
-	ObservedEpisodesPerPeriod float64 `json:"observed_episodes_per_period"`
+// ForecastRunSample holds the data for a single workflow run used in the forecast computation.
+// Included in ForecastWorkflowResult.RunSamples so callers and issue templates can list
+// the individual runs and their raw AI Credit values for human review.
+type ForecastRunSample struct {
+	// RunID is the GitHub Actions run ID.
+	RunID int64 `json:"run_id"`
+	// AIC is the AI Credit cost for this individual run.
+	AIC float64 `json:"aic"`
+	// Date is the ISO-8601 calendar date the run started (YYYY-MM-DD).
+	// Empty when the run's start timestamp is unavailable.
+	Date string `json:"date,omitempty"`
+	// RunURL links to the GitHub Actions run details page.
+	RunURL string `json:"run_url,omitempty"`
 }
 
 // ForecastWorkflowResult contains the projected metrics for a single workflow.
 type ForecastWorkflowResult struct {
 	// WorkflowID is the short identifier of the workflow (basename without .md).
 	WorkflowID string `json:"workflow_id"`
+	// WorkflowPath is the workflow file path when available (e.g. ".github/workflows/ci.yml").
+	WorkflowPath string `json:"workflow_path,omitempty"`
+	// Engines lists engine IDs configured by the workflow frontmatter.
+	Engines []string `json:"engines,omitempty"`
 	// Period is the projection window ("week" or "month").
 	Period string `json:"period"`
 	// SampledRuns is the number of completed runs used to derive per-run averages.
@@ -84,24 +103,36 @@ type ForecastWorkflowResult struct {
 
 	// SuccessRate is the fraction of sampled runs that completed successfully (0–1).
 	SuccessRate float64 `json:"success_rate"`
-	// Yield is the effective throughput: success rate × observed runs per period.
-	Yield float64 `json:"yield"`
 
 	// Average per-run metrics (from completed runs).
-	AvgEffectiveTokens int     `json:"avg_effective_tokens"`
+	AvgAIC             float64 `json:"avg_aic"`
 	AvgDurationSeconds float64 `json:"avg_duration_seconds"`
 
-	// Projected totals for the period.
-	ProjectedEffectiveTokens int `json:"projected_effective_tokens"`
+	// P50AIC is the 50th-percentile (median) AIC of individual sampled runs.
+	P50AIC float64 `json:"p50_aic_per_run"`
+	// P95AIC is the 95th-percentile AIC of individual sampled runs
+	// (conservative / budget-bound per-run cost estimate).
+	P95AIC float64 `json:"p95_aic_per_run"`
 
-	// EpisodeAnalysis contains episode-level metrics derived from the sampled runs.
-	// Nil when no completed runs were available to analyze.
-	EpisodeAnalysis *ForecastEpisodeSummary `json:"episode_analysis,omitempty"`
+	// Projected totals for the configured period.
+	ProjectedAIC float64 `json:"projected_aic"`
 
-	// MonteCarlo contains the probability distribution of projected effective-token
-	// counts derived from a Monte Carlo simulation (10 000 trials).
+	// MonteCarlo contains the probability distribution of projected AIC totals
+	// for the configured period, derived from a Monte Carlo simulation (10 000 trials).
 	// Nil when no completed runs were available.
 	MonteCarlo *ForecastMonteCarloSummary `json:"monte_carlo,omitempty"`
+
+	// WeeklyProjectedAIC is the point-estimate projected total AIC over a 7-day window.
+	WeeklyProjectedAIC float64 `json:"weekly_projected_aic"`
+	// WeeklyMonteCarlo contains the Monte Carlo distribution for the 7-day projection.
+	// Nil when no completed runs were available.
+	WeeklyMonteCarlo *ForecastMonteCarloSummary `json:"weekly_monte_carlo,omitempty"`
+
+	// MonthlyProjectedAIC is the point-estimate projected total AIC over a 30-day window.
+	MonthlyProjectedAIC float64 `json:"monthly_projected_aic"`
+	// MonthlyMonteCarlo contains the Monte Carlo distribution for the 30-day projection.
+	// Nil when no completed runs were available.
+	MonthlyMonteCarlo *ForecastMonteCarloSummary `json:"monthly_monte_carlo,omitempty"`
 
 	// Trigger information derived from frontmatter.
 	ActiveTriggers []string `json:"active_triggers"`
@@ -115,6 +146,11 @@ type ForecastWorkflowResult struct {
 	// Evaluation contains backtesting quality metrics when --eval is set.
 	// Nil in normal forecast mode.
 	Evaluation *ForecastEvaluation `json:"evaluation,omitempty"`
+
+	// RunSamples holds the individual per-run data used in the forecast computation.
+	// Each entry records the run ID, raw AIC, and (when available) the run date.
+	// Zero-AIC runs are treated as missing data and excluded.
+	RunSamples []ForecastRunSample `json:"run_samples,omitempty"`
 }
 
 // ForecastVariantResult contains projected metrics split by A/B experiment variant.
@@ -139,17 +175,17 @@ type ForecastEvaluation struct {
 
 	// ActualRuns is the number of completed runs observed in the validation window.
 	ActualRuns int `json:"actual_runs"`
-	// ActualEffectiveTokens is the total effective-token count actually consumed
+	// ActualAIC is the total AIC value actually consumed
 	// in the validation window.
-	ActualEffectiveTokens int `json:"actual_effective_tokens"`
+	ActualAIC float64 `json:"actual_aic"`
 
-	// P50ErrorAbs is the signed difference (actual − P50 forecast) in effective tokens.
+	// P50ErrorAbs is the signed difference (actual − P50 forecast) in AIC.
 	// Positive = actual was higher than forecast; negative = forecast over-estimated.
-	P50ErrorAbs int `json:"p50_error_abs"`
+	P50ErrorAbs float64 `json:"p50_error_abs"`
 	// P50ErrorPct is P50ErrorAbs as a percentage of the P50 forecast.
 	// NaN-safe: 0 when P50 is 0.
 	P50ErrorPct float64 `json:"p50_error_pct"`
-	// InCI is true when ActualEffectiveTokens fell within the P10–P90 confidence
+	// InCI is true when ActualAIC fell within the P10–P90 confidence
 	// interval.  A well-calibrated model should be in-CI ~80% of the time.
 	InCI bool `json:"in_ci"`
 }
@@ -165,9 +201,24 @@ type ForecastResult struct {
 // RunForecast is the entry point for the forecast command.
 func RunForecast(config ForecastConfig) error {
 	forecastRunLog.Printf("Running forecast: workflows=%v, days=%d, period=%s, eval=%v", config.WorkflowIDs, config.Days, config.Period, config.EvalMode)
+	if config.TimeoutMinutes < 0 {
+		return fmt.Errorf("invalid timeout value: %d; must be >= 0", config.TimeoutMinutes)
+	}
+
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
+	defer stop()
+	if config.TimeoutMinutes > 0 {
+		timeoutCtx, cancel := context.WithTimeout(ctx, time.Duration(config.TimeoutMinutes)*time.Minute)
+		defer cancel()
+		ctx = timeoutCtx
+	}
 
 	// Emit experimental warning so users know this command is not yet stable.
-	fmt.Fprintln(os.Stderr, console.FormatWarningMessage("forecast is an experimental command and may change without notice"))
+	// Per R-IMPL-040: the warning MUST NOT be emitted when --json is specified,
+	// as JSON callers are assumed to be automated pipelines that handle warnings separately.
+	if !config.JSONOutput {
+		fmt.Fprintln(os.Stderr, console.FormatWarningMessage("forecast is an experimental command and may change without notice"))
+	}
 
 	// Validate period.
 	periodDays, ok := forecastPeriodDays[config.Period]
@@ -182,9 +233,9 @@ func RunForecast(config ForecastConfig) error {
 	}
 
 	// Resolve the list of workflow IDs to forecast.
-	workflowIDs, err := resolveForecastWorkflows(config)
+	workflowIDs, err := resolveForecastWorkflows(ctx, config)
 	if err != nil {
-		return err
+		return normalizeForecastRunError(err, config)
 	}
 	if len(workflowIDs) == 0 {
 		fmt.Fprintln(os.Stderr, console.FormatWarningMessage("No agentic workflows found to forecast"))
@@ -232,14 +283,30 @@ func RunForecast(config ForecastConfig) error {
 
 	results := make([]ForecastWorkflowResult, 0, len(workflowIDs))
 	for _, wfID := range workflowIDs {
+		if err := ctx.Err(); err != nil {
+			if !config.Verbose {
+				spinner.Stop()
+			}
+			emitPartialForecastResults(results, config, now)
+			return normalizeForecastRunError(err, config)
+		}
 		if !config.Verbose {
 			spinner.UpdateMessage(fmt.Sprintf("Sampling %s…", wfID))
 		}
 
 		// forecastWorkflow uses the shifted startDate; in eval mode we also pass the
 		// anchor so the function knows where the training window ends.
-		result, err := forecastWorkflow(wfID, startDate, config, periodDays)
+		result, err := forecastWorkflow(ctx, wfID, startDate, config, periodDays)
 		if err != nil {
+			// context.Canceled typically indicates user interruption (Ctrl-C), while
+			// context.DeadlineExceeded indicates the configured forecast timeout.
+			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+				if !config.Verbose {
+					spinner.Stop()
+				}
+				emitPartialForecastResults(results, config, now)
+				return normalizeForecastRunError(err, config)
+			}
 			if !config.Verbose {
 				spinner.Stop()
 			}
@@ -253,7 +320,7 @@ func RunForecast(config ForecastConfig) error {
 
 		// In eval mode, fetch the validation-window runs and attach evaluation metrics.
 		if config.EvalMode {
-			result.Evaluation = evaluateForecast(wfID, result, validationStartDate, validationEndDate, config)
+			result.Evaluation = evaluateForecast(ctx, wfID, result, validationStartDate, validationEndDate, config)
 		}
 
 		results = append(results, result)
@@ -264,16 +331,22 @@ func RunForecast(config ForecastConfig) error {
 	}
 
 	// Sort results by Monte Carlo P50 (or point estimate when MC unavailable) descending.
-	sort.Slice(results, func(i, j int) bool {
-		pi := results[i].ProjectedEffectiveTokens
-		if mc := results[i].MonteCarlo; mc != nil {
-			pi = mc.P50ProjectedEffectiveTokens
+	slices.SortFunc(results, func(a, b ForecastWorkflowResult) int {
+		pi := a.ProjectedAIC
+		if mc := a.MonteCarlo; mc != nil {
+			pi = mc.P50ProjectedAIC
 		}
-		pj := results[j].ProjectedEffectiveTokens
-		if mc := results[j].MonteCarlo; mc != nil {
-			pj = mc.P50ProjectedEffectiveTokens
+		pj := b.ProjectedAIC
+		if mc := b.MonteCarlo; mc != nil {
+			pj = mc.P50ProjectedAIC
 		}
-		return pi > pj
+		if pi > pj {
+			return -1
+		}
+		if pi < pj {
+			return 1
+		}
+		return 0
 	})
 
 	output := ForecastResult{
@@ -289,12 +362,22 @@ func RunForecast(config ForecastConfig) error {
 	return renderForecastTable(output, config)
 }
 
+func normalizeForecastRunError(err error, config ForecastConfig) error {
+	if config.TimeoutMinutes > 0 && errors.Is(err, context.DeadlineExceeded) {
+		fmt.Fprintln(os.Stderr, console.FormatErrorMessage(
+			fmt.Sprintf("Forecast computation timed out after %d minute(s).", config.TimeoutMinutes),
+		))
+		return &ExitCodeError{Code: 124}
+	}
+	return err
+}
+
 // resolveForecastWorkflows returns the ordered list of workflow IDs to forecast.
 // When WorkflowIDs is empty, all agentic workflow IDs in the repository are returned.
 // When RepoOverride is set, workflows are discovered via the GitHub API instead of local files.
-func resolveForecastWorkflows(config ForecastConfig) ([]string, error) {
+func resolveForecastWorkflows(ctx context.Context, config ForecastConfig) ([]string, error) {
 	if config.RepoOverride != "" {
-		return resolveForecastWorkflowsFromRemote(config.WorkflowIDs, config.RepoOverride, config.Verbose)
+		return resolveForecastWorkflowsFromRemote(ctx, config.WorkflowIDs, config.RepoOverride, config.Verbose)
 	}
 
 	if len(config.WorkflowIDs) > 0 {
@@ -322,8 +405,8 @@ func resolveForecastWorkflows(config ForecastConfig) ([]string, error) {
 // the GitHub API. When ids is empty, all workflows in the remote repository are returned.
 // When ids are provided, each is matched (case-insensitively) against remote workflow names
 // and file-path basenames.
-func resolveForecastWorkflowsFromRemote(ids []string, repoOverride string, verbose bool) ([]string, error) {
-	githubWorkflows, err := fetchWorkflowsWithBackoff(ids, repoOverride, verbose)
+func resolveForecastWorkflowsFromRemote(ctx context.Context, ids []string, repoOverride string, verbose bool) ([]string, error) {
+	githubWorkflows, err := fetchWorkflowsWithBackoff(ctx, ids, repoOverride, verbose)
 	if err != nil {
 		return nil, fmt.Errorf("failed to list workflows in %s: %w", repoOverride, err)
 	}
@@ -357,7 +440,7 @@ func forecastRateLimitBackoffDuration(attempt int) time.Duration {
 	return time.Duration(attempt) * forecastRateLimitBaseBackoff
 }
 
-func fetchWorkflowsWithBackoff(ids []string, repoOverride string, verbose bool) (map[string]*GitHubWorkflow, error) {
+func fetchWorkflowsWithBackoff(ctx context.Context, ids []string, repoOverride string, verbose bool) (map[string]*GitHubWorkflow, error) {
 	var lastErr error
 
 	for attempt := 1; attempt <= forecastRateLimitMaxAttempts; attempt++ {
@@ -378,7 +461,9 @@ func fetchWorkflowsWithBackoff(ids []string, repoOverride string, verbose bool) 
 		fmt.Fprintln(os.Stderr, console.FormatWarningMessage(
 			fmt.Sprintf("GitHub API rate limit hit while discovering workflows in %s; backing off for %s before retry %d/%d",
 				repoOverride, backoff, attempt+1, forecastRateLimitMaxAttempts)))
-		forecastRateLimitSleep(backoff)
+		if err := forecastRateLimitSleep(ctx, backoff); err != nil {
+			return nil, err
+		}
 	}
 
 	if len(ids) > 0 {
@@ -396,8 +481,9 @@ func fetchWorkflowsWithBackoff(ids []string, repoOverride string, verbose bool) 
 	return nil, fmt.Errorf("GitHub API rate limit exhausted after %d attempts: %w", forecastRateLimitMaxAttempts, lastErr)
 }
 
-func listRunsWithBackoff(opts ListWorkflowRunsOptions, workflowID string) ([]WorkflowRun, int, error) {
+func listRunsWithBackoff(ctx context.Context, opts ListWorkflowRunsOptions, workflowID string) ([]WorkflowRun, int, error) {
 	var lastErr error
+	opts.Context = ctx
 
 	for attempt := 1; attempt <= forecastRateLimitMaxAttempts; attempt++ {
 		runs, total, err := forecastListWorkflowRunsPaginated(opts)
@@ -417,7 +503,9 @@ func listRunsWithBackoff(opts ListWorkflowRunsOptions, workflowID string) ([]Wor
 		fmt.Fprintln(os.Stderr, console.FormatWarningMessage(
 			fmt.Sprintf("GitHub API rate limit hit while sampling %s; backing off for %s before retry %d/%d",
 				workflowID, backoff, attempt+1, forecastRateLimitMaxAttempts)))
-		forecastRateLimitSleep(backoff)
+		if err := forecastRateLimitSleep(ctx, backoff); err != nil {
+			return nil, 0, err
+		}
 	}
 
 	return nil, 0, lastErr
@@ -427,9 +515,8 @@ func listRunsWithBackoff(opts ListWorkflowRunsOptions, workflowID string) ([]Wor
 // best matches id. Matching is tried against the file-based key (e.g. "ci-doctor") and the
 // display name (e.g. "CI Failure Doctor"), both case-insensitively. Returns "" on no match.
 func matchRemoteWorkflowName(id string, workflows map[string]*GitHubWorkflow) string {
-	lowerID := strings.ToLower(id)
 	for key, wf := range workflows {
-		if strings.ToLower(key) == lowerID || strings.ToLower(wf.Name) == lowerID {
+		if strings.EqualFold(key, id) || strings.EqualFold(wf.Name, id) {
 			return wf.Name
 		}
 	}
@@ -437,7 +524,7 @@ func matchRemoteWorkflowName(id string, workflows map[string]*GitHubWorkflow) st
 }
 
 // forecastWorkflow computes a ForecastWorkflowResult for a single workflow.
-func forecastWorkflow(workflowName, startDate string, config ForecastConfig, periodDays int) (ForecastWorkflowResult, error) {
+func forecastWorkflow(ctx context.Context, workflowName, startDate string, config ForecastConfig, periodDays int) (ForecastWorkflowResult, error) {
 	result := ForecastWorkflowResult{
 		WorkflowID:  extractWorkflowIDFromName(workflowName),
 		Period:      config.Period,
@@ -449,6 +536,7 @@ func forecastWorkflow(workflowName, startDate string, config ForecastConfig, per
 	result.ActiveTriggers = meta.activeTriggers
 	result.ConcurrencyLimit = meta.concurrencyLimit
 	result.ExperimentVariants = meta.variants
+	result.Engines = meta.engines
 
 	// Determine the API name used to filter workflow runs (prefer lock file name).
 	apiName := workflowName
@@ -459,13 +547,15 @@ func forecastWorkflow(workflowName, startDate string, config ForecastConfig, per
 	// Fetch completed runs from the history window.
 	opts := ListWorkflowRunsOptions{
 		WorkflowName: apiName,
+		Status:       "completed",
 		StartDate:    startDate,
 		Limit:        config.SampleSize,
+		TargetCount:  config.SampleSize,
 		RepoOverride: config.RepoOverride,
 		Verbose:      config.Verbose,
 	}
 
-	runs, _, err := listRunsWithBackoff(opts, result.WorkflowID)
+	runs, _, err := listRunsWithBackoff(ctx, opts, result.WorkflowID)
 	if err != nil {
 		if gitutil.IsRateLimitError(err.Error()) {
 			fmt.Fprintln(os.Stderr, console.FormatWarningMessage(
@@ -478,71 +568,108 @@ func forecastWorkflow(workflowName, startDate string, config ForecastConfig, per
 	// Only use completed runs for metric computation.
 	completed := make([]WorkflowRun, 0, len(runs))
 	for _, r := range runs {
-		if r.Status == "completed" {
+		if isCompletedNonSkippedRun(r) {
 			// Compute Duration from StartedAt/UpdatedAt when not already set (gh run list
 			// does not populate the Duration field; health_command uses the same approach).
 			if r.Duration == 0 && !r.StartedAt.IsZero() && !r.UpdatedAt.IsZero() {
 				r.Duration = r.UpdatedAt.Sub(r.StartedAt)
 			}
-			// Enrich with ET from a locally-cached run summary when available.
-			// gh run list does not return token-usage fields; they are only stored in
-			// the aw_info.json artifacts downloaded by `gh aw logs`.  Loading the cached
-			// RunSummary avoids re-downloading artifacts while still providing accurate
-			// ET observations for runs that have already been processed locally.
-			if r.EffectiveTokens == 0 {
-				r.EffectiveTokens = loadCachedEffectiveTokens(r.DatabaseID, config.Verbose)
-			}
 			completed = append(completed, r)
 		}
 	}
-	result.SampledRuns = len(completed)
-
 	if len(completed) == 0 {
 		forecastRunLog.Printf("No completed runs found for %s in last %d days", workflowName, config.Days)
 		return result, nil
 	}
 
-	// Compute per-run averages.
-	var totalET int
+	// Compute per-run averages and collect individual run samples.
+	var totalAIC float64
 	var totalDurSec float64
 	successCount := 0
-	etObservations := make([]int, 0, len(completed))
+	aicObservations := make([]int, 0, len(completed))
+	samples := make([]ForecastRunSample, 0, len(completed))
 
 	for _, r := range completed {
-		totalET += r.EffectiveTokens
+		runAIC := forecastLoadCachedRunAIC(ctx, r.DatabaseID, config.Verbose)
+		if runAIC <= 0 {
+			forecastRunLog.Printf("Skipping run %d for %s: AIC=%.3f treated as missing data", r.DatabaseID, workflowName, runAIC)
+			continue
+		}
+		if result.WorkflowPath == "" && r.WorkflowPath != "" {
+			result.WorkflowPath = r.WorkflowPath
+		}
+		totalAIC += runAIC
 		totalDurSec += r.Duration.Seconds()
-		etObservations = append(etObservations, r.EffectiveTokens)
+		// Monte Carlo currently samples integer observations; keep milli-AIC precision
+		// so sub-1 AIC runs are represented without losing granularity.
+		aicObservations = append(aicObservations, int(math.Round(runAIC*1000)))
 		if r.Conclusion == "success" {
 			successCount++
 		}
+		sample := ForecastRunSample{RunID: r.DatabaseID, AIC: roundForecastAIC(runAIC)}
+		if !r.StartedAt.IsZero() {
+			sample.Date = r.StartedAt.Format("2006-01-02")
+		}
+		if r.URL != "" {
+			sample.RunURL = r.URL
+		}
+		samples = append(samples, sample)
+	}
+	result.RunSamples = samples
+	if result.WorkflowPath == "" {
+		for _, r := range completed {
+			if r.WorkflowPath != "" {
+				result.WorkflowPath = r.WorkflowPath
+				break
+			}
+		}
 	}
 
-	n := len(completed)
-	result.AvgEffectiveTokens = totalET / n
+	n := len(aicObservations)
+	result.SampledRuns = n
+	if n == 0 {
+		forecastRunLog.Printf("No non-zero AIC run samples found for %s in last %d days", workflowName, config.Days)
+		return result, nil
+	}
+
+	result.AvgAIC = roundForecastAIC(totalAIC / float64(n))
 	result.AvgDurationSeconds = totalDurSec / float64(n)
 	result.SuccessRate = float64(successCount) / float64(n)
 
+	// Compute P50 and P95 of individual run AIC (per-run percentiles, not period totals).
+	sortedAIC := make([]int, len(aicObservations))
+	copy(sortedAIC, aicObservations)
+	sort.Ints(sortedAIC)
+	result.P50AIC = roundForecastAIC(float64(percentileInt(sortedAIC, 50)) / 1000)
+	result.P95AIC = roundForecastAIC(float64(percentileInt(sortedAIC, 95)) / 1000)
+
 	// Compute observed run frequency: runs per calendar day over the history window,
 	// scaled to the projection period.
-	result.ObservedRunsPerPeriod = float64(n) / float64(config.Days) * float64(periodDays)
+	observedRunsPerDay := float64(n) / float64(config.Days)
+	result.ObservedRunsPerPeriod = observedRunsPerDay * float64(periodDays)
 
-	// Effective throughput (yield) accounts for the success rate.
-	result.Yield = result.ObservedRunsPerPeriod * result.SuccessRate
+	// Point estimates for weekly (7-day) and monthly (30-day) projections.
+	weeklyRuns := observedRunsPerDay * 7
+	monthlyRuns := observedRunsPerDay * 30
+	result.WeeklyProjectedAIC = roundForecastAIC(weeklyRuns * result.AvgAIC)
+	result.MonthlyProjectedAIC = roundForecastAIC(monthlyRuns * result.AvgAIC)
 
-	// Projected token usage (point estimate using simple means).
-	result.ProjectedEffectiveTokens = int(math.Round(result.ObservedRunsPerPeriod * float64(result.AvgEffectiveTokens)))
+	// Projected token usage (point estimate using simple means) for the configured period.
+	result.ProjectedAIC = roundForecastAIC(result.ObservedRunsPerPeriod * result.AvgAIC)
 
 	// Monte Carlo simulation: model run-count (Poisson), per-run token usage
 	// (bootstrap), and per-run success (Bernoulli) to produce P10/P50/P90 ranges.
-	rng := rand.New(rand.NewSource(time.Now().UnixNano())) //nolint:gosec // non-cryptographic simulation RNG
-	result.MonteCarlo = runMonteCarlo(etObservations, successCount, result.ObservedRunsPerPeriod, rng)
+	// Two independent RNGs ensure the weekly and monthly simulations are uncorrelated.
+	seed := time.Now().UnixNano()
+	rng := rand.New(rand.NewSource(seed))      //nolint:gosec // non-cryptographic simulation RNG
+	rng2 := rand.New(rand.NewSource(seed + 1)) //nolint:gosec
+	rng3 := rand.New(rand.NewSource(seed + 2)) //nolint:gosec
+	result.MonteCarlo = runMonteCarlo(aicObservations, successCount, result.ObservedRunsPerPeriod, rng)
+	result.WeeklyMonteCarlo = runMonteCarlo(aicObservations, successCount, weeklyRuns, rng2)
+	result.MonthlyMonteCarlo = runMonteCarlo(aicObservations, successCount, monthlyRuns, rng3)
 
 	// Populate experiment variant fractions from run history when metadata has variants.
 	result.ExperimentVariants = computeVariantFractions(result.ExperimentVariants, completed)
-
-	// Build lightweight episode analysis from the completed runs using the fields
-	// available in the GitHub Actions run list (no artifact download required).
-	result.EpisodeAnalysis = buildForecastEpisodeSummary(completed, config.Days, periodDays)
 
 	return result, nil
 }
@@ -552,6 +679,7 @@ type workflowMeta struct {
 	activeTriggers   []string
 	concurrencyLimit int
 	variants         []ForecastVariantResult
+	engines          []string
 }
 
 // loadWorkflowMeta reads the workflow's Markdown file and extracts frontmatter metadata.
@@ -592,8 +720,52 @@ func loadWorkflowMeta(workflowName string, verbose bool) workflowMeta {
 
 	// Collect experiment variant names (counts come from run history later).
 	meta.variants = extractExperimentVariantStubs(cfg)
+	meta.engines = extractEngineNames(cfg)
 
 	return meta
+}
+
+func extractEngineNames(cfg *workflow.FrontmatterConfig) []string {
+	seen := make(map[string]struct{})
+	var names []string
+	var collect func(any)
+	collect = func(value any) {
+		switch typed := value.(type) {
+		case string:
+			name := strings.TrimSpace(typed)
+			if name == "" {
+				return
+			}
+			if _, exists := seen[name]; exists {
+				return
+			}
+			seen[name] = struct{}{}
+			names = append(names, name)
+		case []any:
+			for _, entry := range typed {
+				collect(entry)
+			}
+		case map[string]any:
+			if id, ok := typed["id"]; ok {
+				collect(id)
+			}
+			if engine, ok := typed["engine"]; ok {
+				collect(engine)
+			}
+			if fallback, ok := typed["fallback"]; ok {
+				collect(fallback)
+			}
+			if fallbacks, ok := typed["fallbacks"]; ok {
+				collect(fallbacks)
+			}
+			if engines, ok := typed["engines"]; ok {
+				collect(engines)
+			}
+		}
+	}
+	collect(cfg.Engine)
+	sort.Strings(names)
+	return names
 }
 
 // findMarkdownFileForWorkflow tries to locate the .md source file for a workflow.
@@ -625,11 +797,7 @@ func extractTriggerNames(cfg *workflow.FrontmatterConfig) []string {
 	if cfg.On == nil {
 		return nil
 	}
-	names := make([]string, 0, len(cfg.On))
-	for k := range cfg.On {
-		names = append(names, k)
-	}
-	sort.Strings(names)
+	names := sliceutil.SortedKeys(cfg.On)
 	return names
 }
 
@@ -673,11 +841,21 @@ func extractExperimentVariantStubs(cfg *workflow.FrontmatterConfig) []ForecastVa
 			})
 		}
 	}
-	sort.Slice(stubs, func(i, j int) bool {
-		if stubs[i].ExperimentName != stubs[j].ExperimentName {
-			return stubs[i].ExperimentName < stubs[j].ExperimentName
+	slices.SortFunc(stubs, func(a, b ForecastVariantResult) int {
+		if a.ExperimentName != b.ExperimentName {
+			if a.ExperimentName < b.ExperimentName {
+				return -1
+			}
+			return 1
 		}
-		return stubs[i].Variant < stubs[j].Variant
+		switch {
+		case a.Variant < b.Variant:
+			return -1
+		case a.Variant > b.Variant:
+			return 1
+		default:
+			return 0
+		}
 	})
 	return stubs
 }
@@ -720,98 +898,187 @@ func extractWorkflowIDFromName(name string) string {
 	return name
 }
 
-// workflowRunToRunData converts a WorkflowRun (sourced from the GitHub Actions API)
-// to a RunData using the fields available without artifact downloads.  Fields that
-// require aw_info.json (AwContext, Repository, Ref, SHA, Actor, RunAttempt, …) are
-// left as zero values; the episode engine degrades gracefully when they are absent.
-func workflowRunToRunData(r WorkflowRun) RunData {
-	return RunData{
-		RunID:           r.DatabaseID,
-		Number:          r.Number,
-		WorkflowName:    r.WorkflowName,
-		WorkflowPath:    r.WorkflowPath,
-		Status:          r.Status,
-		Conclusion:      r.Conclusion,
-		URL:             r.URL,
-		Event:           r.Event,
-		Branch:          r.HeadBranch,
-		HeadSHA:         r.HeadSha,
-		DisplayTitle:    r.DisplayTitle,
-		CreatedAt:       r.CreatedAt,
-		StartedAt:       r.StartedAt,
-		UpdatedAt:       r.UpdatedAt,
-		TokenUsage:      r.TokenUsage,
-		EffectiveTokens: r.EffectiveTokens,
-		EstimatedCost:   r.EstimatedCost,
-	}
-}
-
-// buildForecastEpisodeSummary derives episode-level metrics from a slice of
-// completed WorkflowRun objects using the lightweight episode engine.  Returns nil
-// when no runs are provided.
-//
-// Because only GitHub API fields are available (no aw_info.json artifacts), the
-// episode engine can link runs via workflow_run event SHA/branch matching but
-// cannot detect dispatch or workflow_call lineage.  The resulting episode count is
-// therefore a lower-bound estimate for orchestrator-style workflows.
-func buildForecastEpisodeSummary(runs []WorkflowRun, historyDays, periodDays int) *ForecastEpisodeSummary {
-	if len(runs) == 0 {
-		return nil
-	}
-
-	runData := make([]RunData, 0, len(runs))
-	for _, r := range runs {
-		runData = append(runData, workflowRunToRunData(r))
-	}
-
-	// buildEpisodeData returns (episodes, edges); edges are not needed for
-	// the lightweight forecast summary so they are intentionally discarded.
-	episodes, _ := buildEpisodeData(runData, nil)
-	numEpisodes := len(episodes)
-	if numEpisodes == 0 {
-		return nil
-	}
-
-	var totalEpisodeET int
-	for _, ep := range episodes {
-		totalEpisodeET += ep.TotalEffectiveTokens
-	}
-
-	avgETPerEpisode := totalEpisodeET / numEpisodes
-	runsPerEpisode := float64(len(runs)) / float64(numEpisodes)
-	observedEpisodesPerPeriod := float64(numEpisodes) / float64(historyDays) * float64(periodDays)
-
-	return &ForecastEpisodeSummary{
-		SampledEpisodes:              numEpisodes,
-		RunsPerEpisode:               runsPerEpisode,
-		AvgEffectiveTokensPerEpisode: avgETPerEpisode,
-		ObservedEpisodesPerPeriod:    observedEpisodesPerPeriod,
-	}
-}
-
-// loadCachedEffectiveTokens looks up a locally-cached RunSummary for the given
-// run ID and returns the TotalEffectiveTokens from its TokenUsage summary.
-// Returns 0 when no cache exists or the cache does not contain token data.
+// loadCachedRunAIC looks up a locally-cached RunSummary for the given
+// run ID and returns the TotalAIC from its TokenUsage summary.
+// Returns 0 when no cache exists or the cache does not contain AIC data.
 // This avoids re-downloading aw_info.json artifacts for runs already processed by
-// `gh aw logs` while still providing accurate ET observations for the simulation.
+// `gh aw logs` while still providing accurate AIC observations for the simulation.
 //
 // Cache location: <defaultLogsOutputDir>/run-<runID>/run_summary.json
 // (defaultLogsOutputDir is ".github/aw/logs" — defined in logs_models.go)
-func loadCachedEffectiveTokens(runID int64, verbose bool) int {
+func loadCachedRunAIC(ctx context.Context, runID int64, verbose bool) float64 {
 	dir := filepath.Join(defaultLogsOutputDir, fmt.Sprintf("run-%d", runID))
 	summary, ok := loadRunSummary(dir, verbose)
-	if !ok || summary == nil {
+	if ok && summary != nil && summary.TokenUsage != nil && summary.TokenUsage.TotalAIC > 0 {
+		forecastRunLog.Printf("AIC cache hit for run %d: aic=%.3f (from run_summary.json)", runID, summary.TokenUsage.TotalAIC)
+		return summary.TokenUsage.TotalAIC
+	}
+	if ok && summary != nil && summary.TokenUsage != nil && summary.TokenUsage.TotalAIC <= 0 {
+		forecastRunLog.Printf("AIC cache stale/empty for run %d: cached_total_aic=%.3f, token_file_recompute_required=true", runID, summary.TokenUsage.TotalAIC)
+	}
+
+	forecastRunLog.Printf("AIC cache miss for run %d; downloading usage artifact to %s", runID, dir)
+	if verbose {
+		fmt.Fprintln(os.Stderr, console.FormatVerboseMessage(fmt.Sprintf("Downloading usage artifact for run %d…", runID)))
+	}
+
+	tryDownload := func(filter []string) error {
+		return forecastDownloadRunArtifacts(ctx, runID, dir, verbose, "", "", "", filter)
+	}
+	usageFilter := []string{"usage"}
+	if err := tryDownload(usageFilter); err != nil {
+		if errors.Is(err, ErrNoArtifacts) {
+			forecastRunLog.Printf("No usage artifact for run %d; AIC will be 0", runID)
+			return 0
+		} else if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			forecastRunLog.Printf("Usage artifact download for run %d interrupted: %v", runID, err)
+			if verbose {
+				fmt.Fprintln(os.Stderr, console.FormatVerboseMessage(fmt.Sprintf("Usage artifact download for run %d interrupted: %v", runID, err)))
+			}
+			return 0
+		} else {
+			forecastRunLog.Printf("Failed to download usage artifact for run %d: %v", runID, err)
+			if verbose {
+				fmt.Fprintln(os.Stderr, console.FormatVerboseMessage(fmt.Sprintf("Failed to download usage artifact for run %d: %v", runID, err)))
+			}
+			return 0
+		}
+	}
+
+	tokenUsage, err := forecastAnalyzeTokenUsage(dir, verbose)
+	if err != nil || tokenUsage == nil || tokenUsage.TotalAIC <= 0 {
+		forecastRunLog.Printf("No AIC data in usage artifact for run %d (err=%v, tokenUsage=%v)", runID, err, tokenUsage)
 		return 0
 	}
-	if summary.TokenUsage != nil && summary.TokenUsage.TotalEffectiveTokens > 0 {
-		return summary.TokenUsage.TotalEffectiveTokens
+	forecastRunLog.Printf("AIC from usage artifact for run %d: aic=%.3f", runID, tokenUsage.TotalAIC)
+	return tokenUsage.TotalAIC
+}
+
+// forecastDownloadUsageArtifact is a forecast-specific replacement for
+// downloadRunArtifacts. Unlike the general-purpose downloader, it:
+//   - Downloads only artifacts matching artifactFilter (typically ["usage"]).
+//   - Skips workflow run log downloads entirely — logs are not needed for
+//     AIC computation and downloading them wastes time when forecasting
+//     many runs.
+//   - Returns ErrNoArtifacts immediately when no matching artifact is found
+//     rather than falling back to log diagnostics.
+//
+// It is referenced by forecastDownloadRunArtifacts so that tests can substitute
+// a mock implementation without modifying the general artifact download path.
+func forecastDownloadUsageArtifact(ctx context.Context, runID int64, outputDir string, verbose bool, owner, repo, hostname string, artifactFilter []string) error {
+	forecastRunLog.Printf("Downloading usage artifact: run_id=%d, output_dir=%s, filter=%v", runID, outputDir, artifactFilter)
+	shouldLogProgress := IsRunningInCI() || verbose
+
+	// Check if the requested artifacts are already on disk (cache hit from actions/cache restore).
+	if fileutil.DirExists(outputDir) && !fileutil.IsDirEmpty(outputDir) {
+		missing := findMissingFilterEntries(artifactFilter, outputDir)
+		if len(missing) == 0 {
+			forecastRunLog.Printf("Usage artifact already on disk for run %d, skipping download", runID)
+			if shouldLogProgress {
+				fmt.Fprintln(os.Stderr, console.FormatInfoMessage(
+					fmt.Sprintf("Usage artifact already present for run %d, skipping download", runID)))
+			}
+			return nil
+		}
+		forecastRunLog.Printf("Usage artifact partially missing for run %d: %v; downloading missing entries", runID, missing)
+		artifactFilter = missing
 	}
-	// Fallback: legacy run summaries (written before TokenUsage was a separate
-	// field) may have stored the computed ET directly on the Run struct.
-	if summary.Run.EffectiveTokens > 0 {
-		return summary.Run.EffectiveTokens
+
+	if err := os.MkdirAll(outputDir, constants.DirPermPublic); err != nil {
+		return fmt.Errorf("failed to create output directory for run %d: %w", runID, err)
 	}
-	return 0
+
+	// List available artifacts for the run to find which match the filter.
+	artifactNames, listErr := listRunArtifactNames(ctx, runID, owner, repo, hostname, verbose)
+	if listErr != nil {
+		forecastRunLog.Printf("Failed to list artifacts for run %d: %v", runID, listErr)
+		if fileutil.IsDirEmpty(outputDir) {
+			_ = os.RemoveAll(outputDir)
+		}
+		return fmt.Errorf("failed to list artifacts for run %d: %w", runID, listErr)
+	}
+
+	var downloadableNames []string
+	for _, name := range artifactNames {
+		if !isDockerBuildArtifact(name) && artifactMatchesFilter(name, artifactFilter) {
+			downloadableNames = append(downloadableNames, name)
+		}
+	}
+
+	forecastRunLog.Printf("Run %d: listed artifacts=%v, filter=%v, downloadable=%v", runID, artifactNames, artifactFilter, downloadableNames)
+
+	if len(downloadableNames) == 0 {
+		// No usage artifact — clean up empty directory and report.
+		if fileutil.IsDirEmpty(outputDir) {
+			_ = os.RemoveAll(outputDir)
+		}
+		return ErrNoArtifacts
+	}
+
+	if shouldLogProgress {
+		fmt.Fprintln(os.Stderr, console.FormatInfoMessage(
+			fmt.Sprintf("Downloading usage artifact(s) for run %d: %v", runID, downloadableNames)))
+	}
+
+	if err := downloadArtifactsByName(ctx, runID, outputDir, downloadableNames, verbose, owner, repo, hostname); err != nil {
+		return fmt.Errorf("failed to download usage artifact for run %d: %w", runID, err)
+	}
+
+	if fileutil.IsDirEmpty(outputDir) {
+		return ErrNoArtifacts
+	}
+
+	forecastRunLog.Printf("Downloaded usage artifact for run %d to %s", runID, outputDir)
+	return nil
+}
+
+// emitPartialForecastResults outputs whatever workflow results have been collected so
+// far when the forecast computation is interrupted (timeout or user cancellation).
+// Partial results are only meaningful when at least one workflow has been fully
+// processed; the function is a no-op when results is empty so callers do not need to
+// guard against it.
+func emitPartialForecastResults(results []ForecastWorkflowResult, config ForecastConfig, now time.Time) {
+	if len(results) == 0 {
+		return
+	}
+	forecastRunLog.Printf("Emitting %d partial forecast result(s) before early exit", len(results))
+	fmt.Fprintln(os.Stderr, console.FormatWarningMessage(
+		fmt.Sprintf("Forecast interrupted; emitting partial results for %d workflow(s) processed so far.", len(results))))
+
+	// Sort partial results by Monte Carlo P50 descending (mirrors the full-results sort).
+	slices.SortFunc(results, func(a, b ForecastWorkflowResult) int {
+		pi := a.ProjectedAIC
+		if mc := a.MonteCarlo; mc != nil {
+			pi = mc.P50ProjectedAIC
+		}
+		pj := b.ProjectedAIC
+		if mc := b.MonteCarlo; mc != nil {
+			pj = mc.P50ProjectedAIC
+		}
+		if pi > pj {
+			return -1
+		}
+		if pi < pj {
+			return 1
+		}
+		return 0
+	})
+
+	output := ForecastResult{
+		Period:    config.Period,
+		AsOf:      now.UTC().Format(time.RFC3339),
+		EvalMode:  config.EvalMode,
+		Workflows: results,
+	}
+	if config.JSONOutput {
+		_ = renderForecastJSON(output)
+	} else {
+		_ = renderForecastTable(output, config)
+	}
+}
+
+func isCompletedNonSkippedRun(r WorkflowRun) bool {
+	return r.Status == "completed" && r.Conclusion != "skipped"
 }
 
 // evaluateForecast fetches actual completed runs in the validation window and
@@ -821,7 +1088,7 @@ func loadCachedEffectiveTokens(runID int64, verbose bool) int {
 // period that was forecast (= one projection period immediately before now).
 // Actual runs are fetched with the same pagination helper used for training,
 // but with the validation date range.
-func evaluateForecast(workflowName string, forecast ForecastWorkflowResult, validationStartDate, validationEndDate string, config ForecastConfig) *ForecastEvaluation {
+func evaluateForecast(ctx context.Context, workflowName string, forecast ForecastWorkflowResult, validationStartDate, validationEndDate string, config ForecastConfig) *ForecastEvaluation {
 	// Compute the actual ISO-8601 training start date by subtracting HistoryDays
 	// from the validation start (= anchor).
 	var trainingStartDate string
@@ -845,11 +1112,14 @@ func evaluateForecast(workflowName string, forecast ForecastWorkflowResult, vali
 	// Fetch completed runs in the validation window.
 	opts := ListWorkflowRunsOptions{
 		WorkflowName: apiName,
+		Status:       "completed",
 		StartDate:    validationStartDate,
 		Limit:        config.SampleSize,
+		TargetCount:  config.SampleSize,
 		RepoOverride: config.RepoOverride,
 		Verbose:      config.Verbose,
 	}
+	opts.Context = ctx
 	runs, _, err := listWorkflowRunsWithPagination(opts)
 	if err != nil {
 		forecastRunLog.Printf("Eval: failed to fetch validation runs for %s: %v", workflowName, err)
@@ -860,7 +1130,7 @@ func evaluateForecast(workflowName string, forecast ForecastWorkflowResult, vali
 	validationEnd := time.Now()
 	validationStart, _ := time.Parse("2006-01-02", validationStartDate)
 	for _, r := range runs {
-		if r.Status != "completed" {
+		if !isCompletedNonSkippedRun(r) {
 			continue
 		}
 		// Skip runs with no timestamp — we cannot verify they belong to the
@@ -871,28 +1141,25 @@ func evaluateForecast(workflowName string, forecast ForecastWorkflowResult, vali
 		if r.StartedAt.Before(validationStart) || r.StartedAt.After(validationEnd) {
 			continue
 		}
-		if r.EffectiveTokens == 0 {
-			r.EffectiveTokens = loadCachedEffectiveTokens(r.DatabaseID, config.Verbose)
-		}
 		eval.ActualRuns++
-		eval.ActualEffectiveTokens += r.EffectiveTokens
+		eval.ActualAIC += forecastLoadCachedRunAIC(ctx, r.DatabaseID, config.Verbose)
 	}
 
 	// Compute error metrics against P50 (falls back to point estimate).
-	p50 := forecast.ProjectedEffectiveTokens
-	p10 := forecast.ProjectedEffectiveTokens
-	p90 := forecast.ProjectedEffectiveTokens
+	p50 := forecast.ProjectedAIC
+	p10 := forecast.ProjectedAIC
+	p90 := forecast.ProjectedAIC
 	if mc := forecast.MonteCarlo; mc != nil {
-		p50 = mc.P50ProjectedEffectiveTokens
-		p10 = mc.P10ProjectedEffectiveTokens
-		p90 = mc.P90ProjectedEffectiveTokens
+		p50 = mc.P50ProjectedAIC
+		p10 = mc.P10ProjectedAIC
+		p90 = mc.P90ProjectedAIC
 	}
 
-	eval.P50ErrorAbs = eval.ActualEffectiveTokens - p50
+	eval.P50ErrorAbs = eval.ActualAIC - p50
 	if p50 > 0 {
-		eval.P50ErrorPct = float64(eval.P50ErrorAbs) / float64(p50) * 100
+		eval.P50ErrorPct = eval.P50ErrorAbs / p50 * 100
 	}
-	eval.InCI = eval.ActualEffectiveTokens >= p10 && eval.ActualEffectiveTokens <= p90
+	eval.InCI = eval.ActualAIC >= p10 && eval.ActualAIC <= p90
 
 	return eval
 }
@@ -905,73 +1172,78 @@ func renderForecastJSON(output ForecastResult) error {
 	if err != nil {
 		return fmt.Errorf("failed to marshal forecast JSON: %w", err)
 	}
-	fmt.Println(string(b))
+	fmt.Fprintln(os.Stdout, string(b))
 	return nil
 }
 
 // forecastTableRow is a flattened struct used for console table rendering.
 type forecastTableRow struct {
-	Workflow           string `json:"workflow"                console:"header:Workflow"`
-	Runs               int    `json:"runs"                    console:"header:Sampled Runs"`
-	SuccessRate        string `json:"success_rate"            console:"header:Success Rate"`
-	Yield              string `json:"yield"                   console:"header:Yield/Period"`
-	AvgEffectiveTokens string `json:"avg_effective_tokens"    console:"header:Avg ET"`
-	ProjectedTokens    string `json:"projected_tokens"        console:"header:Proj. ET (P50)"`
-	ETRange            string `json:"et_range"                console:"header:80% CI (P10–P90)"`
-	Triggers           string `json:"triggers"                console:"header:Triggers"`
+	Workflow    string `json:"workflow"     console:"header:Workflow"`
+	Engines     string `json:"engines"      console:"header:Engines"`
+	Runs        int    `json:"runs"         console:"header:Runs"`
+	P50PerRun   string `json:"p50_per_run"  console:"header:P50/Run"`
+	P95PerRun   string `json:"p95_per_run"  console:"header:P95/Run"`
+	WeeklyP50   string `json:"weekly_p50"   console:"header:Weekly (P50)"`
+	MonthlyP50  string `json:"monthly_p50"  console:"header:Monthly (P50)"`
+	SuccessRate string `json:"success_rate" console:"header:Success Rate"`
+	Triggers    string `json:"triggers"     console:"header:Triggers"`
 }
 
 // renderForecastTable renders the forecast result as a human-readable table.
 func renderForecastTable(output ForecastResult, config ForecastConfig) error {
-	periodLabel := strings.ToUpper(output.Period[:1]) + output.Period[1:]
 	fmt.Fprintln(os.Stderr, console.FormatInfoMessage(
-		fmt.Sprintf("Workflow Forecast — per %s (based on last %d days of history)", periodLabel, config.Days)))
+		fmt.Sprintf("Workflow Forecast — weekly & monthly projections (based on last %d days of history)", config.Days)))
 	fmt.Fprintln(os.Stderr, "")
 
 	anyUnreliable := false
-	rows := make([]forecastTableRow, 0, len(output.Workflows))
+	var totalWeeklyP50, totalMonthlyP50 float64
+	rows := make([]forecastTableRow, 0, len(output.Workflows)+1)
 	for _, wf := range output.Workflows {
-		// Use Monte Carlo P50 as the primary ET estimate when available.
-		projETStr := formatForecastTokens(wf.ProjectedEffectiveTokens)
-		etRangeStr := "-"
 		unreliableMark := ""
-		if mc := wf.MonteCarlo; mc != nil {
-			projETStr = formatForecastTokens(mc.P50ProjectedEffectiveTokens)
-			etRangeStr = fmt.Sprintf("%s–%s",
-				formatForecastTokens(mc.P10ProjectedEffectiveTokens),
-				formatForecastTokens(mc.P90ProjectedEffectiveTokens))
+
+		weeklyP50 := wf.WeeklyProjectedAIC
+		if mc := wf.WeeklyMonteCarlo; mc != nil {
+			weeklyP50 = mc.P50ProjectedAIC
 			if !mc.IsReliable {
 				anyUnreliable = true
 				unreliableMark = "*"
 			}
 		}
+		monthlyP50 := wf.MonthlyProjectedAIC
+		if mc := wf.MonthlyMonteCarlo; mc != nil {
+			monthlyP50 = mc.P50ProjectedAIC
+		}
+		totalWeeklyP50 += weeklyP50
+		totalMonthlyP50 += monthlyP50
+
 		row := forecastTableRow{
-			Workflow:           wf.WorkflowID + unreliableMark,
-			Runs:               wf.SampledRuns,
-			SuccessRate:        formatForecastPercent(wf.SuccessRate, wf.SampledRuns > 0),
-			Yield:              fmt.Sprintf("%.1f", wf.Yield),
-			AvgEffectiveTokens: formatForecastTokens(wf.AvgEffectiveTokens),
-			ProjectedTokens:    projETStr,
-			ETRange:            etRangeStr,
-			Triggers:           formatTriggerList(wf.ActiveTriggers),
+			Workflow:    wf.WorkflowID + unreliableMark,
+			Engines:     formatEngineList(wf.Engines),
+			Runs:        wf.SampledRuns,
+			P50PerRun:   formatForecastAIC(wf.P50AIC),
+			P95PerRun:   formatForecastAIC(wf.P95AIC),
+			WeeklyP50:   formatForecastAIC(weeklyP50),
+			MonthlyP50:  formatForecastAIC(monthlyP50),
+			SuccessRate: formatForecastPercent(wf.SuccessRate, wf.SampledRuns > 0),
+			Triggers:    formatTriggerList(wf.ActiveTriggers),
 		}
 		rows = append(rows, row)
+	}
+
+	// Append a totals row when more than one workflow is present.
+	if len(output.Workflows) > 1 {
+		rows = append(rows, forecastTableRow{
+			Workflow:   "TOTAL",
+			WeeklyP50:  formatForecastAIC(totalWeeklyP50),
+			MonthlyP50: formatForecastAIC(totalMonthlyP50),
+		})
 	}
 
 	fmt.Fprint(os.Stderr, console.RenderStruct(rows))
 	fmt.Fprintln(os.Stderr, "")
 
-	// Show episode analysis when any workflow has multi-run episodes.
-	anyMultiRunEpisodes := false
-	for _, wf := range output.Workflows {
-		if wf.EpisodeAnalysis != nil && wf.EpisodeAnalysis.RunsPerEpisode > 1.0 {
-			anyMultiRunEpisodes = true
-			break
-		}
-	}
-	if anyMultiRunEpisodes {
-		printEpisodeBreakdown(output.Workflows)
-	}
+	// Show detailed per-run samples section.
+	printRunSamplesSection(output.Workflows)
 
 	// Show experiment variant details when present.
 	for _, wf := range output.Workflows {
@@ -986,44 +1258,53 @@ func renderForecastTable(output ForecastResult, config ForecastConfig) error {
 	}
 
 	fmt.Fprintln(os.Stderr, console.FormatInfoMessage(
-		fmt.Sprintf("P50 = median; 80%% CI = P10–P90 from %d-trial Monte Carlo simulation (Gamma–Poisson model accounts for rate estimation uncertainty).", monteCarloIterations)))
+		fmt.Sprintf("P50/Run = per-run median AIC; P95/Run = 95th-percentile per-run AIC; Weekly/Monthly = projected P50 from %d-trial Monte Carlo simulation.", monteCarloIterations)))
 	if anyUnreliable {
 		fmt.Fprintln(os.Stderr, console.FormatWarningMessage(
 			fmt.Sprintf("* Fewer than %d sampled runs — confidence intervals may be unreliable.", minObservationsForReliableForecast)))
 	}
 	fmt.Fprintln(os.Stderr, console.FormatInfoMessage(
-		fmt.Sprintf("Run '%s forecast --json' for full output.", string(constants.CLIExtensionPrefix))))
+		fmt.Sprintf("Run '%s forecast --json' for full Monte Carlo output including P10/P90 confidence intervals.", string(constants.CLIExtensionPrefix))))
 	return nil
 }
 
-// printEpisodeBreakdown renders per-episode ET metrics for workflows that have
-// multi-run episodes (i.e. orchestrator-style workflows dispatching sub-workflows).
-func printEpisodeBreakdown(workflows []ForecastWorkflowResult) {
-	type episodeRow struct {
-		Workflow          string `json:"workflow"               console:"header:Workflow"`
-		Episodes          int    `json:"episodes"               console:"header:Episodes"`
-		RunsPerEpisode    string `json:"runs_per_episode"       console:"header:Runs/Episode"`
-		AvgETPerEpisode   string `json:"avg_et_per_episode"     console:"header:Avg ET/Episode"`
-		EpisodesPerPeriod string `json:"episodes_per_period"    console:"header:Episodes/Period"`
+// printRunSamplesSection prints a detailed table of the sampled runs used in the forecast,
+// including the run ID, date, and raw AIC for each run.  Workflows with no samples are skipped.
+func printRunSamplesSection(workflows []ForecastWorkflowResult) {
+	type runRow struct {
+		RunID string `json:"run_id" console:"header:Run ID"`
+		Date  string `json:"date"   console:"header:Date"`
+		AIC   string `json:"aic"    console:"header:AIC"`
 	}
 
-	fmt.Fprintln(os.Stderr, console.FormatInfoMessage("Episode analysis (runs grouped by logical task):"))
-	epRows := make([]episodeRow, 0, len(workflows))
+	hasSamples := false
 	for _, wf := range workflows {
-		ep := wf.EpisodeAnalysis
-		if ep == nil {
+		if len(wf.RunSamples) > 0 {
+			hasSamples = true
+			break
+		}
+	}
+	if !hasSamples {
+		return
+	}
+
+	fmt.Fprintln(os.Stderr, console.FormatInfoMessage("Sampled runs used in computation:"))
+	for _, wf := range workflows {
+		if len(wf.RunSamples) == 0 {
 			continue
 		}
-		epRows = append(epRows, episodeRow{
-			Workflow:          wf.WorkflowID,
-			Episodes:          ep.SampledEpisodes,
-			RunsPerEpisode:    fmt.Sprintf("%.1f", ep.RunsPerEpisode),
-			AvgETPerEpisode:   formatForecastTokens(ep.AvgEffectiveTokensPerEpisode),
-			EpisodesPerPeriod: fmt.Sprintf("%.1f", ep.ObservedEpisodesPerPeriod),
-		})
+		fmt.Fprintf(os.Stderr, "  %s (%d run(s)):\n", wf.WorkflowID, len(wf.RunSamples))
+		rows := make([]runRow, 0, len(wf.RunSamples))
+		for _, s := range wf.RunSamples {
+			rows = append(rows, runRow{
+				RunID: fmt.Sprintf("#%d", s.RunID),
+				Date:  s.Date,
+				AIC:   formatForecastAIC(s.AIC),
+			})
+		}
+		fmt.Fprint(os.Stderr, console.RenderStruct(rows))
+		fmt.Fprintln(os.Stderr, "")
 	}
-	fmt.Fprint(os.Stderr, console.RenderStruct(epRows))
-	fmt.Fprintln(os.Stderr, "")
 }
 
 // printEvalBreakdown renders the backtesting comparison table.
@@ -1031,7 +1312,7 @@ func printEvalBreakdown(workflows []ForecastWorkflowResult) {
 	type evalRow struct {
 		Workflow    string `json:"workflow"       console:"header:Workflow"`
 		ActualRuns  int    `json:"actual_runs"    console:"header:Actual Runs"`
-		ActualET    string `json:"actual_et"      console:"header:Actual ET"`
+		ActualAIC   string `json:"actual_aic"     console:"header:Actual AIC"`
 		ForecastP50 string `json:"forecast_p50"   console:"header:Forecast P50"`
 		ErrorAbs    string `json:"error_abs"      console:"header:Error (abs)"`
 		ErrorPct    string `json:"error_pct"      console:"header:Error %"`
@@ -1045,9 +1326,9 @@ func printEvalBreakdown(workflows []ForecastWorkflowResult) {
 		if ev == nil {
 			continue
 		}
-		p50 := wf.ProjectedEffectiveTokens
+		p50 := wf.ProjectedAIC
 		if mc := wf.MonteCarlo; mc != nil {
-			p50 = mc.P50ProjectedEffectiveTokens
+			p50 = mc.P50ProjectedAIC
 		}
 		inCI := "No"
 		if ev.InCI {
@@ -1056,9 +1337,9 @@ func printEvalBreakdown(workflows []ForecastWorkflowResult) {
 		rows = append(rows, evalRow{
 			Workflow:    wf.WorkflowID,
 			ActualRuns:  ev.ActualRuns,
-			ActualET:    formatForecastTokens(ev.ActualEffectiveTokens),
-			ForecastP50: formatForecastTokens(p50),
-			ErrorAbs:    formatForecastSignedTokens(ev.P50ErrorAbs),
+			ActualAIC:   formatForecastAIC(ev.ActualAIC),
+			ForecastP50: formatForecastAIC(p50),
+			ErrorAbs:    formatForecastSignedAIC(ev.P50ErrorAbs),
 			ErrorPct:    fmt.Sprintf("%.1f%%", ev.P50ErrorPct),
 			InCI:        inCI,
 		})
@@ -1103,32 +1384,49 @@ func formatForecastPercent(v float64, hasData bool) string {
 	return fmt.Sprintf("%.0f%%", v*100)
 }
 
-func formatForecastTokens(n int) string {
-	if n == 0 {
+func formatForecastAIC(value float64) string {
+	if value <= 0 {
 		return "-"
 	}
-	if n < 1000 {
-		return strconv.Itoa(n)
+	if value < 1 {
+		return fmt.Sprintf("%.3f", value)
 	}
-	if n < 1_000_000 {
-		return fmt.Sprintf("%.1fK", float64(n)/1000)
+	if value < 10 {
+		return fmt.Sprintf("%.2f", value)
 	}
-	return fmt.Sprintf("%.2fM", float64(n)/1_000_000)
+	if value < 1000 {
+		return fmt.Sprintf("%.0f", value)
+	}
+	if value < 1_000_000 {
+		return fmt.Sprintf("%.1fK", value/1000)
+	}
+	return fmt.Sprintf("%.2fM", value/1_000_000)
 }
 
-// formatForecastSignedTokens formats a signed integer token count, preserving
+func formatEngineList(engines []string) string {
+	if len(engines) == 0 {
+		return "-"
+	}
+	return strings.Join(engines, ", ")
+}
+
+// formatForecastSignedAIC formats a signed AIC value, preserving
 // the sign so callers can display positive/negative deltas (e.g., error abs).
-func formatForecastSignedTokens(n int) string {
-	if n == 0 {
+func formatForecastSignedAIC(value float64) string {
+	if value == 0 {
 		return "0"
 	}
 	sign := ""
-	v := n
-	if n < 0 {
+	v := value
+	if value < 0 {
 		sign = "-"
-		v = -n
+		v = math.Abs(value)
 	}
-	return sign + formatForecastTokens(v)
+	return sign + formatForecastAIC(v)
+}
+
+func roundForecastAIC(value float64) float64 {
+	return math.Round(value*1000) / 1000
 }
 
 func formatTriggerList(triggers []string) string {

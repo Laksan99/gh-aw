@@ -1,6 +1,12 @@
 ---
+private: true
+emoji: "🧪"
 description: Smoke test to validate --allow-host-service-ports with Redis service container
 on:
+  slash_command:
+    name: smoke-service-ports
+    strategy: centralized
+    events: [issues, issue_comment, pull_request, pull_request_comment]
   workflow_dispatch:
   status-comment: true
 permissions:
@@ -33,13 +39,15 @@ safe-outputs:
       hide-older-comments: true
       max: 2
     messages:
-      footer: "> 🔌 *Service ports validation by [{workflow_name}]({run_url})*{effective_tokens_suffix}{history_link}"
+      footer: "> 🔌 *Service ports validation by [{workflow_name}]({run_url})*{ai_credits_suffix}{history_link}"
       run-started: "🔌 Starting service ports validation... [{workflow_name}]({run_url}) is testing Redis connectivity..."
       run-success: "✅ Service ports validation passed! [{workflow_name}]({run_url}) confirms agent can reach Redis."
       run-failure: "❌ Service ports validation failed! [{workflow_name}]({run_url}) could not reach Redis: {status}"
 timeout-minutes: 5
 imports:
-  - shared/observability-otlp.md
+  - shared/otlp.md
+features:
+  gh-aw-detection: false
 ---
 
 # Smoke Test: Service Ports (Redis)

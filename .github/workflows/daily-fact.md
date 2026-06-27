@@ -1,9 +1,12 @@
 ---
+private: true
+emoji: "📚"
 description: Posts a daily poetic verse about the gh-aw project to a discussion thread
 on:
   schedule:
     - cron: "daily around 14:00 on weekdays"  # ~2 PM UTC, weekdays only
   workflow_dispatch:
+max-daily-ai-credits: 10000
 permissions:
   contents: read
   issues: read
@@ -13,7 +16,7 @@ permissions:
 tracker-id: daily-fact-thread
 engine:
   id: codex
-  model: gpt-5.4-mini
+  model: gpt-5.4
   bare: true
 strict: true
 experiments:
@@ -36,12 +39,15 @@ timeout-minutes: 15
 runs-on: aw-gpu-runner-T4
 runtimes:
   node:
-    version: "24"
+    version: "22"
 inlined-imports: true
 network:
   allowed:
     - defaults
 
+sandbox:
+  agent:
+    sudo: false
 tools:
   cli-proxy: true
   github:
@@ -53,15 +59,15 @@ safe-outputs:
   add-comment:
     target: "4750"
   messages:
-    footer: "> 🪶 *Penned with care by [{workflow_name}]({run_url})*{effective_tokens_suffix}{history_link}"
+    footer: "> 🪶 *Penned with care by [{workflow_name}]({run_url})*{ai_credits_suffix}{history_link}"
     run-started: "📜 Hark! The muse awakens — [{workflow_name}]({run_url}) begins its verse upon this {event_type}..."
     run-success: "✨ Lo! [{workflow_name}]({run_url}) hath woven its tale to completion, like a sonnet finding its final rhyme. 🌟"
     run-failure: "🌧️ Alas! [{workflow_name}]({run_url}) {status}, its quill fallen mid-verse. The poem remains unfinished..."
 imports:
-  - shared/observability-otlp.md
+  - shared/otlp.md
   - shared/mcp/mempalace.md
-firewall:
-  effective-token-steering: true
+features:
+  gh-aw-detection: true
 ---
 
 {{#runtime-import? .github/shared-instructions.md}}

@@ -87,15 +87,13 @@ Maps PR check rollups to one of the following normalized states:
 JSON output includes two state fields:
   state          - aggregate state across all check runs and commit statuses
   required_state - state derived from check runs and policy commit statuses only;
-                   ignores optional third-party commit statuses (e.g. Vercel,
+                   ignores optional third-party commit statuses (e.g., Vercel,
                    Netlify deployments) but still surfaces policy_blocked when
                    branch-protection or account-gate statuses fail
 
 Use required_state as the authoritative CI verdict in repos that have optional
-deployment integrations posting commit statuses alongside required CI checks.
-
-Examples:
-  ` + string(constants.CLIExtensionPrefix) + ` checks 42                    # Classify checks for PR #42
+deployment integrations posting commit statuses alongside required CI checks.`,
+		Example: `  ` + string(constants.CLIExtensionPrefix) + ` checks 42                    # Classify checks for PR #42
   ` + string(constants.CLIExtensionPrefix) + ` checks 42 --repo owner/repo  # Specify repository
   ` + string(constants.CLIExtensionPrefix) + ` checks 42 --json             # Output in JSON format`,
 		Args: cobra.ExactArgs(1),
@@ -410,6 +408,6 @@ func printChecksText(result *ChecksResult) error {
 	}
 
 	// Always print the normalized state to stdout for machine consumption.
-	fmt.Println(string(result.State))
+	fmt.Fprintln(os.Stdout, string(result.State))
 	return nil
 }

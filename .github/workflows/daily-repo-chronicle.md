@@ -1,4 +1,6 @@
 ---
+private: true
+emoji: "📅"
 description: Creates a narrative chronicle of daily repository activity including commits, PRs, issues, and discussions
 on:
   schedule:
@@ -9,8 +11,11 @@ permissions:
   issues: read
   pull-requests: read
   discussions: read
+  copilot-requests: write
 tracker-id: daily-repo-chronicle
-engine: copilot
+engine:
+  id: copilot
+  copilot-sdk: true
 
 timeout-minutes: 45
 
@@ -20,7 +25,9 @@ network:
     - python
     - node
 sandbox:
-  agent: awf  # Firewall enabled (migrated from network.firewall)
+  agent:
+    id: awf
+    sudo: false
 tools:
   cli-proxy: true
   edit:
@@ -46,10 +53,9 @@ imports:
       title-prefix: "[repo-chronicle] "
       expires: 3d
   - shared/trends.md
-  - shared/observability-otlp.md
+  - shared/otlp.md
 features:
-  copilot-requests: true
-
+  gh-aw-detection: true
 ---
 
 {{#runtime-import? .github/shared-instructions.md}}

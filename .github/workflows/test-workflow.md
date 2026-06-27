@@ -1,4 +1,6 @@
 ---
+private: true
+emoji: "🧪"
 name: Test Workflow
 on:
   workflow_dispatch:
@@ -7,11 +9,14 @@ on:
         description: 'Question from the dispatcher workflow'
         type: string
         required: true
+timeout-minutes: 10
 permissions:
   contents: read
 
 imports:
-  - shared/observability-otlp.md
+  - shared/otlp.md
+features:
+  gh-aw-detection: true
 ---
 
 # Instructions for Test Workflow

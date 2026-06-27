@@ -4,11 +4,13 @@ import (
 	"encoding/json"
 	"fmt"
 	"regexp"
-	"sort"
+	"slices"
 	"strings"
 
 	"github.com/github/gh-aw/pkg/logger"
+	"github.com/github/gh-aw/pkg/setutil"
 	"github.com/github/gh-aw/pkg/sliceutil"
+	"github.com/github/gh-aw/pkg/stringutil"
 )
 
 var schemaSuggestionsLog = logger.New("parser:schema_suggestions")
@@ -35,82 +37,26 @@ type schemaFieldLocation struct {
 // frontmatterContent is the raw YAML frontmatter text, used to extract the user's typed value for enum suggestions.
 func generateSchemaBasedSuggestions(schemaJSON, errorMessage, jsonPath, frontmatterContent string) string {
 	schemaSuggestionsLog.Printf("Generating schema suggestions: path=%s, schema_size=%d bytes", jsonPath, len(schemaJSON))
-	// Use the cached parsed schema document to avoid re-parsing on every error call.
 	schemaDoc, err := getParsedSchemaDoc(schemaJSON)
 	if err != nil {
 		schemaSuggestionsLog.Printf("Failed to parse schema JSON: %v", err)
-		return "" // Can't parse schema, no suggestions
-	}
-
-	// Check if this is an enum constraint violation ("value must be one of")
-	if strings.Contains(strings.ToLower(errorMessage), "value must be one of") {
-		schemaSuggestionsLog.Print("Detected enum constraint violation")
-		enumValues := extractEnumValuesFromError(errorMessage)
-		// For oneOf errors, the path points to the container (e.g., "/permissions") but
-		// the enum constraint is on a nested field (e.g., "/permissions/contents").
-		// Try to extract the actual sub-path from the message.
-		actualPath := extractEnumConstraintPath(errorMessage, jsonPath)
-		userValue := extractYAMLValueAtPath(frontmatterContent, actualPath)
-		if userValue != "" && len(enumValues) > 0 {
-			closest := sliceutil.Deduplicate(FindClosestMatches(userValue, enumValues, maxClosestMatches))
-			if len(closest) == 1 {
-				return fmt.Sprintf("Did you mean '%s'?", closest[0])
-			} else if len(closest) > 1 {
-				return fmt.Sprintf("Did you mean: %s?", strings.Join(closest, ", "))
-			}
-		}
-		// No close matches or no user value — no additional suggestion needed since
-		// the valid values are already listed in the error message itself
 		return ""
 	}
 
-	// Check if this is an additional properties error
-	if strings.Contains(strings.ToLower(errorMessage), "additional propert") && strings.Contains(strings.ToLower(errorMessage), "not allowed") {
-		schemaSuggestionsLog.Print("Detected additional properties error")
-		invalidProps := extractAdditionalPropertyNames(errorMessage)
-		acceptedFields := extractAcceptedFieldsFromSchema(schemaDoc, jsonPath)
-
-		var suggestions []string
-
-		if len(acceptedFields) > 0 {
-			schemaSuggestionsLog.Printf("Found %d accepted fields for invalid properties %v", len(acceptedFields), invalidProps)
-			if s := generateFieldSuggestions(invalidProps, acceptedFields); s != "" {
-				suggestions = append(suggestions, s)
-			}
-		}
-
-		// Search the whole schema for where these fields belong (path heuristic)
-		if s := generatePathLocationSuggestion(invalidProps, schemaDoc, jsonPath); s != "" {
-			schemaSuggestionsLog.Printf("Found path location suggestion: %s", s)
-			suggestions = append(suggestions, s)
-		}
-
-		if len(suggestions) > 0 {
-			return strings.Join(suggestions, ". ")
-		}
+	if suggestion, handled := enumSuggestion(errorMessage, jsonPath, frontmatterContent); handled {
+		return suggestion
 	}
 
-	// Check if this is a minimum/maximum constraint violation and surface schema examples.
-	// pathInfo.Message has the form "at '/timeout-minutes': minimum: got X, want Y",
-	// so use Contains rather than HasPrefix to detect the constraint keyword.
-	lowerMsg := strings.ToLower(errorMessage)
-	if (strings.Contains(lowerMsg, "minimum:") || strings.Contains(lowerMsg, "maximum:")) &&
-		strings.Contains(lowerMsg, "got ") && strings.Contains(lowerMsg, "want ") {
-		schemaSuggestionsLog.Print("Detected range constraint violation, looking for schema examples")
-		if examples := extractSchemaExamples(schemaDoc, jsonPath); len(examples) > 0 {
-			schemaSuggestionsLog.Printf("Found %d schema examples for %s", len(examples), jsonPath)
-			return "Example values: " + strings.Join(examples, ", ")
-		}
+	if suggestion := additionalPropertiesSuggestion(schemaDoc, errorMessage, jsonPath); suggestion != "" {
+		return suggestion
 	}
 
-	// Check if this is a type error
-	if strings.Contains(strings.ToLower(errorMessage), "got ") && strings.Contains(strings.ToLower(errorMessage), "want ") {
-		schemaSuggestionsLog.Print("Detected type mismatch error")
-		example := generateExampleJSONForPath(schemaDoc, jsonPath)
-		if example != "" {
-			schemaSuggestionsLog.Printf("Generated example JSON: length=%d bytes", len(example))
-			return "Expected format: " + example
-		}
+	if suggestion := rangeConstraintSuggestion(schemaDoc, errorMessage, jsonPath); suggestion != "" {
+		return suggestion
+	}
+
+	if suggestion := typeMismatchSuggestion(schemaDoc, errorMessage, jsonPath); suggestion != "" {
+		return suggestion
 	}
 
 	schemaSuggestionsLog.Print("No suggestions generated for error")
@@ -160,11 +106,7 @@ func extractAcceptedFieldsFromSchema(schemaDoc any, jsonPath string) []string {
 
 	// Extract properties from the target schema
 	if properties, ok := targetSchema["properties"].(map[string]any); ok {
-		var fields []string
-		for fieldName := range properties {
-			fields = append(fields, fieldName)
-		}
-		sort.Strings(fields) // Sort for consistent output
+		fields := sliceutil.SortedKeys(properties) // Sort for consistent output
 		return fields
 	}
 
@@ -288,47 +230,8 @@ func generateFieldSuggestions(invalidProps, acceptedFields []string) string {
 // Results are sorted by distance (closest first), then alphabetically for ties.
 func FindClosestMatches(target string, candidates []string, maxResults int) []string {
 	schemaSuggestionsLog.Printf("Finding closest matches for '%s' from %d candidates", target, len(candidates))
-	type match struct {
-		value    string
-		distance int
-	}
-
-	const maxDistance = 3 // Maximum acceptable Levenshtein distance
-
-	var matches []match
-	targetLower := strings.ToLower(target)
-
-	for _, candidate := range candidates {
-		candidateLower := strings.ToLower(candidate)
-
-		// Skip exact matches
-		if targetLower == candidateLower {
-			continue
-		}
-
-		distance := LevenshteinDistance(targetLower, candidateLower)
-
-		// Only include if distance is within acceptable range
-		if distance <= maxDistance {
-			matches = append(matches, match{value: candidate, distance: distance})
-		}
-	}
-
-	// Sort by distance (lower is better), then alphabetically for ties
-	sort.Slice(matches, func(i, j int) bool {
-		if matches[i].distance != matches[j].distance {
-			return matches[i].distance < matches[j].distance
-		}
-		return matches[i].value < matches[j].value
-	})
-
-	// Return top matches
-	var results []string
-	for i := 0; i < len(matches) && i < maxResults; i++ {
-		results = append(results, matches[i].value)
-	}
-
-	schemaSuggestionsLog.Printf("Found %d closest matches (from %d total matches within max distance)", len(results), len(matches))
+	results := stringutil.FindClosestMatches(target, candidates, maxResults)
+	schemaSuggestionsLog.Printf("Found %d closest matches", len(results))
 	return results
 }
 
@@ -336,54 +239,7 @@ func FindClosestMatches(target string, candidates []string, maxResults int) []st
 // This is the minimum number of single-character edits (insertions, deletions, or substitutions)
 // required to change one string into the other.
 func LevenshteinDistance(a, b string) int {
-	aLen := len(a)
-	bLen := len(b)
-
-	// Early exit for empty strings
-	if aLen == 0 {
-		return bLen
-	}
-	if bLen == 0 {
-		return aLen
-	}
-
-	// Create a 2D matrix for dynamic programming
-	// We only need the previous row, so we can optimize space
-	previousRow := make([]int, bLen+1)
-	currentRow := make([]int, bLen+1)
-
-	// Initialize the first row (distance from empty string)
-	for i := 0; i <= bLen; i++ {
-		previousRow[i] = i
-	}
-
-	// Calculate distances for each character in string a
-	for i := 1; i <= aLen; i++ {
-		currentRow[0] = i // Distance from empty string
-
-		for j := 1; j <= bLen; j++ {
-			// Cost of substitution (0 if characters match, 1 otherwise)
-			cost := 1
-			if a[i-1] == b[j-1] {
-				cost = 0
-			}
-
-			// Minimum of:
-			// - Deletion: previousRow[j] + 1
-			// - Insertion: currentRow[j-1] + 1
-			// - Substitution: previousRow[j-1] + cost
-			deletion := previousRow[j] + 1
-			insertion := currentRow[j-1] + 1
-			substitution := previousRow[j-1] + cost
-
-			currentRow[j] = min(deletion, min(insertion, substitution))
-		}
-
-		// Swap rows for next iteration
-		previousRow, currentRow = currentRow, previousRow
-	}
-
-	return previousRow[bLen]
+	return stringutil.LevenshteinDistance(a, b)
 }
 
 // generateExampleJSONForPath generates an example JSON object for a specific schema path
@@ -418,83 +274,192 @@ func generateExampleJSONForPath(schemaDoc any, jsonPath string) string {
 func generateExampleFromSchema(schema map[string]any) any {
 	schemaType, ok := schema["type"].(string)
 	if !ok {
-		// Try to infer from other properties
-		if _, hasProperties := schema["properties"]; hasProperties {
-			schemaType = "object"
-		} else if _, hasItems := schema["items"]; hasItems {
-			schemaType = "array"
-		} else {
+		schemaType = inferSchemaType(schema)
+		if schemaType == "" {
 			return nil
 		}
 	}
 
 	switch schemaType {
 	case "string":
-		if enum, ok := schema["enum"].([]any); ok && len(enum) > 0 {
-			if str, ok := enum[0].(string); ok {
-				return str
-			}
-		}
-		return "string"
+		return generateStringExample(schema)
 	case "number", "integer":
-		// Prefer schema-provided examples over the generic fallback value
-		if examples, ok := schema["examples"].([]any); ok && len(examples) > 0 {
-			return examples[0]
-		}
-		if defaultVal, ok := schema["default"]; ok {
-			return defaultVal
-		}
-		return 42
+		return generateNumberExample(schema)
 	case "boolean":
 		return true
 	case "array":
-		if items, ok := schema["items"].(map[string]any); ok {
-			itemExample := generateExampleFromSchema(items)
-			if itemExample != nil {
-				return []any{itemExample}
-			}
-		}
-		return []any{}
+		return generateArrayExample(schema)
 	case "object":
-		result := make(map[string]any)
-		if properties, ok := schema["properties"].(map[string]any); ok {
-			// Add required properties first
-			requiredFields := make(map[string]bool)
-			if required, ok := schema["required"].([]any); ok {
-				for _, field := range required {
-					if fieldName, ok := field.(string); ok {
-						requiredFields[fieldName] = true
-					}
-				}
-			}
-
-			// Add a few example properties (prioritize required ones)
-			count := 0
-
-			// First, add required fields
-			for propName, propSchema := range properties {
-				if requiredFields[propName] && count < maxExampleFields {
-					if propSchemaMap, ok := propSchema.(map[string]any); ok {
-						result[propName] = generateExampleFromSchema(propSchemaMap)
-						count++
-					}
-				}
-			}
-
-			// Then add some optional fields if we have room
-			for propName, propSchema := range properties {
-				if !requiredFields[propName] && count < maxExampleFields {
-					if propSchemaMap, ok := propSchema.(map[string]any); ok {
-						result[propName] = generateExampleFromSchema(propSchemaMap)
-						count++
-					}
-				}
-			}
-		}
-		return result
+		return generateObjectExample(schema)
 	}
 
 	return nil
+}
+
+func enumSuggestion(errorMessage, jsonPath, frontmatterContent string) (string, bool) {
+	if !strings.Contains(strings.ToLower(errorMessage), "value must be one of") {
+		return "", false
+	}
+
+	schemaSuggestionsLog.Print("Detected enum constraint violation")
+	enumValues := extractEnumValuesFromError(errorMessage)
+	actualPath := extractEnumConstraintPath(errorMessage, jsonPath)
+	userValue := extractYAMLValueAtPath(frontmatterContent, actualPath)
+	if userValue == "" || len(enumValues) == 0 {
+		return "", true
+	}
+
+	closest := sliceutil.Deduplicate(FindClosestMatches(userValue, enumValues, maxClosestMatches))
+	if len(closest) == 1 {
+		return fmt.Sprintf("Did you mean '%s'?", closest[0]), true
+	}
+	if len(closest) > 1 {
+		return fmt.Sprintf("Did you mean: %s?", strings.Join(closest, ", ")), true
+	}
+	return "", true
+}
+
+func additionalPropertiesSuggestion(schemaDoc any, errorMessage, jsonPath string) string {
+	lowerError := strings.ToLower(errorMessage)
+	if !strings.Contains(lowerError, "additional propert") || !strings.Contains(lowerError, "not allowed") {
+		return ""
+	}
+
+	schemaSuggestionsLog.Print("Detected additional properties error")
+	invalidProps := extractAdditionalPropertyNames(errorMessage)
+	acceptedFields := extractAcceptedFieldsFromSchema(schemaDoc, jsonPath)
+	var suggestions []string
+	if len(acceptedFields) > 0 {
+		schemaSuggestionsLog.Printf("Found %d accepted fields for invalid properties %v", len(acceptedFields), invalidProps)
+		if s := generateFieldSuggestions(invalidProps, acceptedFields); s != "" {
+			suggestions = append(suggestions, s)
+		}
+	}
+	if s := generatePathLocationSuggestion(invalidProps, schemaDoc, jsonPath); s != "" {
+		schemaSuggestionsLog.Printf("Found path location suggestion: %s", s)
+		suggestions = append(suggestions, s)
+	}
+	return strings.Join(suggestions, ". ")
+}
+
+func rangeConstraintSuggestion(schemaDoc any, errorMessage, jsonPath string) string {
+	lowerMsg := strings.ToLower(errorMessage)
+	isRangeError := (strings.Contains(lowerMsg, "minimum:") || strings.Contains(lowerMsg, "maximum:")) &&
+		strings.Contains(lowerMsg, "got ") && strings.Contains(lowerMsg, "want ")
+	if !isRangeError {
+		return ""
+	}
+
+	schemaSuggestionsLog.Print("Detected range constraint violation, looking for schema examples")
+	if examples := extractSchemaExamples(schemaDoc, jsonPath); len(examples) > 0 {
+		schemaSuggestionsLog.Printf("Found %d schema examples for %s", len(examples), jsonPath)
+		return "Example values: " + strings.Join(examples, ", ")
+	}
+	return ""
+}
+
+func typeMismatchSuggestion(schemaDoc any, errorMessage, jsonPath string) string {
+	lowerMsg := strings.ToLower(errorMessage)
+	if !strings.Contains(lowerMsg, "got ") || !strings.Contains(lowerMsg, "want ") {
+		return ""
+	}
+
+	schemaSuggestionsLog.Print("Detected type mismatch error")
+	example := generateExampleJSONForPath(schemaDoc, jsonPath)
+	if example == "" {
+		return ""
+	}
+
+	schemaSuggestionsLog.Printf("Generated example JSON: length=%d bytes", len(example))
+	return "Expected format: " + example
+}
+
+func inferSchemaType(schema map[string]any) string {
+	if _, hasProperties := schema["properties"]; hasProperties {
+		return "object"
+	}
+	if _, hasItems := schema["items"]; hasItems {
+		return "array"
+	}
+	return ""
+}
+
+func generateStringExample(schema map[string]any) any {
+	if enum, ok := schema["enum"].([]any); ok && len(enum) > 0 {
+		if str, ok := enum[0].(string); ok {
+			return str
+		}
+	}
+	return "string"
+}
+
+func generateNumberExample(schema map[string]any) any {
+	if examples, ok := schema["examples"].([]any); ok && len(examples) > 0 {
+		return examples[0]
+	}
+	if defaultVal, ok := schema["default"]; ok {
+		return defaultVal
+	}
+	return 42
+}
+
+func generateArrayExample(schema map[string]any) any {
+	items, ok := schema["items"].(map[string]any)
+	if !ok {
+		return []any{}
+	}
+	itemExample := generateExampleFromSchema(items)
+	if itemExample == nil {
+		return []any{}
+	}
+	return []any{itemExample}
+}
+
+func generateObjectExample(schema map[string]any) any {
+	result := make(map[string]any)
+	properties, ok := schema["properties"].(map[string]any)
+	if !ok {
+		return result
+	}
+
+	requiredFields := collectRequiredFields(schema)
+	count := 0
+	count = addObjectExamples(result, properties, requiredFields, true, count)
+	addObjectExamples(result, properties, requiredFields, false, count)
+	return result
+}
+
+func collectRequiredFields(schema map[string]any) map[string]struct {
+} {
+	requiredFields := make(map[string]struct {
+	})
+	required, ok := schema["required"].([]any)
+	if !ok {
+		return requiredFields
+	}
+	for _, field := range required {
+		if fieldName, ok := field.(string); ok {
+			requiredFields[fieldName] = struct {
+			}{}
+		}
+	}
+	return requiredFields
+}
+
+func addObjectExamples(result map[string]any, properties map[string]any, requiredFields map[string]struct {
+}, includeRequired bool, count int) int {
+	for propName, propSchema := range properties {
+		if setutil.Contains(requiredFields, propName) != includeRequired || count >= maxExampleFields {
+			continue
+		}
+		propSchemaMap, ok := propSchema.(map[string]any)
+		if !ok {
+			continue
+		}
+		result[propName] = generateExampleFromSchema(propSchemaMap)
+		count++
+	}
+	return count
 }
 
 // enumValuePattern matches single-quoted values in enum error messages like "value must be one of 'a', 'b', 'c'"
@@ -685,7 +650,8 @@ func findFieldLocationsInSchema(schemaDoc any, targetField, currentPath string) 
 	allLocations := collectSchemaPropertyPaths(schemaDoc, "", 0)
 	targetLower := strings.ToLower(targetField)
 
-	seen := make(map[string]bool)
+	seen := make(map[string]struct {
+	})
 
 	// Collect exact matches first
 	var exactMatches []schemaFieldLocation
@@ -694,12 +660,13 @@ func findFieldLocationsInSchema(schemaDoc any, targetField, currentPath string) 
 			continue
 		}
 		key := loc.FieldName + "|" + loc.SchemaPath
-		if seen[key] {
+		if setutil.Contains(seen, key) {
 			continue
 		}
-		seen[key] = true
+		seen[key] = struct {
+		}{}
 
-		if strings.ToLower(loc.FieldName) == targetLower {
+		if strings.EqualFold(loc.FieldName, targetField) {
 			loc.Distance = 0
 			exactMatches = append(exactMatches, loc)
 		}
@@ -711,17 +678,19 @@ func findFieldLocationsInSchema(schemaDoc any, targetField, currentPath string) 
 	}
 
 	// Fall back to fuzzy matching with a stricter distance threshold for high confidence
-	seenFuzzy := make(map[string]bool)
+	seenFuzzy := make(map[string]struct {
+	})
 	var fuzzyMatches []schemaFieldLocation
 	for _, loc := range allLocations {
 		if loc.SchemaPath == currentPath {
 			continue
 		}
 		key := loc.FieldName + "|" + loc.SchemaPath
-		if seenFuzzy[key] {
+		if setutil.Contains(seenFuzzy, key) {
 			continue
 		}
-		seenFuzzy[key] = true
+		seenFuzzy[key] = struct {
+		}{}
 
 		dist := LevenshteinDistance(targetLower, strings.ToLower(loc.FieldName))
 		if dist > 0 && dist <= maxPathSearchDistance {
@@ -731,11 +700,21 @@ func findFieldLocationsInSchema(schemaDoc any, targetField, currentPath string) 
 	}
 
 	// Sort fuzzy matches by distance (ascending), then path for stable output
-	sort.Slice(fuzzyMatches, func(i, j int) bool {
-		if fuzzyMatches[i].Distance != fuzzyMatches[j].Distance {
-			return fuzzyMatches[i].Distance < fuzzyMatches[j].Distance
+	slices.SortFunc(fuzzyMatches, func(a, b schemaFieldLocation) int {
+		if a.Distance != b.Distance {
+			if a.Distance < b.Distance {
+				return -1
+			}
+			return 1
 		}
-		return fuzzyMatches[i].SchemaPath < fuzzyMatches[j].SchemaPath
+		switch {
+		case a.SchemaPath < b.SchemaPath:
+			return -1
+		case a.SchemaPath > b.SchemaPath:
+			return 1
+		default:
+			return 0
+		}
 	})
 
 	schemaSuggestionsLog.Printf("Found %d fuzzy schema locations for field '%s'", len(fuzzyMatches), targetField)
@@ -773,11 +752,13 @@ func generatePathLocationSuggestion(invalidProps []string, schemaDoc any, curren
 		// Collect unique path display names; track the actual field name for fuzzy matches
 		actualFieldName := locations[0].FieldName
 		var pathNames []string
-		seenPaths := make(map[string]bool)
+		seenPaths := make(map[string]struct {
+		})
 		for _, loc := range locations {
 			display := "'" + formatSchemaPathForDisplay(loc.SchemaPath) + "'"
-			if !seenPaths[display] {
-				seenPaths[display] = true
+			if !setutil.Contains(seenPaths, display) {
+				seenPaths[display] = struct {
+				}{}
 				pathNames = append(pathNames, display)
 			}
 		}

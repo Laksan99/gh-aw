@@ -18,7 +18,6 @@
 //
 // Map Operations:
 //   - excludeMapKeys() - Create new map excluding specified keys
-//   - sortedMapKeys() - Return sorted keys of a map[string]string
 //
 // For type conversion utilities, use pkg/typeutil directly:
 //   - typeutil.ParseIntValue() - Strictly parse numeric types to int; returns (value, ok).
@@ -34,10 +33,8 @@
 package workflow
 
 import (
-	"maps"
-	"slices"
-
 	"github.com/github/gh-aw/pkg/logger"
+	"github.com/github/gh-aw/pkg/setutil"
 )
 
 var mapHelpersLog = logger.New("workflow:map_helpers")
@@ -47,14 +44,16 @@ func excludeMapKeys(original map[string]any, excludeKeys ...string) map[string]a
 	if mapHelpersLog.Enabled() {
 		mapHelpersLog.Printf("excludeMapKeys: input=%d keys, excluding=%v", len(original), excludeKeys)
 	}
-	excludeSet := make(map[string]bool)
+	excludeSet := make(map[string]struct {
+	})
 	for _, key := range excludeKeys {
-		excludeSet[key] = true
+		excludeSet[key] = struct {
+		}{}
 	}
 
 	result := make(map[string]any)
 	for key, value := range original {
-		if !excludeSet[key] {
+		if !setutil.Contains(excludeSet, key) {
 			result[key] = value
 		}
 	}
@@ -62,10 +61,4 @@ func excludeMapKeys(original map[string]any, excludeKeys ...string) map[string]a
 		mapHelpersLog.Printf("excludeMapKeys: output=%d keys", len(result))
 	}
 	return result
-}
-
-// sortedMapKeys returns the keys of a map[string]string in sorted order.
-// Used to produce deterministic output when writing environment variables.
-func sortedMapKeys(m map[string]string) []string {
-	return slices.Sorted(maps.Keys(m))
 }

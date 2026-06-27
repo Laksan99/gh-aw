@@ -56,107 +56,116 @@ var templateInjectionValidationLog = newValidationLogger("template_injection")
 
 // Pre-compiled regex patterns for template injection detection
 var (
-	// inlineExpressionRegex matches GitHub Actions template expressions ${{ ... }}
-	inlineExpressionRegex = regexp.MustCompile(`\$\{\{[^}]+\}\}`)
-
-	// unsafeContextRegex matches high-risk context expressions that could contain user input
-	// These patterns are particularly dangerous when used directly in shell commands
-	unsafeContextRegex = regexp.MustCompile(`\$\{\{\s*(github\.event\.|steps\.[^}]+\.outputs\.|inputs\.)[^}]+\}\}`)
-
 	// allowedRunScriptExpressionRegex matches trusted compiler-owned expressions that are
 	// intentionally rendered in generated run scripts and are not user-controlled.
 	allowedRunScriptExpressionRegex = regexp.MustCompile(`^\$\{\{\s*(env\.[^}]+|vars\.[^}]+|runner\.[^}]+|github\.(repository|run_id|workspace)|steps\.parse-guard-vars\.outputs\.(approval_labels|blocked_users|trusted_users)|job\.services\[[^]]+\]\.ports\[[^]]+\])\s*\}\}$`)
+	runKeyPattern                   = regexp.MustCompile(`(?:^|[\s{,])(?:run|["']run["']):`)
 )
 
-// hasAnyExpressionInRunContent performs a fast line-by-line text scan to determine
-// whether any GitHub Actions expression (${{ ... }}) appears inside a YAML run: block.
-// Used by the compiler regression guardrail to detect expressions that should have
-// been rewritten to env variables.
-func hasAnyExpressionInRunContent(yamlContent string) bool {
-	return hasExpressionInRunContent(yamlContent, inlineExpressionRegex)
+// runContentExpressionScan captures the two signals needed by the skip-validation
+// template-injection fast path before deciding whether to fall back to YAML parsing.
+type runContentExpressionScan struct {
+	hasUnsafe     bool
+	hasDisallowed bool
 }
 
-// hasUnsafeExpressionInRunContent performs a fast line-by-line text scan to determine
-// whether any unsafe context expression (${{ github.event.* }},
-// ${{ steps.*.outputs.* }}, or ${{ inputs.* }}) appears inside the content of a
-// YAML run: block.
-//
-// This is used as an efficient pre-flight check in generateAndValidateYAML.
-// Most compiler-generated workflows place unsafe expressions only in env: values
-// (the compiler's normal output pattern), so the expensive full YAML parse for
-// template-injection validation can be skipped in the common case.
-//
-// The scanner is intentionally lightweight rather than fully conservative: when it
-// encounters `run:` with no inline content (rest == ""), it enters run-block scanning
-// mode and only returns true if a subsequent indented line matches unsafeContextRegex.
-func hasUnsafeExpressionInRunContent(yamlContent string) bool {
-	return hasExpressionInRunContent(yamlContent, unsafeContextRegex)
+// mayContainInlineExpression is a cheap zero-false-negative precheck for
+// GitHub Actions inline expressions. It intentionally allows false positives,
+// for example when `${{` and a later `}}` appear in unrelated text without
+// forming a valid expression. Callers still apply InlineExpressionPattern
+// before classifying expressions.
+func mayContainInlineExpression(s string) bool {
+	_, remainder, found := strings.Cut(s, "${{")
+	return found && strings.Contains(remainder, "}}")
 }
 
-func hasExpressionInRunContent(yamlContent string, expressionRegex *regexp.Regexp) bool {
-	// Fast-path: no matching expressions anywhere → definitely no violation.
-	if !expressionRegex.MatchString(yamlContent) {
-		return false
+func findRunValue(keyPart string) (string, bool) {
+	loc := runKeyPattern.FindStringIndex(keyPart)
+	if loc == nil {
+		return "", false
 	}
+	return strings.TrimSpace(keyPart[loc[1]:]), true
+}
 
-	// Matching expressions exist somewhere; scan for any that appear inside a run: block
-	// without doing a full YAML parse.
-	// Use SplitSeq to iterate over lines lazily, avoiding the up-front allocation of the
-	// full []string slice that strings.Split would create for large YAML content.
+// walkRunBlockLines scans raw YAML text and visits each inline run value or line inside a
+// multiline run block. It recognizes plain run: keys as well as quoted and flow-style forms
+// so Path B stays aligned with the parsed-YAML validators.
+func walkRunBlockLines(yamlContent string, visit func(line string) bool) bool {
 	inRunBlock := false
 	runBlockIndent := 0
 
 	for line := range strings.SplitSeq(yamlContent, "\n") {
-		// Compute indentation first; skip blank and all-whitespace lines in one step.
 		trimmed := strings.TrimLeft(line, " \t")
-		if len(trimmed) == 0 {
-			// Blank / all-whitespace lines are allowed inside block scalars.
+		if trimmed == "" {
 			continue
 		}
 		indent := len(line) - len(trimmed)
 
 		if inRunBlock {
-			// A non-blank line at the same or lesser indentation ends the block.
 			if indent <= runBlockIndent {
 				inRunBlock = false
 				// Fall through: check whether this line starts a new run: block.
 			} else {
-				// Inside run block content — check for matching expressions.
-				if expressionRegex.MatchString(line) {
+				if visit(line) {
 					return true
 				}
 				continue
 			}
 		}
 
-		// Outside a run block: look for a run: key.
-		// Handle both "run: ..." (map key) and "- run: ..." (inline sequence item).
 		keyPart := trimmed
 		if strings.HasPrefix(keyPart, "-") {
 			keyPart = strings.TrimSpace(keyPart[1:])
 		}
-		if !strings.HasPrefix(keyPart, "run:") {
+
+		rest, ok := findRunValue(keyPart)
+		if !ok {
 			continue
 		}
-		rest := strings.TrimSpace(keyPart[4:]) // text after "run:"
 
-		if rest == "" {
-			// Empty run: value is unusual; treat conservatively as if block content follows.
+		if rest == "" || rest[0] == '|' || rest[0] == '>' {
 			inRunBlock = true
 			runBlockIndent = indent
-		} else if rest[0] == '|' || rest[0] == '>' {
-			// Literal or folded block scalar — content is on subsequent lines.
-			inRunBlock = true
-			runBlockIndent = indent
-		} else {
-			// Inline run value, e.g. run: echo "hello ${{ github.event.foo }}".
-			if expressionRegex.MatchString(rest) {
-				return true
-			}
+			continue
+		}
+
+		if visit(rest) {
+			return true
 		}
 	}
 
 	return false
+}
+
+// scanRunContentExpressions performs a single pass over run: blocks to detect both
+// user-controlled expressions and any non-allowlisted expressions. This avoids
+// the duplicate YAML walk used by the skipValidation fast path.
+func scanRunContentExpressions(yamlContent string) runContentExpressionScan {
+	if !mayContainInlineExpression(yamlContent) {
+		return runContentExpressionScan{}
+	}
+
+	var scan runContentExpressionScan
+	walkRunBlockLines(yamlContent, func(line string) bool {
+		if !mayContainInlineExpression(line) {
+			return false
+		}
+
+		for _, expr := range InlineExpressionPattern.FindAllString(line, -1) {
+			if !scan.hasUnsafe && UnsafeContextPattern.MatchString(expr) {
+				scan.hasUnsafe = true
+			}
+			if !scan.hasDisallowed && !allowedRunScriptExpressionRegex.MatchString(expr) {
+				scan.hasDisallowed = true
+			}
+			if scan.hasUnsafe && scan.hasDisallowed {
+				return true
+			}
+		}
+		return false
+	})
+
+	return scan
 }
 
 // validateNoTemplateInjectionFromParsed checks a pre-parsed workflow map for template
@@ -171,21 +180,21 @@ func validateNoTemplateInjectionFromParsed(workflow map[string]any) error {
 
 	for _, runContent := range runBlocks {
 		// Check if this run block contains inline expressions
-		if !inlineExpressionRegex.MatchString(runContent) {
+		if !InlineExpressionPattern.MatchString(runContent) {
 			continue
 		}
 
-		// Remove heredoc content from the run block to avoid false positives
-		// Heredocs (e.g., << 'EOF' ... EOF) safely contain template expressions
-		// because they're written to files, not executed in shell
-		contentWithoutHeredocs := removeHeredocContent(runContent)
+		// Remove non-executable regions from the run block to avoid false positives:
+		//   - heredocs are written to files/stdin, not executed directly
+		//   - bash # comments are ignored by the shell
+		contentWithoutHeredocs := stripShellLineComments(removeHeredocContent(runContent))
 
 		// Extract all inline expressions from this run block (excluding heredocs)
-		expressions := inlineExpressionRegex.FindAllString(contentWithoutHeredocs, -1)
+		expressions := InlineExpressionPattern.FindAllString(contentWithoutHeredocs, -1)
 
 		// Check each expression for unsafe contexts
 		for _, expr := range expressions {
-			if unsafeContextRegex.MatchString(expr) {
+			if UnsafeContextPattern.MatchString(expr) {
 				// Found an unsafe pattern - extract a snippet for context
 				snippet := extractRunSnippet(contentWithoutHeredocs, expr)
 				violations = append(violations, TemplateInjectionViolation{
@@ -223,10 +232,10 @@ func validateNoGitHubExpressionsInRunScriptsFromParsed(workflow map[string]any) 
 	var violations []TemplateInjectionViolation
 
 	for _, runContent := range runBlocks {
-		// Align with template-injection validation: heredoc bodies are written to files
-		// and are not executed as shell commands, so they are excluded from scanning.
-		contentWithoutHeredocs := removeHeredocContent(runContent)
-		expressions := inlineExpressionRegex.FindAllString(contentWithoutHeredocs, -1)
+		// Align with template-injection validation by excluding non-executable regions:
+		// heredoc bodies and bash # comments.
+		contentWithoutHeredocs := stripShellLineComments(removeHeredocContent(runContent))
+		expressions := InlineExpressionPattern.FindAllString(contentWithoutHeredocs, -1)
 		for _, expr := range expressions {
 			if allowedRunScriptExpressionRegex.MatchString(expr) {
 				continue

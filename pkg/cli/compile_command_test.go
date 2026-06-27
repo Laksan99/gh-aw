@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 
@@ -17,6 +18,15 @@ import (
 
 	"github.com/github/gh-aw/pkg/workflow"
 )
+
+// absoluteTestPath returns a path that filepath.IsAbs reports as absolute on
+// the current OS.
+func absoluteTestPath() string {
+	if runtime.GOOS == "windows" {
+		return `C:\absolute\path`
+	}
+	return "/absolute/path"
+}
 
 // TestCompileConfig tests the CompileConfig structure
 func TestCompileConfig(t *testing.T) {
@@ -142,7 +152,7 @@ func TestPrintCompilationSummary(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			// printCompilationSummary writes to stderr, we just verify it doesn't panic
-			printCompilationSummary(tt.stats)
+			printCompilationSummary(tt.stats, false)
 		})
 	}
 }
@@ -222,14 +232,10 @@ func TestCompileWorkflowWithValidation_InvalidFile(t *testing.T) {
 
 	// Try to compile a non-existent file
 	err := CompileWorkflowWithValidation(
+		context.Background(),
 		compiler,
 		"/nonexistent/file.md",
-		false, // verbose
-		false, // zizmor
-		false, // poutine
-		false, // actionlint
-		false, // strict
-		false, // validateActionSHAs
+		CompileValidationOptions{},
 	)
 
 	if err == nil {
@@ -323,7 +329,7 @@ func TestCompileWorkflows_WorkflowDirValidation(t *testing.T) {
 	}{
 		{
 			name:        "absolute path not allowed",
-			workflowDir: "/absolute/path",
+			workflowDir: absoluteTestPath(),
 			expectError: true,
 			errorMsg:    "must be a relative path",
 		},
@@ -395,15 +401,11 @@ This is a test workflow.
 
 	// Compile without emitting
 	err = CompileWorkflowDataWithValidation(
+		context.Background(),
 		compiler,
 		workflowData,
 		testFile,
-		false, // verbose
-		false, // zizmor
-		false, // poutine
-		false, // actionlint
-		false, // strict
-		false, // validateActionSHAs
+		CompileValidationOptions{},
 	)
 
 	// Should complete without error
@@ -445,14 +447,10 @@ This is a test workflow.
 
 	// Compile the workflow
 	err := CompileWorkflowWithValidation(
+		context.Background(),
 		compiler,
 		testFile,
-		false, // verbose
-		false, // zizmor
-		false, // poutine
-		false, // actionlint
-		false, // strict
-		false, // validateActionSHAs
+		CompileValidationOptions{},
 	)
 
 	// Should complete without error
@@ -792,15 +790,13 @@ This is a test workflow.
 			// require Docker, but this test verifies the API contract that
 			// security tools are independent of the validate flag.
 			err = CompileWorkflowDataWithValidation(
+				context.Background(),
 				compiler,
 				workflowData,
 				testFile,
-				false,       // verbose
-				false,       // runZizmor - disabled for unit test (no Docker)
-				false,       // runPoutine - disabled for unit test (no Docker)
-				false,       // runActionlint - disabled for unit test (no Docker)
-				false,       // strict
-				tt.validate, // validateActionSHAs - independent of security tools
+				CompileValidationOptions{
+					ValidateActionSHAs: tt.validate, // independent of security tools
+				},
 			)
 
 			// Even without running security tools, the compilation should succeed

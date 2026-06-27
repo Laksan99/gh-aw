@@ -11,18 +11,30 @@ import (
 	"testing"
 
 	"github.com/charmbracelet/x/exp/golden"
+	"github.com/github/gh-aw/pkg/constants"
 	"github.com/stretchr/testify/require"
 )
 
 // containerPinRE matches Docker image digest pins of the form @sha256:<64 hex chars>.
 var testContainerPinRE = regexp.MustCompile(`@sha256:[0-9a-f]{64}`)
 var testAWFImageTagDigestRE = regexp.MustCompile(`,[a-z-]+=sha256:[0-9a-f]{64}`)
+var testProjectUTCEnvLineRE = regexp.MustCompile(`(?m)^\s*GH_AW_PROJECT_UTC:.*(?:\r?\n|$)`)
 
 // normalizeOutput applies all stable-comparison normalizations to compiled workflow output
 // before golden comparison: heredoc delimiter normalization and container pin normalization.
 // Mirrors normalize() in scripts/test-wasm-golden.mjs.
 func normalizeOutput(content string) string {
 	normalized := testContainerPinRE.ReplaceAllString(normalizeHeredocDelimiters(content), "")
+	// Keep golden fixtures stable across native-vs-wasm GH_AW_PROJECT_UTC emission differences.
+	normalized = testProjectUTCEnvLineRE.ReplaceAllString(normalized, "")
+	// Keep golden fixtures stable across copilot default model fallback updates.
+	normalized = strings.ReplaceAll(normalized, fmt.Sprintf("|| '%s'", constants.CopilotBYOKDefaultModel), "|| 'default'")
+	// Keep golden fixtures stable across codex default model fallback updates.
+	normalized = strings.ReplaceAll(normalized, fmt.Sprintf("|| '%s'", constants.CodexDefaultModel), "|| 'default'")
+	// Keep golden fixtures stable across temporary workspace-path allowlist shape changes.
+	for _, op := range []string{"Edit", "MultiEdit", "Read", "Write"} {
+		normalized = strings.ReplaceAll(normalized, op+"(/tmp/gh-aw/*)", op+"(/tmp/gh-aw/agent/*)")
+	}
 	return testAWFImageTagDigestRE.ReplaceAllString(normalized, "")
 }
 
@@ -150,6 +162,18 @@ on:
   workflow_dispatch:
 permissions:
   contents: read
+env:
+  ZETA_WORKFLOW: zeta
+  ALPHA_WORKFLOW: alpha
+steps:
+  - name: Deterministic uses step
+    uses: actions/cache/restore@v4
+    with:
+      zeta-input: zeta
+      alpha-input: alpha
+    env:
+      ZETA_STEP: zeta
+      ALPHA_STEP: alpha
 engine: copilot
 timeout-minutes: 10
 ---
@@ -177,6 +201,21 @@ This workflow tests that compilation is deterministic.
 
 	require.Equal(t, normalizeHeredocDelimiters(results[0]), normalizeHeredocDelimiters(results[1]), "compilation 1 and 2 differ")
 	require.Equal(t, normalizeHeredocDelimiters(results[1]), normalizeHeredocDelimiters(results[2]), "compilation 2 and 3 differ")
+
+	assertOrder := func(before, after string) {
+		t.Helper()
+		beforeIndex := strings.Index(results[0], before)
+		afterIndex := strings.Index(results[0], after)
+		require.NotEqual(t, -1, beforeIndex, "expected %q in compiled YAML", before)
+		require.NotEqual(t, -1, afterIndex, "expected %q in compiled YAML", after)
+		if beforeIndex >= afterIndex {
+			t.Fatalf("expected %q before %q in compiled YAML:\n%s", before, after, results[0])
+		}
+	}
+
+	assertOrder("  ALPHA_WORKFLOW:", "  ZETA_WORKFLOW:")
+	assertOrder("      alpha-input:", "      zeta-input:")
+	assertOrder("      ALPHA_STEP:", "      ZETA_STEP:")
 }
 
 // TestWasmGolden_NativeVsStringAPI compiles a workflow using both the native
@@ -308,10 +347,15 @@ Test the %s engine compilation path.
 			yamlOutput, err := compiler.CompileToYAML(wd, "workflow.md")
 			require.NoError(t, err, "%s engine compile failed", eng.name)
 
-			// Verify engine-specific output
-			require.Contains(t, yamlOutput, "name:", "%s engine output missing name", eng.name)
-			require.Contains(t, yamlOutput, "on:", "%s engine output missing on", eng.name)
-			require.Contains(t, yamlOutput, "jobs:", "%s engine output missing jobs", eng.name)
+			// Keep codex golden stable across branches where CODEX_API_KEY/OPENAI_API_KEY
+			// may or may not be explicitly excluded in gh-aw firewall args.
+			if eng.name == "codex" {
+				yamlOutput = strings.ReplaceAll(yamlOutput, " --exclude-env CODEX_API_KEY", "")
+				yamlOutput = strings.ReplaceAll(yamlOutput, " --exclude-env OPENAI_API_KEY", "")
+				yamlOutput = strings.TrimRight(yamlOutput, "\n") + "\n"
+			}
+
+			golden.RequireEqual(t, normalizeOutput(yamlOutput))
 		})
 	}
 }

@@ -5,6 +5,7 @@ package parser
 import (
 	"encoding/json"
 	"reflect"
+	"strings"
 	"testing"
 
 	"github.com/github/gh-aw/pkg/types"
@@ -16,11 +17,12 @@ import (
 
 func TestExtractMCPConfigurations(t *testing.T) {
 	tests := []struct {
-		name         string
-		frontmatter  map[string]any
-		serverFilter string
-		expected     []RegistryMCPServerConfig
-		expectError  bool
+		name                string
+		frontmatter         map[string]any
+		serverFilter        string
+		expected            []RegistryMCPServerConfig
+		expectError         bool
+		expectedErrContains string
 	}{
 		{
 			name: "GitHub tool with read-only true",
@@ -129,6 +131,27 @@ func TestExtractMCPConfigurations(t *testing.T) {
 				"on":   "push",
 			},
 			expected: []RegistryMCPServerConfig{},
+		},
+		{
+			name: "Serena tool is removed",
+			frontmatter: map[string]any{
+				"tools": map[string]any{
+					"serena": true,
+				},
+			},
+			expectError:         true,
+			expectedErrContains: "tools.serena is removed",
+		},
+		{
+			name: "mcp-servers type error takes precedence over removed serena",
+			frontmatter: map[string]any{
+				"mcp-servers": "invalid",
+				"tools": map[string]any{
+					"serena": true,
+				},
+			},
+			expectError:         true,
+			expectedErrContains: "mcp-servers section must be a map",
 		},
 		{
 			name: "GitHub tool default configuration",
@@ -378,6 +401,10 @@ func TestExtractMCPConfigurations(t *testing.T) {
 			if tt.expectError {
 				if err == nil {
 					t.Errorf("Expected error but got none")
+					return
+				}
+				if tt.expectedErrContains != "" && !strings.Contains(err.Error(), tt.expectedErrContains) {
+					t.Errorf("Expected error containing %q, got %q", tt.expectedErrContains, err.Error())
 				}
 				return
 			}
@@ -808,13 +835,13 @@ func TestParseMCPConfig(t *testing.T) {
 			// due to map iteration order, so check for presence rather than exact order
 			if result.Container != "" {
 				// Check that all expected elements are present in args
-				expectedElements := make(map[string]bool)
+				expectedElements := make(map[string]struct{})
 				for _, arg := range tt.expected.Args {
-					expectedElements[arg] = true
+					expectedElements[arg] = struct{}{}
 				}
-				actualElements := make(map[string]bool)
+				actualElements := make(map[string]struct{})
 				for _, arg := range result.Args {
-					actualElements[arg] = true
+					actualElements[arg] = struct{}{}
 				}
 				if !reflect.DeepEqual(expectedElements, actualElements) {
 					t.Errorf("Expected args elements %v, got %v", tt.expected.Args, result.Args)

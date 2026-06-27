@@ -1,14 +1,23 @@
 ---
+private: true
+emoji: "🔧"
 timeout-minutes: 10
 strict: true
 on:
   schedule: daily
   workflow_dispatch:
+max-daily-ai-credits: 10000
 permissions:
   issues: read
   pull-requests: read
   contents: read
-engine: copilot
+  copilot-requests: write
+engine:
+  id: copilot
+  copilot-sdk: true
+sandbox:
+  agent:
+    sudo: false
 tools:
   cli-proxy: true
   github:
@@ -19,12 +28,10 @@ safe-outputs:
     target: "*"
   add-comment:
     target: "*"
-features:
-  copilot-requests: true
 imports:
-  - shared/observability-otlp.md
-firewall:
-  effective-token-steering: true
+  - shared/otlp.md
+features:
+  gh-aw-detection: true
 ---
 
 {{#runtime-import? .github/shared-instructions.md}}

@@ -339,6 +339,45 @@ describe("git patch integration tests", () => {
       const applyResult = execGit(["am", patchPath], { cwd: repoDir });
       expect(applyResult.status).toBe(0);
     });
+
+    it("should recover add/add conflicts with checkout --theirs and git am --continue", () => {
+      const baseCommit = execGit(["rev-parse", "HEAD"], { cwd: repoDir }).stdout.trim();
+
+      execGit(["checkout", "-b", "feature-add-add"], { cwd: repoDir });
+      fs.mkdirSync(path.join(repoDir, "docs"), { recursive: true });
+      fs.writeFileSync(path.join(repoDir, "docs", "conflict.md"), "Patch branch content\n");
+      execGit(["add", "docs/conflict.md"], { cwd: repoDir });
+      execGit(["commit", "-m", "Patch adds conflict file"], { cwd: repoDir });
+
+      const patchPath = path.join(patchDir, "add-add.patch");
+      const patchResult = execGit(["format-patch", `${baseCommit}..feature-add-add`, "--stdout"], { cwd: repoDir });
+      fs.writeFileSync(patchPath, patchResult.stdout);
+
+      execGit(["checkout", "main"], { cwd: repoDir });
+      fs.mkdirSync(path.join(repoDir, "docs"), { recursive: true });
+      fs.writeFileSync(path.join(repoDir, "docs", "conflict.md"), "Main branch content\n");
+      execGit(["add", "docs/conflict.md"], { cwd: repoDir });
+      execGit(["commit", "-m", "Main adds same file differently"], { cwd: repoDir });
+
+      execGit(["checkout", "-b", "apply-add-add"], { cwd: repoDir });
+      const amResult = execGit(["am", "--3way", patchPath], { cwd: repoDir, allowFailure: true });
+      expect(amResult.status).not.toBe(0);
+
+      const unresolved = execGit(["diff", "--name-only", "--diff-filter=U", "-z"], { cwd: repoDir }).stdout.split("\0").filter(Boolean);
+      expect(unresolved).toContain("docs/conflict.md");
+
+      const statusPorcelain = execGit(["status", "--porcelain", "-z"], { cwd: repoDir }).stdout.split("\0").filter(Boolean);
+      expect(statusPorcelain).toContain("AA docs/conflict.md");
+
+      execGit(["checkout", "--theirs", "--", "docs/conflict.md"], { cwd: repoDir });
+      execGit(["add", "--", "docs/conflict.md"], { cwd: repoDir });
+      execGit(["am", "--continue"], { cwd: repoDir });
+
+      const content = fs.readFileSync(path.join(repoDir, "docs", "conflict.md"), "utf8");
+      expect(content).toBe("Patch branch content\n");
+      const subject = execGit(["log", "-1", "--format=%s"], { cwd: repoDir }).stdout.trim();
+      expect(subject).toBe("Patch adds conflict file");
+    });
   });
 
   // ──────────────────────────────────────────────────────
@@ -412,6 +451,40 @@ describe("git patch integration tests", () => {
       // Error message varies by git version but contains rejection info
       const errorOutput = pushResult.stderr.toLowerCase();
       expect(errorOutput.includes("rejected") || errorOutput.includes("failed") || errorOutput.includes("non-fast-forward")).toBe(true);
+    });
+
+    it("should succeed when patch apply is re-anchored to the recorded base commit", () => {
+      const baseCommit = execGit(["rev-parse", "HEAD"], { cwd: repoDir }).stdout.trim();
+
+      // Simulate remote branch advancing after patch generation.
+      execGit(["checkout", "-b", "pr-branch"], { cwd: repoDir });
+      fs.writeFileSync(path.join(repoDir, "drift.txt"), "remote-head-change\n");
+      execGit(["add", "drift.txt"], { cwd: repoDir });
+      execGit(["commit", "-m", "Remote branch advanced"], { cwd: repoDir });
+
+      // Simulate patch generated from the earlier base commit.
+      execGit(["checkout", "-b", "patch-generated-from-base", baseCommit], { cwd: repoDir });
+      fs.writeFileSync(path.join(repoDir, "drift.txt"), "patch-change\n");
+      execGit(["add", "drift.txt"], { cwd: repoDir });
+      execGit(["commit", "-m", "Patch commit from recorded base"], { cwd: repoDir });
+
+      const patchPath = path.join(patchDir, "recorded-base.patch");
+      const patchResult = execGit(["format-patch", `${baseCommit}..patch-generated-from-base`, "--stdout"], { cwd: repoDir });
+      fs.writeFileSync(patchPath, patchResult.stdout);
+
+      // Applying directly on the advanced head fails.
+      execGit(["checkout", "pr-branch"], { cwd: repoDir });
+      const applyOnAdvancedHead = execGit(["am", "--3way", patchPath], { cwd: repoDir, allowFailure: true });
+      expect(applyOnAdvancedHead.status).not.toBe(0);
+      const conflictOutput = applyOnAdvancedHead.stderr.toLowerCase();
+      expect(conflictOutput.includes("patch does not apply") || conflictOutput.includes("conflict") || conflictOutput.includes("failed to merge")).toBe(true);
+      execGit(["am", "--abort"], { cwd: repoDir, allowFailure: true });
+
+      // Re-anchor to the recorded base commit first, then apply.
+      execGit(["reset", "--hard", baseCommit], { cwd: repoDir });
+      const applyAfterReanchor = execGit(["am", "--3way", patchPath], { cwd: repoDir });
+      expect(applyAfterReanchor.status).toBe(0);
+      expect(fs.readFileSync(path.join(repoDir, "drift.txt"), "utf8")).toBe("patch-change\n");
     });
   });
 
@@ -875,6 +948,60 @@ describe("git patch integration tests", () => {
       } finally {
         process.env.GITHUB_WORKSPACE = origWorkspace;
         process.env.DEFAULT_BRANCH = origDefaultBranch;
+      }
+    });
+
+    it("should choose origin/main as the closest Strategy 3 base in full mode", async () => {
+      // Create a stale remote ref that sorts before origin/main.
+      execGit(["checkout", "-b", "aaa-stale"], { cwd: workingRepo });
+      execGit(["push", "-u", "origin", "aaa-stale"], { cwd: workingRepo });
+
+      // Advance main with commits that should not appear in the generated patch.
+      execGit(["checkout", "main"], { cwd: workingRepo });
+      fs.writeFileSync(path.join(workingRepo, "phantom1.txt"), "phantom 1\n");
+      execGit(["add", "phantom1.txt"], { cwd: workingRepo });
+      execGit(["commit", "-m", "Phantom commit 1"], { cwd: workingRepo });
+      fs.writeFileSync(path.join(workingRepo, "phantom2.txt"), "phantom 2\n");
+      execGit(["add", "phantom2.txt"], { cwd: workingRepo });
+      execGit(["commit", "-m", "Phantom commit 2"], { cwd: workingRepo });
+      execGit(["push", "origin", "main"], { cwd: workingRepo });
+
+      // Agent branch with one actual change on top of current main.
+      execGit(["checkout", "-b", "strategy3-branch"], { cwd: workingRepo });
+      fs.writeFileSync(path.join(workingRepo, "agent-change.txt"), "real change\n");
+      execGit(["add", "agent-change.txt"], { cwd: workingRepo });
+      execGit(["commit", "-m", "Agent commit for strategy 3"], { cwd: workingRepo });
+
+      // Keep origin/main and stale refs available for Strategy 3 candidate scoring.
+      execGit(["fetch", "origin", "main"], { cwd: workingRepo });
+      execGit(["fetch", "origin", "aaa-stale"], { cwd: workingRepo });
+      // Ensure the lexicographically first remote ref is stale in this regression setup.
+      execGit(["update-ref", "-d", "refs/remotes/origin/HEAD"], { cwd: workingRepo, allowFailure: true });
+
+      // Force full-mode fallthrough into Strategy 3.
+      const origSha = process.env.GITHUB_SHA;
+      process.env.GITHUB_SHA = "side-repo-sha-not-in-target-repo";
+
+      const restore = setTestEnv(workingRepo);
+      try {
+        const mainTip = execGit(["rev-parse", "main"], { cwd: workingRepo }).stdout.trim();
+        const result = await generateGitPatch("strategy3-branch", "strategy3-branch", { mode: "full" });
+
+        expect(result.success).toBe(true);
+        expect(result.baseCommit).toBe(mainTip);
+
+        const patchContent = fs.readFileSync(result.patchPath, "utf8");
+        expect(patchContent).toContain("Agent commit for strategy 3");
+        expect(patchContent).toContain("agent-change.txt");
+        expect(patchContent).not.toContain("Phantom commit 1");
+        expect(patchContent).not.toContain("Phantom commit 2");
+      } finally {
+        if (origSha === undefined) {
+          delete process.env.GITHUB_SHA;
+        } else {
+          process.env.GITHUB_SHA = origSha;
+        }
+        restore();
       }
     });
   });

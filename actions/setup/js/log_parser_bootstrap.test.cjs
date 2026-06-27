@@ -131,6 +131,78 @@ describe("log_parser_bootstrap.cjs", () => {
             fs.unlinkSync(safeOutputsFile),
             fs.rmdirSync(tmpDir));
         }),
+        it("should warn (non-fatal) when MCP fails but agent ran turns (legacy result entry)", () => {
+          const tmpDir = fs.mkdtempSync(path.join(__dirname, "test-"));
+          const logFile = path.join(tmpDir, "test.log");
+          try {
+            fs.writeFileSync(logFile, "content");
+            process.env.GH_AW_AGENT_OUTPUT = logFile;
+            // No safe outputs — simulates a workflow that uses GitHub MCP directly (e.g. creates a
+            // discussion) without writing safe-output file entries.
+            const mockParseLog = vi.fn().mockReturnValue({
+              markdown: "## Result\n",
+              mcpFailures: ["github"],
+              maxTurnsHit: false,
+              logEntries: [
+                { type: "system", subtype: "init", model: "claude-3-7-sonnet" },
+                { type: "assistant", message: { content: [{ type: "text", text: "Analysis complete" }] } },
+                { type: "result", num_turns: 34, duration_ms: 60000 },
+              ],
+            });
+            runLogParser({ parseLog: mockParseLog, parserName: "TestParser" });
+            expect(mockCore.warning).toHaveBeenCalledWith("MCP server(s) failed to launch (github), but agent completed turns — treating as non-fatal post-completion relaunch");
+            expect(mockCore.setFailed).not.toHaveBeenCalled();
+          } finally {
+            fs.unlinkSync(logFile);
+            fs.rmdirSync(tmpDir);
+          }
+        }),
+        it("should warn (non-fatal) when MCP fails but agent ran turns (Copilot event session.result)", () => {
+          const tmpDir = fs.mkdtempSync(path.join(__dirname, "test-"));
+          const logFile = path.join(tmpDir, "test.log");
+          try {
+            fs.writeFileSync(logFile, "content");
+            process.env.GH_AW_AGENT_OUTPUT = logFile;
+            // Copilot event format entries (as returned by parse_claude_log.cjs via
+            // convertLegacyLogEntriesToCopilotEvents): session.result with data.numTurns.
+            const mockParseLog = vi.fn().mockReturnValue({
+              markdown: "## Result\n",
+              mcpFailures: ["github"],
+              maxTurnsHit: false,
+              logEntries: [
+                { type: "session.init", data: { model: "claude-opus-4-5" } },
+                { type: "assistant.message", data: { content: "Done" } },
+                { type: "session.result", data: { numTurns: 34, durationMs: 60000 } },
+              ],
+            });
+            runLogParser({ parseLog: mockParseLog, parserName: "Claude" });
+            expect(mockCore.warning).toHaveBeenCalledWith("MCP server(s) failed to launch (github), but agent completed turns — treating as non-fatal post-completion relaunch");
+            expect(mockCore.setFailed).not.toHaveBeenCalled();
+          } finally {
+            fs.unlinkSync(logFile);
+            fs.rmdirSync(tmpDir);
+          }
+        }),
+        it("should still fail when MCP fails and agent ran no turns", () => {
+          const tmpDir = fs.mkdtempSync(path.join(__dirname, "test-"));
+          const logFile = path.join(tmpDir, "test.log");
+          try {
+            fs.writeFileSync(logFile, "content");
+            process.env.GH_AW_AGENT_OUTPUT = logFile;
+            // logEntries has no result entry — agent never ran any turns (startup failure).
+            const mockParseLog = vi.fn().mockReturnValue({
+              markdown: "## Result\n",
+              mcpFailures: ["github"],
+              maxTurnsHit: false,
+              logEntries: [{ type: "system", subtype: "init" }],
+            });
+            runLogParser({ parseLog: mockParseLog, parserName: "TestParser" });
+            expect(mockCore.setFailed).toHaveBeenCalledWith(`${ERR_API}: MCP server(s) failed to launch: github`);
+          } finally {
+            fs.unlinkSync(logFile);
+            fs.rmdirSync(tmpDir);
+          }
+        }),
         it("should handle max-turns limit reached", () => {
           const tmpDir = fs.mkdtempSync(path.join(__dirname, "test-")),
             logFile = path.join(tmpDir, "test.log");
@@ -237,6 +309,89 @@ describe("log_parser_bootstrap.cjs", () => {
           (fs.writeFileSync(logFile, "content"), (process.env.GH_AW_AGENT_OUTPUT = logFile), (process.env.GH_AW_SAFE_OUTPUTS = "/non/existent/file.jsonl"));
           const mockParseLog = vi.fn().mockReturnValue({ markdown: "## Result\n", mcpFailures: [], maxTurnsHit: false });
           (runLogParser({ parseLog: mockParseLog, parserName: "TestParser" }), expect(mockCore.warning).not.toHaveBeenCalled(), fs.unlinkSync(logFile), fs.rmdirSync(tmpDir));
+        }),
+        it("should write result entry to agent-stdio.log when logEntries has a result entry", () => {
+          const tmpDir = fs.mkdtempSync(path.join(__dirname, "test-"));
+          const logFile = path.join(tmpDir, "test.log");
+          const stdioLogPath = "/tmp/gh-aw/agent-stdio.log";
+          try {
+            fs.writeFileSync(logFile, "content");
+            process.env.GH_AW_AGENT_OUTPUT = logFile;
+            fs.mkdirSync(path.dirname(stdioLogPath), { recursive: true });
+            if (fs.existsSync(stdioLogPath)) fs.unlinkSync(stdioLogPath);
+            const mockParseLog = vi.fn().mockReturnValue({
+              markdown: "## Result\n",
+              mcpFailures: [],
+              maxTurnsHit: false,
+              logEntries: [{ type: "result", num_turns: 5, usage: { input_tokens: 100, output_tokens: 50 } }],
+            });
+            runLogParser({ parseLog: mockParseLog, parserName: "Copilot" });
+            expect(fs.existsSync(stdioLogPath)).toBe(true);
+            const parsed = JSON.parse(fs.readFileSync(stdioLogPath, "utf8").trim());
+            expect(parsed).toEqual({
+              type: "result",
+              num_turns: 5,
+              usage: { input_tokens: 100, output_tokens: 50 },
+            });
+            expect(mockCore.info).toHaveBeenCalledWith("[log-parser] Wrote Copilot result entry to agent-stdio.log: num_turns=5");
+          } finally {
+            fs.unlinkSync(logFile);
+            fs.rmdirSync(tmpDir);
+            if (fs.existsSync(stdioLogPath)) fs.unlinkSync(stdioLogPath);
+          }
+        }),
+        it("should not overwrite result entry when agent-stdio.log already has one in JSON array line", () => {
+          const tmpDir = fs.mkdtempSync(path.join(__dirname, "test-"));
+          const logFile = path.join(tmpDir, "test.log");
+          const stdioLogPath = "/tmp/gh-aw/agent-stdio.log";
+          try {
+            fs.writeFileSync(logFile, "content");
+            process.env.GH_AW_AGENT_OUTPUT = logFile;
+            fs.mkdirSync(path.dirname(stdioLogPath), { recursive: true });
+            fs.writeFileSync(stdioLogPath, `[ {"type":"result","num_turns":3} ]\n`);
+            const mockParseLog = vi.fn().mockReturnValue({
+              markdown: "## Result\n",
+              mcpFailures: [],
+              maxTurnsHit: false,
+              logEntries: [{ type: "result", num_turns: 5, usage: { input_tokens: 100, output_tokens: 50 } }],
+            });
+            runLogParser({ parseLog: mockParseLog, parserName: "Copilot" });
+            const written = fs.readFileSync(stdioLogPath, "utf8");
+            expect(written.trim().split("\n")).toHaveLength(1);
+            expect(JSON.parse(written.trim())[0].num_turns).toBe(3);
+            expect(mockCore.info).not.toHaveBeenCalledWith(expect.stringContaining("[log-parser] Wrote"));
+          } finally {
+            fs.unlinkSync(logFile);
+            fs.rmdirSync(tmpDir);
+            if (fs.existsSync(stdioLogPath)) fs.unlinkSync(stdioLogPath);
+          }
+        }),
+        it("should warn (non-fatal) when writing to agent-stdio.log fails", () => {
+          const tmpDir = fs.mkdtempSync(path.join(__dirname, "test-"));
+          const logFile = path.join(tmpDir, "test.log");
+          const stdioLogPath = "/tmp/gh-aw/agent-stdio.log";
+          try {
+            fs.writeFileSync(logFile, "content");
+            process.env.GH_AW_AGENT_OUTPUT = logFile;
+            fs.mkdirSync(path.dirname(stdioLogPath), { recursive: true });
+            if (fs.existsSync(stdioLogPath)) fs.unlinkSync(stdioLogPath);
+            vi.spyOn(fs, "appendFileSync").mockImplementationOnce(() => {
+              throw new Error("Permission denied");
+            });
+            const mockParseLog = vi.fn().mockReturnValue({
+              markdown: "## Result\n",
+              mcpFailures: [],
+              maxTurnsHit: false,
+              logEntries: [{ type: "result", num_turns: 5, usage: { input_tokens: 100, output_tokens: 50 } }],
+            });
+            runLogParser({ parseLog: mockParseLog, parserName: "Copilot" });
+            expect(mockCore.warning).toHaveBeenCalledWith("[log-parser] Failed to enrich agent-stdio.log with result entry: Permission denied");
+            expect(mockCore.setFailed).not.toHaveBeenCalled();
+          } finally {
+            fs.unlinkSync(logFile);
+            fs.rmdirSync(tmpDir);
+            if (fs.existsSync(stdioLogPath)) fs.unlinkSync(stdioLogPath);
+          }
         }));
     }));
 });

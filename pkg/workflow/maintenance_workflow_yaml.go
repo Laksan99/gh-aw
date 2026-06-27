@@ -1,6 +1,7 @@
 package workflow
 
 import (
+	"context"
 	"strconv"
 	"strings"
 
@@ -9,34 +10,61 @@ import (
 
 var maintenanceWorkflowYAMLLog = logger.New("workflow:maintenance_workflow_yaml")
 
+// buildMaintenanceWorkflowYAMLOptions configures the maintenance workflow YAML builder.
+type buildMaintenanceWorkflowYAMLOptions struct {
+	cronSchedule        string
+	scheduleDesc        string
+	minExpiresDays      int
+	runsOnValue         string
+	actionMode          ActionMode
+	version             string
+	actionTag           string
+	resolver            SHAResolver
+	configuredRunsOn    RunsOnValue
+	defaultBranch       string
+	disableLabelTrigger bool
+	compileGitHubToken  string
+	createCompilePR     bool
+	copilotOrgBilling   bool // all Copilot workflows use copilot-requests: write (GITHUB_TOKEN); COPILOT_GITHUB_TOKEN is not required
+}
+
 // buildMaintenanceWorkflowYAML generates the complete YAML content for the
 // agentics-maintenance.yml workflow. It is called by GenerateMaintenanceWorkflow
 // after the cron schedule and setup parameters have been resolved.
 func buildMaintenanceWorkflowYAML(
-	cronSchedule, scheduleDesc string,
-	minExpiresDays int,
-	runsOnValue string,
-	actionMode ActionMode,
-	version, actionTag string,
-	resolver ActionSHAResolver,
-	configuredRunsOn RunsOnValue,
-	defaultBranch string,
-	disableLabelTrigger bool,
+	ctx context.Context,
+	opts buildMaintenanceWorkflowYAMLOptions,
 ) string {
-	maintenanceWorkflowYAMLLog.Printf("Building maintenance workflow YAML: actionMode=%s minExpiresDays=%d cronSchedule=%q defaultBranch=%q disableLabelTrigger=%v", actionMode, minExpiresDays, cronSchedule, defaultBranch, disableLabelTrigger)
+	cronSchedule := opts.cronSchedule
+	scheduleDesc := opts.scheduleDesc
+	minExpiresDays := opts.minExpiresDays
+	runsOnValue := opts.runsOnValue
+	actionMode := opts.actionMode
+	version := opts.version
+	actionTag := opts.actionTag
+	resolver := opts.resolver
+	configuredRunsOn := opts.configuredRunsOn
+	defaultBranch := opts.defaultBranch
+	disableLabelTrigger := opts.disableLabelTrigger
+	compileGitHubToken := opts.compileGitHubToken
+	createCompilePR := opts.createCompilePR
+	copilotOrgBilling := opts.copilotOrgBilling
+	maintenanceWorkflowYAMLLog.Printf("Building maintenance workflow YAML: actionMode=%s minExpiresDays=%d cronSchedule=%q defaultBranch=%q disableLabelTrigger=%v createCompilePR=%v copilotOrgBilling=%v", actionMode, minExpiresDays, cronSchedule, defaultBranch, disableLabelTrigger, createCompilePR, copilotOrgBilling)
 
 	var yaml strings.Builder
 
 	// Add workflow header with logo and instructions
-	customInstructions := `Alternative regeneration methods:
-  make recompile
+	customInstructions := `This file defines the generated agentic maintenance workflow for this repository.
+It runs scheduled cleanup for expiring safe outputs and supports manual maintenance operations.
 
-Or use the gh-aw CLI directly:
-  ./gh-aw compile --validate --verbose
+This workflow is generated automatically when workflows use expiring safe outputs
+or when repository maintenance features are enabled in .github/workflows/aw.json.
 
-The workflow is generated when any workflow uses the 'expires' field
-in create-discussions, create-issues, or create-pull-request safe-outputs configuration.
-Schedule frequency is automatically determined by the shortest expiration time.`
+To disable maintenance workflow generation, set in .github/workflows/aw.json:
+  {"maintenance": false}
+
+Agentic maintenance docs:
+  https://github.github.com/gh-aw/reference/ephemerals/#manual-maintenance-operations`
 
 	header := GenerateWorkflowHeader("", "pkg/workflow/maintenance_workflow.go", customInstructions)
 	yaml.WriteString(header)
@@ -50,6 +78,7 @@ on:
 
 	// Add push trigger in dev mode so compile-workflows runs when workflow files change
 	if actionMode == ActionModeDev {
+		maintenanceWorkflowYAMLLog.Printf("Adding dev-mode push trigger for branch %q", defaultBranch)
 		yaml.WriteString(`  push:
     branches:
       - ` + defaultBranch + `
@@ -60,6 +89,7 @@ on:
 
 	// Add label-event trigger only when the label-triggered jobs are enabled
 	if !disableLabelTrigger {
+		maintenanceWorkflowYAMLLog.Print("Adding issues:labeled trigger for label-triggered maintenance jobs")
 		yaml.WriteString(`  issues:
     types: [labeled]
 `)
@@ -124,7 +154,7 @@ jobs:
     steps:
 `)
 
-	setupActionRef := ResolveSetupActionReference(actionMode, version, actionTag, resolver)
+	setupActionRef := ResolveSetupActionReference(ctx, actionMode, version, actionTag, resolver)
 
 	// Add checkout step only in dev/script mode (for local action paths)
 	if actionMode == ActionModeDev || actionMode == ActionModeScript {
@@ -254,7 +284,7 @@ jobs:
 
 `)
 
-	yaml.WriteString(generateInstallCLISteps(actionMode, version, actionTag, resolver))
+	yaml.WriteString(generateInstallCLISteps(ctx, actionMode, version, actionTag, resolver))
 	yaml.WriteString(`      - name: Run operation
         uses: ` + getCachedActionPinFromResolver("actions/github-script", resolver) + `
         env:
@@ -271,7 +301,9 @@ jobs:
 
       - name: Record outputs
         id: record
-        run: echo "operation=${{ inputs.operation }}" >> "$GITHUB_OUTPUT"
+        env:
+          GH_AW_OPERATION: ${{ inputs.operation }}
+        run: echo "operation=$GH_AW_OPERATION" >> "$GITHUB_OUTPUT"
 `)
 
 	// Add update_pull_request_branches job for workflow_dispatch with operation == 'update_pull_request_branches'
@@ -374,7 +406,9 @@ jobs:
 
       - name: Record outputs
         id: record
-        run: echo "run_url=${{ inputs.run_url }}" >> "$GITHUB_OUTPUT"
+        env:
+          GH_AW_RUN_URL: ${{ inputs.run_url }}
+        run: echo "run_url=$GH_AW_RUN_URL" >> "$GITHUB_OUTPUT"
 `)
 
 	// Add create_labels job for workflow_dispatch with operation == 'create_labels'
@@ -408,7 +442,7 @@ jobs:
 
 `)
 
-	yaml.WriteString(generateInstallCLISteps(actionMode, version, actionTag, resolver))
+	yaml.WriteString(generateInstallCLISteps(ctx, actionMode, version, actionTag, resolver))
 	yaml.WriteString(`      - name: Create missing labels
         uses: ` + getCachedActionPinFromResolver("actions/github-script", resolver) + `
         env:
@@ -455,7 +489,7 @@ jobs:
 
 `)
 
-	yaml.WriteString(generateInstallCLISteps(actionMode, version, actionTag, resolver))
+	yaml.WriteString(generateInstallCLISteps(ctx, actionMode, version, actionTag, resolver))
 	yaml.WriteString(`      - name: Restore activity report logs cache
         id: activity_report_logs_cache
         uses: ` + getActionPin("actions/cache/restore") + `
@@ -474,12 +508,12 @@ jobs:
           GH_AW_CMD_PREFIX: ` + getCLICmdPrefix(actionMode) + `
         run: |
           ${GH_AW_CMD_PREFIX} logs \
-            --repo "${{ github.repository }}" \
+            --repo "$GITHUB_REPOSITORY" \
             --start-date -1w \
-            --count 100 \
+            --count 500 \
             --output ./.cache/gh-aw/activity-report-logs \
             --format markdown \
-            > ./.cache/gh-aw/activity-report-logs/report.md
+            --report-file ./.cache/gh-aw/activity-report-logs/report.md
 
       - name: Save activity report logs cache
         if: ${{ always() }}
@@ -562,40 +596,65 @@ jobs:
 
 `)
 
-	yaml.WriteString(generateInstallCLISteps(actionMode, version, actionTag, resolver))
+	yaml.WriteString(generateInstallCLISteps(ctx, actionMode, version, actionTag, resolver))
 	yaml.WriteString(`      - name: Restore forecast report logs cache
         id: forecast_report_logs_cache
         uses: ` + getActionPin("actions/cache/restore") + `
         with:
-          path: .github/aw/logs
+          path: ./.github/aw/logs
           key: ${{ runner.os }}-forecast-report-logs-${{ github.repository }}-${{ github.ref_name }}-${{ github.run_id }}
           restore-keys: |
             ${{ runner.os }}-forecast-report-logs-${{ github.repository }}-
             ${{ runner.os }}-forecast-report-logs-
 
       - name: Generate forecast report
+        id: generate_forecast_report
+        timeout-minutes: 30
         shell: bash
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          DEBUG: "*"
           GH_AW_CMD_PREFIX: ` + getCLICmdPrefix(actionMode) + `
         run: |
           mkdir -p ./.cache/gh-aw/forecast
-          ${GH_AW_CMD_PREFIX} logs --repo "${{ github.repository }}" --start-date -30d --count 1500 > /dev/null
-          if ! compgen -G ".github/aw/logs/run-*/run_summary.json" > /dev/null; then
-            echo "::error::Missing run summary cache in .github/aw/logs after gh aw logs warm-up; cannot run forecast."
+          set +e
+          ${GH_AW_CMD_PREFIX} forecast --repo "$GITHUB_REPOSITORY" --timeout 30 --verbose --json > ./.cache/gh-aw/forecast/report.json
+          forecast_exit_code=$?
+          set -e
+          if [ "${forecast_exit_code}" -eq 124 ]; then
+            echo '{"outcome":"timeout","message":"Forecast computation timed out after 30 minutes."}' > ./.cache/gh-aw/forecast/error.json
+            echo "::error::Forecast computation timed out after 30 minutes."
             exit 1
           fi
-          ${GH_AW_CMD_PREFIX} forecast --repo "${{ github.repository }}" --json 2> >(grep -Fv "forecast is an experimental command and may change without notice" >&2) > ./.cache/gh-aw/forecast/report.json
+          if [ "${forecast_exit_code}" -ne 0 ]; then
+            echo '{"outcome":"error","message":"Forecast computation failed before producing a report."}' > ./.cache/gh-aw/forecast/error.json
+            echo "::error::Forecast computation failed with exit code ${forecast_exit_code}."
+            exit 1
+          fi
+
+      - name: Debug forecast logs folder
+        if: ${{ always() }}
+        shell: bash
+        run: |
+          if [ ! -d ./.github/aw/logs ]; then
+            echo "Logs directory not found: ./.github/aw/logs"
+            exit 0
+          fi
+          echo "Files under ./.github/aw/logs:"
+          find ./.github/aw/logs -type f | sort
 
       - name: Save forecast report logs cache
         if: ${{ always() }}
         uses: ` + getActionPin("actions/cache/save") + `
         with:
-          path: .github/aw/logs
-          key: ${{ steps.forecast_report_logs_cache.outputs.cache-primary-key }}
+          path: ./.github/aw/logs
+          key: ${{ runner.os }}-forecast-report-logs-${{ github.repository }}-${{ github.ref_name }}-${{ github.run_id }}
 
       - name: Generate forecast issue
+        if: ${{ always() }}
         uses: ` + getCachedActionPinFromResolver("actions/github-script", resolver) + `
+        env:
+          FORECAST_STEP_OUTCOME: ${{ steps.generate_forecast_report.outcome }}
         with:
           github-token: ${{ secrets.GITHUB_TOKEN }}
           script: |
@@ -653,11 +712,11 @@ jobs:
 
 	// Add validate_workflows job for workflow_dispatch with operation == 'validate'
 	// This job uses ubuntu-latest by default (needs full runner for CLI installation).
-	validateRunsOnValue := FormatRunsOn(configuredRunsOn, "ubuntu-latest")
+	formattedRunsOn := FormatRunsOn(configuredRunsOn, "ubuntu-latest")
 	yaml.WriteString(`
   validate_workflows:
     if: ${{ ` + RenderCondition(buildDispatchOperationCondition("validate")) + ` }}
-    runs-on: ` + validateRunsOnValue + `
+    runs-on: ` + formattedRunsOn + `
     permissions:
       contents: read
       issues: write
@@ -684,7 +743,7 @@ jobs:
 
 `)
 
-	yaml.WriteString(generateInstallCLISteps(actionMode, version, actionTag, resolver))
+	yaml.WriteString(generateInstallCLISteps(ctx, actionMode, version, actionTag, resolver))
 
 	yaml.WriteString(`      - name: Validate workflows and file issue on findings
         uses: ` + getCachedActionPinFromResolver("actions/github-script", resolver) + `
@@ -705,6 +764,7 @@ jobs:
 	// a confirmation comment.
 	// Skipped when label_triggers is set to false in aw.json maintenance config.
 	if !disableLabelTrigger {
+		maintenanceWorkflowYAMLLog.Print("Adding label-triggered jobs: label_disable_agentic_workflow and label_apply_safe_outputs")
 		disableLabelCondition := buildLabeledDisableCondition()
 		yaml.WriteString(`
   label_disable_agentic_workflow:
@@ -829,10 +889,15 @@ jobs:
 
 `)
 
-		yaml.WriteString(generateInstallCLISteps(actionMode, version, actionTag, resolver))
-		yaml.WriteString(`      - name: Compile workflows
+		yaml.WriteString(generateInstallCLISteps(ctx, actionMode, version, actionTag, resolver))
+		yaml.WriteString(`      - name: Pre-compile validation
         run: |
-          ` + getCLICmdPrefix(actionMode) + ` compile --validate --validate-images --verbose
+          ` + getCLICmdPrefix(actionMode) + ` compile --validate --no-emit --verbose
+          echo "✓ Pre-compile validation passed"
+
+      - name: Compile workflows
+        run: |
+          ` + getCLICmdPrefix(actionMode) + ` compile --validate --verbose
           echo "✓ All workflows compiled successfully"
 
       - name: Setup Scripts
@@ -840,10 +905,21 @@ jobs:
         with:
           destination: ${{ runner.temp }}/gh-aw/actions
 
-      - name: Check for out-of-sync workflows and create issue if needed
+      - name: Check for out-of-sync workflows and create issue or pull request if needed
         uses: ` + getCachedActionPinFromResolver("actions/github-script", resolver) + `
-        with:
-          script: |
+`)
+		if compileGitHubToken != "" {
+			yaml.WriteString(`        env:
+          GH_AW_MAINTENANCE_GITHUB_TOKEN: ` + compileGitHubToken + `
+`)
+		}
+		yaml.WriteString(`        with:
+`)
+		if compileGitHubToken != "" {
+			yaml.WriteString(`          github-token: ${{ env.GH_AW_MAINTENANCE_GITHUB_TOKEN }}
+`)
+		}
+		yaml.WriteString(`          script: |
             const { setupGlobals } = require('${{ runner.temp }}/gh-aw/actions/setup_globals.cjs');
             setupGlobals(core, github, context, exec, io, getOctokit);
             const { main } = require('${{ runner.temp }}/gh-aw/actions/check_workflow_recompile_needed.cjs');
@@ -877,7 +953,16 @@ jobs:
         with:
           destination: ${{ runner.temp }}/gh-aw/actions
 
-      - name: Validate Secrets
+`)
+		// Build the Validate Secrets step, conditionally including the org billing flag.
+		// The line uses 10-space indentation to match the surrounding env block structure.
+		copilotOrgBillingLine := ""
+		if copilotOrgBilling {
+			maintenanceWorkflowYAMLLog.Print("Copilot org billing mode detected: adding GH_AW_COPILOT_ORG_BILLING=true to secret-validation step")
+			copilotOrgBillingLine = `          GH_AW_COPILOT_ORG_BILLING: "true"
+`
+		}
+		yaml.WriteString(`      - name: Validate Secrets
         uses: ` + getCachedActionPinFromResolver("actions/github-script", resolver) + `
         env:
           # GitHub tokens
@@ -885,7 +970,7 @@ jobs:
           GH_AW_GITHUB_MCP_SERVER_TOKEN: ${{ secrets.GH_AW_GITHUB_MCP_SERVER_TOKEN }}
           GH_AW_PROJECT_GITHUB_TOKEN: ${{ secrets.GH_AW_PROJECT_GITHUB_TOKEN }}
           GH_AW_COPILOT_TOKEN: ${{ secrets.GH_AW_COPILOT_TOKEN }}
-          # AI Engine API keys
+` + copilotOrgBillingLine + `          # AI Engine API keys
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
           BRAVE_API_KEY: ${{ secrets.BRAVE_API_KEY }}

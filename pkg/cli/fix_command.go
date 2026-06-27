@@ -9,6 +9,7 @@ import (
 
 	"github.com/github/gh-aw/pkg/console"
 	"github.com/github/gh-aw/pkg/constants"
+	"github.com/github/gh-aw/pkg/fileutil"
 	"github.com/github/gh-aw/pkg/logger"
 	"github.com/github/gh-aw/pkg/parser"
 	"github.com/spf13/cobra"
@@ -18,15 +19,16 @@ var fixLog = logger.New("cli:fix_command")
 
 // FixConfig contains configuration for the fix command
 type FixConfig struct {
-	WorkflowIDs []string
-	Write       bool
-	Verbose     bool
-	WorkflowDir string // Custom workflow directory
+	WorkflowIDs        []string
+	Write              bool
+	Verbose            bool
+	WorkflowDir        string   // Custom workflow directory
+	DisabledCodemodIDs []string // Codemod IDs to skip
 }
 
 // RunFix runs the fix command with the given configuration
 func RunFix(config FixConfig) error {
-	return runFixCommand(config.WorkflowIDs, config.Write, config.Verbose, config.WorkflowDir)
+	return runFixCommand(config.WorkflowIDs, config.Write, config.Verbose, config.WorkflowDir, config.DisabledCodemodIDs)
 }
 
 // NewFixCommand creates the fix command
@@ -55,10 +57,8 @@ all steps and additionally:
   6. Delete old template files from previous versions if present
   7. Delete old workflow-specific .agent.md files from .github/agents/ if present
 
-` + WorkflowIDExplanation + `
-
-Examples:
-  ` + string(constants.CLIExtensionPrefix) + ` fix                     # Check all workflows (dry-run)
+` + WorkflowIDExplanation,
+		Example: `  ` + string(constants.CLIExtensionPrefix) + ` fix                     # Check all workflows (dry-run)
   ` + string(constants.CLIExtensionPrefix) + ` fix --write             # Fix all workflows
   ` + string(constants.CLIExtensionPrefix) + ` fix my-workflow         # Check specific workflow
   ` + string(constants.CLIExtensionPrefix) + ` fix my-workflow --write # Fix specific workflow
@@ -69,18 +69,20 @@ Examples:
 			write, _ := cmd.Flags().GetBool("write")
 			verbose, _ := cmd.Flags().GetBool("verbose")
 			dir, _ := cmd.Flags().GetString("dir")
+			disabledCodemods, _ := cmd.Flags().GetStringSlice("disable-codemod")
 
 			if listCodemods {
 				return listAvailableCodemods()
 			}
 
-			return runFixCommand(args, write, verbose, dir)
+			return runFixCommand(args, write, verbose, dir, disabledCodemods)
 		},
 	}
 
 	cmd.Flags().Bool("write", false, "Write changes to files (without this flag, no changes are made)")
 	cmd.Flags().Bool("list-codemods", false, "List all available codemods and exit")
 	cmd.Flags().StringP("dir", "d", "", "Workflow directory (default: .github/workflows)")
+	cmd.Flags().StringSlice("disable-codemod", nil, "Disable specific codemod IDs during the fix step (repeatable)")
 
 	// Register completions
 	cmd.ValidArgsFunction = CompleteWorkflowNames
@@ -110,12 +112,12 @@ func listAvailableCodemods() error {
 }
 
 // runFixCommand runs the fix command on specified or all workflows
-func runFixCommand(workflowIDs []string, write bool, verbose bool, workflowDir string) error {
-	fixLog.Printf("Running fix command: workflowIDs=%v, write=%v, verbose=%v, workflowDir=%s", workflowIDs, write, verbose, workflowDir)
+func runFixCommand(workflowIDs []string, write bool, verbose bool, workflowDir string, disabledCodemodIDs []string) error {
+	fixLog.Printf("Running fix command: workflowIDs=%v, write=%v, verbose=%v, workflowDir=%s, disabledCodemodIDs=%v", workflowIDs, write, verbose, workflowDir, disabledCodemodIDs)
 
 	// Set up workflow directory (using default if not specified)
 	if workflowDir == "" {
-		workflowDir = ".github/workflows"
+		workflowDir = constants.GetWorkflowDir()
 		fixLog.Printf("Using default workflow directory: %s", workflowDir)
 	} else {
 		workflowDir = filepath.Clean(workflowDir)
@@ -149,7 +151,10 @@ func runFixCommand(workflowIDs []string, write bool, verbose bool, workflowDir s
 	}
 
 	// Load all codemods
-	codemods := GetAllCodemods()
+	codemods, err := GetCodemods(disabledCodemodIDs)
+	if err != nil {
+		return err
+	}
 	fixLog.Printf("Loaded %d codemods", len(codemods))
 
 	// Process each file
@@ -178,14 +183,18 @@ func runFixCommand(workflowIDs []string, write bool, verbose bool, workflowDir s
 		}
 	}
 
-	// Update prompt and agent files (similar to init command)
+	// Update prompt and skill files (similar to init command)
 	// This ensures the latest templates are always used
-	fixLog.Print("Updating prompt and agent files")
+	fixLog.Print("Updating prompt and skill files")
 
-	// Update dispatcher agent
+	// Update dispatcher skill
 	if err := ensureAgenticWorkflowsDispatcher(verbose, false); err != nil {
-		fixLog.Printf("Failed to update dispatcher agent: %v", err)
-		fmt.Fprintf(os.Stderr, "%s\n", console.FormatWarningMessage(fmt.Sprintf("Warning: Failed to update dispatcher agent: %v", err)))
+		fixLog.Printf("Failed to update dispatcher skill: %v", err)
+		fmt.Fprintf(os.Stderr, "%s\n", console.FormatWarningMessage(fmt.Sprintf("Warning: Failed to update dispatcher skill: %v", err)))
+	}
+	if err := ensureAgenticWorkflowsAgent(verbose); err != nil {
+		fixLog.Printf("Failed to update agentic workflows custom agent: %v", err)
+		fmt.Fprintf(os.Stderr, "%s\n", console.FormatWarningMessage(fmt.Sprintf("Warning: Failed to update agentic workflows custom agent: %v", err)))
 	}
 
 	// Delete old template files from pkg/cli/templates/ (only with --write)
@@ -200,7 +209,7 @@ func runFixCommand(workflowIDs []string, write bool, verbose bool, workflowDir s
 	// Delete old agent files if write flag is set
 	if write {
 		fixLog.Print("Deleting old agent files")
-		if err := deleteOldAgentFiles(verbose); err != nil {
+		if err := deleteLegacyAgentFiles(verbose); err != nil {
 			fixLog.Printf("Failed to delete old agent files: %v", err)
 			fmt.Fprintf(os.Stderr, "%s\n", console.FormatWarningMessage(fmt.Sprintf("Warning: Failed to delete old agent files: %v", err)))
 		}
@@ -208,7 +217,7 @@ func runFixCommand(workflowIDs []string, write bool, verbose bool, workflowDir s
 
 	// Delete deprecated schema file if it exists
 	schemaPath := filepath.Join(".github", "aw", "schemas", "agentic-workflow.json")
-	if _, err := os.Stat(schemaPath); err == nil {
+	if fileutil.FileExists(schemaPath) {
 		fixLog.Printf("Found deprecated schema file at %s", schemaPath)
 		if write {
 			if err := os.Remove(schemaPath); err != nil {
@@ -324,7 +333,7 @@ func processWorkflowFileWithInfo(filePath string, codemods []Codemod, write bool
 			return false, nil, fmt.Errorf("failed to scaffold shared Serena workflow: %w", err)
 		}
 
-		fmt.Fprintf(os.Stderr, "%s\n", console.FormatSuccessMessage("✓ "+fileName))
+		fmt.Fprintf(os.Stderr, "%s\n", console.FormatSuccessMessage(fileName))
 		for _, codemodName := range appliedCodemods {
 			fmt.Fprintf(os.Stderr, "    • %s\n", codemodName)
 		}

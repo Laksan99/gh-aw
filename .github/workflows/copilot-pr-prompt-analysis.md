@@ -1,4 +1,6 @@
 ---
+private: true
+emoji: "🔍"
 name: Copilot PR Prompt Pattern Analysis
 description: Analyzes prompt patterns used in Copilot PR interactions to identify common usage patterns and optimization opportunities
 on:
@@ -7,13 +9,17 @@ on:
     - cron: daily
   workflow_dispatch:
 
+max-daily-ai-credits: 10000
 permissions:
   contents: read
   issues: read
   pull-requests: read
   actions: read
 
-engine: copilot
+  copilot-requests: write
+engine:
+  id: copilot
+  copilot-sdk: true
 
 network:
   allowed:
@@ -22,7 +28,9 @@ network:
     - node
 
 sandbox:
-  agent: awf  # Firewall enabled (migrated from network.firewall)
+  agent:  # Firewall enabled (migrated from network.firewall)
+    id: awf
+    sudo: false
 imports:
   - uses: shared/daily-audit-base.md
     with:
@@ -34,16 +42,15 @@ imports:
       description: "Historical prompt pattern analysis"
   - shared/copilot-pr-analysis-base.md
 
-  - shared/observability-otlp.md
+  - shared/otlp.md
 timeout-minutes: 15
-
-features:
-  copilot-requests: true
 
 tools:
   cli-proxy: true
-
+features:
+  gh-aw-detection: true
 ---
+
 # Copilot PR Prompt Pattern Analysis
 
 You are an AI analytics agent that analyzes the patterns in prompts used to create pull requests via GitHub Copilot, correlating them with PR outcomes (merged vs closed).
@@ -56,7 +63,7 @@ Generate a daily report analyzing Copilot-generated PRs from the last 30 days, f
 
 - **Repository**: ${{ github.repository }}
 - **Analysis Period**: Last 30 days
-- **Data Location**: Pre-fetched PR data is available at `/tmp/gh-aw/pr-data/copilot-prs.json`
+- **Data Location**: Pre-fetched PR data is available at `/tmp/gh-aw/agent/pr-data/copilot-prs.json`
 
 ## Task Overview
 
@@ -66,12 +73,12 @@ Generate a daily report analyzing Copilot-generated PRs from the last 30 days, f
 
 1. **Load the data**:
    ```bash
-   cat /tmp/gh-aw/pr-data/copilot-prs.json
+   cat /tmp/gh-aw/agent/pr-data/copilot-prs.json
    ```
 
 2. **Verify data**:
    ```bash
-   echo "Total PRs loaded: $(jq 'length' /tmp/gh-aw/pr-data/copilot-prs.json)"
+   echo "Total PRs loaded: $(jq 'length' /tmp/gh-aw/agent/pr-data/copilot-prs.json)"
    ```
 
 ### Phase 2: Extract and Categorize Prompts

@@ -1,4 +1,6 @@
 ---
+private: true
+emoji: "⚡"
 description: Daily analysis and improvement of repository quality focusing on different software development lifecycle areas
 on:
   schedule:
@@ -22,7 +24,7 @@ imports:
       title-prefix: "[repository-quality] "
       expires: 1d
   - shared/repository-quality-report-template.md
-  - shared/observability-otlp.md
+  - shared/otlp.md
 tools:
   cli-proxy: true
   edit:
@@ -74,6 +76,9 @@ steps:
       echo "✅ Quality metrics collected → /tmp/gh-aw/agent/analysis-context.md"
 
 
+sandbox:
+  agent:
+    sudo: false
 ---
 # Repository Quality Improvement Agent
 

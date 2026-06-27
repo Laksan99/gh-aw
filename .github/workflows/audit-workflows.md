@@ -1,8 +1,11 @@
 ---
+emoji: "🔍"
 description: Daily audit of all agentic workflow runs from the last 24 hours to identify issues, missing tools, errors, and improvement opportunities
 on:
   schedule: daily
   workflow_dispatch:
+max-ai-credits: 1500
+max-daily-ai-credits: 10000
 permissions:
   contents: read
   actions: read
@@ -28,10 +31,16 @@ imports:
     with:
       branch-name: "memory/audit-workflows"
       description: "Historical audit data and patterns"
+      max-patch-size: 51200
   - ../skills/jqschema/SKILL.md
 
 
-  - shared/observability-otlp.md
+  - shared/otlp.md
+features:
+  gh-aw-detection: true
+sandbox:
+  agent:
+    sudo: false
 ---
 
 # Agentic Workflow Audit Agent
@@ -51,9 +60,9 @@ Daily audit all agentic workflow runs from the last 24 hours to identify issues,
 Generate 2 charts from past 30 days workflow data:
 
 1. **Workflow Health**: Success/failure counts and success rate (green/red lines, secondary y-axis for %)
-2. **Token & Cost**: Daily tokens (bar/area) + cost line + 7-day moving average
+2. **Token Usage**: Daily tokens (bar/area) + 7-day moving average
 
-Save to: `/tmp/gh-aw/python/charts/{workflow_health,token_cost}_trends.png`
+Save to: `/tmp/gh-aw/python/charts/{workflow_health,token}_trends.png`
 Upload charts and embed them in the discussion with 2-3 sentence analysis each. Call the `upload_asset` safe-output tool for each chart using the absolute chart path. Record the returned asset URLs and include them in the discussion body.
 
 ---
@@ -76,13 +85,22 @@ Output is saved to: /tmp/gh-aw/aw-mcp/logs
 **Analyze**: Review logs for:
 - Missing tools (patterns, frequency, legitimacy)
 - Errors (tool execution, MCP failures, auth, timeouts, resources)
-- Performance (token usage, costs, timeouts, efficiency)
+- Performance (token usage, timeouts, efficiency)
 - Patterns (recurring issues, frequent failures)
 
-**Cache Memory**: Store findings in `/tmp/gh-aw/repo-memory/default/`:
-- `audits/<date>.json` + `audits/index.json`
-- `patterns/{errors,missing-tools,mcp-failures}.json`
-- Compare with historical data
+**Repo Memory**: Store findings in `/tmp/gh-aw/repo-memory/default/`:
+- `audit-history.jsonl` — append one structured summary entry per audit cycle
+- `workflow-trends.json` — rolling per-workflow cost, duration, success, and reliability trends
+- `known-issues.json` — recurring problems with first-seen, last-seen, recurrence count, affected workflows, and status
+- `recommendations.json` — accumulated recommendations linked back to audits, workflows, and known issues
+- `anomalies.json` — unusual runs or cost spikes with a multi-day persistence score and current escalation state
+- `metrics-summary.json` — aggregate daily metrics used for charts and rollups
+
+When updating repo memory:
+- merge with existing data instead of overwriting useful history
+- keep stable IDs so issues, recommendations, and anomalies can be cross-referenced across days
+- increment recurrence and persistence counters when the same problem reappears
+- compare the current audit with prior entries before deciding whether something is new or ongoing
 
 ## Guidelines
 
@@ -91,7 +109,7 @@ Output is saved to: /tmp/gh-aw/aw-mcp/logs
 **Efficiency**: Use repo memory, batch operations, respect timeouts
 **Report Formatting**: Use h3 (###) or lower for all headers in your report to maintain proper document hierarchy. Wrap long sections in `<details><summary>Section Name</summary>` tags to improve readability and reduce scrolling.
 
-Memory structure: `/tmp/gh-aw/repo-memory/default/{audits,patterns,metrics}/*.json`
+Memory structure: `/tmp/gh-aw/repo-memory/default/{audit-history.jsonl,workflow-trends.json,known-issues.json,recommendations.json,anomalies.json,metrics-summary.json}`
 
 Always create discussion with findings and update repo memory.
 

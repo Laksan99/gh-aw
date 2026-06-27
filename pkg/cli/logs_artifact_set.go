@@ -14,11 +14,13 @@ package cli
 import (
 	"fmt"
 	"os"
+	"slices"
 	"sort"
 	"strings"
 
 	"github.com/github/gh-aw/pkg/constants"
 	"github.com/github/gh-aw/pkg/logger"
+	"github.com/github/gh-aw/pkg/setutil"
 )
 
 var artifactSetLog = logger.New("cli:logs_artifact_set")
@@ -62,6 +64,10 @@ const (
 	// ArtifactSetExperiment downloads the experiment artifact containing A/B experiment
 	// state (state.json) uploaded by the activation job when experiments are declared.
 	ArtifactSetExperiment ArtifactSet = "experiment"
+
+	// ArtifactSetUsage downloads the compact usage artifact produced by the
+	// conclusion job (aw-info.jsonl, usage summaries, token usage JSONL).
+	ArtifactSetUsage ArtifactSet = "usage"
 )
 
 // artifactSetArtifacts maps each named set to the list of artifact base names it includes.
@@ -79,7 +85,11 @@ var artifactSetArtifacts = map[ArtifactSet][]string{
 	ArtifactSetGitHubAPI: {constants.ActivationArtifactName, constants.AgentArtifactName},
 	// experiment: A/B experiment state uploaded by the activation job.
 	ArtifactSetExperiment: {constants.ExperimentArtifactName},
+	// usage: compact conclusion artifact for lightweight reporting/forecasting.
+	ArtifactSetUsage: {constants.UsageArtifactName},
 }
+
+const maxArtifactHintExamples = 2
 
 // ValidArtifactSetNames returns a sorted list of valid artifact set names,
 // derived dynamically from the artifactSetArtifacts map to stay in sync automatically.
@@ -90,6 +100,56 @@ func ValidArtifactSetNames() []string {
 	}
 	sort.Strings(names)
 	return names
+}
+
+func usageOnlyArtifactHintMessage() string {
+	examples := artifactHintExampleSets()
+	switch len(examples) {
+	case 0:
+		return "Only the usage artifact was downloaded. Use --artifacts all to download all artifacts."
+	case 1:
+		return fmt.Sprintf("Only the usage artifact was downloaded. Use --artifacts all to download all artifacts, or a specific set such as --artifacts %s.", examples[0])
+	default:
+		return fmt.Sprintf(
+			"Only the usage artifact was downloaded. Use --artifacts all to download all artifacts, or a specific set such as --artifacts %s, or combinations such as --artifacts %s.",
+			examples[0],
+			strings.Join(examples, ","),
+		)
+	}
+}
+
+func artifactHintExampleSets() []string {
+	valid := ValidArtifactSetNames()
+	excluded := map[string]struct{}{
+		string(ArtifactSetAll):   {},
+		string(ArtifactSetUsage): {},
+	}
+	selected := make([]string, 0, maxArtifactHintExamples)
+	seen := make(map[string]struct{}, maxArtifactHintExamples)
+
+	add := func(name string) {
+		if len(selected) == maxArtifactHintExamples {
+			return
+		}
+		if _, skip := excluded[name]; skip {
+			return
+		}
+		if _, dup := seen[name]; dup {
+			return
+		}
+		if slices.Contains(valid, name) {
+			selected = append(selected, name)
+			seen[name] = struct{}{}
+		}
+	}
+
+	add(string(ArtifactSetAgent))
+	add(string(ArtifactSetFirewall))
+	for _, name := range valid {
+		add(name)
+	}
+
+	return selected
 }
 
 // ValidateArtifactSets checks that every entry in sets is a known ArtifactSet name.
@@ -129,12 +189,14 @@ func ResolveArtifactFilter(sets []string) []string {
 		}
 	}
 
-	seen := make(map[string]bool)
+	seen := make(map[string]struct {
+	})
 	var names []string
 	for _, s := range sets {
 		for _, name := range artifactSetArtifacts[ArtifactSet(s)] {
-			if !seen[name] {
-				seen[name] = true
+			if !setutil.Contains(seen, name) {
+				seen[name] = struct {
+				}{}
 				names = append(names, name)
 			}
 		}

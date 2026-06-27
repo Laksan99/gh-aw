@@ -28,6 +28,23 @@ func ParseFrontmatterConfig(frontmatter map[string]any) (*FrontmatterConfig, err
 		return nil, fmt.Errorf("failed to unmarshal frontmatter into config: %w", err)
 	}
 
+	if err := validateRunsOnValue(config.RunsOn); err != nil {
+		return nil, err
+	}
+	if err := validateRunsOnValue(config.RunsOnSlim); err != nil {
+		return nil, err
+	}
+	if safeOutputsRaw, ok := frontmatter["safe-outputs"].(map[string]any); ok {
+		if err := validateRunsOnValue(safeOutputsRaw["runs-on"]); err != nil {
+			return nil, err
+		}
+		if threatRaw, ok := safeOutputsRaw["threat-detection"].(map[string]any); ok {
+			if err := validateRunsOnValue(threatRaw["runs-on"]); err != nil {
+				return nil, err
+			}
+		}
+	}
+
 	// Parse typed Runtimes field if runtimes exist
 	if len(config.Runtimes) > 0 {
 		runtimesTyped, err := parseRuntimesConfig(config.Runtimes)
@@ -77,7 +94,6 @@ func ParseFrontmatterConfig(frontmatter map[string]any) (*FrontmatterConfig, err
 	frontmatterTypesLog.Printf("Successfully parsed frontmatter config: name=%s, engine=%v", config.Name, config.Engine)
 	return &config, nil
 }
-
 func parseOnNeedsConfig(on map[string]any) ([]string, error) {
 	return parseOnNeedsValues(on)
 }
@@ -133,12 +149,21 @@ func parseRuntimesConfig(runtimes map[string]any) (*RuntimesConfig, error) {
 			}
 		}
 
+		// Extract cooldown flag (optional, default true when omitted)
+		var cooldown *bool
+		if cooldownAny, hasCooldown := configMap["cooldown"]; hasCooldown {
+			if cooldownBool, ok := cooldownAny.(bool); ok {
+				cooldown = &cooldownBool
+			}
+		}
+
 		// Create runtime config with all fields
 		runtimeConfig := &RuntimeConfig{
 			Version:           version,
 			If:                ifCondition,
 			ActionRepo:        actionRepo,
 			ActionVersion:     actionVersion,
+			Cooldown:          cooldown,
 			RunInstallScripts: runInstallScripts,
 		}
 

@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -47,7 +48,11 @@ func TestMain(m *testing.M) {
 		}
 		binaryTempDir = tempDir
 
-		globalBinaryPath = filepath.Join(tempDir, "gh-aw")
+		binaryName := "gh-aw"
+		if runtime.GOOS == "windows" {
+			binaryName = "gh-aw.exe"
+		}
+		globalBinaryPath = filepath.Join(tempDir, binaryName)
 
 		// Build the gh-aw binary
 		buildCmd := exec.Command("make", "build")
@@ -58,7 +63,7 @@ func TestMain(m *testing.M) {
 		}
 
 		// Copy binary to temp directory
-		srcBinary := filepath.Join(projectRoot, "gh-aw")
+		srcBinary := filepath.Join(projectRoot, binaryName)
 		if err := fileutil.CopyFile(srcBinary, globalBinaryPath); err != nil {
 			panic("Failed to copy gh-aw binary to temp directory: " + err.Error())
 		}
@@ -120,8 +125,10 @@ func setupIntegrationTest(t *testing.T) *integrationTestSetup {
 		t.Fatalf("Failed to change to temp directory: %v", err)
 	}
 
-	// Copy the pre-built binary to this test's temp directory
-	binaryPath := filepath.Join(tempDir, "gh-aw")
+	// Copy the pre-built binary to this test's temp directory, preserving the
+	// executable extension (e.g. ".exe" on Windows) so the OS can execute it.
+	binaryName := "gh-aw" + filepath.Ext(globalBinaryPath)
+	binaryPath := filepath.Join(tempDir, binaryName)
 	if err := fileutil.CopyFile(globalBinaryPath, binaryPath); err != nil {
 		t.Fatalf("Failed to copy gh-aw binary to temp directory: %v", err)
 	}
@@ -223,6 +230,9 @@ Please check the repository for any open issues and create a summary.
 }
 
 func TestCompileWithIncludeWithEmptyFrontmatterUnderPty(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("PTY-based test is not supported on Windows")
+	}
 	setup := setupIntegrationTest(t)
 	defer setup.cleanup()
 
@@ -2236,4 +2246,66 @@ func TestCompileWithActionsRepoDefaultFallback(t *testing.T) {
 	}
 
 	t.Logf("Default actions repo test passed - default repo baked into lock file: %s", lockFilePath)
+}
+
+func TestCompileWithActionRefOverrideIncludesCompilerVersionMetadata(t *testing.T) {
+	tests := []struct {
+		name string
+		args []string
+	}{
+		{
+			name: "action-tag",
+			args: []string{"--action-tag", "v9.9.9"},
+		},
+		{
+			name: "gh-aw-ref",
+			args: []string{"--gh-aw-ref", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			setup := setupIntegrationTest(t)
+			defer setup.cleanup()
+
+			srcPath := filepath.Join(projectRoot, "pkg/cli/workflows/test-actions-repo.md")
+			dstPath := filepath.Join(setup.workflowsDir, "test-actions-repo.md")
+
+			srcContent, err := os.ReadFile(srcPath)
+			if err != nil {
+				t.Fatalf("Failed to read source workflow file %s: %v", srcPath, err)
+			}
+			if err := os.WriteFile(dstPath, srcContent, 0o644); err != nil {
+				t.Fatalf("Failed to write workflow to test dir: %v", err)
+			}
+
+			cmdArgs := append([]string{"compile"}, tt.args...)
+			cmdArgs = append(cmdArgs, dstPath)
+			cmd := exec.Command(setup.binaryPath, cmdArgs...)
+			output, err := cmd.CombinedOutput()
+			if err != nil {
+				t.Fatalf("CLI compile command failed: %v\nOutput: %s", err, string(output))
+			}
+
+			lockFilePath := filepath.Join(setup.workflowsDir, "test-actions-repo.lock.yml")
+			lockContent, err := os.ReadFile(lockFilePath)
+			if err != nil {
+				t.Fatalf("Failed to read lock file: %v", err)
+			}
+
+			metadataLine := ""
+			for line := range strings.SplitSeq(string(lockContent), "\n") {
+				if strings.Contains(line, "gh-aw-metadata:") {
+					metadataLine = line
+					break
+				}
+			}
+			if metadataLine == "" {
+				t.Fatal("Could not find gh-aw-metadata in lock file")
+			}
+			if !strings.Contains(metadataLine, `"compiler_version":"`) || strings.Contains(metadataLine, `"compiler_version":""`) {
+				t.Fatalf("Expected non-empty compiler_version in metadata, got: %s", metadataLine)
+			}
+		})
+	}
 }

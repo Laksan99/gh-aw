@@ -180,8 +180,23 @@ async function main() {
       return;
     }
     if (!fs.existsSync(outputFile)) {
-      core.info(`Output file does not exist: ${outputFile}`);
-      core.setOutput("output", "");
+      core.info(`Output file does not exist: ${outputFile} — no safe-output items were emitted; treating as empty collection (graceful no-op)`);
+      const emptyOutput = { items: [], errors: [] };
+      const emptyOutputJson = JSON.stringify(emptyOutput);
+      // Write agent_output.json for consistent downstream handling so the safe_outputs job
+      // always finds a valid (empty) collection file even when the agent emitted nothing.
+      try {
+        fs.mkdirSync(TMP_GH_AW_PATH, { recursive: true });
+        const agentOutputFile = require("path").join(TMP_GH_AW_PATH, AGENT_OUTPUT_FILENAME);
+        fs.writeFileSync(agentOutputFile, emptyOutputJson, "utf8");
+        core.info(`Stored empty collection to: ${agentOutputFile}`);
+        core.exportVariable("GH_AW_AGENT_OUTPUT", agentOutputFile);
+      } catch (writeError) {
+        core.error(`Failed to write empty agent output file: ${getErrorMessage(writeError)}`);
+      }
+      // Always set the step output even if the artifact write failed;
+      // downstream steps reading GH_AW_AGENT_OUTPUT must handle the var being absent.
+      core.setOutput("output", emptyOutputJson);
       core.setOutput("output_types", "");
       core.setOutput("has_patch", "false");
       return;
@@ -307,17 +322,26 @@ async function main() {
         }
         core.info(`Line ${i + 1}: type '${itemType}'`);
 
+        const typeConfig = expectedOutputTypes[itemType];
+        const normalizeIssueClosingKeywords = typeConfig !== null && typeof typeConfig === "object" && typeConfig.normalize_closing_keywords === true;
+
         // Use the validation engine to validate the item
         if (hasValidationConfig(itemType)) {
-          const validationResult = validateItem(item, itemType, i + 1, { allowedAliases: allowedMentions, maxBotMentions });
+          const validationResult = validateItem(item, itemType, i + 1, {
+            allowedAliases: allowedMentions,
+            maxBotMentions,
+            normalizeIssueClosingKeywords,
+          });
           if (!validationResult.isValid) {
             if (validationResult.error) {
               errors.push(validationResult.error);
             }
             continue;
           }
-          // Update item with normalized values
-          Object.assign(item, validationResult.normalizedItem);
+          // Use the normalized item (with sanitized/validated fields) rather
+          // than the raw input, so downstream consumers see the canonical form.
+          core.info(`Line ${i + 1}: Valid ${itemType} item`);
+          parsedItems.push(validationResult.normalizedItem);
         } else {
           // Fall back to validateItemWithSafeJobConfig for unknown types
           const jobOutputType = expectedOutputTypes[itemType];
@@ -334,10 +358,9 @@ async function main() {
             }
             Object.assign(item, validation.normalizedItem);
           }
+          core.info(`Line ${i + 1}: Valid ${itemType} item`);
+          parsedItems.push(item);
         }
-
-        core.info(`Line ${i + 1}: Valid ${itemType} item`);
-        parsedItems.push(item);
       } catch (error) {
         const errorMsg = getErrorMessage(error);
         errors.push(`Line ${i + 1}: Invalid JSON - ${errorMsg}`);

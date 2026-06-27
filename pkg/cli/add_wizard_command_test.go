@@ -14,3 +14,13 @@ func TestAddWizardCommandMentionsCrush(t *testing.T) {
 	require.NotNil(t, cmd, "Add wizard command should be created")
 	assert.Contains(t, cmd.Long, "Copilot, Claude, Codex, Gemini, or Crush", "Add wizard help should mention all interactive engine options")
 }
+
+func TestAddWizardCommand_UsesStandardThreePartWorkflowSpecWording(t *testing.T) {
+	cmd := NewAddWizardCommand(func(string) error { return nil })
+	require.NotNil(t, cmd)
+
+	assert.Contains(t, cmd.Long, `Three parts: "owner/repo/workflow-name[@version]" (implicitly looks in workflows/ directory)`)
+	assert.Contains(t, cmd.Long, "shorthand source specs resolve on your enterprise host by default.")
+	assert.Contains(t, cmd.Long, "For github/*, githubnext/*, and microsoft/* sources, shorthand resolves on github.com.")
+	assert.Contains(t, cmd.Long, "Use full https://github.com/... source URLs for other public github.com workflows.")
+}

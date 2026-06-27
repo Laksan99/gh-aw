@@ -15,11 +15,12 @@ package workflow
 
 import (
 	"fmt"
-	"sort"
 	"strings"
 
 	"github.com/github/gh-aw/pkg/constants"
 	"github.com/github/gh-aw/pkg/parser"
+	"github.com/github/gh-aw/pkg/setutil"
+	"github.com/github/gh-aw/pkg/sliceutil"
 )
 
 var mcpValidationLog = newValidationLogger("mcp_config")
@@ -47,11 +48,7 @@ var builtInToolNames = map[string]bool{
 // builtInToolNamesForError is the sorted, comma-separated list of built-in tool names
 // used in error messages, derived once from builtInToolNames.
 var builtInToolNamesForError = func() string {
-	names := make([]string, 0, len(builtInToolNames))
-	for name := range builtInToolNames {
-		names = append(names, name)
-	}
-	sort.Strings(names)
+	names := sliceutil.SortedKeys(builtInToolNames)
 	return strings.Join(names, ", ")
 }()
 
@@ -62,11 +59,7 @@ func ValidateMCPConfigs(tools map[string]any) error {
 	mcpValidationLog.Printf("Validating MCP configurations for %d tools", len(tools))
 
 	// Collect and sort tool names for deterministic error messages
-	toolNames := make([]string, 0, len(tools))
-	for name := range tools {
-		toolNames = append(toolNames, name)
-	}
-	sort.Strings(toolNames)
+	toolNames := sliceutil.SortedKeys(tools)
 
 	for _, toolName := range toolNames {
 		toolConfig := tools[toolName]
@@ -127,11 +120,7 @@ func ValidateToolsSection(tools map[string]any) error {
 	}
 
 	// Collect and sort names for deterministic error messages
-	toolNames := make([]string, 0, len(tools))
-	for name := range tools {
-		toolNames = append(toolNames, name)
-	}
-	sort.Strings(toolNames)
+	toolNames := sliceutil.SortedKeys(tools)
 
 	for _, toolName := range toolNames {
 		if !builtInToolNames[toolName] {
@@ -155,31 +144,34 @@ func getRawMCPConfig(toolConfig map[string]any) (map[string]any, error) {
 	mcpFields := []string{"type", "url", "command", "container", "env", "headers"}
 
 	// List of all known tool config fields (not just MCP)
-	knownToolFields := map[string]bool{
-		"type":            true,
-		"url":             true,
-		"command":         true,
-		"container":       true,
-		"env":             true,
-		"headers":         true,
-		"auth":            true, // upstream OIDC authentication (HTTP servers only)
-		"version":         true,
-		"args":            true,
-		"entrypoint":      true,
-		"entrypointArgs":  true,
-		"mounts":          true,
-		"proxy-args":      true,
-		"registry":        true,
-		"allowed":         true,
-		"mode":            true, // for github tool: prompt/runtime mode (cli) or legacy MCP transport (local/remote)
-		"github-token":    true, // for github tool
-		"read-only":       true, // for github tool
-		"toolsets":        true, // for github tool
-		"integrity-proxy": true, // for github tool
-		"id":              true, // for cache-memory (array notation)
-		"key":             true, // for cache-memory
-		"description":     true, // for cache-memory
-		"retention-days":  true, // for cache-memory
+	knownToolFields := map[string]struct {
+	}{
+		"type":            {},
+		"url":             {},
+		"command":         {},
+		"container":       {},
+		"env":             {},
+		"headers":         {},
+		"auth":            {}, // upstream OIDC authentication (HTTP servers only)
+		"version":         {},
+		"args":            {},
+		"entrypoint":      {},
+		"entrypointArgs":  {},
+		"mounts":          {},
+		"proxy-args":      {},
+		"registry":        {},
+		"allowed":         {},
+		"mode":            {}, // for github tool: prompt/runtime mode (cli) or legacy MCP transport (local/remote)
+		"github-token":    {}, // for github tool
+		"read-only":       {}, // for github tool
+		"toolsets":        {}, // for github tool
+		"integrity-proxy": {   // for github tool
+		},
+		"id":             {}, // for cache-memory (array notation)
+		"key":            {}, // for cache-memory
+		"description":    {}, // for cache-memory
+		"retention-days": {   // for cache-memory
+		},
 	}
 
 	// Check new format: direct fields in tool config
@@ -191,13 +183,9 @@ func getRawMCPConfig(toolConfig map[string]any) (map[string]any, error) {
 
 	// Check for unknown fields that might be typos or deprecated (like "network")
 	for field := range toolConfig {
-		if !knownToolFields[field] {
+		if !setutil.Contains(knownToolFields, field) {
 			// Build list of valid fields for the error message
-			validFields := []string{}
-			for k := range knownToolFields {
-				validFields = append(validFields, k)
-			}
-			sort.Strings(validFields)
+			validFields := sliceutil.SortedKeys(knownToolFields)
 			maxFields := min(10, len(validFields))
 			return nil, fmt.Errorf("unknown property '%s' in tool configuration. Valid properties include: %s.\n\nExample:\ntools:\n  my-tool:\n    command: \"node server.js\"\n    args: [\"--verbose\"]\n\nSee: %s", field, strings.Join(validFields[:maxFields], ", "), constants.DocsToolsURL)
 		}

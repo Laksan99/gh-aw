@@ -20,7 +20,7 @@ const fs = require("fs");
 const path = require("path");
 const { getErrorMessage } = require("./error_helpers.cjs");
 const { listFilesRecursively } = require("./file_helpers.cjs");
-const { DETECTION_LOG_FILENAME } = require("./constants.cjs");
+const { DETECTION_LOG_FILENAME, DETECTION_RESULT_FILENAME } = require("./constants.cjs");
 const { ERR_SYSTEM, ERR_PARSE, ERR_VALIDATION } = require("./error_codes.cjs");
 
 const RESULT_PREFIX = "THREAT_DETECTION_RESULT:";
@@ -79,6 +79,34 @@ function extractResultFromText(text) {
   return RESULT_PREFIX + text.substring(jsonStartPos, jsonEndPos + 1);
 }
 
+/** Required fields that must be present for a valid structured threat detection object. */
+const STRUCTURED_OUTPUT_REQUIRED_FIELDS = ["prompt_injection", "secret_leak", "malicious_patch"];
+
+/**
+ * Try to extract a threat detection verdict from Codex structured output.
+ * When Codex runs with -c response_schema enabled for detection jobs, it outputs the
+ * JSON verdict object directly — without the THREAT_DETECTION_RESULT: prefix that
+ * non-structured (text-mode) engines use.  This function detects such output by
+ * checking for the expected threat detection fields and wraps it with the prefix so
+ * the existing parsing pipeline can handle it uniformly.
+ *
+ * @param {string} text - Text that may be a raw JSON threat detection object
+ * @returns {string|null} RESULT_PREFIX + JSON string if the text is a valid
+ *   threat detection object without the prefix, null otherwise
+ */
+function extractStructuredOutput(text) {
+  const trimmed = text.trim();
+  if (!trimmed.startsWith("{")) return null;
+  try {
+    const parsed = JSON.parse(trimmed);
+    if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) return null;
+    if (!STRUCTURED_OUTPUT_REQUIRED_FIELDS.every(field => field in parsed)) return null;
+    return RESULT_PREFIX + trimmed;
+  } catch {
+    return null;
+  }
+}
+
 /**
  * Try to extract a THREAT_DETECTION_RESULT value from a stream-json line.
  * Stream-json output from Claude wraps the result in JSON envelopes like:
@@ -87,15 +115,53 @@ function extractResultFromText(text) {
  * The same result also appears in {"type":"assistant"} messages, but we only
  * extract from "type":"result" which is the authoritative final summary.
  *
+ * When Codex runs with structured outputs (response_schema), the Responses API
+ * emits the verdict as a plain JSON object in response events (no prefix).
+ * extractStructuredOutput handles that case as a fallback.
+ *
  * @param {string} line - A single line from the detection log
  * @returns {string|null} The raw THREAT_DETECTION_RESULT:... string if found, null otherwise
  */
 function extractFromStreamJson(line) {
   const trimmed = line.trim();
-  if (!trimmed.startsWith("{")) return null;
+
+  // Support log lines prefixed with runner/codex tracing metadata, e.g.:
+  //   2026-... TRACE ...: {"type":"response.output_text.done",...}
+  // Assumes the first JSON object on the line is the event payload.
+  const jsonStart = trimmed.indexOf("{");
+  if (jsonStart === -1) return null;
+  const jsonText = trimmed.slice(jsonStart);
+
+  /**
+   * @param {string} text
+   * @returns {string|null}
+   */
+  function extractPrefixedResult(text) {
+    const prefixIdx = text.indexOf(RESULT_PREFIX);
+    if (prefixIdx === -1) return null;
+    return extractResultFromText(text.slice(prefixIdx));
+  }
+
+  /**
+   * @param {unknown} content
+   * @returns {string|null}
+   */
+  function extractFromAssistantContent(content) {
+    if (typeof content === "string") {
+      return extractPrefixedResult(content) || extractStructuredOutput(content);
+    }
+    if (!Array.isArray(content)) return null;
+    for (const part of content) {
+      const text = part && typeof part === "object" && typeof part.text === "string" ? part.text : null;
+      if (!text) continue;
+      const extracted = extractPrefixedResult(text) || extractStructuredOutput(text);
+      if (extracted) return extracted;
+    }
+    return null;
+  }
 
   try {
-    const obj = JSON.parse(trimmed);
+    const obj = JSON.parse(jsonText);
     // Only extract from the authoritative "result" summary, not "assistant" messages.
     // In stream-json mode, the same content appears in both; using only "result"
     // avoids double-counting.
@@ -125,6 +191,38 @@ function extractFromStreamJson(line) {
 
       // Extract the complete JSON object using brace-counting.
       return extractResultFromText(joined);
+    }
+
+    // Codex responses API emits final output text in response events.
+    // Try the prefixed format first; fall back to structured output (no prefix)
+    // when Codex runs with -c response_schema in detection mode.
+    if (obj.type === "response.output_text.done" && typeof obj.text === "string") {
+      return extractPrefixedResult(obj.text) || extractStructuredOutput(obj.text);
+    }
+    if (obj.type === "response.content_part.done" && obj.part && typeof obj.part.text === "string") {
+      return extractPrefixedResult(obj.part.text) || extractStructuredOutput(obj.part.text);
+    }
+    if (obj.type === "item.completed" && obj.item && typeof obj.item.text === "string") {
+      return extractPrefixedResult(obj.item.text) || extractStructuredOutput(obj.item.text);
+    }
+
+    // Pi emits final assistant verdicts in turn_end/message_end envelopes.
+    if ((obj.type === "turn_end" || obj.type === "message_end") && obj.message && obj.message.role === "assistant") {
+      return extractFromAssistantContent(obj.message.content);
+    }
+
+    // Some streams emit final assistant state via message_update.
+    if (obj.type === "message_update" && obj.message && obj.message.role === "assistant") {
+      return extractFromAssistantContent(obj.message.content);
+    }
+
+    // Agent-level summaries may include all messages; parse assistant messages only.
+    if (obj.type === "agent_end" && Array.isArray(obj.messages)) {
+      for (const message of obj.messages) {
+        if (!message || message.role !== "assistant") continue;
+        const extracted = extractFromAssistantContent(message.content);
+        if (extracted) return extracted;
+      }
     }
   } catch {
     // Not valid JSON — not a stream-json line
@@ -161,11 +259,45 @@ function parseDetectionLog(content) {
     }
   }
 
-  // Phase 2: If no stream-json results, try raw line matching.
+  // Phase 2: If no stream-json result field matches, try assistant stream chunk matching.
+  // Gemini stream-json output may emit assistant text in multiple "type":"message"
+  // entries (with role=assistant) where the verdict is split across chunks:
+  //   "THREAT_DETECTION_"
+  //   "RESULT:{...}"
+  // Reassemble assistant chunks and parse the first complete verdict object.
+  const assistantMatches = [];
+  if (streamMatches.length === 0) {
+    const assistantChunks = [];
+    for (const line of lines) {
+      const trimmed = line.trim();
+      if (!trimmed.startsWith("{")) continue;
+      try {
+        const obj = JSON.parse(trimmed);
+        if (obj.type === "message" && obj.role === "assistant" && typeof obj.content === "string") {
+          assistantChunks.push(obj.content);
+        }
+      } catch {
+        // Not valid JSON — ignore
+      }
+    }
+
+    if (assistantChunks.length > 0) {
+      const combinedAssistantText = assistantChunks.join("");
+      const prefixIdx = combinedAssistantText.indexOf(RESULT_PREFIX);
+      if (prefixIdx !== -1) {
+        const extracted = extractResultFromText(combinedAssistantText.slice(prefixIdx));
+        if (extracted !== null) {
+          assistantMatches.push(extracted);
+        }
+      }
+    }
+  }
+
+  // Phase 3: If no stream-json or assistant chunk results, try raw line matching.
   // Apply the same join-and-brace-count approach to handle cases where the
   // reasons values contain actual newlines that split the JSON across lines.
   const rawMatches = [];
-  if (streamMatches.length === 0) {
+  if (streamMatches.length === 0 && assistantMatches.length === 0) {
     let i = 0;
     while (i < lines.length) {
       if (lines[i].trim().startsWith(RESULT_PREFIX)) {
@@ -191,7 +323,7 @@ function parseDetectionLog(content) {
     }
   }
 
-  const matches = streamMatches.length > 0 ? streamMatches : rawMatches;
+  const matches = streamMatches.length > 0 ? streamMatches : assistantMatches.length > 0 ? assistantMatches : rawMatches;
 
   if (matches.length === 0) {
     return { error: "No THREAT_DETECTION_RESULT found in detection log. The detection model may have failed to follow the output format." };
@@ -245,6 +377,63 @@ function parseDetectionLog(content) {
 }
 
 /**
+ * Try to parse the threat detection verdict from a Codex structured output file.
+ *
+ * When Codex runs with `--output-last-message <file>`, it writes the final model
+ * response directly to that file as plain text. Combined with `--output-schema`,
+ * the content is the JSON verdict object (no THREAT_DETECTION_RESULT: prefix, no
+ * log noise).  This function reads and validates the file, returning the verdict
+ * or an error object exactly like `parseDetectionLog`.
+ *
+ * @param {string} resultFilePath - Absolute path to the structured result file
+ * @returns {{ verdict?: { prompt_injection: boolean, secret_leak: boolean, malicious_patch: boolean, reasons: string[] }, error?: string } | null}
+ *   Returns null if the file does not exist (caller should fall back to log parsing).
+ *   Returns an error object if the file exists but is malformed (conservative: report parse_error).
+ */
+function parseStructuredResultFile(resultFilePath) {
+  if (!fs.existsSync(resultFilePath)) {
+    return null;
+  }
+
+  let content;
+  try {
+    content = fs.readFileSync(resultFilePath, "utf8");
+  } catch (/** @type {any} */ readError) {
+    return { error: `Failed to read structured result file: ${getErrorMessage(readError)}` };
+  }
+
+  const trimmed = content.trim();
+  if (!trimmed) {
+    return { error: "Structured result file is empty" };
+  }
+
+  try {
+    const parsed = JSON.parse(trimmed);
+
+    if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
+      return { error: `Structured result must be a JSON object, got ${parsed === null ? "null" : Array.isArray(parsed) ? "array" : typeof parsed}` };
+    }
+
+    for (const field of ["prompt_injection", "secret_leak", "malicious_patch"]) {
+      if (typeof parsed[field] !== "boolean") {
+        return { error: `Invalid type for "${field}" in structured result: expected boolean, got ${typeof parsed[field]} (${JSON.stringify(parsed[field])})` };
+      }
+    }
+
+    return {
+      verdict: {
+        prompt_injection: parsed.prompt_injection,
+        secret_leak: parsed.secret_leak,
+        malicious_patch: parsed.malicious_patch,
+        reasons: Array.isArray(parsed.reasons) ? parsed.reasons : [],
+      },
+    };
+  } catch (/** @type {any} */ parseError) {
+    return { error: `Failed to parse JSON from structured result file: ${getErrorMessage(parseError)}` };
+  }
+}
+
+/**
  * Main entry point for parsing threat detection results and concluding the detection job.
  *
  * This function consolidates three responsibilities previously split across two steps:
@@ -264,7 +453,6 @@ async function main() {
   const runDetection = process.env.RUN_DETECTION;
   const continueOnError = process.env.GH_AW_DETECTION_CONTINUE_ON_ERROR !== "false";
   const detectionExecutionOutcome = process.env.DETECTION_AGENTIC_EXECUTION_OUTCOME || "";
-  const detectionExecutionFailed = detectionExecutionOutcome === "failure";
   const isWarnMode = continueOnError;
 
   /**
@@ -275,17 +463,63 @@ async function main() {
    * @param {string} message - Human-readable error message
    */
   function setDetectionFailure(reason, message) {
-    const mustFail = detectionExecutionFailed && (reason === "agent_failure" || reason === "parse_error");
     core.setOutput("reason", reason);
-    if (isWarnMode && !mustFail) {
+    core.exportVariable("GH_AW_DETECTION_REASON", reason);
+    if (isWarnMode) {
       core.warning(`⚠️ ${message}`);
       core.setOutput("conclusion", "warning");
+      core.exportVariable("GH_AW_DETECTION_CONCLUSION", "warning");
       core.setOutput("success", "false");
     } else {
       core.setOutput("conclusion", "failure");
+      core.exportVariable("GH_AW_DETECTION_CONCLUSION", "failure");
       core.setOutput("success", "false");
       core.setFailed(message);
     }
+  }
+
+  /**
+   * Log and evaluate a parsed verdict, then set step outputs/failure state.
+   * @param {{ prompt_injection: boolean, secret_leak: boolean, malicious_patch: boolean, reasons: string[] }} verdict
+   * @param {string} sourceLabel
+   */
+  function evaluateAndReportVerdict(verdict, sourceLabel) {
+    core.info(`📋 Threat detection verdict${sourceLabel ? ` (${sourceLabel})` : ""}:`);
+    core.info(`   prompt_injection : ${verdict.prompt_injection}`);
+    core.info(`   secret_leak      : ${verdict.secret_leak}`);
+    core.info(`   malicious_patch  : ${verdict.malicious_patch}`);
+    const hasReasons = verdict.reasons.length > 0;
+    if (hasReasons) {
+      core.info(`   reasons (${verdict.reasons.length}):`);
+      verdict.reasons.forEach((reason, i) => core.info(`     [${i + 1}] ${reason}`));
+    } else {
+      core.info("   reasons          : (none)");
+    }
+
+    const threatsDetected = verdict.prompt_injection || verdict.secret_leak || verdict.malicious_patch;
+    if (threatsDetected) {
+      const threats = [];
+      if (verdict.prompt_injection) threats.push("prompt injection");
+      if (verdict.secret_leak) threats.push("secret leak");
+      if (verdict.malicious_patch) threats.push("malicious patch");
+      const reasonsText = hasReasons ? "\nReasons: " + verdict.reasons.join("; ") : "";
+      core.error("🚨 Security threats detected: " + threats.join(", "));
+      if (hasReasons) {
+        core.error("   Reasons: " + verdict.reasons.join("; "));
+      }
+      setDetectionFailure("threat_detected", `${ERR_VALIDATION}: ❌ Security threats detected: ${threats.join(", ")}${reasonsText}`);
+    } else {
+      core.info("✅ No security threats detected. Safe outputs may proceed.");
+      core.setOutput("conclusion", "success");
+      core.exportVariable("GH_AW_DETECTION_CONCLUSION", "success");
+      core.setOutput("success", "true");
+      core.setOutput("reason", "");
+      core.exportVariable("GH_AW_DETECTION_REASON", "");
+    }
+
+    core.info("════════════════════════════════════════════════════════");
+    core.info("🛡️  Threat detection conclusion complete.");
+    core.info("════════════════════════════════════════════════════════");
   }
 
   // Top-level try/catch ensures outputs are always set and the step never throws
@@ -314,7 +548,9 @@ async function main() {
     core.info(`📋 continue-on-error: ${continueOnError}`);
     core.info(`📋 detection execution outcome: ${JSON.stringify(detectionExecutionOutcome)}`);
     core.info(`📁 Threat detection directory: ${threatDetectionDir}`);
+    const resultFilePath = path.join(threatDetectionDir, DETECTION_RESULT_FILENAME);
     core.info(`📄 Detection log path: ${logPath}`);
+    core.info(`📄 Structured result path: ${resultFilePath}`);
 
     // ── Step 1: Check whether detection was needed ──────────────────────────
     if (runDetection !== "true") {
@@ -322,15 +558,39 @@ async function main() {
       core.info("   Reason: no agent output types or patch files were produced.");
       core.info("   Setting conclusion=skipped, success=true.");
       core.setOutput("conclusion", "skipped");
+      core.exportVariable("GH_AW_DETECTION_CONCLUSION", "skipped");
       core.setOutput("success", "true");
       core.setOutput("reason", "");
+      core.exportVariable("GH_AW_DETECTION_REASON", "");
       core.info("✅ Detection skipped — no threats to evaluate.");
       return;
     }
 
-    core.info("🔍 Detection is required. Proceeding to parse detection log...");
+    core.info("🔍 Detection is required. Proceeding to parse detection result...");
 
-    // ── Step 2: Verify the detection log file exists ─────────────────────────
+    // ── Step 2: Try the Codex structured result file first ───────────────────
+    // When Codex runs with --output-schema and --output-last-message the final
+    // model response is written directly to detection_result.json as clean JSON,
+    // eliminating log-scraping parse failures caused by SSE/trace noise.
+    core.info(`🔎 Checking for structured result file: ${resultFilePath}`);
+    const structuredResult = parseStructuredResultFile(resultFilePath);
+
+    if (structuredResult !== null) {
+      if (structuredResult.error) {
+        core.warning(`⚠️  Structured result file exists but could not be parsed: ${structuredResult.error}`);
+        core.info("   Falling back to detection log parsing...");
+      } else if (!structuredResult.verdict) {
+        core.warning("⚠️  Structured result parsed but verdict was missing. Falling back to detection log parsing...");
+      } else {
+        core.info("✔️  Structured result file found and parsed successfully.");
+        evaluateAndReportVerdict(structuredResult.verdict, "from structured result file");
+        return;
+      }
+    } else {
+      core.info("ℹ️  No structured result file found. Falling back to detection log parsing.");
+    }
+
+    // ── Step 3: Verify the detection log file exists ─────────────────────────
     if (!fs.existsSync(logPath)) {
       core.error("❌ Detection log file not found at: " + logPath);
       core.info("📁 Listing all files in artifact directory for diagnosis: " + threatDetectionDir);
@@ -351,7 +611,7 @@ async function main() {
 
     core.info("✔️  Detection log file exists: " + logPath);
 
-    // ── Step 3: Read the detection log ───────────────────────────────────────
+    // ── Step 4: Read the detection log ───────────────────────────────────────
     let logContent;
     try {
       logContent = fs.readFileSync(logPath, "utf8");
@@ -373,7 +633,7 @@ async function main() {
       core.info(`📄 No lines containing THREAT_DETECTION_RESULT found in ${logLines.length} lines`);
     }
 
-    // ── Step 4: Parse the detection result ───────────────────────────────────
+    // ── Step 5: Parse the detection result from log ───────────────────────────
     core.info("🔎 Parsing THREAT_DETECTION_RESULT from detection log...");
     const { verdict, error } = parseDetectionLog(logContent);
 
@@ -386,46 +646,9 @@ async function main() {
       return;
     }
 
-    // ── Step 5: Log the full verdict ─────────────────────────────────────────
-    core.info("📋 Threat detection verdict:");
-    core.info(`   prompt_injection : ${verdict.prompt_injection}`);
-    core.info(`   secret_leak      : ${verdict.secret_leak}`);
-    core.info(`   malicious_patch  : ${verdict.malicious_patch}`);
-    if (verdict.reasons && verdict.reasons.length > 0) {
-      core.info(`   reasons (${verdict.reasons.length}):`);
-      verdict.reasons.forEach((reason, i) => core.info(`     [${i + 1}] ${reason}`));
-    } else {
-      core.info("   reasons          : (none)");
-    }
-
-    // ── Step 6: Evaluate verdict and set conclusion ───────────────────────────
-    const threatsDetected = verdict.prompt_injection || verdict.secret_leak || verdict.malicious_patch;
-
-    if (threatsDetected) {
-      const threats = [];
-      if (verdict.prompt_injection) threats.push("prompt injection");
-      if (verdict.secret_leak) threats.push("secret leak");
-      if (verdict.malicious_patch) threats.push("malicious patch");
-
-      const reasonsText = verdict.reasons && verdict.reasons.length > 0 ? "\nReasons: " + verdict.reasons.join("; ") : "";
-
-      core.error("🚨 Security threats detected: " + threats.join(", "));
-      if (verdict.reasons && verdict.reasons.length > 0) {
-        core.error("   Reasons: " + verdict.reasons.join("; "));
-      }
-
-      setDetectionFailure("threat_detected", `${ERR_VALIDATION}: ❌ Security threats detected: ${threats.join(", ")}${reasonsText}`);
-    } else {
-      core.info("✅ No security threats detected. Safe outputs may proceed.");
-      core.setOutput("conclusion", "success");
-      core.setOutput("success", "true");
-      core.setOutput("reason", "");
-    }
-
-    core.info("════════════════════════════════════════════════════════");
-    core.info("🛡️  Threat detection conclusion complete.");
-    core.info("════════════════════════════════════════════════════════");
+    // ── Step 6: Log and evaluate verdict ─────────────────────────────────────
+    evaluateAndReportVerdict(verdict, "");
   } // end runMain
 }
 
-module.exports = { main, parseDetectionLog, extractFromStreamJson, extractResultFromText };
+module.exports = { main, parseDetectionLog, extractFromStreamJson, extractResultFromText, extractStructuredOutput, parseStructuredResultFile };

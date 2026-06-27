@@ -7,9 +7,9 @@ import (
 	"path/filepath"
 	"testing"
 
+	"github.com/goccy/go-yaml"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
-	"go.yaml.in/yaml/v3"
 )
 
 // TestSafeOutputsImport tests that safe-output types can be imported from shared workflows
@@ -564,6 +564,36 @@ func TestMergeSafeOutputsUnit(t *testing.T) {
 	}
 }
 
+func TestMergeSafeOutputsDescriptorMergedFieldsUnit(t *testing.T) {
+	compiler := NewCompiler(WithVersion("1.0.0"))
+
+	t.Run("imports unassign-from-user", func(t *testing.T) {
+		result, err := compiler.MergeSafeOutputs(nil, []string{
+			`{"unassign-from-user":{"max":1}}`,
+		}, nil)
+		require.NoError(t, err)
+		require.NotNil(t, result)
+		require.NotNil(t, result.UnassignFromUser)
+		assert.Equal(t, strPtr("1"), result.UnassignFromUser.Max)
+	})
+
+	t.Run("imports dispatch_repository", func(t *testing.T) {
+		result, err := compiler.MergeSafeOutputs(nil, []string{
+			`{"dispatch_repository":{"trigger_ci":{"workflow":"ci.yml","event_type":"ci_trigger","repository":"org/target-repo","max":1}}}`,
+		}, nil)
+		require.NoError(t, err)
+		require.NotNil(t, result)
+		require.NotNil(t, result.DispatchRepository)
+		require.Len(t, result.DispatchRepository.Tools, 1)
+		tool := result.DispatchRepository.Tools["trigger_ci"]
+		require.NotNil(t, tool)
+		assert.Equal(t, "ci.yml", tool.Workflow)
+		assert.Equal(t, "ci_trigger", tool.EventType)
+		assert.Equal(t, "org/target-repo", tool.Repository)
+		assert.Equal(t, strPtr("1"), tool.Max)
+	})
+}
+
 // TestMergeSafeOutputsMessagesUnit tests the MergeSafeOutputs function for messages field
 func TestMergeSafeOutputsMessagesUnit(t *testing.T) {
 	compiler := NewCompiler(WithVersion("1.0.0"))
@@ -752,13 +782,13 @@ This workflow uses the imported meta configuration.
 
 	// Verify imported meta fields
 	assert.Equal(t, []string{"example.com", "api.example.com"}, workflowData.SafeOutputs.AllowedDomains, "AllowedDomains should be imported")
-	assert.True(t, workflowData.SafeOutputs.Staged, "Staged should be imported and set to true")
+	assert.True(t, templatableBoolIsTrue(workflowData.SafeOutputs.Staged), "Staged should be imported and set to true")
 	assert.Equal(t, map[string]string{"TEST_VAR": "test_value"}, workflowData.SafeOutputs.Env, "Env should be imported")
 	assert.Equal(t, "${{ secrets.CUSTOM_TOKEN }}", workflowData.SafeOutputs.GitHubToken, "GitHubToken should be imported")
-	// Note: When main workflow has safe-outputs section, extractSafeOutputsConfig sets MaximumPatchSize default (1024)
+	// Note: When main workflow has safe-outputs section, extractSafeOutputsConfig sets MaximumPatchSize default (4096)
 	// before merge happens, so imported value is not used. User should specify max-patch-size in main workflow.
-	assert.Equal(t, 1024, workflowData.SafeOutputs.MaximumPatchSize, "MaximumPatchSize defaults to 1024 when main has safe-outputs")
-	assert.Equal(t, "ubuntu-latest", workflowData.SafeOutputs.RunsOn, "RunsOn should be imported")
+	assert.Equal(t, 4096, workflowData.SafeOutputs.MaximumPatchSize, "MaximumPatchSize defaults to 4096 when main has safe-outputs")
+	assert.Equal(t, "runs-on: ubuntu-latest", workflowData.SafeOutputs.RunsOn, "RunsOn should be imported")
 }
 
 // TestSafeOutputsImportMetaFieldsMainTakesPrecedence tests that main workflow meta fields take precedence over imports
@@ -898,8 +928,8 @@ This workflow uses only imported safe-outputs configuration.
 	assert.Equal(t, []string{"import.example.com"}, workflowData.SafeOutputs.AllowedDomains, "AllowedDomains should be imported")
 	assert.Equal(t, "${{ secrets.IMPORT_TOKEN }}", workflowData.SafeOutputs.GitHubToken, "GitHubToken should be imported")
 	assert.Equal(t, 4096, workflowData.SafeOutputs.MaximumPatchSize, "MaximumPatchSize should be imported")
-	assert.True(t, workflowData.SafeOutputs.Staged, "Staged should be imported and set to true")
-	assert.Equal(t, "ubuntu-22.04", workflowData.SafeOutputs.RunsOn, "RunsOn should be imported")
+	assert.True(t, templatableBoolIsTrue(workflowData.SafeOutputs.Staged), "Staged should be imported and set to true")
+	assert.Equal(t, "runs-on: ubuntu-22.04", workflowData.SafeOutputs.RunsOn, "RunsOn should be imported")
 }
 
 // TestSafeOutputsImportJobsFromSharedWorkflow tests that safe-outputs.jobs can be imported from shared workflows

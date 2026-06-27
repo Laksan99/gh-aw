@@ -32,13 +32,23 @@ function getWorkflowMetadata(owner, repo) {
  * cross-repo effectiveContext) so that footer links point back to the actual workflow
  * run regardless of which repository the output action targets.
  *
- * @param {any} ctx - GitHub Actions context (provides serverUrl and runId)
+ * @param {{ serverUrl?: string, runId: number | string }} ctx - GitHub Actions context (provides serverUrl and runId)
  * @param {{ owner: string, repo: string }} workflowRepo - The repository that owns the workflow run
  * @returns {string} The full workflow run URL
  */
 function buildWorkflowRunUrl(ctx, workflowRepo) {
   const server = ctx.serverUrl || process.env.GITHUB_SERVER_URL || "https://github.com";
-  return `${server}/${workflowRepo.owner}/${workflowRepo.repo}/actions/runs/${ctx.runId}`;
+  let { owner, repo } = workflowRepo || {};
+  if (!owner || !repo) {
+    // When context is spread (e.g. `{...context}`), prototype getters like context.repo
+    // are not included. Fall back to GITHUB_REPOSITORY for the workflow repo.
+    const parts = (process.env.GITHUB_REPOSITORY || "").split("/");
+    if (parts.length === 2 && parts[0] && parts[1]) {
+      owner = owner || parts[0];
+      repo = repo || parts[1];
+    }
+  }
+  return `${server}/${owner}/${repo}/actions/runs/${ctx.runId}`;
 }
 
 module.exports = {

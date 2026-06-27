@@ -224,7 +224,10 @@ func TestUpdateCommand_HelpText(t *testing.T) {
 	// Should mention merge behavior
 	assert.Contains(t, outputStr, "no-merge", "Help should document --no-merge flag")
 	assert.Contains(t, outputStr, "no-redirect", "Help should document --no-redirect flag")
-	assert.Contains(t, outputStr, "disable-security-scanner", "Help should document --disable-security-scanner flag")
+	assert.Contains(t, outputStr, "no-security-scanner", "Help should document --no-security-scanner flag")
+	assert.Contains(t, outputStr, "repo", "Help should document --repo flag")
+	assert.Contains(t, outputStr, "org", "Help should document --org flag")
+	assert.Contains(t, outputStr, "repos", "Help should document --repos flag")
 	assert.Contains(t, outputStr, "3-way merge", "Help should explain merge behavior")
 
 	// Should reference upgrade for other features
@@ -234,6 +237,61 @@ func TestUpdateCommand_HelpText(t *testing.T) {
 	assert.NotContains(t, outputStr, "--pr", "Help should not mention removed --pr flag")
 	assert.NotContains(t, outputStr, "--audit", "Help should not mention removed --audit flag")
 	assert.NotContains(t, outputStr, "--dry-run", "Help should not mention removed --dry-run flag")
+}
+
+// TestUpdateCommand_RepoFlag verifies that --repo is recognized.
+func TestUpdateCommand_RepoFlag(t *testing.T) {
+	setup := setupUpdateIntegrationTest(t)
+	defer setup.cleanup()
+
+	// Use an invalid repo slug to avoid network calls while still validating flag parsing.
+	cmd := exec.Command(setup.binaryPath, "update", "--repo", "not-a-valid-slug", "--verbose")
+	cmd.Dir = setup.tempDir
+	output, err := cmd.CombinedOutput()
+	outputStr := string(output)
+
+	assert.Error(t, err, "Command should fail for invalid repo slug")
+	assert.NotContains(t, outputStr, "unknown flag", "The --repo flag should be recognized")
+}
+
+// TestUpdateCommand_AfterManifestAddIntegration verifies a manifest package can be
+// added and then updated in place.
+func TestUpdateCommand_AfterManifestAddIntegration(t *testing.T) {
+	skipWithoutGitHubAuth(t)
+
+	setup := setupUpdateIntegrationTest(t)
+	defer setup.cleanup()
+
+	addCmd := exec.Command(setup.binaryPath, "add", "githubnext/agentic-ops@v-1", "--verbose")
+	addCmd.Dir = setup.tempDir
+	addOutput, addErr := addCmd.CombinedOutput()
+	addOutputStr := string(addOutput)
+	require.NoError(t, addErr, "add command should succeed: %s", addOutputStr)
+
+	entries, err := os.ReadDir(setup.workflowsDir)
+	require.NoError(t, err, "should read workflows directory")
+	require.NotEmpty(t, entries, "add should create at least one workflow")
+
+	var workflowPath string
+	for _, entry := range entries {
+		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".md") {
+			continue
+		}
+		workflowPath = filepath.Join(setup.workflowsDir, entry.Name())
+		break
+	}
+	require.NotEmpty(t, workflowPath, "expected at least one markdown workflow file")
+
+	content, err := os.ReadFile(workflowPath)
+	require.NoError(t, err, "should read added workflow")
+	assert.Contains(t, string(content), "source: githubnext/agentic-ops@", "workflow source should be manifest-scoped")
+
+	updateCmd := exec.Command(setup.binaryPath, "update", "--verbose")
+	updateCmd.Dir = setup.tempDir
+	updateOutput, updateErr := updateCmd.CombinedOutput()
+	updateOutputStr := string(updateOutput)
+	require.NoError(t, updateErr, "update command should succeed after manifest add: %s", updateOutputStr)
+	assert.NotContains(t, updateOutputStr, "no workflows found", "update should detect added workflows")
 }
 
 // --- Merge Behavior Integration Tests ---
@@ -389,4 +447,72 @@ func TestGetLatestBranchCommitSHA_Integration(t *testing.T) {
 	sha, err := getLatestBranchCommitSHA(context.Background(), "actions/checkout", "main")
 	require.NoError(t, err, "Should fetch latest commit SHA for actions/checkout main branch")
 	assert.True(t, IsCommitSHA(sha), "Result should be a 40-char commit SHA, got: %s", sha)
+}
+
+// --- Org Dry-Run Integration Tests ---
+
+// TestUpdateCommand_OrgDryRunIntegration verifies that --org mode runs in dry-run
+// (the default, without --create-pull-request or --create-issue) for two known
+// repositories: github/gh-aw and github/gh-aw-firewall. The test validates that
+// the command completes successfully and produces well-formed output regardless
+// of whether the repos have pending updates.
+func TestUpdateCommand_OrgDryRunIntegration(t *testing.T) {
+	skipWithoutGitHubAuth(t)
+
+	setup := setupUpdateIntegrationTest(t)
+	defer setup.cleanup()
+
+	// Run update --org github targeting only gh-aw and gh-aw-firewall.
+	// No --create-pull-request or --create-issue flags → dry-run mode (default).
+	cmd := exec.Command(setup.binaryPath, "update",
+		"--org", "github",
+		"--repos", "gh-aw,gh-aw-firewall",
+	)
+	cmd.Dir = setup.tempDir
+	output, err := cmd.CombinedOutput()
+	outputStr := string(output)
+	t.Logf("Output:\n%s", outputStr)
+
+	require.NoError(t, err, "org dry-run should succeed: %s", outputStr)
+
+	// --org and --repos flags must be recognised.
+	assert.NotContains(t, outputStr, "unknown flag", "All flags should be recognized")
+
+	// The output must indicate one of the three valid terminal states:
+	//   1. Dry-run preview with pending updates listed.
+	//   2. All repos already up-to-date.
+	//   3. No repos with source-managed workflows found in the filtered set.
+	dryRunPreview := strings.Contains(outputStr, "Dry-run preview")
+	alreadyUpToDate := strings.Contains(outputStr, "up to date")
+	noReposFound := strings.Contains(outputStr, "No repositories")
+	assert.True(t, dryRunPreview || alreadyUpToDate || noReposFound,
+		"Output should indicate dry-run preview, up-to-date status, or no repos found; got: %s", outputStr)
+}
+
+// TestUpdateCommand_OrgSingleRepoDryRunIntegration verifies that --org mode can
+// target a single repository using --repos gh-aw and still complete in dry-run
+// mode without requiring write operations.
+func TestUpdateCommand_OrgSingleRepoDryRunIntegration(t *testing.T) {
+	skipWithoutGitHubAuth(t)
+
+	setup := setupUpdateIntegrationTest(t)
+	defer setup.cleanup()
+
+	cmd := exec.Command(setup.binaryPath, "update",
+		"--org", "github",
+		"--repos", "gh-aw",
+	)
+	cmd.Dir = setup.tempDir
+	output, err := cmd.CombinedOutput()
+	outputStr := string(output)
+	t.Logf("Output:\n%s", outputStr)
+
+	require.NoError(t, err, "org single-repo dry-run should succeed: %s", outputStr)
+	assert.NotContains(t, outputStr, "unknown flag", "All flags should be recognised")
+
+	dryRunPreview := strings.Contains(outputStr, "Dry-run preview")
+	alreadyUpToDate := strings.Contains(outputStr, "up to date")
+	noReposFound := strings.Contains(outputStr, "No repositories")
+	assert.True(t, dryRunPreview || alreadyUpToDate || noReposFound,
+		"Output should indicate dry-run preview, up-to-date status, or no repos found; got: %s", outputStr)
 }

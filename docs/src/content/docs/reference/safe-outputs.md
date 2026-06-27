@@ -9,8 +9,7 @@ The [`safe-outputs:`](/gh-aw/reference/glossary/#safe-outputs) (validated GitHub
 
 Safe outputs enforce security through separation: agents run read-only and request actions via structured output, while separate permission-controlled jobs execute those requests. This provides least privilege, defense against prompt injection, auditability, and controlled limits per operation.
 
-> [!NOTE]
-> When no `safe-outputs:` section is present (or when only [system types](#system-types-auto-enabled) are configured), `create-issue` is automatically enabled with conservative defaults (`max: 1`, labels and title-prefix set to the workflow ID). To opt out, add an explicit `safe-outputs:` section with the outputs you want.
+When no `safe-outputs:` section is present (or when only [system types](#system-types-auto-enabled) are configured), `create-issue` is automatically enabled with conservative defaults (`max: 1`, labels and title-prefix set to the workflow ID). To opt out, add an explicit `safe-outputs:` section with the outputs you want.
 
 Example:
 
@@ -25,62 +24,76 @@ The agent requests issue creation; a separate job with `issues: write` creates i
 
 ### Issues & Discussions
 
-- [**Create Issue**](#issue-creation-create-issue) (`create-issue`) - Create GitHub issues (max: 1)
-- [**Update Issue**](#issue-updates-update-issue) (`update-issue`) - Update issue status, title, or body (max: 1)
-- [**Close Issue**](#close-issue-close-issue) (`close-issue`) - Close issues with comment (max: 1)
-- [**Link Sub-Issue**](#link-sub-issue-link-sub-issue) (`link-sub-issue`) - Link issues as sub-issues (max: 1)
-- [**Create Discussion**](#discussion-creation-create-discussion) (`create-discussion`) - Create GitHub discussions (max: 1)
-- [**Update Discussion**](#discussion-updates-update-discussion) (`update-discussion`) - Update discussion title, body, or labels (max: 1)
-- [**Close Discussion**](#close-discussion-close-discussion) (`close-discussion`) - Close discussions with comment and resolution (max: 1)
+| Output | Key | Description |
+|--------|-----|-------------|
+| [Create Issue](#issue-creation-create-issue) | `create-issue` | Create GitHub issues (max: 1) |
+| [Update Issue](#issue-updates-update-issue) | `update-issue` | Update issue status, title, or body (max: 1) |
+| [Close Issue](#close-issue-close-issue) | `close-issue` | Close issues with comment (max: 1) |
+| [Link Sub-Issue](#link-sub-issue-link-sub-issue) | `link-sub-issue` | Link issues as sub-issues (max: 1) |
+| [Create Discussion](#discussion-creation-create-discussion) | `create-discussion` | Create GitHub discussions (max: 1) |
+| [Update Discussion](#discussion-updates-update-discussion) | `update-discussion` | Update discussion title, body, or labels (max: 1) |
+| [Close Discussion](#close-discussion-close-discussion) | `close-discussion` | Close discussions with comment and resolution (max: 1) |
 
 ### Pull Requests
 
-- [**Create PR**](/gh-aw/reference/safe-outputs-pull-requests/#pull-request-creation-create-pull-request) (`create-pull-request`) - Create pull requests with code changes (default max: 1, configurable)
-- [**Update PR**](/gh-aw/reference/safe-outputs-pull-requests/#pull-request-updates-update-pull-request) (`update-pull-request`) - Update PR title or body (max: 1)
-- [**Close PR**](/gh-aw/reference/safe-outputs-pull-requests/#close-pull-request-close-pull-request) (`close-pull-request`) - Close pull requests without merging (max: 10)
-- [**PR Review Comments**](/gh-aw/reference/safe-outputs-pull-requests/#pr-review-comments-create-pull-request-review-comment) (`create-pull-request-review-comment`) - Create review comments on code lines (max: 10)
-- [**Reply to PR Review Comment**](/gh-aw/reference/safe-outputs-pull-requests/#reply-to-pr-review-comment-reply-to-pull-request-review-comment) (`reply-to-pull-request-review-comment`) - Reply to existing review comments (max: 10)
-- [**Resolve PR Review Thread**](/gh-aw/reference/safe-outputs-pull-requests/#resolve-pr-review-thread-resolve-pull-request-review-thread) (`resolve-pull-request-review-thread`) - Resolve review threads after addressing feedback (max: 10)
-- [**Add Reviewer**](/gh-aw/reference/safe-outputs-pull-requests/#add-reviewer-add-reviewer) (`add-reviewer`) - Add reviewers to pull requests (max: 3)
-- [**Push to PR Branch**](/gh-aw/reference/safe-outputs-pull-requests/#push-to-pr-branch-push-to-pull-request-branch) (`push-to-pull-request-branch`) - Push changes to PR branch (default max: 1, configurable; cross-repo supported via `target-repo` when the target repository is checked out)
+| Output | Key | Description |
+|--------|-----|-------------|
+| [Create PR](/gh-aw/reference/safe-outputs-pull-requests/#pull-request-creation-create-pull-request) | `create-pull-request` | Create pull requests with code changes (default max: 1, configurable) |
+| [Update PR](/gh-aw/reference/safe-outputs-pull-requests/#pull-request-updates-update-pull-request) | `update-pull-request` | Update PR title or body (max: 1) |
+| [Close PR](/gh-aw/reference/safe-outputs-pull-requests/#close-pull-request-close-pull-request) | `close-pull-request` | Close pull requests without merging (max: 10) |
+| [Merge PR](/gh-aw/reference/safe-outputs-pull-requests/#merge-pull-request-merge-pull-request) | `merge-pull-request` | Merge pull requests after policy gates pass (max: 1, experimental) |
+| [PR Review Comments](/gh-aw/reference/safe-outputs-pull-requests/#pr-review-comments-create-pull-request-review-comment) | `create-pull-request-review-comment` | Create review comments on code lines (max: 10) |
+| [Reply to PR Review Comment](/gh-aw/reference/safe-outputs-pull-requests/#reply-to-pr-review-comment-reply-to-pull-request-review-comment) | `reply-to-pull-request-review-comment` | Reply to existing review comments (max: 10) |
+| [Resolve PR Review Thread](/gh-aw/reference/safe-outputs-pull-requests/#resolve-pr-review-thread-resolve-pull-request-review-thread) | `resolve-pull-request-review-thread` | Resolve review threads after addressing feedback (max: 10) |
+| [Add Reviewer](/gh-aw/reference/safe-outputs-pull-requests/#add-reviewer-add-reviewer) | `add-reviewer` | Add reviewers to pull requests (max: 3) |
+| [Push to PR Branch](/gh-aw/reference/safe-outputs-pull-requests/#push-to-pr-branch-push-to-pull-request-branch) | `push-to-pull-request-branch` | Push changes to PR branch (default max: 1, configurable; cross-repo supported via `target-repo` when the target repository is checked out) |
 
 ### Labels, Assignments & Reviews
 
-- [**Add Comment**](#comment-creation-add-comment) (`add-comment`) - Post comments on issues, PRs, or discussions (max: 1)
-- [**Hide Comment**](#hide-comment-hide-comment) (`hide-comment`) - Hide comments on issues, PRs, or discussions (max: 5)
-- [**Add Labels**](#add-labels-add-labels) (`add-labels`) - Add labels to issues or PRs (max: 3)
-- [**Remove Labels**](#remove-labels-remove-labels) (`remove-labels`) - Remove labels from issues or PRs (max: 3)
-- [**Assign Milestone**](#assign-milestone-assign-milestone) (`assign-milestone`) - Assign issues to milestones (max: 1)
-- [**Assign to Agent**](#assign-to-agent-assign-to-agent) (`assign-to-agent`) - Assign Copilot coding agent to issues or PRs (max: 1)
-- [**Assign to User**](#assign-to-user-assign-to-user) (`assign-to-user`) - Assign users to issues (max: 1)
-- [**Unassign from User**](#unassign-from-user-unassign-from-user) (`unassign-from-user`) - Remove user assignments from issues or PRs (max: 1)
-- [**Set Issue Type**](#set-issue-type-set-issue-type) (`set-issue-type`) - Set or clear the type of GitHub issues (max: 5)
-- [**Set Issue Field**](#set-issue-field-set-issue-field) (`set-issue-field`) - Set one issue field value by name/value (max: 5)
+| Output | Key | Description |
+|--------|-----|-------------|
+| [Add Comment](#comment-creation-add-comment) | `add-comment` | Post comments on issues, PRs, or discussions (max: 1) |
+| [Hide Comment](#hide-comment-hide-comment) | `hide-comment` | Hide comments on issues, PRs, or discussions (max: 5) |
+| [Add Labels](#add-labels-add-labels) | `add-labels` | Add labels to issues or PRs (max: 3) |
+| [Remove Labels](#remove-labels-remove-labels) | `remove-labels` | Remove labels from issues or PRs (max: 3) |
+| [Assign Milestone](#assign-milestone-assign-milestone) | `assign-milestone` | Assign issues to milestones (max: 1) |
+| [Assign to Agent](#assign-to-agent-assign-to-agent) | `assign-to-agent` | Assign Copilot coding agent to issues or PRs (max: 1) |
+| [Assign to User](#assign-to-user-assign-to-user) | `assign-to-user` | Assign users to issues (max: 1) |
+| [Unassign from User](#unassign-from-user-unassign-from-user) | `unassign-from-user` | Remove user assignments from issues or PRs (max: 1) |
+| [Set Issue Type](#set-issue-type-set-issue-type) | `set-issue-type` | Set or clear the type of GitHub issues (max: 5) |
+| [Set Issue Field](#set-issue-field-set-issue-field) | `set-issue-field` | Set one issue field value by name/value (max: 5) |
 
 ### Projects, Releases & Assets
 
-- [**Create Project**](#project-creation-create-project) (`create-project`) - Create new GitHub Projects boards (max: 1, cross-repo)
-- [**Update Project**](#project-board-updates-update-project) (`update-project`) - Manage GitHub Projects boards (max: 10, same-repo only)
-- [**Create Project Status Update**](#project-status-updates-create-project-status-update) (`create-project-status-update`) - Create project status updates
-- [**Update Release**](#release-updates-update-release) (`update-release`) - Update GitHub release descriptions (max: 1)
-- [**Upload Artifact**](#artifact-uploads-upload-artifact) (`upload-artifact`) - Upload files as run-scoped GitHub Actions artifacts (max: 1 by default)
-- [**Upload Assets**](#asset-uploads-upload-asset) (`upload-asset`) - Upload files to orphaned git branch (max: 10, same-repo only). **Prefer `upload-artifact` with `skip-archive` instead.**
+| Output | Key | Description |
+|--------|-----|-------------|
+| [Create Project](#project-creation-create-project) | `create-project` | Create new GitHub Projects boards (max: 1, cross-repo) |
+| [Update Project](#project-board-updates-update-project) | `update-project` | Manage GitHub Projects boards (max: 10, same-repo only) |
+| [Create Project Status Update](#project-status-updates-create-project-status-update) | `create-project-status-update` | Create project status updates |
+| [Update Release](#release-updates-update-release) | `update-release` | Update GitHub release descriptions (max: 1) |
+| [Upload Artifact](#artifact-uploads-upload-artifact) | `upload-artifact` | Upload files as run-scoped GitHub Actions artifacts (max: 1 by default) |
+| [Upload Assets](#asset-uploads-upload-asset) | `upload-asset` | Upload files to orphaned git branch (max: 10, same-repo only). **Prefer `upload-artifact` with `skip-archive` instead.** |
 
 ### Security & Agent Tasks
 
-- [**Dispatch Workflow**](#workflow-dispatch-dispatch-workflow) (`dispatch-workflow`) - Trigger other workflows with inputs (max: 3, same-repo only)
-- [**Call Workflow**](#workflow-call-call-workflow) (`call-workflow`) - Call reusable workflows via compile-time fan-out (max: 1, same-repo only)
-- [**Dispatch Repository Event**](#repository-dispatch-dispatch_repository) (`dispatch_repository`) - Trigger `repository_dispatch` events in external repositories, experimental (cross-repo)
-- [**Code Scanning Alerts**](#code-scanning-alerts-create-code-scanning-alert) (`create-code-scanning-alert`) - Generate SARIF security advisories (max: unlimited, same-repo only)
-- [**Autofix Code Scanning Alerts**](#autofix-code-scanning-alerts-autofix-code-scanning-alert) (`autofix-code-scanning-alert`) - Create automated fixes for code scanning alerts (max: 10, same-repo only)
-- [**Create Agent Session**](#agent-session-creation-create-agent-session) (`create-agent-session`) - Create Copilot coding agent sessions (max: 1)
+| Output | Key | Description |
+|--------|-----|-------------|
+| [Dispatch Workflow](#workflow-dispatch-dispatch-workflow) | `dispatch-workflow` | Trigger other workflows with inputs (max: 3, same-repo only) |
+| [Call Workflow](#workflow-call-call-workflow) | `call-workflow` | Call reusable workflows via compile-time fan-out (max: 1, same-repo only) |
+| [Dispatch Repository Event](#repository-dispatch-dispatch_repository) | `dispatch_repository` | Trigger `repository_dispatch` events in external repositories, experimental (cross-repo) |
+| [Code Scanning Alerts](#code-scanning-alerts-create-code-scanning-alert) | `create-code-scanning-alert` | Generate SARIF security advisories (max: unlimited, same-repo only) |
+| [Autofix Code Scanning Alerts](#autofix-code-scanning-alerts-autofix-code-scanning-alert) | `autofix-code-scanning-alert` | Create automated fixes for code scanning alerts (max: 10, same-repo only) |
+| [Create Check Run](#check-run-creation-create-check-run) | `create-check-run` | Create GitHub Check Runs to surface analysis results in the PR checks UI (default max: 1, same-repo only) |
+| [Create Agent Session](/gh-aw/reference/copilot-cloud-agent/#create-agent-session) | `create-agent-session` | Create Copilot coding agent sessions (max: 1) |
 
 ### System Types (Auto-Enabled)
 
-- [**No-Op**](#no-op-logging-noop) (`noop`) - Log completion message for transparency (max: 1, same-repo only)
-- [**Missing Tool**](#missing-tool-reporting-missing-tool) (`missing-tool`) - Report missing tools (max: unlimited, same-repo only)
-- [**Missing Data**](#missing-data-reporting-missing-data) (`missing-data`) - Report missing data required to achieve goals (max: unlimited, same-repo only)
-- [**Create Issue**](#issue-creation-create-issue) (`create-issue`) - Auto-injected when no `safe-outputs:` section is present or when only system types (`noop`, `missing-tool`, `missing-data`) are configured (max: 1, labels and title-prefix set to workflow ID).
+| Output | Key | Description |
+|--------|-----|-------------|
+| [No-Op](#no-op-logging-noop) | `noop` | Log completion message for transparency (max: 1, same-repo only) |
+| [Missing Tool](#missing-tool-reporting-missing-tool) | `missing-tool` | Report missing tools (max: unlimited, same-repo only) |
+| [Missing Data](#missing-data-reporting-missing-data) | `missing-data` | Report missing data required to achieve goals (max: unlimited, same-repo only) |
+| [Create Issue](#issue-creation-create-issue) | `create-issue` | Auto-injected when no `safe-outputs:` section is present or when only system types (`noop`, `missing-tool`, `missing-data`) are configured (max: 1, labels and title-prefix set to workflow ID). |
 
 ### Custom Safe Output Jobs (`jobs:`)
 
@@ -105,6 +118,8 @@ safe-outputs:
     expires: 7                       # auto-close after 7 days (or false to disable)
     group: true                      # group as sub-issues under parent
     close-older-issues: true         # close previous issues from same workflow
+    deduplicate-by-title: 1          # drop duplicate titles (true=exact, integer=edit distance)
+    normalize-closing-keywords: true # strip backticks around recognized issue-closing keywords in body text
     target-repo: "owner/repo"        # cross-repository
     allowed-repos: ["org/repo1", "org/repo2"]  # additional allowed repositories
     github-token: ${{ secrets.SOME_CUSTOM_TOKEN }} # optional custom token for permissions
@@ -116,6 +131,8 @@ See [Cross-Repository Operations](/gh-aw/reference/cross-repository/) for compre
 > Use `footer: false` to omit the AI-generated footer while preserving workflow-id markers for searchability. See [Footer Control](/gh-aw/reference/footers/) for details.
 
 #### `create_issue` tool field schema (`fields`)
+
+`create_issue.body` must be between **20** and **65000** characters.
 
 | Parameter | Type | Required | Description | Example |
 |-----------|------|----------|-------------|---------|
@@ -205,6 +222,23 @@ safe-outputs:
 
 This is useful for scheduled workflows (e.g. every 4 hours) that produce recurring daily reports: all runs on the same day contribute to one issue, eliminating duplicate open/closed issues. The max-count slot is not consumed when posting as a comment; on failure of the pre-check, normal issue creation proceeds as a fallback.
 
+#### Title-Based Deduplication
+
+The `deduplicate-by-title` field drops duplicate issues by comparing titles before creation. Accepts:
+
+- `true` — match titles exactly (after normalization)
+- integer `0`–`100` — match titles within the given Levenshtein edit distance (e.g., `1` allows one-character differences)
+
+Deduplication runs at both the MCP tool-call boundary (within-run drops with immediate `duplicate_dropped` feedback to the agent) and at apply time (within-run plus open and recently-closed repository issues). Dropped items are recorded in the safe-output summary with the matched title, edit distance, and source (`mcp-precheck`, `within-run`, or `repo-level`).
+
+```yaml wrap
+safe-outputs:
+  create-issue:
+    title-prefix: "[triage] "
+    labels: [bug]
+    deduplicate-by-title: 1   # tolerate one-character title differences
+```
+
 #### Searching for Workflow-Created Items
 
 All items created by workflows (issues, pull requests, discussions, and comments) include a hidden **workflow-id marker** in their body:
@@ -236,43 +270,69 @@ Closes GitHub issues with an optional comment and state reason. Filters by label
 safe-outputs:
   close-issue:
     target: "triggering"              # "triggering" (default), "*", or number
-    required-labels: [automated]      # only close with any of these labels
+    required-labels: [automated]      # only close if ALL these labels are present
     required-title-prefix: "[bot]"    # only close matching prefix
     max: 20                           # max closures (default: 1)
     target-repo: "owner/repo"         # cross-repository
     allowed-repos: ["org/repo1", "org/repo2"]  # additional allowed repositories
     state-reason: "duplicate"         # completed (default), not_planned, duplicate
+    allow-body: false               # prevent closing comment (drop body if provided)
 ```
 
 **Target**: `"triggering"` (requires issue event), `"*"` (any issue), or number (specific issue).
 
 **State Reasons**: `completed`, `not_planned`, `duplicate` (default: `completed`). Can also be set per-item in agent output.
 
+**`allow-body: false`**: When set, any `body` field the agent provides is dropped (a warning is logged) and the issue is closed without posting a comment. Use this when you want to guarantee a clean close with no duplicate comment — for example, when a prior `add-comment` step already posted the summary.
+
 ### Comment Creation (`add-comment:`)
 
 Posts comments on issues, PRs, or discussions. Defaults to triggering item; use `target: "*"` for any, or number for specific items. When combined with `create-issue`, `create-discussion`, or `create-pull-request`, includes "Related Items" section.
+
+Use `required-labels` to only comment on issues/PRs that have **all** of the specified labels. Use `required-title-prefix` to only comment on issues/PRs whose title starts with the given prefix. These filters apply to issues and PRs only (not discussions).
 
 ```yaml wrap
 safe-outputs:
   add-comment:
     max: 3                       # max comments (default: 1)
     target: "*"                  # "triggering" (default), "*", or number
-    discussions: false           # exclude discussions:write permission (default: true)
+    discussions: true            # request discussions:write permission (default: false)
     target-repo: "owner/repo"    # cross-repository
     allowed-repos: ["org/repo1", "org/repo2"]  # additional allowed repositories
     hide-older-comments: true    # hide previous comments from same workflow
     allowed-reasons: [outdated]  # restrict hiding reasons (optional)
     footer: false                # omit AI-generated footer (default: true)
+    normalize-closing-keywords: true # strip backticks around recognized issue-closing keywords in body text
+    required-labels: [bot, automated]  # only comment if item has ALL of these labels
+    required-title-prefix: "[bot] "    # only comment if item title starts with this prefix
 ```
 
 > [!TIP]
 > Use `footer: false` to suppress the "Generated by..." attribution line in posted comments. See [Footer Control](/gh-aw/reference/footers/) for global and per-handler options.
+
+#### Normalize closing keywords
+
+Set `normalize-closing-keywords: true` to strip wrapping backticks from recognized issue-closing keywords in body text (for example, `` `Closes #123` `` becomes `Closes #123` so GitHub can process it as a closing keyword). This field is supported by `create-issue` and `add-comment` on this page, and by `create-pull-request` in [Safe Outputs (Pull Requests)](/gh-aw/reference/safe-outputs-pull-requests/#pull-request-creation-create-pull-request).
 
 The author of the parent issue, PR, or discussion receiving the comment is automatically preserved as an allowed mention. This means `@username` references to the issue/PR/discussion author are not neutralized when the workflow posts a reply.
 
 #### Hide Older Comments
 
 Set `hide-older-comments: true` to minimize previous comments from the same workflow (identified by `GITHUB_WORKFLOW`) before posting new ones. Useful for status updates. Allowed reasons: `spam`, `abuse`, `off_topic`, `outdated` (default), `resolved`, `low_quality`.
+
+To also minimize comments from one or more other workflows in the same pass, use the object form with `match`:
+
+```yaml wrap
+safe-outputs:
+  add-comment:
+    hide-older-comments:
+      enabled: true
+      match:
+        - other_workflow
+        - yet-another
+```
+
+`match` is an exact-match list of workflow IDs (the `GITHUB_WORKFLOW` value, not the file name). The current workflow is always included; entries in `match` are added to the set. Set `enabled: false` to disable hiding while keeping the object form. The boolean form (`hide-older-comments: true`) is still supported for the single-workflow case.
 
 #### Append-Only Status Comments
 
@@ -303,6 +363,8 @@ safe-outputs:
 
 Adds labels to issues or PRs. Specify `allowed` to restrict to specific labels or glob patterns, or `blocked` to deny specific label patterns regardless of the allow list.
 
+Use `required-labels` to only add labels to issues/PRs that already have **all** of the specified labels. Use `required-title-prefix` to only add labels to issues/PRs whose title starts with the given prefix.
+
 ```yaml wrap
 safe-outputs:
   add-labels:
@@ -312,6 +374,8 @@ safe-outputs:
     target: "*"                  # "triggering" (default), "*", or number
     target-repo: "owner/repo"    # cross-repository
     allowed-repos: ["org/repo1", "org/repo2"]  # additional allowed repositories
+    required-labels: [automated, bot]  # only operate if item has ALL of these labels
+    required-title-prefix: "[bot] "    # only operate if item title starts with this prefix
 ```
 
 #### Blocked Label Patterns
@@ -342,6 +406,8 @@ safe-outputs:
 
 Removes labels from issues or PRs. Specify `allowed` to restrict which labels can be removed (specific labels or glob patterns), or `blocked` to prevent removal of specific label patterns. If a label is not present on the item, it will be silently skipped.
 
+Use `required-labels` to only remove labels from issues/PRs that already have **all** of the specified labels. Use `required-title-prefix` to only remove labels from issues/PRs whose title starts with the given prefix.
+
 ```yaml wrap
 safe-outputs:
   remove-labels:
@@ -351,6 +417,8 @@ safe-outputs:
     target: "*"                  # "triggering" (default), "*", or number
     target-repo: "owner/repo"    # cross-repository
     allowed-repos: ["org/repo1", "org/repo2"]  # additional allowed repositories
+    required-labels: [automated]  # only operate if item has ALL of these labels
+    required-title-prefix: "[bot] "  # only operate if item title starts with this prefix
 ```
 
 **Target**: `"triggering"` (requires issue/PR event), `"*"` (any issue/PR), or number (specific issue/PR).
@@ -384,6 +452,8 @@ safe-outputs:
     auto_create: true         # auto-create milestones in the allowed list if they don't exist
     max: 1                   # max assignments (default: 1)
     target-repo: "owner/repo" # cross-repository
+    required-labels: [automated]     # only assign if item has ALL these labels
+    required-title-prefix: "[bot] "  # only assign if item title starts with this prefix
     github-token: ${{ secrets.SOME_CUSTOM_TOKEN }} # optional custom token for permissions
 ```
 
@@ -391,7 +461,7 @@ When `auto_create: true` is set, any milestone from the `allowed` list that does
 
 ### Issue Updates (`update-issue:`)
 
-Updates issue status, title, or body. Only explicitly enabled fields can be updated. Status must be "open" or "closed". The `operation` field controls how body updates are applied: `append` (default), `prepend`, `replace`, or `replace-island`. Use `title-prefix` to restrict updates to issues whose titles start with a specific prefix.
+Updates issue status, title, or body. Only explicitly enabled fields can be updated. Status must be "open" or "closed". The `operation` field controls how body updates are applied: `append` (default), `prepend`, `replace`, or `replace-island`. Use `required-title-prefix` to restrict updates to issues whose titles start with a specific prefix, and `required-labels` to restrict to issues that have all the specified labels.
 
 ```yaml wrap
 safe-outputs:
@@ -399,7 +469,8 @@ safe-outputs:
     status:                   # enable status updates
     title:                    # enable title updates
     body:                     # enable body updates
-    title-prefix: "[bot] "    # only update issues with this title prefix
+    required-title-prefix: "[bot] "  # only update issues with this title prefix
+    required-labels: [automated]     # only update if ALL these labels are present
     max: 3                    # max updates (default: 1)
     target: "*"               # "triggering" (default), "*", or number
     target-repo: "owner/repo" # cross-repository
@@ -410,7 +481,7 @@ safe-outputs:
 
 When using `target: "*"`, the agent must provide `issue_number` or `item_number` in the output to identify which issue to update.
 
-**Title Prefix**: When `title-prefix` is set, the update is rejected if the target issue's current title does not start with the specified prefix. This ensures agents can only modify issues that have been explicitly tagged for automated updates.
+**Required Filters**: When `required-title-prefix` is set, the update is rejected if the target issue's current title does not start with the specified prefix. When `required-labels` is set, the update is rejected unless the issue has **all** of the specified labels. These filters ensure agents can only modify issues that have been explicitly tagged for automated updates.
 
 **Operation Types** (for body updates):
 
@@ -441,6 +512,7 @@ safe-outputs:
     sub-title-prefix: "[Task]"            # sub must match prefix
     max: 1                                # max links (default: 1)
     target-repo: "owner/repo"             # cross-repository
+    allowed-repos: ["owner/repo1"]        # additional allowed repositories
     github-token: ${{ secrets.SOME_CUSTOM_TOKEN }} # optional custom token for permissions
 ```
 
@@ -458,6 +530,8 @@ safe-outputs:
     target: "triggering"                   # "triggering" (default), "*", or issue number
     target-repo: "owner/repo"              # cross-repository
     allowed-repos: ["owner/repo1"]         # additional allowed repositories
+    required-labels: [automated]           # only operate if item has ALL these labels
+    required-title-prefix: "[bot] "        # only operate if item title starts with this prefix
     github-token: ${{ secrets.SOME_CUSTOM_TOKEN }}
 ```
 
@@ -475,6 +549,8 @@ safe-outputs:
     allowed-fields: [Priority, Iteration] # restrict issue fields this workflow may set
     target-repo: "owner/repo"             # cross-repository
     allowed-repos: ["owner/repo1"]        # additional allowed repositories
+    required-labels: [automated]          # only operate if item has ALL these labels
+    required-title-prefix: "[bot] "       # only operate if item title starts with this prefix
     github-token: ${{ secrets.SOME_CUSTOM_TOKEN }}
 ```
 
@@ -639,7 +715,7 @@ Optionally include `item_url` (GitHub issue URL) to add the issue as the first p
 > - **Fine-grained PAT**: Organization permissions → Projects: Read & Write
 
 > [!NOTE]
-> You can configure views directly during project creation using the `views` field (see above), or later using `update-project` to add custom fields and additional views. For pattern guidance, see [Projects & Monitoring](/gh-aw/patterns/monitoring/).
+> You can configure views directly during project creation using the `views` field (see above), or later using `update-project` to add custom fields and additional views. For pattern guidance, see [Monitoring with Projects](/gh-aw/experimental/monitoring-with-projects/).
 
 ### Project Board Updates (`update-project:`)
 
@@ -797,6 +873,7 @@ safe-outputs:
     labels: [automation]
     reviewers: [user1, copilot]
     assignees: [user1]            # assignees for fallback issues created when PR creation cannot proceed (including protected-files fallback)
+    normalize-closing-keywords: true   # strip backticks around recognized issue-closing keywords in PR body text
     protected-files: fallback-to-issue  # create review issue if protected files modified, git commands (`checkout`, `branch`, `switch`, `add`, `rm`, `commit`, `merge`) are automatically enabled.
 ```
 
@@ -878,6 +955,57 @@ safe-outputs:
     github-token: ${{ secrets.SOME_CUSTOM_TOKEN }} # optional custom token for permissions
 ```
 
+### Check Run Creation (`create-check-run:`)
+
+Creates a GitHub Check Run that surfaces agent analysis results as a first-class status check on a commit or pull request. Check Runs appear in the PR checks UI and on commits with a pass/fail status.
+
+```yaml wrap
+safe-outputs:
+  create-check-run:
+    name: "Security Analysis"     # check run name in the Checks UI (default: workflow name)
+    target: "*"                   # "triggering" (default), "*", or explicit PR number expression
+    max: 1                        # max check runs per workflow run (default: 1)
+    output:                       # optional static fallbacks used when the agent omits them
+      title: "Analysis complete"
+      summary: "No findings to report."
+    staged: true                  # optional preview mode — emits step summary instead of calling the API
+```
+
+The check run `name` is configured in frontmatter, **not** accepted as an agent parameter. When `name` equals the workflow name it is auto-suffixed with `(Result)` to avoid being collapsed into the workflow's own check suite entry in compact UI views.
+
+The agent calls `create_check_run` with the required fields:
+
+```json
+{
+  "type": "create_check_run",
+  "conclusion": "failure",
+  "title": "3 issues found",
+  "summary": "### Findings\n- Issue A\n- Issue B\n- Issue C"
+}
+```
+
+`conclusion` must be one of: `success`, `failure`, `neutral`, `cancelled`, `skipped`, `timed_out`, `action_required`. `title` (max 256 characters) and `summary` (max 65535 characters) are required; an optional `text` field provides additional detail content.
+
+#### Pull Request Targeting
+
+The `target` field controls which pull request the check run is attached to:
+
+- **omitted** — the handler resolves the head SHA from the triggering event payload (`pull_request.head.sha`, falling back to `GITHUB_SHA` / `context.sha`). No Pulls API call is made.
+- **`triggering`** — resolves the PR number from the event context, then fetches the current PR head SHA via `GET /repos/{owner}/{repo}/pulls/{pull_number}`. The API call is intentional so the check run always references the most recent head even if the PR was force-pushed between the triggering event and handler execution.
+- **`"*"`** — the agent must include `pull_request_number` (or any of the aliases `pr_number`, `pr`, `pull_number`) in each `create_check_run` call. The handler resolves the head SHA via the Pulls API.
+- **explicit PR number expression** (e.g. `"${{ github.event.inputs.pr }}"`) — resolves to the specified PR and fetches the head SHA via the Pulls API.
+
+When `target` is configured, the compiled workflow automatically adds the `pull-requests: read` permission required for PR head SHA resolution.
+
+#### Required Permissions
+
+| Configuration | Permissions |
+|---------------|-------------|
+| `target` omitted | `contents: read`, `checks: write` |
+| `target` configured | `contents: read`, `checks: write`, `pull-requests: read` |
+
+A GitHub App credential block (`github-app:`) can be supplied to mint a short-lived installation token scoped to `checks:write` for this handler only.
+
 ### Push to PR Branch (`push-to-pull-request-branch:`)
 
 Pushes changes to a PR's branch. Includes configurable [Protected Files](/gh-aw/reference/safe-outputs-pull-requests/#protected-files) against supply chain attacks.
@@ -888,12 +1016,15 @@ See the full reference: [Safe Outputs (Pull Requests) — push-to-pull-request-b
 safe-outputs:
   push-to-pull-request-branch:
     target: "*"                 # "triggering" (default), "*", or number
-    title-prefix: "[bot] "      # require title prefix
-    labels: [automated]         # require all labels
+    required-title-prefix: "[bot] "      # require title prefix
+    required-labels: [automated]         # require all labels
+    signed-commits: false  # optional: use git push directly when signed commits are not required
     protected-files: fallback-to-issue  # create review issue if protected files modified
 ```
 
 When `push-to-pull-request-branch` is configured, git commands (`checkout`, `branch`, `switch`, `add`, `rm`, `commit`, `merge`) are automatically enabled.
+
+For multi-checkout workflows, if one checkout is marked `current: true` and the PR tool targets that repository, patch generation for both `create-pull-request` and `push-to-pull-request-branch` uses that checkout directory.
 
 ### Release Updates (`update-release:`)
 
@@ -1041,16 +1172,19 @@ safe-outputs:
   close-discussion:
     target: "triggering"         # "triggering" (default), "*", or number
     required-category: "Ideas"   # only close in category
-    required-labels: [resolved]  # only close with labels
+    required-labels: [resolved]  # only close if ALL these labels are present
     required-title-prefix: "[ai]" # only close matching prefix
     max: 1                       # max closures (default: 1)
     target-repo: "owner/repo"    # cross-repository
     github-token: ${{ secrets.SOME_CUSTOM_TOKEN }} # optional custom token for permissions
+    allow-body: false          # prevent closing comment (drop body if provided)
 ```
 
 **Target**: `"triggering"` (requires discussion event), `"*"` (any discussion), or number (specific discussion).
 
 **Resolution Reasons**: `RESOLVED`, `DUPLICATE`, `OUTDATED`, `ANSWERED`.
+
+**`allow-body: false`**: When set, any `body` field the agent provides is dropped (a warning is logged) and the discussion is closed without posting a comment. Use this when you want to guarantee a clean close with no duplicate comment — for example, when a prior `add-comment` step already posted the summary.
 
 ### Discussion Updates (`update-discussion:`)
 
@@ -1093,6 +1227,9 @@ safe-outputs:
 
 - **`workflows`** (required) - List of workflow names (without `.md` extension) that the agent is allowed to dispatch. For same-repo dispatch, each workflow must exist locally and support the `workflow_dispatch` trigger.
 - **`max`** (optional) - Maximum number of workflow dispatches allowed (default: 1, maximum: 50). This prevents excessive workflow triggering.
+- **`target-repo`** (optional) - Target repository in `owner/repo` format for cross-repository dispatch.
+- **`allowed-repos`** (optional) - Allowlist of cross-repository dispatch targets. Required when `target-repo` points to a different repository. Supports repository slugs and wildcards such as `org/*`, or a GitHub Actions expression string (e.g. `"${{ inputs['allowed-repos'] }}"`) for dynamic allowlists.
+- **`target-ref`** (optional) - Git ref to dispatch on. In `workflow_call` relay scenarios, the compiler injects this automatically so the dispatch uses the target repository's branch or tag instead of the caller's `GITHUB_REF`.
 
 #### Validation Rules
 
@@ -1266,6 +1403,8 @@ safe-outputs:
     github-token: ${{ secrets.SOME_CUSTOM_TOKEN }} # optional custom token for permissions
 ```
 
+See **[Copilot Cloud Agent](/gh-aw/reference/copilot-cloud-agent/#create-agent-session)** for full details and authentication setup.
+
 ### Assign to Agent (`assign-to-agent:`)
 
 Programmatically assigns GitHub Copilot coding agent to **existing** issues or pull requests through workflow automation. This safe output automates the [standard GitHub workflow for assigning issues to Copilot](https://docs.github.com/en/copilot/how-tos/use-copilot-agents/coding-agent/create-a-pr#assigning-an-issue-to-copilot).
@@ -1287,7 +1426,7 @@ safe-outputs:
     github-token: ${{ secrets.SOME_CUSTOM_TOKEN }} # optional custom token for permissions
 ```
 
-See **[Assign to Copilot](/gh-aw/reference/assign-to-copilot/)** for complete configuration options and authorization setup.
+See **[Copilot Cloud Agent](/gh-aw/reference/copilot-cloud-agent/#assign-to-agent)** for complete configuration options and authorization setup.
 
 If you're creating new issues and want to assign an agent immediately, use `assignees: copilot` in your [`create-issue`](#issue-creation-create-issue) configuration instead.
 
@@ -1304,6 +1443,8 @@ safe-outputs:
     target-repo: "owner/repo"  # cross-repository
     allowed-repos: ["org/repo1", "org/repo2"]  # additional allowed repositories
     unassign-first: true       # unassign all current assignees before assigning (default: false)
+    required-labels: [automated]     # only assign if item has ALL these labels
+    required-title-prefix: "[bot] "  # only assign if item title starts with this prefix
     github-token: ${{ secrets.SOME_CUSTOM_TOKEN }} # optional custom token for permissions
 ```
 
@@ -1319,6 +1460,8 @@ safe-outputs:
     target: "*"                # "triggering" (default), "*", or number
     target-repo: "owner/repo"  # cross-repository
     allowed-repos: ["org/repo1", "org/repo2"]  # additional allowed repositories
+    required-labels: [automated]     # only unassign if item has ALL these labels
+    required-title-prefix: "[bot] "  # only unassign if item title starts with this prefix
     github-token: ${{ secrets.SOME_CUSTOM_TOKEN }} # optional custom token for permissions
 ```
 
@@ -1364,7 +1507,11 @@ jobs:
 
 ### Failure Issue Reporting (`report-failure-as-issue:`)
 
-Controls whether workflow failures are reported as GitHub issues (default: `true`). Set to `false` to suppress automatic failure issue creation for a specific workflow.
+Controls whether workflow failures are reported as GitHub issues (default: `true`).
+
+#### Simple Boolean (Opt-Out All Failures)
+
+Set to `false` to suppress automatic failure issue creation for a specific workflow:
 
 ```yaml wrap
 safe-outputs:
@@ -1373,6 +1520,93 @@ safe-outputs:
 ```
 
 This mirrors the `noop.report-as-issue` pattern. Use this to silence noisy failure reports for workflows where failures are expected or handled externally.
+
+#### Category Filtering (Selective Reporting)
+
+Filter which failure types trigger issue creation by specifying a list of categories. Categories can be included (default) or excluded (using `!` prefix).
+
+##### Include Only Specific Categories
+
+Only failures matching the specified categories will create issues:
+
+```yaml wrap
+safe-outputs:
+  report-failure-as-issue:
+    - agent_failure           # Report only genuine agent-side failures
+    - missing_safe_outputs    # Report missing outputs
+  create-issue:
+```
+
+##### Exclude Specific Categories
+
+Report all failures except the specified categories (use `!` prefix):
+
+```yaml wrap
+safe-outputs:
+  report-failure-as-issue:
+    - "!inference_access_error"        # Exclude AI server transient errors
+    - "!ai_credits_rate_limit_error"   # Exclude AI rate limits
+    - "!report_incomplete"             # Exclude infrastructure failures
+  create-issue:
+```
+
+##### Mixed Include and Exclude
+
+Combine both syntaxes - categories must match included AND not match excluded:
+
+```yaml wrap
+safe-outputs:
+  report-failure-as-issue:
+    - agent_failure                    # Include agent failures
+    - missing_safe_outputs             # Include missing outputs
+    - "!unknown_model_ai_credits"      # But exclude unknown model AI credits
+  create-issue:
+```
+
+**Common failure categories:**
+
+| Category | Description |
+|---|---|
+| `agent_failure` | Agent crashed or returned a non-zero exit code (excluding timeouts) |
+| `timed_out` | Agent execution exceeded the timeout limit |
+| `missing_safe_outputs` | Agent succeeded but produced no safe outputs |
+| `report_incomplete` | Agent reported that the task could not be completed (infrastructure or tool failures) |
+| `missing_tool` | Required functionality is not available |
+| `missing_data` | Required data is not accessible |
+| `inference_access_error` | AI inference endpoint authentication or access failures |
+| `mcp_policy_error` | MCP server policy violations |
+| `ai_credits_rate_limit_error` | AI credits rate limit exceeded |
+| `max_ai_credits_exceeded` | Maximum AI credits budget exceeded |
+| `cache_miss_misconfiguration` | Cache configuration errors |
+| `code_push_failures` | Failures pushing code to branches |
+| `assignment_errors` | Failures assigning issues or reviewers |
+
+**Use case: Suppress transient infrastructure failures**
+
+For scheduled workflows that frequently encounter transient infrastructure failures (Docker registry timeouts, AI server 5xx errors, firewall issues), you can either:
+
+Include only actionable categories:
+```yaml wrap
+safe-outputs:
+  report-failure-as-issue:
+    - agent_failure
+    - missing_safe_outputs
+    - missing_tool
+    - missing_data
+  create-issue:
+```
+
+Or exclude transient categories:
+```yaml wrap
+safe-outputs:
+  report-failure-as-issue:
+    - "!report_incomplete"           # Exclude infrastructure errors
+    - "!inference_access_error"      # Exclude AI server flake
+    - "!ai_credits_rate_limit_error" # Exclude rate limits
+  create-issue:
+```
+
+Both approaches prevent noise while preserving actionable signals, but exclusion syntax is more concise when most categories should be reported.
 
 ### Failure Issue Repository (`failure-issue-repo:`)
 
@@ -1492,7 +1726,7 @@ safe-outputs:
 
 The `default-safe-outputs` compound ecosystem is the recommended baseline — it covers infrastructure certificates (`defaults`), GitHub domains (`github`), popular developer tooling (`dev-tools`), and loopback addresses (`local`).
 
-**Reference Escaping** (`allowed-github-references`): Controls which GitHub repository references (`#123`, `owner/repo#456`) are allowed in workflow output. When configured, references to unlisted repositories are escaped with backticks to prevent GitHub from creating timeline items. This is particularly useful for [SideRepoOps](/gh-aw/patterns/side-repo-ops/) workflows to prevent automation from cluttering your main repository's timeline.
+**Reference Escaping** (`allowed-github-references`): Controls which GitHub repository references (`#123`, `owner/repo#456`) are allowed in workflow output. When configured, references to unlisted repositories are escaped with backticks to prevent GitHub from creating timeline items. This is particularly useful for [side repository](/gh-aw/patterns/multi-repo-ops/#using-a-side-repository) workflows to prevent automation from cluttering your main repository's timeline.
 
 - `[]` - Escape all references (prevents all timeline items)
 - `["repo"]` - Allow only the target repository's references
@@ -1513,6 +1747,40 @@ safe-outputs:
 
 Accepts a literal integer or a GitHub Actions expression string (e.g., `${{ inputs.max-mentions }}`). Set to `0` to escape all bot trigger phrases. Default: 10.
 
+### Mention Filtering (`mentions:`)
+
+By default, `@mentions` in AI-generated content are escaped with backticks unless the mentioned user is a verified collaborator or inferred from the event context (issue/PR author, assignees, etc.). Use `mentions:` to control this behavior:
+
+```yaml wrap
+safe-outputs:
+  mentions: false          # Escape all mentions
+  add-comment: {}
+```
+
+```yaml wrap
+safe-outputs:
+  mentions:
+    allow-team-members: true    # Allow repo collaborators (default: true)
+    allow-context: true         # Allow event context participants (default: true)
+    allowed:                    # Individual users/bots always allowed
+      - trusted-bot
+    allowed-teams:              # Team members always allowed
+      - myorg/eng               # org/team-slug format
+      - reviewers               # team-slug only (uses current org)
+    max: 50                     # Max mentions per message (default: 50)
+  add-comment: {}
+```
+
+**`allowed-teams`** lets organizations allow all members of specific GitHub teams to be mentioned without listing individual usernames. Team members are fetched from the GitHub API at runtime using `GET /orgs/{org}/teams/{team_slug}/members`. Bot accounts within the team are excluded. Use `org/team-slug` for cross-org teams or just `team-slug` to resolve against the current repository's organization.
+
+> [!IMPORTANT]
+> `allowed-teams` requires the workflow token to have `read:org` scope. The default `GITHUB_TOKEN` does **not** include this scope. Use one of the following:
+> - A **classic PAT** with the `read:org` scope stored as a repository secret
+> - A **fine-grained PAT** with the "Members" repository permission (read)
+> - A **GitHub App** installation token with the "Members" permission (read)
+>
+> If the token lacks `read:org`, team membership lookup will fail with HTTP 403/404 and a warning will be logged. The workflow continues without those team members in the allowlist.
+
 ### Templatable Fields
 
 `max`, `expires`, and `max-bot-mentions` accept GitHub Actions expression strings in addition to literal integers, allowing workflow inputs or repository variables to control limits at runtime:
@@ -1532,7 +1800,7 @@ Most boolean configuration fields also accept expression strings. Fields that in
 
 ### Maximum Patch Size (`max-patch-size:`)
 
-Limits git patch size for PR operations (1-10,240 KB, default: 1024 KB):
+Limits git patch size for PR operations (1-10,240 KB, default: 4096 KB):
 
 ```yaml wrap
 safe-outputs:
@@ -1547,12 +1815,12 @@ Specify a custom runner for safe output jobs (default: `ubuntu-slim`):
 ```aw
 ---
 safe-outputs:
-  runs-on: ubuntu-22.04
+  runs-on: [self-hosted, linux, x64]
   create-issue: {}
 ---
 ```
 
-`safe-outputs.runs-on` overrides `runs-on-slim:` for safe-output jobs specifically. To override the runner for all framework jobs at once, use the top-level [`runs-on-slim:`](/gh-aw/guides/self-hosted-runners/#configuring-the-framework-job-runner) field instead.
+`safe-outputs.runs-on` overrides `runs-on-slim:` for safe-output jobs specifically. To override the runner for all framework jobs at once, use the top-level [`runs-on-slim:`](/gh-aw/reference/self-hosted-runners/#configuring-the-framework-job-runner) field instead.
 
 ### Safe Outputs Job Concurrency (`concurrency-group:`)
 
@@ -1585,9 +1853,11 @@ safe-outputs:
 
 **Options**: `append-only-comments` (default: `false`)
 
-**Variables**: `{workflow_name}`, `{run_url}`, `{agentic_workflow_url}`, `{triggering_number}`, `{workflow_source}`, `{workflow_source_url}`, `{event_type}`, `{status}`, `{operation}`, `{effective_tokens}`, `{effective_tokens_formatted}`, `{effective_tokens_suffix}`
+The `footer-install` template renders the install instructions that follow the footer attribution line. When a workflow source is available and no custom template is set, the default renders as a collapsed `<details>` disclosure with the summary `Add this agentic workflows to your repo`; the expanded block contains the `gh aw add {workflow_source}` command. Custom `footer-install` overrides bypass the disclosure wrapper, so include `<details>` markup explicitly if you want the same collapsed UX. Supported placeholders: `{workflow_source}`, `{workflow_source_url}`.
 
-`{effective_tokens}` contains the raw total effective token count for the run (e.g. `1200`), and `{effective_tokens_formatted}` is the compact human-readable form (e.g. `1.2K`, `3M`). Both are only present when the effective token count is greater than zero. `{effective_tokens_suffix}` is a pre-formatted, always-safe suffix string (e.g. `" · ● 1.2K"` or `""`) that can be inserted directly into footer templates alongside `{history_link}`. The default footer automatically includes the formatted value — use these variables in custom footer templates to include token usage in your own format. See [Effective Tokens Specification](/gh-aw/reference/effective-tokens-specification/) for details on how effective tokens are computed.
+**Variables**: `{workflow_name}`, `{run_url}`, `{agentic_workflow_url}`, `{triggering_number}`, `{triggering_type}`, `{workflow_source}`, `{workflow_source_url}`, `{event_type}`, `{status}`, `{operation}`, `{effective_tokens}`, `{effective_tokens_formatted}`, `{ai_credits_suffix}`, `{effective_tokens_suffix}`
+
+`{ai_credits_suffix}` is the preferred pre-formatted, always-safe suffix for run cost (for example, `" · sonnet46 12.4 AIC"` or `""`) and can be inserted directly into footer templates alongside `{history_link}`. `{effective_tokens}` and `{effective_tokens_formatted}` remain available as legacy ET compatibility fields. `{effective_tokens_suffix}` is also preserved as a legacy alias for older templates. When the run's engine model is known, the suffix is prefixed with a deterministic compact model identifier — `sonnetNN` for Sonnet, `gptNN` for GPT, `opusNN` for Opus, `haikuNN` for Haiku, `gemNN` for Gemini, with a stable fallback for other models. Direct short aliases like `opus`, `sonnet`, and `haiku` are preserved. The default footer uses AI Credits formatting; use these variables to customize output as needed. See [AI Credits Specification](/gh-aw/specs/ai-credits-specification/) for AIC details and [Effective Tokens Specification](/gh-aw/specs/effective-tokens-specification/) for legacy ET computation.
 
 ## Staged Mode
 

@@ -90,7 +90,7 @@ func TestExtractStringFromMap(t *testing.T) {
 	}
 }
 
-func TestParseTitlePrefixFromConfig(t *testing.T) {
+func TestExtractTitlePrefixFromMap(t *testing.T) {
 	tests := []struct {
 		name     string
 		input    map[string]any
@@ -133,7 +133,7 @@ func TestParseTitlePrefixFromConfig(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			result := parseTitlePrefixFromConfig(tt.input)
+			result := extractStringFromMap(tt.input, "title-prefix", nil)
 			if result != tt.expected {
 				t.Errorf("expected %q, got %q", tt.expected, result)
 			}
@@ -141,7 +141,7 @@ func TestParseTitlePrefixFromConfig(t *testing.T) {
 	}
 }
 
-func TestParseTargetRepoFromConfig(t *testing.T) {
+func TestExtractTargetRepoFromMap(t *testing.T) {
 	tests := []struct {
 		name     string
 		input    map[string]any
@@ -184,7 +184,7 @@ func TestParseTargetRepoFromConfig(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			result := parseTargetRepoFromConfig(tt.input)
+			result := extractStringFromMap(tt.input, "target-repo", nil)
 			if result != tt.expected {
 				t.Errorf("expected %q, got %q", tt.expected, result)
 			}
@@ -204,7 +204,7 @@ func TestParseIssuesConfigWithHelpers(t *testing.T) {
 		},
 	}
 
-	result := compiler.parseIssuesConfig(outputMap)
+	result := compiler.parseCreateIssuesConfig(outputMap)
 	if result == nil {
 		t.Fatal("expected non-nil result")
 	}
@@ -233,7 +233,7 @@ func TestParsePullRequestsConfigWithHelpers(t *testing.T) {
 		},
 	}
 
-	result := compiler.parsePullRequestsConfig(outputMap)
+	result := compiler.parseCreatePullRequestsConfig(outputMap)
 	if result == nil {
 		t.Fatal("expected non-nil result")
 	}
@@ -252,6 +252,77 @@ func TestParsePullRequestsConfigWithHelpers(t *testing.T) {
 
 	if result.TargetRepoSlug != "org/project" {
 		t.Errorf("expected target-repo 'org/project', got %q", result.TargetRepoSlug)
+	}
+}
+
+func TestParseIssuesConfigWithSingleStringAssignee(t *testing.T) {
+	compiler := &Compiler{}
+	outputMap := map[string]any{
+		"create-issue": map[string]any{
+			"assignees": "single-assignee",
+		},
+	}
+
+	result := compiler.parseCreateIssuesConfig(outputMap)
+	if result == nil {
+		t.Fatal("expected non-nil result")
+	}
+
+	if len(result.Assignees) != 1 {
+		t.Fatalf("expected 1 assignee, got %d", len(result.Assignees))
+	}
+	if result.Assignees[0] != "single-assignee" {
+		t.Errorf("expected assignee 'single-assignee', got %q", result.Assignees[0])
+	}
+}
+
+func TestParsePullRequestsConfigWithSingleStringReviewerAndTeamReviewer(t *testing.T) {
+	compiler := &Compiler{}
+	outputMap := map[string]any{
+		"create-pull-request": map[string]any{
+			"reviewers":      "single-reviewer",
+			"team-reviewers": "single-team",
+		},
+	}
+
+	result := compiler.parseCreatePullRequestsConfig(outputMap)
+	if result == nil {
+		t.Fatal("expected non-nil result")
+	}
+
+	if len(result.Reviewers) != 1 {
+		t.Fatalf("expected 1 reviewer, got %d", len(result.Reviewers))
+	}
+	if result.Reviewers[0] != "single-reviewer" {
+		t.Errorf("expected reviewer 'single-reviewer', got %q", result.Reviewers[0])
+	}
+
+	if len(result.TeamReviewers) != 1 {
+		t.Fatalf("expected 1 team reviewer, got %d", len(result.TeamReviewers))
+	}
+	if result.TeamReviewers[0] != "single-team" {
+		t.Errorf("expected team reviewer 'single-team', got %q", result.TeamReviewers[0])
+	}
+}
+
+func TestParsePullRequestsConfigWithSingleStringAssignee(t *testing.T) {
+	compiler := &Compiler{}
+	outputMap := map[string]any{
+		"create-pull-request": map[string]any{
+			"assignees": "single-assignee",
+		},
+	}
+
+	result := compiler.parseCreatePullRequestsConfig(outputMap)
+	if result == nil {
+		t.Fatal("expected non-nil result")
+	}
+
+	if len(result.Assignees) != 1 {
+		t.Fatalf("expected 1 assignee, got %d", len(result.Assignees))
+	}
+	if result.Assignees[0] != "single-assignee" {
+		t.Errorf("expected assignee 'single-assignee', got %q", result.Assignees[0])
 	}
 }
 
@@ -282,7 +353,7 @@ func TestParsePullRequestsConfigExpires(t *testing.T) {
 				},
 			}
 
-			result := compiler.parsePullRequestsConfig(outputMap)
+			result := compiler.parseCreatePullRequestsConfig(outputMap)
 			if result == nil {
 				t.Fatal("expected non-nil result")
 			}
@@ -303,7 +374,7 @@ func TestParseDiscussionsConfigWithHelpers(t *testing.T) {
 		},
 	}
 
-	result := compiler.parseDiscussionsConfig(outputMap)
+	result := compiler.parseCreateDiscussionsConfig(outputMap)
 	if result == nil {
 		t.Fatal("expected non-nil result")
 	}
@@ -363,7 +434,7 @@ func TestParseIssuesConfigWithWildcardTargetRepo(t *testing.T) {
 		},
 	}
 
-	result := compiler.parseIssuesConfig(outputMap)
+	result := compiler.parseCreateIssuesConfig(outputMap)
 	if result == nil {
 		t.Errorf("expected non-nil config for wildcard target-repo, got nil")
 	} else if result.TargetRepoSlug != "*" {
@@ -379,7 +450,7 @@ func TestParsePullRequestsConfigWithWildcardTargetRepo(t *testing.T) {
 		},
 	}
 
-	result := compiler.parsePullRequestsConfig(outputMap)
+	result := compiler.parseCreatePullRequestsConfig(outputMap)
 	if result == nil {
 		t.Errorf("expected non-nil config for wildcard target-repo, got nil")
 	} else if result.TargetRepoSlug != "*" {
@@ -396,7 +467,7 @@ func TestParseDiscussionsConfigWithWildcardTargetRepo(t *testing.T) {
 		},
 	}
 
-	result := compiler.parseDiscussionsConfig(outputMap)
+	result := compiler.parseCreateDiscussionsConfig(outputMap)
 	if result == nil {
 		t.Errorf("expected non-nil config for wildcard target-repo, got nil")
 	} else if result.TargetRepoSlug != "*" {
@@ -1127,8 +1198,8 @@ func TestAddTemplatableStringSliceBuilder(t *testing.T) {
 }
 
 // TestParsePullRequestsConfigExpressionFields verifies that create-pull-request
-// accepts GitHub Actions expression strings for labels, allowed-repos, and
-// allowed-base-branches.
+// accepts GitHub Actions expression strings for labels, allowed-repos,
+// allowed-base-branches, and allowed-branches.
 func TestParsePullRequestsConfigExpressionFields(t *testing.T) {
 	tests := []struct {
 		name     string
@@ -1154,6 +1225,12 @@ func TestParsePullRequestsConfigExpressionFields(t *testing.T) {
 			expr:     "${{ inputs['allowed-base-branches'] }}",
 			getField: func(c *CreatePullRequestsConfig) []string { return c.AllowedBaseBranches },
 		},
+		{
+			name:     "allowed-branches as expression",
+			field:    "allowed-branches",
+			expr:     "${{ inputs['allowed-branches'] }}",
+			getField: func(c *CreatePullRequestsConfig) []string { return c.AllowedBranches },
+		},
 	}
 
 	for _, tt := range tests {
@@ -1165,7 +1242,7 @@ func TestParsePullRequestsConfigExpressionFields(t *testing.T) {
 				},
 			}
 
-			result := compiler.parsePullRequestsConfig(outputMap)
+			result := compiler.parseCreatePullRequestsConfig(outputMap)
 			if result == nil {
 				t.Fatal("expected non-nil result")
 			}
@@ -1207,7 +1284,7 @@ func TestParseAddCommentConfigExpressionFields(t *testing.T) {
 
 // TestParsePushToPullRequestBranchExpressionFields verifies that
 // push-to-pull-request-branch accepts GitHub Actions expression strings for
-// labels and allowed-repos.
+// required-labels and allowed-repos.
 func TestParsePushToPullRequestBranchExpressionFields(t *testing.T) {
 	tests := []struct {
 		name     string
@@ -1216,10 +1293,10 @@ func TestParsePushToPullRequestBranchExpressionFields(t *testing.T) {
 		getField func(*PushToPullRequestBranchConfig) []string
 	}{
 		{
-			name:     "labels as expression",
-			field:    "labels",
+			name:     "required-labels as expression",
+			field:    "required-labels",
 			expr:     "${{ inputs['required-labels'] }}",
-			getField: func(c *PushToPullRequestBranchConfig) []string { return c.Labels },
+			getField: func(c *PushToPullRequestBranchConfig) []string { return c.RequiredLabels },
 		},
 		{
 			name:     "allowed-repos as expression",
@@ -1251,6 +1328,24 @@ func TestParsePushToPullRequestBranchExpressionFields(t *testing.T) {
 				t.Errorf("expected expression %q, got %q", tt.expr, got[0])
 			}
 		})
+	}
+}
+
+func TestParsePushToPullRequestBranchMaxPatchSize(t *testing.T) {
+	compiler := &Compiler{}
+	outputMap := map[string]any{
+		"push-to-pull-request-branch": map[string]any{
+			"max-patch-size": 2048,
+		},
+	}
+
+	result := compiler.parsePushToPullRequestBranchConfig(outputMap)
+	if result == nil {
+		t.Fatal("expected non-nil result")
+	}
+
+	if result.MaxPatchSize != 2048 {
+		t.Fatalf("expected MaxPatchSize=2048, got %d", result.MaxPatchSize)
 	}
 }
 
@@ -1311,6 +1406,17 @@ func TestHandlerConfigExpressionFields(t *testing.T) {
 			wantValue: "${{ inputs['allowed-base-branches'] }}",
 		},
 		{
+			name: "create_pull_request allowed_branches expression stored as string",
+			safeOuts: &SafeOutputsConfig{
+				CreatePullRequests: &CreatePullRequestsConfig{
+					AllowedBranches: []string{"${{ inputs['allowed-branches'] }}"},
+				},
+			},
+			handler:   "create_pull_request",
+			configKey: "allowed_branches",
+			wantValue: "${{ inputs['allowed-branches'] }}",
+		},
+		{
 			name: "add_comment allowed_repos expression stored as string",
 			safeOuts: &SafeOutputsConfig{
 				AddComments: &AddCommentsConfig{
@@ -1322,14 +1428,14 @@ func TestHandlerConfigExpressionFields(t *testing.T) {
 			wantValue: "${{ inputs['allowed-repos'] }}",
 		},
 		{
-			name: "push_to_pull_request_branch labels expression stored as string",
+			name: "push_to_pull_request_branch required_labels expression stored as string",
 			safeOuts: &SafeOutputsConfig{
 				PushToPullRequestBranch: &PushToPullRequestBranchConfig{
-					Labels: []string{"${{ inputs['required-labels'] }}"},
+					RequiredLabels: []string{"${{ inputs['required-labels'] }}"},
 				},
 			},
 			handler:   "push_to_pull_request_branch",
-			configKey: "labels",
+			configKey: "required_labels",
 			wantValue: "${{ inputs['required-labels'] }}",
 		},
 		{
@@ -1387,14 +1493,14 @@ func TestExpressionFieldsRejectedForInvalidStrings(t *testing.T) {
 	// create-pull-request: non-expression bare string returns nil config
 	compiler := &Compiler{}
 
-	for _, field := range []string{"labels", "allowed-repos", "allowed-base-branches"} {
+	for _, field := range []string{"labels", "allowed-repos", "allowed-base-branches", "allowed-branches"} {
 		t.Run("create-pull-request/"+field+"/non-expression", func(t *testing.T) {
 			outputMap := map[string]any{
 				"create-pull-request": map[string]any{
 					field: "not-an-expression",
 				},
 			}
-			result := compiler.parsePullRequestsConfig(outputMap)
+			result := compiler.parseCreatePullRequestsConfig(outputMap)
 			// Must return nil (invalid input is rejected)
 			if result != nil {
 				t.Errorf("expected nil result for invalid bare string in %q, got %+v", field, result)
@@ -1441,7 +1547,7 @@ func TestAllListEncodingForms(t *testing.T) {
 		wantSlice []string // expected []string in the parsed config struct; nil = field absent
 	}
 
-	// Helper: run a single field case through parsePullRequestsConfig.labels and
+	// Helper: run a single field case through parseCreatePullRequestsConfig.labels and
 	// verify the Labels field.
 	runPRLabelsCase := func(t *testing.T, tc listFieldCase) {
 		t.Helper()
@@ -1451,7 +1557,7 @@ func TestAllListEncodingForms(t *testing.T) {
 				"labels": tc.value,
 			},
 		}
-		result := compiler.parsePullRequestsConfig(outputMap)
+		result := compiler.parseCreatePullRequestsConfig(outputMap)
 		if tc.wantSlice == nil {
 			// Invalid input — parser should reject (nil config)
 			if result != nil && len(result.Labels) > 0 {

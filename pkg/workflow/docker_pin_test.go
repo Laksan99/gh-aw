@@ -5,6 +5,7 @@ package workflow
 import (
 	"testing"
 
+	"github.com/github/gh-aw/pkg/constants"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -30,8 +31,22 @@ func TestApplyContainerPins(t *testing.T) {
 			name:            "embedded pin used when cache is absent",
 			images:          []string{"node:lts-alpine"},
 			pins:            nil,
-			expectedRefs:    []string{"node:lts-alpine@sha256:d1b3b4da11eefd5941e7f0b9cf17783fc99d9c6fc34884a665f40a06dbdfc94f"},
-			expectedDigests: []string{"sha256:d1b3b4da11eefd5941e7f0b9cf17783fc99d9c6fc34884a665f40a06dbdfc94f"},
+			expectedRefs:    []string{"node:lts-alpine@sha256:2bdb65ed1dab192432bc31c95f94155ca5ad7fc1392fb7eb7526ab682fa5bf14"},
+			expectedDigests: []string{"sha256:2bdb65ed1dab192432bc31c95f94155ca5ad7fc1392fb7eb7526ab682fa5bf14"},
+		},
+		{
+			name:            "embedded firewall pin used when cache is absent",
+			images:          []string{"ghcr.io/github/gh-aw-firewall/agent:0.27.0"},
+			pins:            nil,
+			expectedRefs:    []string{"ghcr.io/github/gh-aw-firewall/agent:0.27.0@sha256:3816d1692e6d96887b27f1e4f1d64b8d7edb43ed9d7506b8f203913cbb81c248"},
+			expectedDigests: []string{"sha256:3816d1692e6d96887b27f1e4f1d64b8d7edb43ed9d7506b8f203913cbb81c248"},
+		},
+		{
+			name:            "embedded gh-aw-node pin used when cache is absent",
+			images:          []string{constants.DefaultGhAwNodeImage},
+			pins:            nil,
+			expectedRefs:    []string{"ghcr.io/github/gh-aw-node@sha256:529d02eb970b1161aa25c593a9c3df57fdfad5a8add328cb3b6eccef66f3183b"},
+			expectedDigests: []string{"sha256:529d02eb970b1161aa25c593a9c3df57fdfad5a8add328cb3b6eccef66f3183b"},
 		},
 		{
 			name:   "pinned image replaced with digest reference",
@@ -94,9 +109,9 @@ func TestApplyContainerPins(t *testing.T) {
 // populates workflowData.DockerImages and DockerImagePins with the collected image refs.
 func TestCollectDockerImages_StoresInWorkflowData(t *testing.T) {
 	workflowData := &WorkflowData{
-		SafeOutputs: &SafeOutputsConfig{
-			CreateIssues: &CreateIssuesConfig{
-				BaseSafeOutputConfig: BaseSafeOutputConfig{},
+		SandboxConfig: &SandboxConfig{
+			MCP: &MCPGatewayRuntimeConfig{
+				Container: constants.DefaultMCPGatewayContainer,
 			},
 		},
 	}
@@ -105,13 +120,43 @@ func TestCollectDockerImages_StoresInWorkflowData(t *testing.T) {
 
 	images := collectDockerImages(tools, workflowData, ActionModeRelease)
 
-	// DockerImages on workflowData should now be populated (node:lts-alpine from safe-outputs).
+	// DockerImages on workflowData should now be populated (MCP gateway from sandbox config).
 	require.NotEmpty(t, workflowData.DockerImages, "DockerImages should be populated after collectDockerImages")
 	assert.Equal(t, images, workflowData.DockerImages, "DockerImages should match the returned slice")
 
 	// DockerImagePins should also be populated with matching Image fields.
 	require.NotEmpty(t, workflowData.DockerImagePins, "DockerImagePins should be populated")
 	assert.Len(t, workflowData.DockerImagePins, len(workflowData.DockerImages), "pin count should match image count")
+}
+
+// TestCollectDockerImages_SafeOutputsAddsGhAwNodeImage verifies that enabling
+// safe-outputs adds the published gh-aw-node container to the default Docker pull
+// list and manifest data, while not falling back to node:lts-alpine.
+func TestCollectDockerImages_SafeOutputsAddsGhAwNodeImage(t *testing.T) {
+	workflowData := &WorkflowData{
+		SafeOutputs: &SafeOutputsConfig{
+			CreateIssues: &CreateIssuesConfig{
+				BaseSafeOutputConfig: BaseSafeOutputConfig{},
+			},
+		},
+	}
+
+	images := collectDockerImages(map[string]any{}, workflowData, ActionModeRelease)
+
+	pinnedGhAwNodeImage := resolveContainerImage(constants.DefaultGhAwNodeImage, nil)
+	assert.Contains(t, images, pinnedGhAwNodeImage,
+		"safe-outputs should add the gh-aw-node container image to the Docker pull list")
+	require.NotEmpty(t, workflowData.DockerImagePins, "DockerImagePins should be populated")
+	assert.Contains(t, workflowData.DockerImagePins, GHAWManifestContainer{
+		Image:       constants.DefaultGhAwNodeImage,
+		Digest:      "sha256:529d02eb970b1161aa25c593a9c3df57fdfad5a8add328cb3b6eccef66f3183b",
+		PinnedImage: pinnedGhAwNodeImage,
+	}, "safe-outputs should add gh-aw-node to manifest container pins")
+
+	for _, img := range images {
+		assert.NotContains(t, img, constants.DefaultNodeAlpineLTSImage,
+			"safe-outputs should not add node:lts-alpine (or any digest-pinned form) to the Docker pull list")
+	}
 }
 
 // TestMergeDockerImages verifies deduplication when merging two slices.

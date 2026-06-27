@@ -1,4 +1,6 @@
 ---
+private: true
+emoji: "📊"
 name: Daily Syntax Error Quality Check
 description: Tests compiler error message quality by introducing syntax errors in workflows, evaluating error clarity, and suggesting improvements
 on:
@@ -8,17 +10,14 @@ permissions:
   contents: read
   issues: read
   pull-requests: read
+  copilot-requests: write
 tracker-id: daily-syntax-error-quality
-engine: copilot
+engine:
+  id: copilot
+  copilot-sdk: true
 tools:
   cli-proxy: true
-  bash:
-    - "gh aw compile *"
-    - "gh aw compile /tmp/gh-aw/syntax-error-tests/*.md"
-    - "head -n 30 /tmp/gh-aw/agent/candidates/"
-    - "cp /tmp/gh-aw/agent/candidates/"
-    - "cat /tmp/gh-aw/syntax-error-tests/*.md"
-    - "mkdir -p /tmp/gh-aw/syntax-error-tests"
+  bash: true
 safe-outputs:
   create-issue:
     expires: 3d
@@ -26,6 +25,7 @@ safe-outputs:
     labels: [dx, error-messages, automated-analysis]
     max: 1
     close-older-issues: true
+  noop:
 timeout-minutes: 20
 strict: true
 steps:
@@ -51,14 +51,8 @@ steps:
       fi
       gh aw --version
 imports:
-  - uses: shared/daily-audit-base.md
-    with:
-      title-prefix: "[syntax-error-quality] "
-      expires: 3d
-  - shared/observability-otlp.md
-features:
-  copilot-requests: true
-
+  - shared/reporting.md
+  - shared/otlp.md
 ---
 
 {{#runtime-import? .github/shared-instructions.md}}
@@ -120,7 +114,7 @@ cat /tmp/gh-aw/agent/candidates.txt
 1. Simple workflow (< 100 lines, minimal config)
 2. Complex workflow (> 300 lines, many tools/features)
 
-## Phase 2: Generate Syntax Errors
+### Phase 2: Generate Syntax Errors
 
 For each selected workflow, create exactly **1 test case** with a different error type:
 
@@ -162,10 +156,10 @@ Examples:
 
 For each workflow:
 
-1. **Copy workflow to /tmp** for testing:
+1. **Copy workflow to `/tmp/gh-aw/agent`** for testing:
    ```bash
-   mkdir -p /tmp/gh-aw/syntax-error-tests
-   cp /tmp/gh-aw/agent/candidates/selected-workflow.md /tmp/gh-aw/syntax-error-tests/test-1.md
+   mkdir -p /tmp/gh-aw/agent/syntax-error-tests
+   cp /tmp/gh-aw/agent/candidates/selected-workflow.md /tmp/gh-aw/agent/syntax-error-tests/test-1.md
    ```
 
 2. **Introduce ONE error** from a different category:
@@ -183,13 +177,13 @@ For each workflow:
    }
    ```
 
-## Phase 3: Run Compiler and Capture Output
+### Phase 3: Run Compiler and Capture Output
 
 For each test case:
 
 1. **Attempt to compile** the modified workflow:
    ```bash
-   cd /tmp/gh-aw/syntax-error-tests
+   cd /tmp/gh-aw/agent/syntax-error-tests
    gh aw compile test-1.md 2>&1 | tee test-1-output.txt
    ```
 
@@ -231,16 +225,28 @@ test-1 | <workflow> | <error type> | clarity:<n>/25 actionability:<n>/25 context
 
 Collect key strengths (1–2 bullets) and improvement suggestions (1–2 bullets) per test. Do **not** reproduce the full compiler output in your report — reference file:line only.
 
-## Phase 6: Create Issue with Suggestions
+### Phase 6: Create Issue with Suggestions
 
 **Only create an issue if**:
 - Average score < 65 across all test cases, OR
 - Any individual test case scores < 50, OR
 - Critical pattern issues are identified
 
+If the threshold is met (average ≥ 65 and no score < 50), **skip this phase entirely** and proceed directly to Phase 7.
+
 ### Issue Structure
 
 Use this **compact** template (do not add extra sections):
+
+Use h3 (`###`) or lower for all headers in your report. Never use h1 (`#`) or h2 (`##`) inside issue/comment bodies — these are reserved for the issue title.
+
+Wrap long sections in `<details><summary><b>Section Name</b></summary>` tags to improve readability and reduce scrolling. Keep critical summaries and key metrics always visible.
+
+Suggested structure:
+- Brief summary (always visible)
+- Key metrics or highlights (always visible)
+- Detailed analysis (in `<details>` tags)
+- Recommendations (always visible)
 
 ```markdown
 ### 📊 Error Message Quality Analysis
@@ -267,7 +273,7 @@ Use this **compact** template (do not add extra sections):
 1. **Realistic Errors**: Introduce errors that developers actually make
 2. **Diverse Coverage**: Test different error categories and workflows
 3. **No False Positives**: Ensure the error we introduce is actually invalid
-4. **Clean Workspace**: Use /tmp for test files, don't modify actual workflows
+4. **Clean Workspace**: Use `/tmp/gh-aw/agent` for test files, don't modify actual workflows
 
 ### Evaluation Guidelines
 
@@ -283,6 +289,26 @@ Use this **compact** template (do not add extra sections):
 3. **Prioritize Improvements**: Focus on high-impact, feasible changes
 4. **Include Examples**: Show both current and improved error messages
 
+## Phase 7: Signal Completion ⚠️ REQUIRED — DO NOT SKIP
+
+**This phase is mandatory regardless of your findings. Execute it as your final action.**
+
+After Phase 5 scoring (and after Phase 6 if you created an issue):
+
+**Path A — Threshold met (average ≥ 65, no score < 50)**:
+Run this shell command now:
+```
+safeoutputs noop --message "Analyzed [workflow1.md] (Category A) + [workflow2.md] (Category B). Average: [N]/100. Threshold met — no issue needed."
+```
+
+**Path B — Issue created in Phase 6**:
+Run this shell command now:
+```
+safeoutputs noop --message "Created quality improvement issue. Analyzed [workflow1.md] + [workflow2.md]. Average: [N]/100."
+```
+
+⚠️ **Your session ends only after executing one of the above shell commands. Do not output text and stop — run the command.**
+
 ## Success Criteria
 
 A successful analysis run:
@@ -292,6 +318,7 @@ A successful analysis run:
 - ✅ Provides quality scores across all dimensions
 - ✅ Creates issue only when quality is below threshold (average < 65 or any score < 50)
 - ✅ Cleans up temporary test files
+- ✅ Executes Phase 7 shell command to signal completion
 
 ---
 

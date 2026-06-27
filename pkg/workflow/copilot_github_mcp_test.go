@@ -7,12 +7,13 @@ import (
 	"testing"
 
 	"github.com/github/gh-aw/pkg/constants"
+	"github.com/stretchr/testify/assert"
 )
 
 func TestRenderGitHubCopilotMCPConfig_AllowedTools(t *testing.T) {
 	tests := []struct {
 		name              string
-		githubTool        any
+		githubTool        map[string]any
 		isLast            bool
 		expectedContent   []string
 		unexpectedContent []string
@@ -20,7 +21,7 @@ func TestRenderGitHubCopilotMCPConfig_AllowedTools(t *testing.T) {
 		{
 			name: "GitHub with specific allowed tools",
 			githubTool: map[string]any{
-				"allowed": []string{"list_workflows", "list_workflow_runs", "list_workflow_run_artifacts"},
+				"allowed": []string{"actions_list", "actions_get", "get_job_logs"},
 			},
 			isLast: true,
 			expectedContent: []string{
@@ -28,7 +29,7 @@ func TestRenderGitHubCopilotMCPConfig_AllowedTools(t *testing.T) {
 				`"type": "stdio"`,
 				`"container": "ghcr.io/github/github-mcp-server:` + string(constants.DefaultGitHubMCPServerVersion) + `"`,
 				`"env": {`,
-				`"GITHUB_PERSONAL_ACCESS_TOKEN": "\${GITHUB_MCP_SERVER_TOKEN}"`,
+				`"GITHUB_PERSONAL_ACCESS_TOKEN": "${GITHUB_MCP_SERVER_TOKEN}"`,
 			},
 			unexpectedContent: []string{},
 		},
@@ -121,7 +122,7 @@ func TestRenderGitHubCopilotMCPConfig_AllowedTools(t *testing.T) {
 func TestGetGitHubAllowedTools(t *testing.T) {
 	tests := []struct {
 		name       string
-		githubTool any
+		githubTool map[string]any
 		expected   []string
 	}{
 		{
@@ -151,8 +152,25 @@ func TestGetGitHubAllowedTools(t *testing.T) {
 			expected: []string{"tool1", "tool2", "tool3"},
 		},
 		{
-			name:       "Not a map",
-			githubTool: "invalid",
+			name: "Allowed supports object entries with max-calls",
+			githubTool: map[string]any{
+				"allowed": []any{
+					map[string]any{"name": "issue_read", "max-calls": 1},
+					"list_labels",
+				},
+			},
+			expected: []string{"issue_read", "list_labels"},
+		},
+		{
+			name: "Allowed string entries with colons are preserved as tool names",
+			githubTool: map[string]any{
+				"allowed": []any{"issue_read:1", "list_labels"},
+			},
+			expected: []string{"issue_read:1", "list_labels"},
+		},
+		{
+			name:       "Nil tool",
+			githubTool: nil,
 			expected:   nil,
 		},
 	}
@@ -185,4 +203,74 @@ func TestGetGitHubAllowedTools(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestGetGitHubGuardPoliciesToolCallLimits(t *testing.T) {
+	tests := []struct {
+		name       string
+		githubTool map[string]any
+		expected   map[string]any
+	}{
+		{
+			name: "tool-call-limits only creates allow-only policy with default repos",
+			githubTool: map[string]any{
+				"allowed": []any{
+					map[string]any{"name": "issue_read", "max-calls": 1},
+					"list_labels",
+				},
+			},
+			expected: map[string]any{
+				"allow-only": map[string]any{
+					"repos": "all",
+					"tool-call-limits": map[string]int{
+						"issue_read": 1,
+					},
+					"blocked-users":   guardExprSentinel + "${{ steps.parse-guard-vars.outputs.blocked_users }}",
+					"trusted-users":   guardExprSentinel + "${{ steps.parse-guard-vars.outputs.trusted_users }}",
+					"approval-labels": guardExprSentinel + "${{ steps.parse-guard-vars.outputs.approval_labels }}",
+				},
+			},
+		},
+		{
+			name: "tool-call-limits merge with existing guard policy",
+			githubTool: map[string]any{
+				"allowed-repos": "github/gh-aw",
+				"min-integrity": "approved",
+				"allowed": []any{
+					"list_labels",
+					map[string]any{"name": "issue_read", "max-calls": 2},
+				},
+			},
+			expected: map[string]any{
+				"allow-only": map[string]any{
+					"repos":         "github/gh-aw",
+					"min-integrity": "approved",
+					"tool-call-limits": map[string]int{
+						"issue_read": 2,
+					},
+					"blocked-users":   guardExprSentinel + "${{ steps.parse-guard-vars.outputs.blocked_users }}",
+					"trusted-users":   guardExprSentinel + "${{ steps.parse-guard-vars.outputs.trusted_users }}",
+					"approval-labels": guardExprSentinel + "${{ steps.parse-guard-vars.outputs.approval_labels }}",
+				},
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.expected, getGitHubGuardPolicies(tt.githubTool))
+		})
+	}
+}
+
+func TestParseGitHubToolAllowedObjectEntries(t *testing.T) {
+	parsed := parseGitHubTool(map[string]any{
+		"allowed": []any{
+			map[string]any{"name": "issue_read", "max-calls": 1},
+			"list_labels",
+		},
+	})
+
+	assert.NotNil(t, parsed)
+	assert.Equal(t, GitHubAllowedTools{"issue_read", "list_labels"}, parsed.Allowed)
 }

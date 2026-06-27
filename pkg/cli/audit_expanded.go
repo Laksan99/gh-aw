@@ -6,11 +6,13 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"sort"
+	"slices"
 	"strings"
 	"time"
 
+	"github.com/github/gh-aw/pkg/fileutil"
 	"github.com/github/gh-aw/pkg/logger"
+	"github.com/github/gh-aw/pkg/sliceutil"
 	"github.com/github/gh-aw/pkg/timeutil"
 	"github.com/github/gh-aw/pkg/workflow"
 )
@@ -111,7 +113,7 @@ func findAwInfoPath(logsPath string) string {
 		filepath.Join(logsPath, "activation", "aw_info.json"),
 	}
 	for _, p := range candidates {
-		if _, err := os.Stat(p); err == nil {
+		if fileutil.FileExists(p) {
 			return p
 		}
 	}
@@ -171,7 +173,7 @@ func inferFallbackLogMetrics(logsPath string) (LogMetrics, string) {
 	}
 
 	if eventsJSONLPath := findEventsJSONLFile(logsPath); eventsJSONLPath != "" {
-		if metrics, err := parseEventsJSONLFile(eventsJSONLPath, false); err == nil && hasUsefulFallbackMetrics(metrics) {
+		if metrics, err := parseEventsJSONLMetrics(eventsJSONLPath, false); err == nil && hasUsefulFallbackMetrics(metrics) {
 			return metrics, "copilot"
 		}
 	}
@@ -189,7 +191,7 @@ func inferFallbackLogMetrics(logsPath string) (LogMetrics, string) {
 
 func findAgentStdioLogPath(logsPath string) string {
 	root := filepath.Join(logsPath, "agent-stdio.log")
-	if _, err := os.Stat(root); err == nil {
+	if fileutil.FileExists(root) {
 		return root
 	}
 
@@ -211,7 +213,7 @@ func findAgentStdioLogPath(logsPath string) string {
 }
 
 func hasUsefulFallbackMetrics(metrics LogMetrics) bool {
-	return metrics.TokenUsage > 0 || metrics.Turns > 0 || metrics.EstimatedCost > 0 || len(metrics.ToolCalls) > 0
+	return metrics.TokenUsage > 0 || metrics.Turns > 0 || len(metrics.ToolCalls) > 0
 }
 
 func inferBestEngineMetricsFromContent(logContent string) (LogMetrics, string) {
@@ -402,11 +404,21 @@ func buildSafeOutputSummary(items []CreatedItemReport, chainMetrics SafeOutputCh
 			Count: count,
 		})
 	}
-	sort.Slice(summary.TypeDetails, func(i, j int) bool {
-		if summary.TypeDetails[i].Count == summary.TypeDetails[j].Count {
-			return summary.TypeDetails[i].Type < summary.TypeDetails[j].Type
+	slices.SortFunc(summary.TypeDetails, func(a, b SafeOutputTypeDetail) int {
+		if a.Count == b.Count {
+			switch {
+			case a.Type < b.Type:
+				return -1
+			case a.Type > b.Type:
+				return 1
+			default:
+				return 0
+			}
 		}
-		return summary.TypeDetails[i].Count > summary.TypeDetails[j].Count
+		if a.Count > b.Count {
+			return -1
+		}
+		return 1
 	})
 
 	// Build human-readable summary string
@@ -462,9 +474,11 @@ func buildMCPServerHealth(mcpToolUsage *MCPToolUsageData, mcpFailures []MCPFailu
 	health := &MCPServerHealth{}
 
 	// Track failed servers from MCPFailures
-	failedServers := make(map[string]bool)
+	failedServers := make(map[string]struct {
+	})
 	for _, failure := range mcpFailures {
-		failedServers[failure.ServerName] = true
+		failedServers[failure.ServerName] = struct {
+		}{}
 	}
 	health.FailedSvrs = len(failedServers)
 
@@ -474,10 +488,7 @@ func buildMCPServerHealth(mcpToolUsage *MCPToolUsageData, mcpFailures []MCPFailu
 			health.TotalRequests += server.RequestCount
 			health.TotalErrors += server.ErrorCount
 
-			errorRate := 0.0
-			if server.RequestCount > 0 {
-				errorRate = float64(server.ErrorCount) / float64(server.RequestCount) * 100
-			}
+			errorRate := safePercent(server.ErrorCount, server.RequestCount)
 
 			status := "✅ healthy"
 			if _, isFailed := failedServers[server.ServerName]; isFailed {
@@ -532,13 +543,17 @@ func buildMCPServerHealth(mcpToolUsage *MCPToolUsageData, mcpFailures []MCPFailu
 	health.HealthySvrs = health.TotalServers - health.FailedSvrs - health.DegradedSvrs
 
 	// Calculate overall error rate
-	if health.TotalRequests > 0 {
-		health.ErrorRate = float64(health.TotalErrors) / float64(health.TotalRequests) * 100
-	}
+	health.ErrorRate = safePercent(health.TotalErrors, health.TotalRequests)
 
 	// Sort servers by request count (highest first)
-	sort.Slice(health.Servers, func(i, j int) bool {
-		return health.Servers[i].RequestCount > health.Servers[j].RequestCount
+	slices.SortFunc(health.Servers, func(a, b MCPServerHealthDetail) int {
+		if a.RequestCount > b.RequestCount {
+			return -1
+		}
+		if a.RequestCount < b.RequestCount {
+			return 1
+		}
+		return 0
 	})
 
 	// Build summary string
@@ -581,8 +596,14 @@ func buildSlowestToolCalls(calls []MCPToolCall, topN int) []MCPSlowestToolCall {
 	}
 
 	// Sort by duration descending
-	sort.Slice(withDuration, func(i, j int) bool {
-		return withDuration[i].duration > withDuration[j].duration
+	slices.SortFunc(withDuration, func(a, b callWithDuration) int {
+		if a.duration > b.duration {
+			return -1
+		}
+		if a.duration < b.duration {
+			return 1
+		}
+		return 0
 	})
 
 	// Take top N
@@ -641,10 +662,6 @@ func extractMCPServerNamesFromAwInfo(logsPath string) ([]string, bool) {
 		return nil, false
 	}
 
-	names := make([]string, 0, len(servers))
-	for name := range servers {
-		names = append(names, name)
-	}
-	sort.Strings(names)
+	names := sliceutil.SortedKeys(servers)
 	return names, len(names) > 0
 }

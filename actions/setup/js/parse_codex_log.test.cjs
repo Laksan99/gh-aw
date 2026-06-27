@@ -41,6 +41,8 @@ describe("parse_codex_log.cjs", () => {
   });
 
   describe("parseCodexLog function", () => {
+    const getEventData = (entries, eventType) => entries.filter(e => e.type === eventType).map(e => e.data || {});
+
     it("should parse basic tool call with success", () => {
       const logContent = `tool github.list_pull_requests({"state":"open"})
 github.list_pull_requests(...) success in 123ms:
@@ -75,6 +77,17 @@ Let me start by listing the files in the root directory`;
       expect(result.markdown).toContain("## 🤖 Reasoning");
       expect(result.markdown).toContain("I need to analyze the repository structure");
       expect(result.markdown).toContain("Let me start by listing the files");
+    });
+
+    it("should render thinking sections with open circle icon and italic styling", () => {
+      const logContent = `thinking
+I need to analyze the repository structure to understand the codebase`;
+
+      const result = parseCodexLog(logContent);
+
+      // Thinking content should be wrapped in italic markup with open circle icon
+      expect(result.markdown).toContain("◐");
+      expect(result.markdown).toContain("<em>I need to analyze the repository structure");
     });
 
     it("should skip metadata lines", () => {
@@ -202,13 +215,9 @@ github.list_pull_requests(...) success in 123ms:
       expect(result.logEntries).toBeDefined();
       expect(result.logEntries.length).toBeGreaterThan(0);
 
-      // Should contain a tool_use entry for the tool call
-      const assistantEntries = result.logEntries.filter(e => e.type === "assistant");
-      expect(assistantEntries.length).toBeGreaterThan(0);
-
-      const toolUseEntry = assistantEntries.find(e => e.message?.content?.some(c => c.type === "tool_use"));
-      expect(toolUseEntry).toBeDefined();
-      expect(toolUseEntry.message.content[0].name).toBe("github__list_pull_requests");
+      const toolStarts = getEventData(result.logEntries, "tool.execution_start");
+      expect(toolStarts.length).toBeGreaterThan(0);
+      expect(toolStarts[0].toolName).toBe("github__list_pull_requests");
     });
 
     it("should populate logEntries with response for new-format tool calls", () => {
@@ -220,13 +229,9 @@ github.create_issue(...) success in 200ms:
 
       expect(result.logEntries.length).toBeGreaterThan(0);
 
-      // Should have a tool_result entry (user entry with tool_result)
-      const userEntries = result.logEntries.filter(e => e.type === "user");
-      expect(userEntries.length).toBeGreaterThan(0);
-
-      const toolResultEntry = userEntries.find(e => e.message?.content?.some(c => c.type === "tool_result"));
-      expect(toolResultEntry).toBeDefined();
-      expect(toolResultEntry.message.content[0].is_error).toBe(false);
+      const toolCompletes = getEventData(result.logEntries, "tool.execution_complete");
+      expect(toolCompletes.length).toBeGreaterThan(0);
+      expect(toolCompletes[0].success).toBe(true);
     });
 
     it("should mark failed new-format tool calls as errors in logEntries", () => {
@@ -238,10 +243,9 @@ github.create_issue(...) failed in 100ms:
 
       expect(result.logEntries.length).toBeGreaterThan(0);
 
-      const userEntries = result.logEntries.filter(e => e.type === "user");
-      const toolResultEntry = userEntries.find(e => e.message?.content?.some(c => c.type === "tool_result"));
-      expect(toolResultEntry).toBeDefined();
-      expect(toolResultEntry.message.content[0].is_error).toBe(true);
+      const toolCompletes = getEventData(result.logEntries, "tool.execution_complete");
+      expect(toolCompletes.length).toBeGreaterThan(0);
+      expect(toolCompletes[0].success).toBe(false);
     });
 
     it("should handle tokens with commas in final count", () => {
@@ -670,7 +674,7 @@ github.list_pull_requests(...) success in 123ms:
     it("should always include a system init entry", () => {
       const result = parseCodexLog("thinking\nsome thinking here");
 
-      const initEntry = result.logEntries.find(e => e.type === "system" && e.subtype === "init");
+      const initEntry = result.logEntries.find(e => e.type === "session.init");
       expect(initEntry).toBeDefined();
     });
 
@@ -692,9 +696,9 @@ Some analysis here`;
 
       const result = parseCodexLog(logContent);
 
-      const initEntry = result.logEntries.find(e => e.type === "system" && e.subtype === "init");
+      const initEntry = result.logEntries.find(e => e.type === "session.init");
       expect(initEntry).toBeDefined();
-      expect(initEntry.model).toBe("gpt-4o");
+      expect(initEntry.data?.model).toBe("gpt-4o");
     });
 
     it("should still include system init entry when model is absent from log", () => {
@@ -703,9 +707,9 @@ Some analysis here`;
 
       const result = parseCodexLog(logContent);
 
-      const initEntry = result.logEntries.find(e => e.type === "system" && e.subtype === "init");
+      const initEntry = result.logEntries.find(e => e.type === "session.init");
       expect(initEntry).toBeDefined();
-      expect(initEntry.model).toBeUndefined();
+      expect(initEntry.data?.model).toBeUndefined();
     });
 
     it("should add error messages as assistant entries when there are no tool calls", () => {
@@ -714,11 +718,9 @@ ERROR: cyber_policy_violation`;
 
       const result = parseCodexLog(logContent);
 
-      const assistantEntries = result.logEntries.filter(e => e.type === "assistant");
-      expect(assistantEntries.length).toBeGreaterThan(0);
-      const textContent = assistantEntries.flatMap(e => e.message?.content || []).find(c => c.type === "text");
-      expect(textContent).toBeDefined();
-      expect(textContent.text).toContain("cyber_policy_violation");
+      const assistantMessages = result.logEntries.filter(e => e.type === "assistant.message");
+      expect(assistantMessages.length).toBeGreaterThan(0);
+      expect(assistantMessages[0].data?.content).toContain("cyber_policy_violation");
     });
 
     it("should add reconnect count as assistant entry when no tool calls and reconnects occurred", () => {
@@ -728,11 +730,10 @@ ERROR: connection lost`;
 
       const result = parseCodexLog(logContent);
 
-      const assistantEntries = result.logEntries.filter(e => e.type === "assistant");
-      const textContents = assistantEntries.flatMap(e => e.message?.content || []).filter(c => c.type === "text");
-      const reconnectEntry = textContents.find(c => c.text.includes("Reconnect attempts:"));
+      const assistantMessages = result.logEntries.filter(e => e.type === "assistant.message");
+      const reconnectEntry = assistantMessages.find(c => (c.data?.content || "").includes("Reconnect attempts:"));
       expect(reconnectEntry).toBeDefined();
-      expect(reconnectEntry.text).toContain("2/3");
+      expect(reconnectEntry.data?.content).toContain("2/3");
     });
 
     it("should not add error assistant entries when tool calls are present", () => {
@@ -743,12 +744,11 @@ github.list_issues(...) success in 50ms:
 
       const result = parseCodexLog(logContent);
 
-      const assistantEntries = result.logEntries.filter(e => e.type === "assistant");
-      const toolUseEntries = assistantEntries.filter(e => e.message?.content?.some(c => c.type === "tool_use"));
+      const toolUseEntries = result.logEntries.filter(e => e.type === "tool.execution_start");
       expect(toolUseEntries.length).toBeGreaterThan(0);
 
       // Error messages should NOT be added as extra assistant text entries
-      const errorTextEntries = assistantEntries.filter(e => e.message?.content?.some(c => c.type === "text" && c.text.includes("some error")));
+      const errorTextEntries = result.logEntries.filter(e => e.type === "assistant.message" && (e.data?.content || "").includes("some error"));
       expect(errorTextEntries.length).toBe(0);
     });
 
@@ -759,6 +759,81 @@ ERROR: This user's access to o4-mini has been temporarily limited`;
       const result = parseCodexLog(logContent);
 
       expect(result.logEntries.length).toBeGreaterThan(0);
+    });
+  });
+
+  describe("Codex experimental JSONL event format", () => {
+    let isCodexJsonlFormat;
+
+    beforeEach(async () => {
+      const module = await import("./parse_codex_log.cjs");
+      isCodexJsonlFormat = module.isCodexJsonlFormat;
+    });
+
+    // Representative of the stream emitted by newer Codex CLI versions (0.141+),
+    // including AWF infrastructure noise and harness lines around the JSON events.
+    const jsonlLog = [
+      "[INFO] API proxy enabled",
+      "[codex-harness] 2026-06-24T08:42:05Z attempt 1: spawning: codex exec --model gpt-5.4 -c web_search=disabled --skip-git-repo-check <prompt omitted>",
+      "Reading additional input from stdin...",
+      '{"type":"thread.started","thread_id":"019ef8cb"}',
+      '{"type":"turn.started"}',
+      '{"type":"item.completed","item":{"id":"item_0","type":"agent_message","text":"I will fetch the issue context first."}}',
+      '{"type":"item.completed","item":{"id":"item_1","type":"mcp_tool_call","server":"github","tool":"issue_read","arguments":{"owner":"github","repo":"gh-aw","issue_number":34896},"result":{"content":[{"type":"text","text":"ok"}]},"error":null,"status":"completed"}}',
+      '{"type":"item.completed","item":{"id":"item_2","type":"command_execution","command":"/bin/bash -c \'safeoutputs --help\'","aggregated_output":"command not found","exit_code":127,"status":"failed"}}',
+      '{"type":"item.completed","item":{"id":"item_3","type":"reasoning","text":"The issue is on-topic, so no label change is needed."}}',
+      '{"type":"item.completed","item":{"id":"item_4","type":"agent_message","text":"### Summary\\nReviewed the issue; it is legitimate."}}',
+      '{"type":"turn.completed","usage":{"input_tokens":337251,"cached_input_tokens":255488,"output_tokens":2867,"reasoning_output_tokens":1891}}',
+      "Process exiting with code: 0",
+    ].join("\n");
+
+    it("detects the JSONL event format and not the legacy format", () => {
+      expect(isCodexJsonlFormat(jsonlLog.split("\n"))).toBe(true);
+      expect(isCodexJsonlFormat("thinking\nsome thinking\ntool github.x({})".split("\n"))).toBe(false);
+    });
+
+    it("extracts agent messages, tool calls, bash commands, and reasoning", () => {
+      const result = parseCodexLog(jsonlLog);
+      const types = result.logEntries.map(e => e.type);
+
+      expect(types).toContain("session.init");
+      expect(types).toContain("assistant.message");
+      expect(types).toContain("assistant.reasoning");
+
+      const toolStarts = result.logEntries.filter(e => e.type === "tool.execution_start");
+      // One MCP tool call + one bash command.
+      expect(toolStarts.length).toBe(2);
+      expect(toolStarts.some(e => e.data?.toolName === "github__issue_read")).toBe(true);
+      expect(toolStarts.some(e => e.data?.toolName === "Bash")).toBe(true);
+    });
+
+    it("marks failed command executions as errors", () => {
+      const result = parseCodexLog(jsonlLog);
+      const completes = result.logEntries.filter(e => e.type === "tool.execution_complete");
+      const bashComplete = completes.find(e => e.data?.toolName === "Bash");
+      expect(bashComplete).toBeDefined();
+      expect(bashComplete.data?.success).toBe(false);
+    });
+
+    it("surfaces token usage and turn count via a session.result entry", () => {
+      const result = parseCodexLog(jsonlLog);
+      const resultEntry = result.logEntries.find(e => e.type === "session.result");
+      expect(resultEntry).toBeDefined();
+      expect(resultEntry.data?.usage?.input_tokens).toBe(337251);
+      expect(resultEntry.data?.usage?.output_tokens).toBe(2867);
+      expect(resultEntry.data?.numTurns).toBe(1);
+    });
+
+    it("extracts the model from the harness spawn line when no header is present", () => {
+      const result = parseCodexLog(jsonlLog);
+      const initEntry = result.logEntries.find(e => e.type === "session.init");
+      expect(initEntry?.data?.model).toBe("gpt-5.4");
+    });
+
+    it("produces non-empty markdown for a JSONL run", () => {
+      const result = parseCodexLog(jsonlLog);
+      expect(result.markdown).toContain("Reviewed the issue");
+      expect(result.markdown).toContain("Total Tokens Used:");
     });
   });
 });

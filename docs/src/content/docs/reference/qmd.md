@@ -162,10 +162,13 @@ Import the shared file in any workflow that uses qmd:
 ```aw wrap
 ---
 on: push
+
 engine: copilot
+
 imports:
-  - shared/observability-otlp.md   # sets OTEL_EXPORTER_OTLP_ENDPOINT
+  - shared/otlp.md   # sets OTEL_EXPORTER_OTLP_ENDPOINT
   - shared/qmd-otlp.md             # records index size and search hits
+
 tools:
   qmd:
     checkouts:
@@ -179,4 +182,4 @@ tools:
 - [Frontmatter](/gh-aw/reference/frontmatter/) - Complete frontmatter configuration guide
 - [Cache Memory](/gh-aw/reference/cache-memory/) - Persistent memory across workflow runs
 - [GitHub Tools](/gh-aw/reference/github-tools/) - GitHub API operations
-- [Custom OTLP Attributes](/gh-aw/guides/custom-otlp-attributes/) - Emit telemetry from shared imports
+- [OpenTelemetry](/gh-aw/guides/open-telemetry/#custom-spans-from-shared-imports) - Emit telemetry from shared imports

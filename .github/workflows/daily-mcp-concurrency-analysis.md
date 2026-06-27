@@ -1,64 +1,72 @@
 ---
-name: Daily MCP Tool Concurrency Analysis
-description: Performs deep-dive concurrency analysis on each safe-outputs MCP server tool to ensure thread-safety and detect race conditions
+private: true
 on:
   schedule:
-    - cron: "daily around 9:00 on weekdays"  # ~Weekdays at 9 AM UTC (scattered)
-  workflow_dispatch:
-
+  - cron: daily around 9:00 on weekdays
+  workflow_dispatch: null
+max-daily-ai-credits: 10000
 permissions:
   contents: read
   issues: read
   pull-requests: read
-
-tracker-id: mcp-concurrency-analysis
-engine: copilot
-
+  copilot-requests: write
 imports:
-  - uses: shared/daily-audit-base.md
-    with:
-      title-prefix: "[mcp-concurrency] "
-      expires: 3d
-  - shared/safe-output-app.md
-  - uses: shared/mcp/serena.md
-    with:
-      languages: ["go", "typescript"]
-
-  - shared/observability-otlp.md
+- uses: shared/daily-audit-base.md
+  with:
+    expires: 3d
+    title-prefix: "[mcp-concurrency] "
+- shared/safe-output-app.md
+- uses: shared/mcp/serena.md
+  with:
+    languages:
+    - go
+    - typescript
+- shared/otlp.md
 safe-outputs:
-  create-issue:
-    expires: 7d
-    title-prefix: "[concurrency] "
-    labels: [bug, concurrency, thread-safety, automated-analysis, cookie]
-    max: 5
   create-agent-session:
     max: 3
-
+  create-issue:
+    expires: 7d
+    labels:
+    - bug
+    - concurrency
+    - thread-safety
+    - automated-analysis
+    - cookie
+    max: 5
+    title-prefix: "[concurrency] "
+description: Performs deep-dive concurrency analysis on each safe-outputs MCP server tool to ensure thread-safety and detect race conditions
+emoji: 📊
+engine:
+  id: copilot
+  copilot-sdk: true
+name: Daily MCP Tool Concurrency Analysis
+strict: true
+timeout-minutes: 45
+sandbox:
+  agent:
+    sudo: false
 tools:
-  cli-proxy: true
+  bash:
+  - cat pkg/workflow/js/safe_outputs_tools.json
+  - jq -r ".[].name" pkg/workflow/js/safe_outputs_tools.json
+  - find actions/setup/js -name "*.cjs" ! -name "*.test.cjs" -type f
+  - cat actions/setup/js/*.cjs
+  - "grep -r \"let \\\\|var \\\\|const \" actions/setup/js --include=\"*.cjs\""
+  - grep -r "module.exports" actions/setup/js --include="*.cjs"
+  - head -n * actions/setup/js/*.cjs
+  - "git log -1 --format=\"%ai\" -- actions/setup/js/*.cjs"
+  - "git log -3 --format=\"%ai %s\" -- actions/setup/js/*.cjs"
   cache-memory: true
+  cli-proxy: true
+  edit: null
   github:
     mode: gh-proxy
-    toolsets: [default]
-  edit:
-  bash:
-    - "cat pkg/workflow/js/safe_outputs_tools.json"
-    - "jq -r '.[].name' pkg/workflow/js/safe_outputs_tools.json"
-    - "find actions/setup/js -name '*.cjs' ! -name '*.test.cjs' -type f"
-    - "cat actions/setup/js/*.cjs"
-    - "grep -r 'let \\|var \\|const ' actions/setup/js --include='*.cjs'"
-    - "grep -r 'module.exports' actions/setup/js --include='*.cjs'"
-    - "head -n * actions/setup/js/*.cjs"
-    - "git log -1 --format='%ai' -- actions/setup/js/*.cjs"
-    - "git log -3 --format='%ai %s' -- actions/setup/js/*.cjs"
-
-timeout-minutes: 45
-strict: true
+    toolsets:
+    - default
+tracker-id: mcp-concurrency-analysis
 features:
-  copilot-requests: true
-
-firewall:
-  effective-token-steering: true
+  gh-aw-detection: true
 ---
 
 {{#runtime-import? .github/shared-instructions.md}}
@@ -291,6 +299,16 @@ If issues were found (CRITICAL, HIGH, or MEDIUM severity):
 
 Use the following template:
 
+Use h3 (`###`) or lower for all headers in the issue body. Never use h1 (`#`) or h2 (`##`) — these are reserved for the issue title.
+
+Wrap long sections in `<details><summary><b>Section Name</b></summary>` tags to improve readability and reduce scrolling.
+
+Suggested structure:
+- Brief summary (always visible)
+- Key metrics or highlights (always visible)
+- Detailed analysis (in `<details>` tags)
+- Recommendations (always visible)
+
 ```markdown
 ### Concurrency Safety Issue in \`${TOOL_NAME}\`
 
@@ -496,6 +514,18 @@ Your output MUST include:
    - Detailed issue report if problems found (create issue + optional agent session)
    - Clean tool confirmation if no problems found
 3. **Cache Update Confirmation**: Confirm cache was updated with results
+
+## Completion Requirement
+
+You MUST call at least one safe-output tool before finishing:
+- Use `create_issue` (and optionally `create_agent_session`) when you find actionable concurrency issues.
+- If no GitHub write action is needed, you MUST call `noop` with a brief explanation.
+
+If you emitted any actionable safe outputs, do not emit `noop`.
+
+```json
+{"noop": {"message": "No actionable concurrency issues found in <tool_name>; analysis completed and cache state updated."}}
+```
 
 ## Concurrency Analysis Best Practices
 

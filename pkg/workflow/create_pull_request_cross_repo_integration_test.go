@@ -53,22 +53,22 @@ Create a pull request in a different repository.
 
 	compiledContent := string(compiledBytes)
 
-	// Test 1: Verify repository parameter is set in actions/checkout
-	assert.Contains(t, compiledContent, "repository: microsoft/vscode-docs",
-		"Expected checkout to specify target repository")
+	// Test 1: Verify target-repo is propagated to the safe-outputs handler config
+	assert.Contains(t, compiledContent, `"target-repo":"microsoft/vscode-docs"`,
+		"Expected target-repo to be included in safe-outputs handler config")
 
-	// Test 2: Verify REPO_NAME environment variable is set to target repo
-	assert.Contains(t, compiledContent, `REPO_NAME: "microsoft/vscode-docs"`,
-		"Expected REPO_NAME env var to be set to target repository")
-
-	// Test 3: Verify token is included for cross-repo checkout
-	assert.Contains(t, compiledContent, "token: ${{ secrets.GH_AW_GITHUB_TOKEN || secrets.GITHUB_TOKEN }}",
-		"Expected token to be set for cross-repo checkout")
-
-	// Test 4: Verify it does NOT use the default github.repository
+	// Test 2: Verify checkout remains a default workspace checkout (no explicit cross-repo checkout)
 	checkoutSection := extractCheckoutSection(compiledContent)
-	assert.NotContains(t, checkoutSection, "github.repository",
-		"Checkout section should not reference github.repository when target-repo is set")
+	assert.NotContains(t, checkoutSection, "repository:",
+		"Checkout section should not have explicit repository when using default workspace checkout")
+
+	// Test 3: Verify checkout does not inject a dedicated token for target-repo
+	assert.NotContains(t, checkoutSection, "token:",
+		"Checkout section should not have an explicit token for target-repo")
+
+	// Test 4: Verify GITHUB_REPOSITORY remains the source repository expression
+	assert.Contains(t, compiledContent, "GITHUB_REPOSITORY: ${{ github.repository }}",
+		"Expected GITHUB_REPOSITORY to remain github.repository expression")
 }
 
 // TestCreatePullRequestSameRepoCheckout tests that without target-repo, we use default checkout
@@ -115,9 +115,9 @@ Create a pull request in the same repository.
 	assert.NotContains(t, checkoutSection, "repository:",
 		"Checkout section should not have explicit repository when using source repo")
 
-	// Test 2: Verify REPO_NAME uses github.repository expression
-	assert.Contains(t, compiledContent, "REPO_NAME: ${{ github.repository }}",
-		"Expected REPO_NAME to use github.repository expression for same-repo")
+	// Test 2: Verify GITHUB_REPOSITORY uses github.repository expression
+	assert.Contains(t, compiledContent, "GITHUB_REPOSITORY: ${{ github.repository }}",
+		"Expected GITHUB_REPOSITORY to use github.repository expression for same-repo")
 
 	// Test 3: Verify no token in checkout (not needed for same repo)
 	assert.NotContains(t, checkoutSection, "token:",

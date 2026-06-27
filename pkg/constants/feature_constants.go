@@ -18,10 +18,6 @@ const (
 	MCPGatewayFeatureFlag FeatureFlag = "mcp-gateway"
 	// DisableXPIAPromptFeatureFlag is the feature flag name for disabling XPIA prompt
 	DisableXPIAPromptFeatureFlag FeatureFlag = "disable-xpia-prompt"
-	// CopilotRequestsFeatureFlag is the feature flag name for enabling copilot-requests mode.
-	// When enabled: no secret validation step is generated, copilot-requests: write permission is added,
-	// and the GitHub Actions token is used as the agentic engine secret.
-	CopilotRequestsFeatureFlag FeatureFlag = "copilot-requests"
 	// DIFCProxyFeatureFlag is the deprecated feature flag name for the DIFC proxy.
 	// Deprecated: Use tools.github.integrity-proxy instead. The proxy is now enabled
 	// by default when guard policies are configured. Set tools.github.integrity-proxy: false
@@ -80,4 +76,25 @@ const (
 	//	features:
 	//	  group-concurrency-queue: false
 	GroupConcurrencyQueueFeatureFlag FeatureFlag = "group-concurrency-queue"
+	// DangerouslyDisableSandboxAgentFeatureFlag is required to allow sandbox.agent: false.
+	// Without this flag, setting sandbox.agent to false raises a validation error.
+	// This flag is intentionally named with "dangerously" to make the security
+	// implications explicit and visible in the workflow frontmatter.
+	//
+	// Workflow frontmatter usage:
+	//
+	//	features:
+	//	  dangerously-disable-sandbox-agent: "controlled environment with no internet access"
+	DangerouslyDisableSandboxAgentFeatureFlag FeatureFlag = "dangerously-disable-sandbox-agent"
+	// GHAWDetectionFeatureFlag gates the external threat-detect binary detection path.
+	// When enabled, the compiler emits a detection job that downloads and runs
+	// the threat-detect binary from GitHub Releases under AWF, writing a structured
+	// detection_result.json instead of using the inline engine execution path.
+	// The binary version is hard-pinned via DefaultThreatDetectVersion in version_constants.go.
+	//
+	// Workflow frontmatter usage:
+	//
+	//	features:
+	//	  gh-aw-detection: true
+	GHAWDetectionFeatureFlag FeatureFlag = "gh-aw-detection"
 )

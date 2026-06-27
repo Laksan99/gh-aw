@@ -1,18 +1,26 @@
 ---
+private: true
+emoji: "📦"
 description: Generates a comprehensive summary of GitHub Actions artifacts usage across all workflows in the repository
 on:
   workflow_dispatch:
   schedule: weekly on sunday around 06:00
+max-daily-ai-credits: 10000
 permissions:
   contents: read
   actions: read
-engine: copilot
+  copilot-requests: write
+engine:
+  id: copilot
+  copilot-sdk: true
 network:
   allowed:
     - defaults
     - node
 sandbox:
-  agent: awf  # Firewall enabled (migrated from network.firewall)
+  agent:
+    id: awf
+    sudo: false
 tools:
   cli-proxy: true
   edit:
@@ -31,10 +39,9 @@ strict: true
 imports:
   - shared/reporting.md
   - shared/safe-output-app.md
-  - shared/observability-otlp.md
+  - shared/otlp.md
 features:
-  copilot-requests: true
-
+  gh-aw-detection: true
 ---
 
 # Artifacts Summary

@@ -1,97 +1,108 @@
 # Architecture Diagram
 
-> Last updated: 2026-05-11 · Source: [Issue created by workflow run §25663288420](https://github.com/github/gh-aw/actions/runs/25663288420)
+> Last updated: 2026-06-22 · Source: [Workflow run §27946410822](https://github.com/github/gh-aw/actions/runs/27946410822)
 
 ## Overview
 
-This diagram shows the package structure and dependencies of the `gh-aw` codebase. The project is organized into three layers: entry points (CLI binaries), core packages (main business logic), and utility packages (shared helpers).
+This diagram shows the package structure and dependency layers of the `gh-aw` codebase.
+The project compiles markdown workflow files into GitHub Actions YAML via a layered pipeline:
+CLI entry points → core packages (cli, workflow, parser, console) → domain helpers → utility leaf packages.
 
 ```
-┌──────────────────────────────────────────────────────────────────────────────────────────────────────┐
-│                                          ENTRY POINTS                                                │
-│                                                                                                      │
-│          ┌─────────────────────────┐                   ┌───────────────────────────┐                │
-│          │       cmd/gh-aw         │                   │      cmd/gh-aw-wasm        │                │
-│          │   Main CLI binary        │                   │   WebAssembly build target │                │
-│          └────────────┬────────────┘                   └─────────────┬─────────────┘                │
-│                       │ imports: cli, workflow, parser, console,      │                              │
-│                       │ constants                                     │                              │
-├───────────────────────┼───────────────────────────────────────────────┼──────────────────────────────┤
-│                       ▼              CORE PACKAGES                    ▼                              │
-│                                                                                                      │
-│  ┌──────────────────────────────┐   ┌───────────────────────────┐   ┌──────────────────────────┐   │
-│  │           pkg/cli            │──▶│       pkg/workflow         │──▶│       pkg/parser          │   │
-│  │  Command implementations     │   │  Workflow compilation      │   │  Markdown frontmatter     │   │
-│  │  (compile, run, audit, logs, │   │  engine (Markdown →        │   │  parsing & content        │   │
-│  │   mcp, stats)                │   │  GitHub Actions YAML)      │   │  extraction               │   │
-│  └──────────────────────────────┘   └───────────────────────────┘   └──────────────────────────┘   │
-│           │  also uses:                      │ also uses:                      │                     │
-│           │  parser, agentdrain,             │  actionpins, console            │                     │
-│           │  stats, repoutil                 │                                 │                     │
-│           │                                  │                                 │                     │
-│  ┌────────▼──────────┐  ┌────────────────────▼────────────────────────────────▼──────────────────┐ │
-│  │  pkg/agentdrain   │  │                     pkg/console                                         │ │
-│  │  Agent log drain  │  │  Terminal UI formatting, rendering, and style management                │ │
-│  └───────────────────┘  └────────────────────────────────────────────────────────────────────────┘ │
-│                                                                                                      │
-│  ┌───────────────────────────────────────────────────────────────────────────────────────────────┐  │
-│  │  pkg/actionpins — GitHub Actions pin resolution         pkg/stats — Metrics & statistics      │  │
-│  └───────────────────────────────────────────────────────────────────────────────────────────────┘  │
-│                                                                                                      │
-├──────────────────────────────────────────────────────────────────────────────────────────────────────┤
-│                                         UTILITY PACKAGES                                             │
-│                                                                                                      │
-│  ┌───────────────┐  ┌──────────────┐  ┌──────────────┐  ┌────────────┐  ┌──────────────────────┐  │
-│  │ pkg/constants │  │  pkg/types   │  │  pkg/logger  │  │pkg/styles  │  │   pkg/stringutil     │  │
-│  │ Shared consts │  │ Shared type  │  │ Debug logging│  │Terminal    │  │  String utilities    │  │
-│  │ & type aliases│  │ definitions  │  │ (zero-cost)  │  │colors/styles│  │                      │  │
-│  └───────────────┘  └──────────────┘  └──────────────┘  └────────────┘  └──────────────────────┘  │
-│                                                                                                      │
-│  ┌───────────────┐  ┌──────────────┐  ┌──────────────┐  ┌────────────┐  ┌──────────────────────┐  │
-│  │ pkg/fileutil  │  │ pkg/gitutil  │  │ pkg/jsonutil │  │pkg/envutil │  │   pkg/sliceutil      │  │
-│  │ File path &   │  │ Git repo     │  │ JSON utility │  │ Env var    │  │  Generic slice       │  │
-│  │ I/O utilities │  │ utilities    │  │ functions    │  │ utilities  │  │  utilities           │  │
-│  └───────────────┘  └──────────────┘  └──────────────┘  └────────────┘  └──────────────────────┘  │
-│                                                                                                      │
-│  ┌───────────────┐  ┌──────────────┐  ┌──────────────┐  ┌────────────┐  ┌──────────────────────┐  │
-│  │ pkg/repoutil  │  │pkg/semverutil│  │ pkg/typeutil │  │ pkg/timeutil│  │   pkg/tty            │  │
-│  │ GitHub repo   │  │ Semantic     │  │ Type convert │  │ Time helpers│  │  TTY detection       │  │
-│  │ slug/URL util │  │ versioning   │  │ utilities    │  │            │  │                      │  │
-│  └───────────────┘  └──────────────┘  └──────────────┘  └────────────┘  └──────────────────────┘  │
-│                                                                                                      │
-│  ┌──────────────────────────────────┐                                                               │
-│  │  pkg/testutil  (test builds only)│                                                               │
-│  │  Test helper utilities           │                                                               │
-│  └──────────────────────────────────┘                                                               │
-└──────────────────────────────────────────────────────────────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────────────────────────────────────────┐
+│                                    ENTRY POINTS                                          │
+│                                                                                          │
+│   ┌──────────────────┐      ┌──────────────────────┐      ┌─────────────────────┐        │
+│   │   cmd/gh-aw      │      │   cmd/gh-aw-wasm      │      │    cmd/linters      │       │
+│   │   (main binary)  │      │   (WebAssembly target)│      │    (linter runner)  │       │
+│   └────────┬─────────┘      └──────────┬────────────┘      └──────────┬──────────┘       │
+│            │                            │                               │                │
+├──────────────────────────────────────────────────────────────────────────────────────────┤
+│            ▼           CORE PACKAGES    ▼                               ▼                │
+│                                                                    pkg/linters/*         │
+│                                                                                          │
+│   ┌──────────────────────────┐   ┌──────────────────────────────────────────────────┐    │
+│   │          cli             │   │                  workflow                         │   │
+│   │  Command implementations │──▶│  Compilation engine (MD → GH Actions YAML)       │    │
+│   │  compile, run, audit,    │   │  Frontmatter eval, engine dispatch,              │    │
+│   │  mcp, logs, campaigns    │   │  lock file generation                            │    │
+│   └──────────┬───────────────┘   └──────────────────┬───────────────────────────────┘    │
+│              │             ┌────────────────────────┘                                    │
+│              ▼             ▼                                                             │
+│   ┌──────────────────────┐   ┌────────────────────────────────────────────────────┐      │
+│   │       console        │   │                      parser                         │     │
+│   │  Terminal UI         │   │  Markdown frontmatter & YAML parsing, schema        │     │
+│   │  rendering and msg   │   │  validation, expression extraction                  │     │
+│   └──────────────────────┘   └────────────────────────────────────────────────────┘      │
+│                                                                                          │
+│   ┌──────────────────┐  ┌────────────────────────────────┐  ┌────────────────────────┐   │
+│   │      types       │  │           constants             │  │  workflow/compilerenv  │  │
+│   │  Shared domain   │  │  Semantic type aliases,         │  │  Compiler env          │  │
+│   │  type definitions│  │  engine/job names, flags        │  │  management            │  │
+│   └──────────────────┘  └────────────────────────────────┘  │  (used by cli+workflow)│   │
+│                                                              └────────────────────────┘  │
+├──────────────────────────────────── DOMAIN PACKAGES ─────────────────────────────────────┤
+│                                                                                          │
+│  ┌─────────────────┐  ┌─────────────────┐  ┌───────────────────────┐  ┌────────────┐     │
+│  │   actionpins    │  │   agentdrain    │  │        linters         │  │   stats    │    │
+│  │  Action pin     │  │  Agent lifecycle│  │  Custom Go vet-style   │  │ Numerical  │    │
+│  │  resolution &   │  │  & drain helpers│  │  code analyzers        │  │ statistics │    │
+│  │  version mgmt   │  └─────────────────┘  └───────────────────────┘  └────────────┘     │
+│  └─────────────────┘                                                                     │
+│  ┌──────────────────────────────────────────────────────────────────────────────────┐    │
+│  │  github  —  GitHub label ↔ objective-value mapping (configurable audit scoring)  │    │
+│  └──────────────────────────────────────────────────────────────────────────────────┘    │
+│  ┌──────────────────────────────────────────────────────────────────────────────────┐    │
+│  │  intent  —  PR intent attribution resolver (maps PRs to issues/objectives)       │    │
+│  └──────────────────────────────────────────────────────────────────────────────────┘    │
+├──────────────────────────────────── UTILITY PACKAGES ────────────────────────────────────┤
+│                                                                                          │
+│  ┌──────────┐ ┌─────────┐ ┌────────────┐ ┌────────┐ ┌─────────┐ ┌──────────┐             │
+│  │ fileutil │ │ gitutil │ │ stringutil │ │ logger │ │ envutil │ │ errorutil│             │
+│  └──────────┘ └─────────┘ └────────────┘ └────────┘ └─────────┘ └──────────┘             │
+│                                                                                          │
+│  ┌──────────┐ ┌──────────┐ ┌──────────┐ ┌─────────┐ ┌────────┐ ┌──────────┐ ┌─────┐      │
+│  │ jsonutil │ │ repoutil │ │semverutil│ │ sliceutil│ │syncutil│ │ timeutil │ │ tty │     │
+│  └──────────┘ └──────────┘ └──────────┘ └─────────┘ └────────┘ └──────────┘ └─────┘      │
+│                                                                                          │
+│  ┌──────────┐ ┌──────────┐ ┌─────────┐ ┌────────────────────────────┐ ┌──────────────┐   │
+│  │ typeutil │ │  styles  │ │ setutil │ │  importinpututil           │ │  testutil    │   │
+│  └──────────┘ └──────────┘ └─────────┘ └────────────────────────────┘ └──────────────┘   │
+└──────────────────────────────────────────────────────────────────────────────────────────┘
 ```
 
 ## Package Reference
 
 | Package | Layer | Description |
 |---------|-------|-------------|
-| `cmd/gh-aw` | Entry Point | Main CLI binary |
-| `cmd/gh-aw-wasm` | Entry Point | WebAssembly build target |
-| `pkg/cli` | Core | Command implementations (compile, run, audit, logs, mcp, stats) |
-| `pkg/workflow` | Core | Workflow compilation engine (Markdown → GitHub Actions YAML) |
-| `pkg/parser` | Core | Markdown frontmatter parsing and content extraction |
-| `pkg/console` | Core | Terminal UI formatting, rendering, and style management |
-| `pkg/agentdrain` | Core | Agent log draining and streaming |
-| `pkg/actionpins` | Core | GitHub Actions pin resolution |
-| `pkg/stats` | Core | Numerical statistics for metric collection |
-| `pkg/constants` | Utility | Shared constants and semantic type aliases |
-| `pkg/types` | Utility | Shared type definitions |
-| `pkg/logger` | Utility | Namespace-based debug logging (zero overhead) |
-| `pkg/styles` | Utility | Centralized terminal style/color definitions |
-| `pkg/stringutil` | Utility | String utility functions |
-| `pkg/fileutil` | Utility | File path and I/O operation utilities |
-| `pkg/gitutil` | Utility | Git repository utilities |
-| `pkg/jsonutil` | Utility | JSON utility functions |
-| `pkg/repoutil` | Utility | GitHub repository slug/URL utilities |
-| `pkg/envutil` | Utility | Environment variable reading/validation |
-| `pkg/sliceutil` | Utility | Generic slice utilities |
-| `pkg/typeutil` | Utility | General-purpose type conversion utilities |
-| `pkg/semverutil` | Utility | Semantic versioning primitives |
-| `pkg/timeutil` | Utility | Time helper utilities |
-| `pkg/tty` | Utility | TTY detection utilities |
-| `pkg/testutil` | Utility | Test helper utilities (test builds only) |
+| `cli` | Core | Command implementations (compile, run, audit, mcp, logs, campaigns) |
+| `workflow` | Core | Workflow compilation engine — markdown → GitHub Actions YAML |
+| `parser` | Core | Markdown frontmatter & YAML parsing, schema validation, expression extraction |
+| `console` | Core | Terminal UI rendering and message formatting |
+| `types` | Core | Shared domain type definitions |
+| `constants` | Core | Semantic type aliases, engine/job names, feature flags |
+| `workflow/compilerenv` | Core | Compiler environment management (used by cli + workflow) |
+| `github` | Domain | GitHub label ↔ objective-value mapping for audit/outcomes scoring |
+| `intent` | Domain | PR intent attribution resolver (maps PRs to closing issues/objectives) |
+| `actionpins` | Domain | GitHub Actions pin resolution and version management |
+| `agentdrain` | Domain | Agent drain/lifecycle utilities |
+| `linters` | Domain | Custom Go analysis linters (vet-style checks) |
+| `stats` | Domain | Numerical statistics for metric collection |
+| `fileutil` | Util | File path and file operation helpers |
+| `gitutil` | Util | Git repository helpers |
+| `stringutil` | Util | String utilities (ANSI stripping, transforms) |
+| `logger` | Util | Namespace-based debug logging with zero overhead |
+| `envutil` | Util | Environment variable reading and validation |
+| `errorutil` | Util | Error classification and inspection helpers |
+| `jsonutil` | Util | JSON serialization helpers |
+| `repoutil` | Util | GitHub repository slug and URL utilities |
+| `semverutil` | Util | Semantic versioning primitives |
+| `sliceutil` | Util | Generic slice operation helpers |
+| `setutil` | Util | Generic set operation helpers (map[K]struct{}) |
+| `syncutil` | Util | Concurrency synchronization helpers |
+| `timeutil` | Util | Time formatting helpers |
+| `tty` | Util | TTY detection utilities |
+| `typeutil` | Util | General-purpose type conversion utilities |
+| `styles` | Util | Centralized terminal color/style definitions |
+| `importinpututil` | Util | Import path / sub-key resolver |
+| `testutil` | Util | Test helpers (test-only, not used in production) |

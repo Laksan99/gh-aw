@@ -1,4 +1,6 @@
 ---
+private: true
+emoji: "⚡"
 name: Daily Skill Optimizer Improvements
 description: Runs fastxyz/skill-optimizer daily, packages results as an artifact, and creates one issue with 3 improvements
 on:
@@ -10,7 +12,10 @@ permissions:
   issues: read
   pull-requests: read
 tracker-id: daily-skill-optimizer
-engine: copilot
+engine:
+  id: copilot
+  copilot-sdk: true
+  driver: .github/drivers/copilot_sdk_driver_sample_typescript.ts
 strict: true
 timeout-minutes: 45
 
@@ -25,7 +30,7 @@ jobs:
       run_status: ${{ steps.run_skill_optimizer.outputs.run_status }}
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v6.0.2
+        uses: actions/checkout@v7.0.0
         with:
           persist-credentials: false
 
@@ -55,7 +60,7 @@ jobs:
         run: |
           set -euo pipefail
 
-          RESULT_DIR="/tmp/gh-aw/skill-optimizer-results"
+          RESULT_DIR="/tmp/gh-aw/agent/skill-optimizer-results"
           TOOL_DIR="$RESULT_DIR/skill-optimizer-src"
           mkdir -p "$RESULT_DIR"
 
@@ -120,7 +125,7 @@ jobs:
         uses: actions/upload-artifact@v7.0.1
         with:
           name: skill-optimizer-results
-          path: /tmp/gh-aw/skill-optimizer-results
+          path: /tmp/gh-aw/agent/skill-optimizer-results
           if-no-files-found: error
           retention-days: 7
 
@@ -136,7 +141,7 @@ steps:
     uses: actions/download-artifact@v8.0.1
     with:
       name: skill-optimizer-results
-      path: /tmp/gh-aw/skill-optimizer-results
+      path: /tmp/gh-aw/agent/skill-optimizer-results
 
 tools:
   cli-proxy: true
@@ -145,9 +150,10 @@ tools:
   edit:
 
 imports:
-  - shared/otel.md
-
-  - shared/observability-otlp.md
+  - shared/otlp.md
+sandbox:
+  agent:
+    sudo: false
 ---
 
 # Daily Skill Optimizer Improvements
@@ -156,8 +162,8 @@ You are a workflow quality analyst for `${{ github.repository }}`.
 
 ## Inputs
 
-- Downloaded artifact directory: `/tmp/gh-aw/skill-optimizer-results`
-- Required file: `/tmp/gh-aw/skill-optimizer-results/summary.json`
+- Downloaded artifact directory: `/tmp/gh-aw/agent/skill-optimizer-results`
+- Required file: `/tmp/gh-aw/agent/skill-optimizer-results/summary.json`
 - Optional logs:
   - `clone.log`
   - `npm-ci.log`

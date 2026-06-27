@@ -9,11 +9,6 @@ sidebar:
 
 APM is configured by importing the `shared/apm.md` workflow, which creates a dedicated `apm` job that packs packages and uploads the bundle as a GitHub Actions artifact. The agent job then downloads and unpacks the bundle for deterministic startup.
 
-> [!NOTE]
-> The `dependencies:` frontmatter field is deprecated and no longer supported. Migrate to the import-based approach shown below.
->
-> The `dependencies:` input on the underlying `microsoft/apm-action` (used inside `shared/apm.md`) is also deprecated in favour of the `packages:` and `apps:` inputs — do not reach for `dependencies:` when hand-editing a vendored copy of the file.
-
 ## Where `shared/apm.md` comes from
 
 `shared/apm.md` is a **local workflow file** that gh-aw resolves at `.github/workflows/shared/apm.md` in your repository — it is not a remote import (the `uses:` syntax inside `imports:` is gh-aw's local-import shape, not GitHub Actions' `uses: owner/repo@ref`).
@@ -24,7 +19,7 @@ The canonical source is maintained in [microsoft/apm](https://github.com/microso
 gh aw add microsoft/apm/.github/workflows/shared/apm.md --dir shared
 ```
 
-Running `gh aw update` will keep your vendored copy in sync with the canonical source. The `shared/apm.md` file declares a `redirect` to the `microsoft/apm` library, so any copy sourced from gh-aw will automatically follow the redirect and rewrite its `source` field to track the canonical location on the next `gh aw update` run.
+Running `gh aw update` will keep your vendored copy in sync with the canonical source.
 
 The canonical version pins `microsoft/apm-action@v1.5.0` and supports multi-org GitHub App authentication (`apps:[]`) and multi-bundle restore.
 

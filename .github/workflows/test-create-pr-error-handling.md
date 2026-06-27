@@ -1,4 +1,6 @@
 ---
+private: true
+emoji: "🧪"
 name: Test Create PR Error Handling
 description: Test workflow to verify create_pull_request error handling
 on:
@@ -19,11 +21,12 @@ safe-outputs:
     labels: [test]
 
 imports:
-  - shared/observability-otlp.md
+  - shared/otlp.md
 tools:
   cli-proxy: true
   cache-memory: true
-
+features:
+  gh-aw-detection: true
 ---
 
 # Test Create PR Error Handling

@@ -9,6 +9,7 @@
 const { getErrorMessage } = require("./error_helpers.cjs");
 const { matchesSimpleGlob } = require("./glob_pattern_helpers.cjs");
 const { logStagedPreviewInfo } = require("./staged_preview.cjs");
+const { resolveInvocationContext } = require("./invocation_context_helpers.cjs");
 
 /**
  * Parse a comma-separated list of allowed items from environment variable
@@ -70,12 +71,24 @@ function parseMaxCount(envValue, defaultValue = 3) {
  */
 function resolveTarget(params) {
   const { targetConfig, item, context, itemType, supportsPR = false, supportsIssue = false } = params;
+  let invocationContext;
+  try {
+    invocationContext = resolveInvocationContext(context);
+  } catch (err) {
+    return {
+      success: false,
+      error: `Failed to resolve invocation context for ${itemType}: ${getErrorMessage(err)}`,
+      shouldFail: true,
+    };
+  }
+  const effectiveEventName = invocationContext?.eventName || context.eventName;
+  const effectivePayload = invocationContext?.eventPayload || context.payload;
 
   // Check context type
   const prEventNames = new Set(["pull_request", "pull_request_target", "pull_request_review", "pull_request_review_comment"]);
-  const isIssueCommentOnPR = context.eventName === "issue_comment" && Boolean(context.payload?.issue?.pull_request);
-  const isIssueContext = context.eventName === "issues" || (context.eventName === "issue_comment" && !isIssueCommentOnPR);
-  const isPRContext = prEventNames.has(context.eventName) || isIssueCommentOnPR;
+  const isIssueCommentOnPR = effectiveEventName === "issue_comment" && Boolean(effectivePayload?.issue?.pull_request);
+  const isIssueContext = effectiveEventName === "issues" || (effectiveEventName === "issue_comment" && !isIssueCommentOnPR);
+  const isPRContext = prEventNames.has(effectiveEventName) || isIssueCommentOnPR;
 
   // Default target is "triggering"
   const target = targetConfig || "triggering";
@@ -117,9 +130,9 @@ function resolveTarget(params) {
   let contextType;
 
   if (target === "*") {
-    // Use item_number, issue_number, or pull_request_number from item
+    // Use item_number, issue_number, or pull_request_number (aliases: pr_number, pr, pull_number) from item
     let numberField;
-    const pullRequestNumberField = item.pull_request_number || item.pr_number || item.pr;
+    const pullRequestNumberField = item.pull_request_number || item.pr_number || item.pr || item.pull_number;
     if (supportsPR) {
       // Supports both issues and PRs: check all fields
       numberField = item.item_number || item.issue_number || pullRequestNumberField;
@@ -131,10 +144,18 @@ function resolveTarget(params) {
       numberField = pullRequestNumberField;
     }
 
+    let fieldNames;
+    if (supportsPR) {
+      fieldNames = "item_number/issue_number/pull_request_number/pr_number/pr/pull_number";
+    } else if (supportsIssue) {
+      fieldNames = "item_number/issue_number";
+    } else {
+      fieldNames = "pull_request_number/pr_number/pr/pull_number";
+    }
+
     if (numberField) {
       itemNumber = typeof numberField === "number" ? numberField : parseInt(String(numberField), 10);
       if (isNaN(itemNumber) || itemNumber <= 0) {
-        const fieldNames = supportsPR ? "item_number/issue_number/pull_request_number" : supportsIssue ? "item_number/issue_number" : "pull_request_number";
         return {
           success: false,
           error: `Invalid ${fieldNames} specified: ${numberField}`,
@@ -147,7 +168,6 @@ function resolveTarget(params) {
         contextType = "pull request";
       }
     } else {
-      const fieldNames = supportsPR ? "item_number/issue_number" : supportsIssue ? "item_number/issue_number" : "pull_request_number";
       return {
         success: false,
         error: `Target is "*" but no ${fieldNames} specified in ${itemType} item`,
@@ -195,8 +215,8 @@ function resolveTarget(params) {
   } else {
     // Use triggering context
     if (isIssueContext) {
-      if (context.payload.issue) {
-        itemNumber = context.payload.issue.number;
+      if (effectivePayload.issue) {
+        itemNumber = effectivePayload.issue.number;
         contextType = "issue";
       } else {
         return {
@@ -206,11 +226,11 @@ function resolveTarget(params) {
         };
       }
     } else if (isPRContext) {
-      if (context.payload.pull_request) {
-        itemNumber = context.payload.pull_request.number;
+      if (effectivePayload.pull_request) {
+        itemNumber = effectivePayload.pull_request.number;
         contextType = "pull request";
       } else if (isIssueCommentOnPR) {
-        itemNumber = context.payload.issue.number;
+        itemNumber = effectivePayload.issue.number;
         contextType = "pull request";
       } else {
         return {
@@ -401,15 +421,64 @@ function loadCustomSafeOutputActionHandlers() {
 }
 
 /**
+ * Parse a templatable boolean value that may arrive as a boolean literal or as
+ * the string result of a resolved GitHub Actions expression. Undefined,
+ * null, false, and unresolved expression strings return false.
+ * @param {any} value - Candidate templatable boolean value.
+ * @returns {boolean}
+ */
+function isTemplatableTrue(value) {
+  return value === true || value === "true";
+}
+
+/**
  * Returns true when the current execution is in staged mode.
  * Staged mode is active when either the global GH_AW_SAFE_OUTPUTS_STAGED
- * environment variable is "true" or when the per-handler config has staged: true.
+ * environment variable is "true" or when the per-handler config resolves to true.
  * Use this helper in all handlers to ensure consistent staged mode detection.
- * @param {Object} [config] - Handler configuration object (may have staged: true)
+ * @param {Object} [config] - Handler configuration object (may have staged: true/"true")
  * @returns {boolean}
  */
 function isStagedMode(config) {
-  return process.env.GH_AW_SAFE_OUTPUTS_STAGED === "true" || (config != null && config.staged === true);
+  return process.env.GH_AW_SAFE_OUTPUTS_STAGED === "true" || (config != null && isTemplatableTrue(config.staged));
+}
+
+/**
+ * Checks required-labels and required-title-prefix precondition filters.
+ * Returns a skip result if the item does not pass, or null if it passes.
+ * Fetches the issue/PR from GitHub to check its labels and title.
+ *
+ * @param {Object} githubClient - Authenticated GitHub client (Octokit)
+ * @param {{owner: string, repo: string}} repoParts - Repository owner and name
+ * @param {number} itemNumber - Issue or PR number to check
+ * @param {string[]} requiredLabels - Labels that must ALL be present on the item
+ * @param {string} requiredTitlePrefix - Title prefix the item must start with
+ * @param {string} handlerType - Handler type name used in log messages
+ * @returns {Promise<{success: false, skipped: true, error: string}|null>}
+ */
+async function checkRequiredFilter(githubClient, repoParts, itemNumber, requiredLabels, requiredTitlePrefix, handlerType) {
+  if (!requiredLabels.length && !requiredTitlePrefix) return null;
+
+  const { data: item } = await githubClient.rest.issues.get({
+    owner: repoParts.owner,
+    repo: repoParts.repo,
+    issue_number: itemNumber,
+  });
+
+  if (requiredLabels.length > 0) {
+    const itemLabels = (item.labels || []).map(/** @param {any} l */ l => (typeof l === "string" ? l : l.name || ""));
+    if (!requiredLabels.every(r => itemLabels.includes(r))) {
+      core.info(`Skipping ${handlerType} for #${itemNumber}: does not match required-labels filter (${requiredLabels.join(", ")})`);
+      return { success: false, skipped: true, error: `Item does not match required-labels filter` };
+    }
+  }
+
+  if (requiredTitlePrefix && !item.title?.startsWith(requiredTitlePrefix)) {
+    core.info(`Skipping ${handlerType} for #${itemNumber}: title does not start with required prefix "${requiredTitlePrefix}"`);
+    return { success: false, skipped: true, error: `Item title does not start with required prefix` };
+  }
+
+  return null;
 }
 
 module.exports = {
@@ -423,6 +492,8 @@ module.exports = {
   extractAssignees,
   matchesBlockedPattern,
   isUsernameBlocked,
+  isTemplatableTrue,
   isStagedMode,
   logStagedPreviewInfo,
+  checkRequiredFilter,
 };

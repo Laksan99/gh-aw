@@ -4,12 +4,13 @@
 **Branch:** {branch}  
 **Run:** {run_url}{pull_request_info}
 
-{secret_verification_context}{credential_auth_error_context}{inference_access_error_context}{mcp_policy_error_context}{model_not_supported_error_context}{effective_tokens_rate_limit_error_context}{app_token_minting_failed_context}{lockdown_check_failed_context}{stale_lock_file_failed_context}{assignment_errors_context}{assign_copilot_failure_context}{create_discussion_errors_context}{code_push_failure_context}{repo_memory_validation_context}{push_repo_memory_failure_context}{missing_data_context}{missing_tool_context}{missing_safe_outputs_context}{engine_failure_context}{timeout_context}{fork_context}
+{secret_verification_context}{credential_auth_error_context}{inference_access_error_context}{mcp_policy_error_context}{model_not_supported_error_context}{ai_credits_rate_limit_error_context}{unknown_model_ai_credits_context}{app_token_minting_failed_context}{lockdown_check_failed_context}{stale_lock_file_failed_context}{daily_ai_credits_exceeded_context}{assignment_errors_context}{assign_copilot_failure_context}{create_discussion_errors_context}{code_push_failure_context}{repo_memory_validation_context}{push_repo_memory_failure_context}{missing_data_context}{missing_tool_context}{permission_denied_context}{tool_denials_exceeded_context}{report_incomplete_context}{missing_safe_outputs_context}{engine_failure_context}{timeout_context}{fork_context}
 
 ### Action Required
 
-**Assign this issue to Copilot** using the `agentic-workflows` sub-agent to automatically debug and fix the workflow failure.
+**Assign this issue to an agent** to debug and fix the issue.
 
+{optimize_token_consumption_context}
 <details>
 <summary>Debug with any coding agent</summary>
 
@@ -29,7 +30,7 @@ The failed workflow run is at {run_url}
 Debug this workflow failure using your favorite Agent CLI and the `agentic-workflows` prompt.
 
 - Start your agent
-- Load the `agentic-workflows` prompt from `.github/agents/agentic-workflows.agent.md` or <https://github.com/github/gh-aw/blob/main/.github/agents/agentic-workflows.agent.md>
+- Load the `agentic-workflows` skill from `.github/skills/agentic-workflows/SKILL.md` or <https://github.com/github/gh-aw/blob/main/.github/skills/agentic-workflows/SKILL.md>
 - Type `debug the agentic workflow {workflow_id} failure in {run_url}`
 
 </details>

@@ -1,18 +1,24 @@
 ---
+private: true
+emoji: "🔧"
 name: Daily AW Cross-Repo Compile Check
 description: Daily Claude workflow that finds popular repositories using gh-aw lock files, compiles/upgrades them, caches results, and reports compatibility gaps
 on:
   schedule: daily on weekdays
   workflow_dispatch:
+max-daily-ai-credits: 10000
 permissions:
   contents: read
   issues: read
   pull-requests: read
   actions: read
 tracker-id: daily-aw-cross-repo-compile-check
+max-turns: 140
 engine:
   id: claude
-  max-turns: 140
+sandbox:
+  agent:
+    sudo: false
 tools:
   cli-proxy: true
   github:
@@ -42,11 +48,9 @@ network:
     - go
 imports:
   - shared/reporting.md
-  - shared/otel.md
-
-  - shared/observability-otlp.md
-firewall:
-  effective-token-steering: true
+  - shared/otlp.md
+features:
+  gh-aw-detection: true
 ---
 
 # Daily AW Cross-Repo Compilation Agent
@@ -71,7 +75,7 @@ Every run must:
 ## Run Context
 
 - Cache root: `/tmp/gh-aw/cache-memory/aw-compat`
-- Work root: `/tmp/gh-aw/aw-compat-work`
+- Work root: `/tmp/gh-aw/agent/aw-compat-work`
 - Use filesystem-safe timestamps only: `YYYY-MM-DD-HH-MM-SS-sss` (no colons).
 
 ## Phase 0: Prepare Workspace and Build Latest gh-aw
@@ -82,7 +86,7 @@ set -euo pipefail
 RUN_TS="$(date -u +%Y-%m-%d-%H-%M-%S)-$(date -u +%3N)"
 CACHE_ROOT="/tmp/gh-aw/cache-memory/aw-compat"
 RUN_DIR="$CACHE_ROOT/runs/$RUN_TS"
-WORK_ROOT="/tmp/gh-aw/aw-compat-work/$RUN_TS"
+WORK_ROOT="/tmp/gh-aw/agent/aw-compat-work/$RUN_TS"
 
 mkdir -p "$RUN_DIR" "$WORK_ROOT" "$CACHE_ROOT/index"
 

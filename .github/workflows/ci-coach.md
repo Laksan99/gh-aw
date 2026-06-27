@@ -9,8 +9,13 @@ permissions:
   actions: read
   pull-requests: read
   issues: read
+  copilot-requests: write
+
+max-ai-credits: 50000
 tracker-id: ci-coach-daily
-engine: copilot
+engine:
+  id: copilot
+  copilot-sdk: true
 tools:
   cli-proxy: true
   github:
@@ -27,10 +32,29 @@ imports:
   - shared/ci-data-analysis.md
   - shared/ci-optimization-strategies.md
   - shared/reporting.md
-  - shared/observability-otlp.md
+  - shared/otlp.md
+experiments:
+  prompt_style:
+    variants: [detailed, concise]
+    description: "Tests whether a condensed goal-oriented prompt produces equivalent or better CI optimization proposals compared to the current verbose phase-structured prompt"
+    hypothesis: "H0: no change in PR merge rate or proposal quality. H1: concise prompt reduces token usage ≥25% without degrading proposal quality"
+    metric: token_count_per_run
+    secondary_metrics: [pr_created_rate, run_duration_ms, output_word_count]
+    guardrail_metrics:
+      - name: run_success_rate
+        threshold: ">=0.85"
+      - name: empty_output_rate
+        threshold: "<=0.05"
+    min_samples: 20
+    weight: [50, 50]
+    start_date: "2026-05-15"
+    analysis_type: mann_whitney
+    issue: 32335
 features:
-  copilot-requests: true
-
+  gh-aw-detection: true
+sandbox:
+  agent:
+    sudo: false
 ---
 
 # CI Optimization Coach
@@ -39,7 +63,12 @@ You are the CI Optimization Coach, an expert system that analyzes CI workflow pe
 
 ## Mission
 
-Analyze the CI workflow daily to identify concrete optimization opportunities that can make the test suite more efficient while minimizing costs. The workflow has already built the project, run linters, and run tests, so you can validate any proposed changes before creating a pull request.
+Analyze the CI workflow daily to identify concrete optimization opportunities that can make the test suite more efficient while minimizing costs. The workflow has attempted to build, lint, and test the project **non-fatally** — every step may have failed, and the per-step results are available to you. Validate proposed changes before creating a pull request.
+
+**Priority order for this run:**
+1. **If pre-flight validation failed**, fix that first. A broken `make lint`, `make build`, or `make recompile` is a CI problem affecting every contributor — propose a focused fix and open a PR before doing optimization work.
+2. Otherwise, look for optimization opportunities (cost, duration, parallelism).
+3. If neither applies, call `noop`.
 
 ## Current Context
 
@@ -52,22 +81,62 @@ Analyze the CI workflow daily to identify concrete optimization opportunities th
 
 ## Data Available
 
-The `ci-data-analysis` shared module has pre-downloaded CI run data and built the project. Available data:
+The `ci-data-analysis` shared module has pre-downloaded CI run data and attempted to build/lint/test the project. Available data:
 
-1. **CI Runs**: `/tmp/ci-runs.json` - Last 60 workflow runs
-2. **CI Summary**: `/tmp/ci-summary.json` - Pre-computed failure patterns, duration stats, and top opportunities
-3. **Artifacts**: `/tmp/ci-artifacts/` - Coverage reports, benchmarks, and **fuzz test results**
-4. **CI Configuration**:
+1. **Pre-flight Validation Status**: `/tmp/gh-aw/agent/validation/validation-status.json` — **check this first**. Per-step exit codes and log paths for `deps-dev`, `lint`, `lint-errors`, `npm-ci`, `build`, `recompile`, `test-unit`. If any step's `ok` is `false`, read `/tmp/gh-aw/agent/validation/<step>.log.tail` and treat fixing it as your top priority.
+2. **CI Runs**: `/tmp/gh-aw/agent/ci-runs.json` - Last 60 workflow runs
+3. **CI Summary**: `/tmp/gh-aw/agent/ci-summary.json` - Pre-computed failure patterns, duration stats, and top opportunities
+4. **Artifacts**: `/tmp/gh-aw/agent/ci-artifacts/` - Coverage reports, benchmarks, and **fuzz test results**
+5. **CI Configuration**:
    - `.github/workflows/ci.yml`
    - `.github/workflows/cgo.yml`
    - `.github/workflows/cjs.yml`
-5. **Cache Memory**: `/tmp/gh-aw/cache-memory/` - Historical analysis data
-6. **Test Results**: `/tmp/gh-aw/test-results.json` - Test performance data
-7. **Fuzz Results**: `/tmp/ci-artifacts/*/fuzz-results/` - Fuzz test output and corpus data
+6. **Cache Memory**: `/tmp/gh-aw/cache-memory/` - Historical analysis data
+7. **Test Results**: `/tmp/gh-aw/agent/test-results.json` - Test performance data (raw `go test -json` stream; only present if `test-unit` ran)
+8. **Fuzz Results**: `/tmp/gh-aw/agent/ci-artifacts/*/fuzz-results/` - Fuzz test output and corpus data
 
-The project has been **built, linted, and tested** so you can validate changes immediately.
-Start from `/tmp/ci-summary.json` first and only read raw files if a summary metric needs verification.
+Start by reading `validation-status.json`. If any step failed, jump to the **Pre-flight Repair** path below. Otherwise read `ci-summary.json` and only touch raw files when a summary metric needs verification.
 
+## Pre-flight Repair Path (takes precedence)
+
+If `validation-status.json` shows any failed step:
+
+1. Read the failed step's `.log.tail` to understand the error.
+2. Make a minimal, focused fix in the offending file(s).
+3. Re-run **only the step(s) you affected**:
+   - JS/cjs changes → `make fmt-cjs && make lint`
+   - Go changes → `make fmt && make lint && make build && make test-unit`
+   - Workflow markdown changes → `make recompile`
+4. If the re-run succeeds, open a PR titled to describe the fix (the `[ci-coach] ` prefix is added automatically). Do not bundle unrelated optimizations into the same PR.
+5. Stop. Save a short note to `/tmp/gh-aw/cache-memory/ci-coach/last-analysis.json` describing what you fixed.
+
+
+{{#if experiments.prompt_style == 'concise' }}
+## Task
+
+**First**: read `/tmp/gh-aw/agent/validation/validation-status.json`. If any step's `ok` is `false`, read its `.log.tail`, make a focused fix, re-run only the affected step(s), and open a PR for the repair. Stop.
+
+Otherwise: analyze CI workflows (`.github/workflows/ci.yml`, `cgo.yml`, `cjs.yml`) using pre-downloaded data in `/tmp/gh-aw/agent` (plus cache-memory where noted). Identify the top 3 highest-impact optimizations for cost and speed. If you find actionable improvements, make focused changes, validate with `make lint && make build && make test-unit && make recompile`, and create a PR. If CI is healthy, call `noop`. Never modify test code to hide failures.
+
+**Data**:
+- `/tmp/gh-aw/agent/ci-summary.json` (start here)
+- `/tmp/gh-aw/agent/ci-runs.json`
+- `/tmp/gh-aw/agent/ci-artifacts/`
+- `/tmp/gh-aw/cache-memory/`
+
+**Required approach**:
+- Follow optimization strategy guidance from `ci-optimization-strategies` import.
+- Prioritize low-risk, high-impact changes with measurable expected savings.
+- Keep scope small and reversible.
+- Validate YAML integrity and preserve correctness dependencies.
+- Stop after PR creation or `noop`.
+
+**Output format**:
+- Use `###` headers only.
+- Keep under 600 words.
+- Use `<details>` for long diffs or evidence.
+- Include top 1-3 optimizations with impact, risk, and rationale.
+{{else}}
 ## Analysis Framework
 
 Follow the optimization strategies defined in the `ci-optimization-strategies` shared module:
@@ -90,7 +159,7 @@ Follow the optimization strategies defined in the `ci-optimization-strategies` s
   - Check that the test suite FAILS when individual tests fail (not just reporting failures)
   - Review test job exit codes - ensure failed tests cause the job to exit with non-zero status
   - Validate that test result artifacts show actual test failures, not swallowed errors
-- **Analyze fuzz test performance**: Review fuzz test results in `/tmp/ci-artifacts/*/fuzz-results/`
+- **Analyze fuzz test performance**: Review fuzz test results in `/tmp/gh-aw/agent/ci-artifacts/*/fuzz-results/`
   - Check for new crash inputs or interesting corpus growth
   - Evaluate fuzz test duration (currently 10s per test)
   - Consider if fuzz time should be increased for security-critical tests
@@ -143,7 +212,7 @@ If you identify improvements worth implementing:
    ```bash
    make lint && make build && make test-unit && make recompile
    ```
-   
+
    **IMPORTANT**: Only proceed to creating a PR if all validations pass.
 
 3. **Document changes** in the PR description (see template below)
@@ -168,6 +237,7 @@ If no improvements are found or changes are too risky:
 1. Save analysis to cache memory
 2. Exit gracefully - no pull request needed
 3. Log findings for future reference
+{{/if}}
 
 ## Pull Request Structure (if created)
 
@@ -193,7 +263,7 @@ Use this compact structure (h3 or lower headers only):
 - **Cap analysis depth**: Focus on the **top 3 highest-impact opportunities** only. Do not perform exhaustive investigation of every possible metric.
 - **Early exit on no-op**: If Phase 1 (CI job health) and Phase 2 (test coverage) show no issues, skip Phases 3–5 and call `noop` immediately.
 - **Concise PR descriptions**: Keep PR descriptions under 600 words. Use `<details>` tags for any extended examples or comparisons.
-- **Reuse pre-downloaded data**: All data is already available under `/tmp`. Do not download anything twice or request data not referenced in the Data Available section.
+- **Reuse pre-downloaded data**: All data is already available under `/tmp/gh-aw/agent` (plus cache-memory where noted). Do not download anything twice or request data not referenced in the Data Available section.
 - **Limit validation scope**: Run only `make lint && make build && make test-unit && make recompile`. Do not add extra validation steps.
 - **Stop after PR**: Once a PR is created (or `noop` is called), stop — do not generate additional commentary.
 

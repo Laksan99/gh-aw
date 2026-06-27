@@ -21,23 +21,22 @@ import (
 // createTestProcessedRun creates a test ProcessedRun with customizable parameters
 func createTestProcessedRun(opts ...func(*ProcessedRun)) ProcessedRun {
 	run := WorkflowRun{
-		DatabaseID:    123456,
-		WorkflowName:  "Test Workflow",
-		Status:        "completed",
-		Conclusion:    "success",
-		CreatedAt:     time.Date(2024, 1, 1, 10, 0, 0, 0, time.UTC),
-		StartedAt:     time.Date(2024, 1, 1, 10, 0, 30, 0, time.UTC),
-		UpdatedAt:     time.Date(2024, 1, 1, 10, 5, 0, 0, time.UTC),
-		Duration:      4*time.Minute + 30*time.Second,
-		Event:         "push",
-		HeadBranch:    "main",
-		URL:           "https://github.com/org/repo/actions/runs/123456",
-		TokenUsage:    1500,
-		EstimatedCost: 0.025,
-		Turns:         5,
-		ErrorCount:    0,
-		WarningCount:  0,
-		LogsPath:      "/tmp/test-logs",
+		DatabaseID:   123456,
+		WorkflowName: "Test Workflow",
+		Status:       "completed",
+		Conclusion:   "success",
+		CreatedAt:    time.Date(2024, 1, 1, 10, 0, 0, 0, time.UTC),
+		StartedAt:    time.Date(2024, 1, 1, 10, 0, 30, 0, time.UTC),
+		UpdatedAt:    time.Date(2024, 1, 1, 10, 5, 0, 0, time.UTC),
+		Duration:     4*time.Minute + 30*time.Second,
+		Event:        "push",
+		HeadBranch:   "main",
+		URL:          "https://github.com/org/repo/actions/runs/123456",
+		TokenUsage:   1500,
+		Turns:        5,
+		ErrorCount:   0,
+		WarningCount: 0,
+		LogsPath:     "/tmp/test-logs",
 	}
 
 	processedRun := ProcessedRun{
@@ -111,11 +110,10 @@ func TestGenerateFindings(t *testing.T) {
 				return pr
 			}(),
 			metrics: MetricsData{
-				TokenUsage:    1000,
-				EstimatedCost: 0.01,
-				Turns:         3,
-				ErrorCount:    0,
-				WarningCount:  0,
+				TokenUsage:   1000,
+				Turns:        3,
+				ErrorCount:   0,
+				WarningCount: 0,
 			},
 			errors:        []ErrorInfo{},
 			expectedCount: 1, // Should have success finding
@@ -132,11 +130,10 @@ func TestGenerateFindings(t *testing.T) {
 				return pr
 			}(),
 			metrics: MetricsData{
-				TokenUsage:    1000,
-				EstimatedCost: 0.01,
-				Turns:         3,
-				ErrorCount:    2,
-				WarningCount:  0,
+				TokenUsage:   1000,
+				Turns:        3,
+				ErrorCount:   2,
+				WarningCount: 0,
 			},
 			errors:        []ErrorInfo{{Type: "error", Message: "Test error"}},
 			expectedCount: 1, // Should have failure finding
@@ -186,6 +183,31 @@ func TestGenerateFindings(t *testing.T) {
 			},
 		},
 		{
+			name: "failed workflow uses actual error count not stale metrics.ErrorCount",
+			processedRun: func() ProcessedRun {
+				pr := createTestProcessedRun()
+				pr.Run.Conclusion = "failure"
+				return pr
+			}(),
+			metrics: MetricsData{
+				ErrorCount: 0, // metrics are wrong / stale — should not be used when errors slice is populated
+			},
+			errors: []ErrorInfo{
+				{Type: "step_failure", Message: "##[error]Process completed with exit code 1."},
+				{Type: "step_failure", Message: "##[error]Process completed with exit code 1."},
+			},
+			expectedCount: 1,
+			checkFindings: func(t *testing.T, findings []Finding) {
+				finding := findFindingByCategory(findings, "error")
+				require.NotNil(t, finding, "Failed workflow should generate an error finding")
+				assert.Equal(t, "critical", finding.Severity, "Error finding should have critical severity")
+				assert.Contains(t, finding.Description, "2 error(s)",
+					"Description should reflect the actual number of errors, not metrics.ErrorCount")
+				assert.NotContains(t, finding.Description, "0 error(s)",
+					"Description must not show 0 errors when the errors slice is non-empty")
+			},
+		},
+		{
 			name: "failed workflow with zero errors and no error details uses pre-activation message",
 			processedRun: func() ProcessedRun {
 				pr := createTestProcessedRun()
@@ -210,6 +232,47 @@ func TestGenerateFindings(t *testing.T) {
 			},
 		},
 		{
+			name: "failed workflow with agent job failure and no telemetry uses post-activation message",
+			processedRun: func() ProcessedRun {
+				pr := createTestProcessedRun()
+				pr.Run.Conclusion = "failure"
+				pr.JobDetails = []JobInfoWithDuration{
+					{
+						JobInfo: JobInfo{
+							Name:       "activation",
+							Status:     "completed",
+							Conclusion: "success",
+						},
+						Duration: 37 * time.Second,
+					},
+					{
+						JobInfo: JobInfo{
+							Name:       "agent",
+							Status:     "completed",
+							Conclusion: "failure",
+						},
+						Duration: 2 * time.Minute,
+					},
+				}
+				return pr
+			}(),
+			metrics: MetricsData{
+				ErrorCount: 0,
+			},
+			errors:        []ErrorInfo{},
+			expectedCount: 1,
+			checkFindings: func(t *testing.T, findings []Finding) {
+				finding := findFindingByCategory(findings, "error")
+				require.NotNil(t, finding, "Failed workflow should still generate an error finding")
+				assert.Contains(t, finding.Description, "after agent activation",
+					"Description should indicate post-activation failure when agent job ran")
+				assert.Contains(t, finding.Description, "ran for 2.0m before failing",
+					"Description should include agent job runtime before failure")
+				assert.Contains(t, finding.Description, "no agent telemetry was available to analyze",
+					"Description should explain why no error details were available")
+			},
+		},
+		{
 			name: "timed out workflow",
 			processedRun: func() ProcessedRun {
 				pr := createTestProcessedRun()
@@ -224,38 +287,6 @@ func TestGenerateFindings(t *testing.T) {
 			checkFindings: func(t *testing.T, findings []Finding) {
 				assertFindingContains(t, findings, "performance", "Timeout",
 					"Timed out workflow should generate a timeout finding")
-			},
-		},
-		{
-			name: "high cost workflow",
-			processedRun: func() ProcessedRun {
-				return createTestProcessedRun()
-			}(),
-			metrics: MetricsData{
-				EstimatedCost: 1.50, // > 1.0 threshold
-				Turns:         5,
-			},
-			errors:        []ErrorInfo{},
-			expectedCount: 1, // High cost finding
-			checkFindings: func(t *testing.T, findings []Finding) {
-				assertFindingExists(t, findings, "cost", "high",
-					"High cost workflow should generate a high cost finding")
-			},
-		},
-		{
-			name: "moderate cost workflow",
-			processedRun: func() ProcessedRun {
-				return createTestProcessedRun()
-			}(),
-			metrics: MetricsData{
-				EstimatedCost: 0.75, // Between 0.5 and 1.0
-				Turns:         5,
-			},
-			errors:        []ErrorInfo{},
-			expectedCount: 1, // Moderate cost finding
-			checkFindings: func(t *testing.T, findings []Finding) {
-				assertFindingExists(t, findings, "cost", "medium",
-					"Moderate cost workflow should generate a medium cost finding")
 			},
 		},
 		{
@@ -422,25 +453,6 @@ func TestGenerateRecommendations(t *testing.T) {
 			},
 		},
 		{
-			name:         "high cost findings generate optimization recommendation",
-			processedRun: createTestProcessedRun(),
-			metrics:      MetricsData{EstimatedCost: 1.5},
-			findings: []Finding{
-				{Category: "cost", Severity: "high", Title: "High Cost"},
-			},
-			expectedMinCount: 1,
-			checkRecommendations: func(t *testing.T, recs []Recommendation) {
-				found := false
-				for _, r := range recs {
-					if strings.Contains(r.Action, "Optimize") || strings.Contains(r.Action, "prompt") {
-						found = true
-						break
-					}
-				}
-				assert.True(t, found, "High cost findings should generate optimization recommendation")
-			},
-		},
-		{
 			name: "missing tools generate add tools recommendation",
 			processedRun: func() ProcessedRun {
 				pr := createTestProcessedRun()
@@ -565,70 +577,6 @@ func TestGeneratePerformanceMetrics(t *testing.T) {
 			},
 		},
 		{
-			name: "cost efficiency - excellent",
-			processedRun: func() ProcessedRun {
-				pr := createTestProcessedRun()
-				pr.Run.Duration = 10 * time.Minute
-				return pr
-			}(),
-			metrics: MetricsData{
-				EstimatedCost: 0.05, // $0.005/min < $0.01 threshold
-			},
-			toolUsage: []ToolUsageInfo{},
-			checkMetrics: func(t *testing.T, pm *PerformanceMetrics) {
-				assert.Equal(t, "excellent", pm.CostEfficiency,
-					"Cost efficiency should be excellent for low cost per minute")
-			},
-		},
-		{
-			name: "cost efficiency - good",
-			processedRun: func() ProcessedRun {
-				pr := createTestProcessedRun()
-				pr.Run.Duration = 10 * time.Minute
-				return pr
-			}(),
-			metrics: MetricsData{
-				EstimatedCost: 0.25, // $0.025/min
-			},
-			toolUsage: []ToolUsageInfo{},
-			checkMetrics: func(t *testing.T, pm *PerformanceMetrics) {
-				assert.Equal(t, "good", pm.CostEfficiency,
-					"Cost efficiency should be good for moderate cost per minute")
-			},
-		},
-		{
-			name: "cost efficiency - moderate",
-			processedRun: func() ProcessedRun {
-				pr := createTestProcessedRun()
-				pr.Run.Duration = 10 * time.Minute
-				return pr
-			}(),
-			metrics: MetricsData{
-				EstimatedCost: 0.75, // $0.075/min
-			},
-			toolUsage: []ToolUsageInfo{},
-			checkMetrics: func(t *testing.T, pm *PerformanceMetrics) {
-				assert.Equal(t, "moderate", pm.CostEfficiency,
-					"Cost efficiency should be moderate for higher cost per minute")
-			},
-		},
-		{
-			name: "cost efficiency - poor",
-			processedRun: func() ProcessedRun {
-				pr := createTestProcessedRun()
-				pr.Run.Duration = 10 * time.Minute
-				return pr
-			}(),
-			metrics: MetricsData{
-				EstimatedCost: 1.50, // $0.15/min
-			},
-			toolUsage: []ToolUsageInfo{},
-			checkMetrics: func(t *testing.T, pm *PerformanceMetrics) {
-				assert.Equal(t, "poor", pm.CostEfficiency,
-					"Cost efficiency should be poor for high cost per minute")
-			},
-		},
-		{
 			name:         "most used tool",
 			processedRun: createTestProcessedRun(),
 			metrics:      MetricsData{},
@@ -720,23 +668,22 @@ func TestBuildAuditDataComplete(t *testing.T) {
 
 	processedRun := ProcessedRun{
 		Run: WorkflowRun{
-			DatabaseID:    12345,
-			WorkflowName:  "Complete Test Workflow",
-			Status:        "completed",
-			Conclusion:    "failure",
-			CreatedAt:     time.Date(2024, 1, 1, 10, 0, 0, 0, time.UTC),
-			StartedAt:     time.Date(2024, 1, 1, 10, 0, 30, 0, time.UTC),
-			UpdatedAt:     time.Date(2024, 1, 1, 10, 10, 0, 0, time.UTC),
-			Duration:      9*time.Minute + 30*time.Second,
-			Event:         "pull_request",
-			HeadBranch:    "feature-branch",
-			URL:           "https://github.com/test/repo/actions/runs/12345",
-			TokenUsage:    25000,
-			EstimatedCost: 0.75,
-			Turns:         8,
-			ErrorCount:    3,
-			WarningCount:  2,
-			LogsPath:      tmpDir,
+			DatabaseID:   12345,
+			WorkflowName: "Complete Test Workflow",
+			Status:       "completed",
+			Conclusion:   "failure",
+			CreatedAt:    time.Date(2024, 1, 1, 10, 0, 0, 0, time.UTC),
+			StartedAt:    time.Date(2024, 1, 1, 10, 0, 30, 0, time.UTC),
+			UpdatedAt:    time.Date(2024, 1, 1, 10, 10, 0, 0, time.UTC),
+			Duration:     9*time.Minute + 30*time.Second,
+			Event:        "pull_request",
+			HeadBranch:   "feature-branch",
+			URL:          "https://github.com/test/repo/actions/runs/12345",
+			TokenUsage:   25000,
+			Turns:        8,
+			ErrorCount:   3,
+			WarningCount: 2,
+			LogsPath:     tmpDir,
 		},
 		JobDetails: []JobInfoWithDuration{
 			{JobInfo: JobInfo{Name: "build", Status: "completed", Conclusion: "success"}, Duration: 2 * time.Minute},
@@ -768,9 +715,8 @@ func TestBuildAuditDataComplete(t *testing.T) {
 	}
 
 	metrics := workflow.LogMetrics{
-		TokenUsage:    25000,
-		EstimatedCost: 0.75,
-		Turns:         8,
+		TokenUsage: 25000,
+		Turns:      8,
 		ToolCalls: []workflow.ToolCallInfo{
 			{Name: "bash", CallCount: 15, MaxInputSize: 500, MaxOutputSize: 2000, MaxDuration: 5 * time.Second},
 			{Name: "github_issue_read", CallCount: 8, MaxInputSize: 100, MaxOutputSize: 5000, MaxDuration: 2 * time.Second},
@@ -937,11 +883,10 @@ func TestRenderJSONComplete(t *testing.T) {
 			URL:          "https://github.com/test/repo/actions/runs/99999",
 		},
 		Metrics: MetricsData{
-			TokenUsage:    5000,
-			EstimatedCost: 0.10,
-			Turns:         4,
-			ErrorCount:    1,
-			WarningCount:  2,
+			TokenUsage:   5000,
+			Turns:        4,
+			ErrorCount:   1,
+			WarningCount: 2,
 		},
 		KeyFindings: []Finding{
 			{Category: "success", Severity: "info", Title: "Test Finding", Description: "Test description"},
@@ -1045,39 +990,6 @@ func TestToolUsageAggregation(t *testing.T) {
 		"Bash should be present in tool usage")
 }
 
-func TestRenderTokenUsageDisplaysRawCountsOnly(t *testing.T) {
-	summary := &TokenUsageSummary{
-		TotalInputTokens:      100,
-		TotalOutputTokens:     200,
-		TotalCacheReadTokens:  5000,
-		TotalCacheWriteTokens: 3000,
-		TotalRequests:         2,
-		TotalDurationMs:       3000,
-		ByModel:               map[string]*ModelTokenUsage{},
-	}
-
-	oldStderr := os.Stderr
-	r, w, err := os.Pipe()
-	require.NoError(t, err)
-	os.Stderr = w
-
-	renderTokenUsage(summary)
-	require.NoError(t, w.Close())
-	os.Stderr = oldStderr
-
-	var buf bytes.Buffer
-	_, copyErr := io.Copy(&buf, r)
-	require.NoError(t, copyErr)
-
-	output := buf.String()
-	assert.Contains(t, output, "Tokens:")
-	assert.Contains(t, output, "100 input")
-	assert.Contains(t, output, "cache read")
-	assert.Contains(t, output, "cache write")
-	assert.NotContains(t, output, "Total:")
-	assert.NotContains(t, output, "Cache hit:")
-}
-
 func TestExtractDownloadedFilesEmpty(t *testing.T) {
 	// Test with nonexistent directory
 	files := extractDownloadedFiles("/nonexistent/path")
@@ -1107,9 +1019,8 @@ func TestFindingSeverityOrdering(t *testing.T) {
 	}
 
 	metrics := MetricsData{
-		ErrorCount:    5,
-		EstimatedCost: 2.0, // High cost
-		Turns:         15,  // Many turns
+		ErrorCount: 5,
+		Turns:      15, // Many turns
 	}
 
 	errors := []ErrorInfo{
@@ -1155,9 +1066,7 @@ func TestRecommendationPriorityOrdering(t *testing.T) {
 		},
 	}
 
-	metrics := MetricsData{
-		EstimatedCost: 1.5,
-	}
+	metrics := MetricsData{}
 
 	findings := []Finding{
 		{Category: "error", Severity: "critical", Title: "Critical"},
@@ -1235,6 +1144,21 @@ func TestExtractCreatedItemsFromManifest(t *testing.T) {
 		assert.Empty(t, items[0].URL)
 		assert.Equal(t, 20875, items[0].Number)
 		assert.Equal(t, "https://github.com/owner/repo/issues/2", items[1].URL)
+	})
+
+	t.Run("parses execution metadata snapshots", func(t *testing.T) {
+		dir := t.TempDir()
+		content := `{"type":"update_issue","number":7,"repo":"owner/repo","before_state":{"title":"Before","labels":["triage"]},"after_state":{"title":"After","labels":["triage","done"]},"timestamp":"2024-01-01T00:00:00Z"}
+`
+		require.NoError(t, os.WriteFile(filepath.Join(dir, safeOutputItemsManifestFilename), []byte(content), 0600))
+
+		items := extractCreatedItemsFromManifest(dir)
+		require.Len(t, items, 1)
+		require.Equal(t, "update_issue", items[0].Type)
+		require.Equal(t, "Before", items[0].BeforeState["title"])
+		require.Equal(t, "After", items[0].AfterState["title"])
+		require.Equal(t, []any{"triage"}, items[0].BeforeState["labels"])
+		require.Equal(t, []any{"triage", "done"}, items[0].AfterState["labels"])
 	})
 
 	t.Run("skips entries without type field", func(t *testing.T) {

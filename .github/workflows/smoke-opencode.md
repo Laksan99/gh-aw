@@ -1,6 +1,12 @@
 ---
+private: true
+emoji: "🧪"
 description: Smoke test workflow that validates OpenCode engine functionality
 on:
+  slash_command:
+    name: smoke-opencode
+    strategy: centralized
+    events: [issues, issue_comment, pull_request, pull_request_comment]
   workflow_dispatch:
   pull_request:
     types: [labeled]
@@ -19,7 +25,7 @@ strict: true
 imports:
   - shared/gh.md
   - shared/reporting-otlp.md
-  - shared/observability-otlp.md
+  - shared/otlp.md
 network:
   allowed:
     - defaults
@@ -45,12 +51,13 @@ safe-outputs:
     add-labels:
       allowed: [smoke-opencode]
     messages:
-      footer: "> 🔥 *[{workflow_name}]({run_url}) — Powered by OpenCode*{effective_tokens_suffix}{history_link}"
+      footer: "> 🔥 *[{workflow_name}]({run_url}) — Powered by OpenCode*{ai_credits_suffix}{history_link}"
       run-started: "🔥 OpenCode initializing... [{workflow_name}]({run_url}) begins on this {event_type}..."
       run-success: "🚀 [{workflow_name}]({run_url}) **MISSION COMPLETE!** OpenCode delivered. 🔥"
       run-failure: "⚠️ [{workflow_name}]({run_url}) {status}. OpenCode encountered unexpected challenges..."
 timeout-minutes: 10
-
+features:
+  gh-aw-detection: false
 ---
 
 # Smoke Test: OpenCode Engine Validation
@@ -66,7 +73,7 @@ timeout-minutes: 10
 2. **Web Fetch Testing**: Use the web-fetch MCP tool to fetch https://github.com and verify the response contains "GitHub" (do NOT use bash or playwright for this test - use the web-fetch MCP tool directly)
 3. **File Writing Testing**: Create a test file `/tmp/gh-aw/agent/smoke-test-opencode-${{ github.run_id }}.txt` with content "Smoke test passed for OpenCode at $(date)" (create the directory if it doesn't exist)
 4. **Bash Tool Testing**: Execute bash commands to verify file creation was successful (use `cat` to read the file back)
-5. **Build gh-aw**: Run `GOCACHE=/tmp/go-cache GOMODCACHE=/tmp/go-mod make build` to verify the agent can successfully build the gh-aw project. If the command fails, mark this test as ❌ and report the failure.
+5. **Build gh-aw**: Run `GOCACHE=/tmp/gh-aw/agent/go-cache GOMODCACHE=/tmp/gh-aw/agent/go-mod make build` to verify the agent can successfully build the gh-aw project. If the command fails, mark this test as ❌ and report the failure.
 
 ## Output
 

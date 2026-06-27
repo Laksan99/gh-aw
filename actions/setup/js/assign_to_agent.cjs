@@ -1,7 +1,7 @@
 // @ts-check
 /// <reference types="@actions/github-script" />
 
-const { AGENT_LOGIN_NAMES, getAvailableAgentLogins, findAgent, getIssueDetails, getPullRequestDetails, assignAgentToIssue, generatePermissionErrorSummary } = require("./assign_agent_helpers.cjs");
+const { AGENT_LOGIN_NAMES, getAgentLogins, getAvailableAgentLogins, findAgent, getIssueDetails, getPullRequestDetails, assignAgentToIssue, generatePermissionErrorSummary } = require("./assign_agent_helpers.cjs");
 const { getErrorMessage } = require("./error_helpers.cjs");
 const { resolveTarget, isStagedMode } = require("./safe_output_helpers.cjs");
 const { generateStagedPreview } = require("./staged_preview.cjs");
@@ -87,7 +87,7 @@ async function main(config = {}) {
   if (configuredBaseBranch) core.info(`Configured base branch: ${configuredBaseBranch}`);
   core.info(`Target configuration: ${targetConfig}`);
   core.info(`Max count: ${maxCount}`);
-  if (ignoreIfError) core.info("Ignore-if-error mode enabled: Will not fail if agent assignment encounters auth errors");
+  if (ignoreIfError) core.info("Ignore-if-error mode enabled: Will not fail if agent assignment encounters auth or availability errors");
   if (allowedAgents) core.info(`Allowed agents: ${allowedAgents.join(", ")}`);
   core.info(`Default target repo: ${defaultTargetRepo}`);
   if (allowedRepos.size > 0) core.info(`Allowed repos: ${[...allowedRepos].join(", ")}`);
@@ -95,7 +95,6 @@ async function main(config = {}) {
   // Resolve pull request repo upfront (if globally configured)
   let pullRequestOwner = null;
   let pullRequestRepo = null;
-  let pullRequestRepoId = null;
   let effectiveBaseBranch = configuredBaseBranch;
   const pullRequestRepoConfig = config["pull-request-repo"] ? String(config["pull-request-repo"]).trim() : null;
 
@@ -111,14 +110,12 @@ async function main(config = {}) {
       core.info(`Using pull request repository: ${pullRequestOwner}/${pullRequestRepo}`);
       try {
         const resolved = await resolvePullRequestRepo(githubClient, pullRequestOwner, pullRequestRepo, configuredBaseBranch);
-        pullRequestRepoId = resolved.repoId;
         effectiveBaseBranch = resolved.effectiveBaseBranch;
-        core.info(`Pull request repository ID: ${pullRequestRepoId}`);
         if (!configuredBaseBranch && effectiveBaseBranch) {
           core.info(`Resolved pull request repository default branch: ${effectiveBaseBranch}`);
         }
       } catch (error) {
-        throw new Error(`Failed to fetch pull request repository ID for ${pullRequestOwner}/${pullRequestRepo}: ${getErrorMessage(error)}`);
+        throw new Error(`Failed to fetch pull request repository for ${pullRequestOwner}/${pullRequestRepo}: ${getErrorMessage(error)}`);
       }
     } else {
       core.warning(`Invalid pull-request-repo format: ${pullRequestRepoConfig}. Expected owner/repo. PRs will be created in issue repository.`);
@@ -193,11 +190,15 @@ async function main(config = {}) {
     }
 
     // Defer if issue_number is a temporary ID that hasn't been resolved yet
-    if (message.issue_number != null && isTemporaryId(message.issue_number)) {
-      const normalized = normalizeTemporaryId(String(message.issue_number));
-      if (!temporaryIdMap.has(normalized)) {
-        core.info(`Deferring assign_to_agent — temporary ID ${message.issue_number} not yet resolved`);
-        return { success: false, deferred: true };
+    // Strip leading '#' so both 'aw_abc1' and '#aw_abc1' (canonical validator form) are handled
+    if (message.issue_number != null) {
+      const issueNumStr = String(message.issue_number).trim();
+      if (isTemporaryId(issueNumStr)) {
+        const normalized = normalizeTemporaryId(issueNumStr);
+        if (!temporaryIdMap.has(normalized)) {
+          core.info(`Deferring assign_to_agent — temporary ID ${message.issue_number} not yet resolved`);
+          return { success: false, deferred: true };
+        }
       }
     }
 
@@ -236,7 +237,6 @@ async function main(config = {}) {
     const basePullRequestRepoSlug = pullRequestOwner && pullRequestRepo ? `${pullRequestOwner}/${pullRequestRepo}` : `${effectiveOwner}/${effectiveRepo}`;
 
     // Handle per-item pull_request_repo override
-    let effectivePullRequestRepoId = pullRequestRepoId;
     let effectivePullRequestRepoSlug = basePullRequestRepoSlug;
     let hasValidatedPerItemPullRequestRepoOverride = false;
     const hasPullRequestRepoOverrideField = message.pull_request_repo != null;
@@ -254,18 +254,12 @@ async function main(config = {}) {
           return { success: false, error };
         }
         try {
-          const itemPullRequestRepoQuery = `
-            query($owner: String!, $name: String!) {
-              repository(owner: $owner, name: $name) { id }
-            }
-          `;
-          const itemPullRequestRepoResponse = await githubClient.graphql(itemPullRequestRepoQuery, { owner: pullRequestRepoParts[0], name: pullRequestRepoParts[1] });
-          effectivePullRequestRepoId = itemPullRequestRepoResponse.repository.id;
+          await resolvePullRequestRepo(githubClient, pullRequestRepoParts[0], pullRequestRepoParts[1], configuredBaseBranch);
           effectivePullRequestRepoSlug = itemPullRequestRepo;
           hasValidatedPerItemPullRequestRepoOverride = true;
-          core.info(`Using per-item pull request repository: ${itemPullRequestRepo} (ID: ${effectivePullRequestRepoId})`);
+          core.info(`Using per-item pull request repository: ${itemPullRequestRepo}`);
         } catch (error) {
-          const errorMsg = `Failed to fetch pull request repository ID for ${itemPullRequestRepo}: ${getErrorMessage(error)}`;
+          const errorMsg = `Failed to resolve pull request repository for ${itemPullRequestRepo}: ${getErrorMessage(error)}`;
           core.error(errorMsg);
           _allResults.push({ issue_number: message.issue_number || null, pull_number: message.pull_number || null, agent: agentName, owner: effectiveOwner, repo: effectiveRepo, success: false, error: errorMsg });
           return { success: false, error: errorMsg };
@@ -333,31 +327,34 @@ async function main(config = {}) {
 
     try {
       // Find agent (use cache to avoid repeated lookups)
-      let agentId = agentCache[agentName];
-      if (!agentId) {
+      let agentLogin = agentCache[agentName];
+      if (!agentLogin) {
         core.info(`Looking for ${agentName} coding agent...`);
-        agentId = await findAgent(effectiveOwner, effectiveRepo, agentName, githubClient);
-        if (!agentId) {
+        agentLogin = await findAgent(effectiveOwner, effectiveRepo, agentName, issueNumber || pullNumber, githubClient);
+        if (!agentLogin) {
           throw new Error(`${agentName} coding agent is not available for this repository`);
         }
-        agentCache[agentName] = agentId;
-        core.info(`Found ${agentName} coding agent (ID: ${agentId})`);
+        agentCache[agentName] = agentLogin;
+        core.info(`Found ${agentName} coding agent (login: ${agentLogin})`);
       }
 
       // Get issue or PR details
       core.info(`Getting ${type} details...`);
       let assignableId;
       let currentAssignees;
+      let taskContext = null;
       if (issueNumber) {
         const issueDetails = await getIssueDetails(effectiveOwner, effectiveRepo, issueNumber, githubClient);
         if (!issueDetails) throw new Error(`Failed to get issue details`);
         assignableId = issueDetails.issueId;
         currentAssignees = issueDetails.currentAssignees;
+        taskContext = issueDetails.taskContext || { owner: effectiveOwner, repo: effectiveRepo, type: "issue", number: issueNumber };
       } else if (pullNumber) {
         const prDetails = await getPullRequestDetails(effectiveOwner, effectiveRepo, pullNumber, githubClient);
         if (!prDetails) throw new Error(`Failed to get pull request details`);
         assignableId = prDetails.pullRequestId;
         currentAssignees = prDetails.currentAssignees;
+        taskContext = prDetails.taskContext || { owner: effectiveOwner, repo: effectiveRepo, type: "pull", number: pullNumber };
       } else {
         throw new Error(`No issue or pull request number available`);
       }
@@ -374,7 +371,8 @@ async function main(config = {}) {
       // Skip if agent is already assigned and no explicit per-item pull_request_repo is specified.
       // When a different pull_request_repo is provided on the message, allow re-assignment
       // so Copilot can be triggered for a different target repository on the same issue.
-      if (currentAssignees.some(a => a.id === agentId) && !shouldAllowReassignment) {
+      const knownLogins = getAgentLogins(agentName);
+      if (currentAssignees.some(a => a.login === agentLogin || knownLogins.includes(a.login)) && !shouldAllowReassignment) {
         core.info(`${agentName} is already assigned to ${type} #${number}`);
         _allResults.push({ issue_number: issueNumber, pull_number: pullNumber, agent: agentName, owner: effectiveOwner, repo: effectiveRepo, pull_request_repo: effectivePullRequestRepoSlug, success: true });
         return { success: true };
@@ -386,8 +384,8 @@ async function main(config = {}) {
       if (customInstructions) core.info(`Using custom instructions: ${customInstructions.substring(0, 100)}${customInstructions.length > 100 ? "..." : ""}`);
       if (effectiveBaseBranch) core.info(`Using base branch: ${effectiveBaseBranch}`);
 
-      const success = await assignAgentToIssue(assignableId, agentId, currentAssignees, agentName, allowedAgents, effectivePullRequestRepoId, model, customAgent, customInstructions, effectiveBaseBranch, githubClient);
-      if (!success) throw new Error(`Failed to assign ${agentName} via GraphQL`);
+      const success = await assignAgentToIssue(assignableId, agentLogin, currentAssignees, agentName, allowedAgents, model, customAgent, customInstructions, effectiveBaseBranch, githubClient, taskContext, effectivePullRequestRepoSlug);
+      if (!success) throw new Error(`Failed to assign ${agentName} via REST`);
 
       core.info(`Successfully assigned ${agentName} coding agent to ${type} #${number}`);
       _allResults.push({ issue_number: issueNumber, pull_number: pullNumber, agent: agentName, owner: effectiveOwner, repo: effectiveRepo, pull_request_repo: effectivePullRequestRepoSlug, success: true });
@@ -395,18 +393,48 @@ async function main(config = {}) {
     } catch (error) {
       let errorMessage = getErrorMessage(error);
 
-      const isAuthError = ["Bad credentials", "Not Authenticated", "Resource not accessible", "Insufficient permissions", "requires authentication"].some(msg => errorMessage.includes(msg));
+      // When the agent specified an issue_number that turns out to be a PR, skip
+      // silently without posting a comment — error comments on PRs are confusing.
+      if (/** @type {any} */ error.isPullRequest) {
+        core.warning(`Skipping assign_to_agent for #${number}: target is a pull request, not an issue.`);
+        _allResults.push({
+          issue_number: issueNumber,
+          pull_number: pullNumber,
+          agent: agentName,
+          owner: effectiveOwner,
+          repo: effectiveRepo,
+          pull_request_repo: effectivePullRequestRepoSlug,
+          success: false,
+          skipped: true,
+          error: errorMessage,
+        });
+        return { success: false, skipped: true, error: errorMessage };
+      }
 
-      if (ignoreIfError && isAuthError) {
-        core.warning(`Agent assignment failed for ${agentName} on ${type} #${number} due to authentication/permission error. Skipping due to ignore-if-error=true.`);
+      const isAuthError = ["Bad credentials", "Not Authenticated", "Resource not accessible", "Insufficient permissions", "requires authentication"].some(msg => errorMessage.includes(msg));
+      const isAvailabilityError = errorMessage.includes("coding agent is not available for this repository");
+
+      if (ignoreIfError && (isAuthError || isAvailabilityError)) {
+        const errorType = isAuthError ? "authentication/permission" : "agent availability";
+        core.warning(`Agent assignment failed for ${agentName} on ${type} #${number} due to ${errorType} error. Skipping due to ignore-if-error=true.`);
         core.info(`Error details: ${errorMessage}`);
-        _allResults.push({ issue_number: issueNumber, pull_number: pullNumber, agent: agentName, owner: effectiveOwner, repo: effectiveRepo, pull_request_repo: effectivePullRequestRepoSlug, success: true, skipped: true });
+        _allResults.push({
+          issue_number: issueNumber,
+          pull_number: pullNumber,
+          agent: agentName,
+          owner: effectiveOwner,
+          repo: effectiveRepo,
+          pull_request_repo: effectivePullRequestRepoSlug,
+          success: true,
+          skipped: true,
+          error: errorMessage,
+        });
         return { success: true, skipped: true };
       }
 
-      if (errorMessage.includes("coding agent is not available for this repository")) {
+      if (isAvailabilityError) {
         try {
-          const available = await getAvailableAgentLogins(effectiveOwner, effectiveRepo, githubClient);
+          const available = await getAvailableAgentLogins(effectiveOwner, effectiveRepo, issueNumber || pullNumber, githubClient);
           if (available.length > 0) errorMessage += ` (available agents: ${available.join(", ")})`;
         } catch (e) {
           core.debug("Failed to enrich unavailable agent message with available list");
@@ -452,18 +480,24 @@ function getAssignToAgentAssigned() {
 
 /**
  * Returns the "assignment_errors" output string for step outputs.
- * Format: "issue:N:agent:error" or "pr:N:agent:error" per failure, newline-separated.
+ * Format: "issue:N:agent:error" or "pr:N:agent:error" per failure/skipped-with-error,
+ * newline-separated.
  * @returns {string}
  */
 function getAssignToAgentErrors() {
-  return _allResults
-    .filter(r => !r.success && !r.skipped)
-    .map(r => {
-      const number = r.issue_number || r.pull_number;
-      const prefix = r.issue_number ? "issue" : "pr";
-      return `${prefix}:${number}:${r.agent}:${r.error}`;
-    })
-    .join("\n");
+  return (
+    _allResults
+      // Include skipped(ignore-if-error) entries that still captured an error so
+      // downstream failure handling can surface assignment problems in issue/comment reports.
+      // Include hard failures (!success) and ignored failures (skipped=true with error).
+      .filter(r => r.error && (r.skipped || !r.success))
+      .map(r => {
+        const number = r.issue_number || r.pull_number;
+        const prefix = r.issue_number ? "issue" : "pr";
+        return `${prefix}:${number}:${r.agent}:${r.error}`;
+      })
+      .join("\n")
+  );
 }
 
 /**

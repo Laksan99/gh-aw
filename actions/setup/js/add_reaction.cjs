@@ -63,10 +63,11 @@ async function main() {
 
 /**
  * Resolve the REST API endpoint for non-discussion events.
- * Returns null for discussion/discussion_comment/unsupported events (handled separately).
+ * Returns null for discussion/discussion_comment/pull_request_review/unsupported events (handled separately).
  * @param {string} eventName
  * @param {string} owner
  * @param {string} repo
+ * @param {Record<string, any>} payload
  * @returns {string | null}
  */
 function resolveRestEndpoint(eventName, owner, repo, payload) {
@@ -108,6 +109,10 @@ function resolveRestEndpoint(eventName, owner, repo, payload) {
       return `/repos/${owner}/${repo}/pulls/comments/${reviewCommentId}/reactions`;
     }
 
+    case "pull_request_review":
+      // Reactions are not supported on review objects; skip silently.
+      return null;
+
     default:
       return null;
   }
@@ -118,7 +123,7 @@ function resolveRestEndpoint(eventName, owner, repo, payload) {
  * @returns {boolean}
  */
 function isRestReactionEvent(eventName) {
-  return ["issues", "issue_comment", "pull_request", "pull_request_review_comment"].includes(eventName);
+  return ["issues", "issue_comment", "pull_request", "pull_request_review", "pull_request_review_comment"].includes(eventName);
 }
 
 /**
@@ -126,6 +131,7 @@ function isRestReactionEvent(eventName) {
  * @param {string} eventName
  * @param {string} owner
  * @param {string} repo
+ * @param {Record<string, any>} payload
  * @param {string} reaction
  */
 async function handleGraphQLOrUnknownEvent(eventName, owner, repo, payload, reaction) {

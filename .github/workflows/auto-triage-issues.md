@@ -1,4 +1,5 @@
 ---
+emoji: "🔧"
 name: Auto-Triage Issues
 description: Automatically labels new and existing unlabeled issues to improve discoverability and triage efficiency
 on:
@@ -6,15 +7,17 @@ on:
     types: [opened, edited]
   schedule: every 6h
   workflow_dispatch:
+max-daily-ai-credits: 10000
 user-rate-limit:
   max-runs-per-window: 5
   window: 60
 permissions:
   contents: read
   issues: read
+  copilot-requests: write
 engine:
-  id: copilot
-  model: gpt-5-mini
+  id: pi
+  model: copilot/gpt-5.4
 strict: true
 network:
   allowed:
@@ -23,7 +26,7 @@ network:
 imports:
   - shared/github-guard-policy.md
   - shared/reporting.md
-  - shared/observability-otlp.md
+  - shared/otlp.md
 tools:
   cli-proxy: true
   github:
@@ -56,8 +59,10 @@ safe-outputs:
   noop:
 timeout-minutes: 15
 features:
-  copilot-requests: true
-
+  gh-aw-detection: true
+sandbox:
+  agent:
+    sudo: false
 ---
 
 # Auto-Triage Issues Agent 🏷️
@@ -202,7 +207,7 @@ For the triggering issue (on issue events), you can omit `item_number`:
 }
 ```
 
-## Scheduled Run Report
+### Scheduled Run Report
 
 When running on schedule, create a discussion report following these formatting guidelines:
 

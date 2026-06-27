@@ -1,4 +1,6 @@
 ---
+private: true
+emoji: "📝"
 name: Multi-Device Docs Tester
 description: Tests documentation site functionality and responsive design across multiple device form factors
 on:
@@ -14,9 +16,10 @@ permissions:
   issues: read
   pull-requests: read
 tracker-id: daily-multi-device-docs-tester
+max-turns: 80  # 10 devices × ~5 turns each + setup/report overhead
 engine:
-  id: claude
-  max-turns: 80  # 10 devices × ~5 turns each + setup/report overhead
+  id: pi
+  model: copilot/gpt-5.4
 strict: true
 timeout-minutes: 30
 runtimes:
@@ -24,6 +27,8 @@ runtimes:
     version: "24"
 tools:
   cli-proxy: true
+  github:
+    mode: gh-proxy
   timeout: 120  # Playwright navigation on Astro dev server can take >60s; increase to 120s
   playwright:
     mode: cli
@@ -35,7 +40,6 @@ tools:
     - "playwright-cli*"  # CLI-mode playwright commands
     - "curl*"
     - "kill*"
-    - "pkill*"          # Kill processes by name (e.g. pkill -f "astro dev")
     - "lsof*"
     - "ls*"             # List files for directory navigation
     - "pwd*"            # Print working directory
@@ -63,13 +67,65 @@ network:
     - chrome
 
 imports:
-  - shared/docs-server-lifecycle.md
   - uses: shared/daily-audit-base.md
     with:
       title-prefix: "[multi-device-docs] "
       expires: 3d
 
-  - shared/observability-otlp.md
+  - shared/otlp.md
+pre-agent-steps:
+  - name: Install docs dependencies
+    env:
+      EXPR_GITHUB_WORKSPACE: ${{ github.workspace }}
+    run: |
+      cd "$EXPR_GITHUB_WORKSPACE/docs"
+      npm install
+  - name: Resolve slide deck PDF
+    env:
+      EXPR_GITHUB_WORKSPACE: ${{ github.workspace }}
+    run: |
+      cd "$EXPR_GITHUB_WORKSPACE/docs"
+      node ../scripts/ensure-docs-slide-pdf.js
+  - name: Start docs server
+    env:
+      EXPR_GITHUB_RUN_ID: ${{ github.run_id }}
+      EXPR_GITHUB_WORKSPACE: ${{ github.workspace }}
+    run: |
+      LOG_FILE="/tmp/gh-aw/agent/docs-server-$EXPR_GITHUB_RUN_ID.log"
+      PID_FILE="/tmp/gh-aw/agent/docs-server-$EXPR_GITHUB_RUN_ID.pid"
+      cd "$EXPR_GITHUB_WORKSPACE/docs"
+      nohup npm run dev -- --host 0.0.0.0 --port 4321 > "$LOG_FILE" 2>&1 &
+      PID=$!
+      echo $PID > "$PID_FILE"
+      echo "Server PID: $PID"
+      echo "Server log: $LOG_FILE"
+  - name: Wait for server readiness
+    env:
+      EXPR_GITHUB_RUN_ID: ${{ github.run_id }}
+    run: |
+      PID_FILE="/tmp/gh-aw/agent/docs-server-$EXPR_GITHUB_RUN_ID.pid"
+      LOG_FILE="/tmp/gh-aw/agent/docs-server-$EXPR_GITHUB_RUN_ID.log"
+      MAX_WAIT=135  # Maximum 135 seconds wait time
+      WAITED=0
+      until curl -sf http://localhost:4321/gh-aw/ > /dev/null 2>&1; do
+        # Check if the server process has already died
+        if [ -f "$PID_FILE" ] && ! kill -0 "$(cat "$PID_FILE")" 2>/dev/null; then
+          echo "::error::Documentation server process died before becoming ready. Server log:"
+          cat "$LOG_FILE"
+          exit 1
+        fi
+        WAITED=$((WAITED + 3))
+        if [ $WAITED -ge $MAX_WAIT ]; then
+          echo "::error::Documentation server did not start after ${MAX_WAIT}s. Server log:"
+          cat "$LOG_FILE"
+          exit 1
+        fi
+        echo "Waiting for server... ($WAITED/${MAX_WAIT}s)"
+        sleep 3
+      done
+      echo "Server ready at http://localhost:4321/gh-aw/!"
+features:
+  gh-aw-detection: true
 ---
 
 {{#runtime-import? .github/shared-instructions.md}}
@@ -99,18 +155,14 @@ This workflow has `strict: true` — it will fail if no safe output is produced.
 
 Start the documentation development server and perform comprehensive multi-device testing. Test layout responsiveness, accessibility, interactive elements, and visual rendering across all device types. Use a single Playwright browser instance for efficiency.
 
-## Step 1: Install Dependencies and Start Server
+## Step 1: Verify Server Availability
 
-Navigate to the docs folder and install dependencies:
+The workflow pre-agent steps already installed docs dependencies and started the Astro dev server.
+Quickly verify it is reachable before testing:
 
 ```bash
-cd ${{ github.workspace }}/docs
-npm install
+curl -sf http://localhost:4321/gh-aw/ > /dev/null && echo "Docs server is ready"
 ```
-
-Follow the shared **Documentation Server Lifecycle Management** instructions:
-1. Start the dev server (section "Starting the Documentation Preview Server")
-2. Wait for server readiness (section "Waiting for Server Readiness")
 
 ## Step 2: Device Configuration
 
@@ -226,7 +278,8 @@ Label with: `documentation`, `testing`, `automated`
 
 ## Step 6: Cleanup
 
-Follow the shared **Documentation Server Lifecycle Management** instructions for cleanup (section "Stopping the Documentation Server").
+No manual server cleanup is required in-agent for this workflow.
+The server lifecycle is handled by pre-agent setup and job teardown.
 
 ## Summary
 

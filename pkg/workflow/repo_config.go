@@ -8,10 +8,16 @@
 //
 //	{
 //	  "ghes": true,               // enables GHES compatibility mode (v3 artifact pins)
+//	  "help_command": false,      // disables builtin centralized /help comment handler
+//	  "utc": "-08:00", // project home UTC offset for rendered local times
+//	  "auto_upgrade": true, // set to true to generate agentic-auto-upgrade.yml with weekly schedule
 //	  "maintenance": {              // enables generation of agentics-maintenance.yml
 //	    "runs_on": "custom runner", // string or string[] – runner label(s) for all
 //	    "action_failure_issue_expires": 72, // expiration (hours) for conclusion failure issues
-//	    "label_triggers": true // set to true to enable all label-triggered jobs (opt-in)
+//	    "label_triggers": true, // set to true to enable all label-triggered jobs (opt-in)
+//	    "compile": {
+//	      "create_pull_request_github_token": "MY_REPO_TOKEN" // create/update a deduplicated PR instead of an issue
+//	    }
 //	  }                            // maintenance jobs (default: ubuntu-slim)
 //	}
 //
@@ -26,12 +32,15 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"regexp"
+	"strings"
 
 	"github.com/github/gh-aw/pkg/logger"
 	"github.com/github/gh-aw/pkg/parser"
 )
 
 var repoConfigLog = logger.New("workflow:repo_config")
+var repoConfigSecretNamePattern = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`)
 
 // RepoConfigFileName is the path of the repository-level configuration file
 // relative to the git root.
@@ -67,6 +76,14 @@ func (r *RunsOnValue) UnmarshalJSON(data []byte) error {
 }
 
 // MaintenanceConfig holds maintenance-workflow-specific settings from aw.json.
+type MaintenanceCompileConfig struct {
+	// CreatePullRequestGitHubToken is the secret name used by the compile-workflows
+	// maintenance job for GitHub API calls and branch pushes. When configured,
+	// out-of-sync compiled workflows are reported via a deduplicated pull request
+	// instead of an issue.
+	CreatePullRequestGitHubToken string `json:"create_pull_request_github_token,omitempty"`
+}
+
 type MaintenanceConfig struct {
 	// RunsOn is the runner label or labels used for all jobs in agentics-maintenance.yml.
 	RunsOn RunsOnValue `json:"runs_on,omitempty"`
@@ -81,6 +98,9 @@ type MaintenanceConfig struct {
 	// nil (omitted) or false both disable label-triggered jobs.
 	// To opt in, set label_triggers: true in aw.json.
 	LabelTriggers *bool `json:"label_triggers,omitempty"`
+
+	// Compile controls compile-workflows maintenance job behavior.
+	Compile *MaintenanceCompileConfig `json:"compile,omitempty"`
 }
 
 // IsLabelTriggerEnabled returns true only when label_triggers is explicitly set to true.
@@ -100,6 +120,21 @@ type RepoConfig struct {
 	// which are not supported on GHES.
 	GHES bool
 
+	// UTC is the project's home UTC offset used for rendering local times in CLI output.
+	// The value must be a numeric UTC offset such as "+00:00" or "-08:00".
+	UTC string
+
+	// HelpCommand controls builtin centralized /help command behavior.
+	// When nil or true, the builtin help command is enabled.
+	// Set to false in aw.json to disable it.
+	HelpCommand *bool
+
+	// AutoUpgrade enables generation of agentic-auto-upgrade.yml when true.
+	// The workflow runs on a fuzzy weekly schedule and runs the upgrade operation
+	// to check for and report available workflow upgrades.
+	// Opt-in: nil (omitted) or false both disable generation.
+	AutoUpgrade *bool
+
 	// MaintenanceDisabled is true when maintenance has been explicitly set to false
 	// in aw.json, disabling agentic-maintenance generation and any features that
 	// depend on it (such as expires).
@@ -109,6 +144,21 @@ type RepoConfig struct {
 	// and an object was provided (nil when maintenance is not configured or is
 	// disabled).
 	Maintenance *MaintenanceConfig
+
+	// ActionPins maps action repository@version references to replacement
+	// repository@version references. Enterprises running in a private cloud
+	// can use this to redirect actions to internal mirrors. Keys and values
+	// must use the format "owner/repo@ref".
+	ActionPins map[string]string
+}
+
+// IsAutoUpgradeEnabled returns true only when auto_upgrade is explicitly set to true.
+// The default (nil / omitted) is treated as disabled (false) — opt-in semantics.
+func (r *RepoConfig) IsAutoUpgradeEnabled() bool {
+	if r == nil || r.AutoUpgrade == nil {
+		return false
+	}
+	return *r.AutoUpgrade
 }
 
 // UnmarshalJSON implements json.Unmarshaler to handle the polymorphic maintenance
@@ -116,14 +166,22 @@ type RepoConfig struct {
 func (r *RepoConfig) UnmarshalJSON(data []byte) error {
 	// Use an intermediate struct with json.RawMessage to defer maintenance parsing.
 	var raw struct {
-		GHES        bool            `json:"ghes,omitempty"`
-		Maintenance json.RawMessage `json:"maintenance,omitempty"`
+		GHES        bool              `json:"ghes,omitempty"`
+		HelpCommand *bool             `json:"help_command,omitempty"` // nil = use default (enabled)
+		UTC         string            `json:"utc,omitempty"`
+		AutoUpgrade *bool             `json:"auto_upgrade,omitempty"`
+		Maintenance json.RawMessage   `json:"maintenance,omitempty"`
+		ActionPins  map[string]string `json:"action_pins,omitempty"`
 	}
 	if err := json.Unmarshal(data, &raw); err != nil {
 		return err
 	}
 
 	r.GHES = raw.GHES
+	r.HelpCommand = raw.HelpCommand
+	r.UTC = strings.TrimSpace(raw.UTC)
+	r.AutoUpgrade = raw.AutoUpgrade
+	r.ActionPins = raw.ActionPins
 
 	if len(raw.Maintenance) == 0 || string(raw.Maintenance) == "null" {
 		return nil
@@ -145,6 +203,15 @@ func (r *RepoConfig) UnmarshalJSON(data []byte) error {
 	repoConfigLog.Printf("Maintenance field parsed as object: runsOn=%v, issueExpires=%d", mc.RunsOn, mc.ActionFailureIssueExpires)
 	r.Maintenance = &mc
 	return nil
+}
+
+// IsHelpCommandEnabled returns true when the builtin centralized /help command
+// handler should be enabled. The default is enabled.
+func (r *RepoConfig) IsHelpCommandEnabled() bool {
+	if r == nil || r.HelpCommand == nil {
+		return true
+	}
+	return *r.HelpCommand
 }
 
 // LoadRepoConfig loads and validates .github/workflows/aw.json from the
@@ -175,6 +242,9 @@ func LoadRepoConfig(gitRoot string) (*RepoConfig, error) {
 	if err := json.Unmarshal(data, &cfg); err != nil {
 		return nil, fmt.Errorf("failed to parse %s: %w", RepoConfigFileName, err)
 	}
+	if err := validateRepoConfigValues(&cfg); err != nil {
+		return nil, err
+	}
 
 	return &cfg, nil
 }
@@ -198,6 +268,29 @@ func validateRepoConfigJSON(data []byte, filePath string) error {
 	}
 
 	repoConfigLog.Print("Repo config JSON schema validation passed")
+	return nil
+}
+
+func validateRepoConfigValues(cfg *RepoConfig) error {
+	if cfg == nil {
+		return nil
+	}
+	if cfg.UTC != "" {
+		normalized, err := NormalizeUTCOffset(cfg.UTC)
+		if err != nil {
+			return fmt.Errorf("invalid %s: utc %w", RepoConfigFileName, err)
+		}
+		cfg.UTC = normalized
+	}
+
+	if cfg.Maintenance == nil || cfg.Maintenance.Compile == nil {
+		return nil
+	}
+	compileCfg := cfg.Maintenance.Compile
+	secretName := compileCfg.CreatePullRequestGitHubToken
+	if secretName != "" && !repoConfigSecretNamePattern.MatchString(secretName) {
+		return fmt.Errorf("invalid %s: maintenance.compile.create_pull_request_github_token must match %s", RepoConfigFileName, repoConfigSecretNamePattern.String())
+	}
 	return nil
 }
 

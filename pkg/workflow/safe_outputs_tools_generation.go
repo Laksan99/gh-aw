@@ -3,8 +3,8 @@ package workflow
 import (
 	"encoding/json"
 	"fmt"
-	"sort"
 
+	"github.com/github/gh-aw/pkg/sliceutil"
 	"github.com/github/gh-aw/pkg/stringutil"
 )
 
@@ -36,11 +36,7 @@ func generateDynamicTools(data *WorkflowData, markdownPath string) ([]map[string
 		safeOutputsConfigLog.Printf("Adding %d custom job tools", len(data.SafeOutputs.Jobs))
 
 		// Sort job names for deterministic output
-		jobNames := make([]string, 0, len(data.SafeOutputs.Jobs))
-		for jobName := range data.SafeOutputs.Jobs {
-			jobNames = append(jobNames, jobName)
-		}
-		sort.Strings(jobNames)
+		jobNames := sliceutil.SortedKeys(data.SafeOutputs.Jobs)
 
 		for _, jobName := range jobNames {
 			jobConfig := data.SafeOutputs.Jobs[jobName]
@@ -54,11 +50,7 @@ func generateDynamicTools(data *WorkflowData, markdownPath string) ([]map[string
 	if len(data.SafeOutputs.Scripts) > 0 {
 		safeOutputsConfigLog.Printf("Adding %d custom script tools to dynamic tools", len(data.SafeOutputs.Scripts))
 
-		scriptNames := make([]string, 0, len(data.SafeOutputs.Scripts))
-		for scriptName := range data.SafeOutputs.Scripts {
-			scriptNames = append(scriptNames, scriptName)
-		}
-		sort.Strings(scriptNames)
+		scriptNames := sliceutil.SortedKeys(data.SafeOutputs.Scripts)
 
 		for _, scriptName := range scriptNames {
 			scriptConfig := data.SafeOutputs.Scripts[scriptName]
@@ -75,11 +67,7 @@ func generateDynamicTools(data *WorkflowData, markdownPath string) ([]map[string
 	if len(data.SafeOutputs.Actions) > 0 {
 		safeOutputsConfigLog.Printf("Adding %d custom action tools to dynamic tools", len(data.SafeOutputs.Actions))
 
-		actionNames := make([]string, 0, len(data.SafeOutputs.Actions))
-		for actionName := range data.SafeOutputs.Actions {
-			actionNames = append(actionNames, actionName)
-		}
-		sort.Strings(actionNames)
+		actionNames := sliceutil.SortedKeys(data.SafeOutputs.Actions)
 
 		for _, actionName := range actionNames {
 			actionConfig := data.SafeOutputs.Actions[actionName]
@@ -146,11 +134,7 @@ func generateDynamicTools(data *WorkflowData, markdownPath string) ([]map[string
 		safeOutputsConfigLog.Printf("Adding %d dispatch_repository tools to dynamic tools", len(data.SafeOutputs.DispatchRepository.Tools))
 
 		// Sort tool keys for deterministic output
-		toolKeys := make([]string, 0, len(data.SafeOutputs.DispatchRepository.Tools))
-		for toolKey := range data.SafeOutputs.DispatchRepository.Tools {
-			toolKeys = append(toolKeys, toolKey)
-		}
-		sort.Strings(toolKeys)
+		toolKeys := sliceutil.SortedKeys(data.SafeOutputs.DispatchRepository.Tools)
 
 		for _, toolKey := range toolKeys {
 			toolConfig := data.SafeOutputs.DispatchRepository.Tools[toolKey]
@@ -229,6 +213,48 @@ type ToolsMeta struct {
 	// targets, and call_workflow targets. These are workflow-specific and cannot be
 	// derived from the static safe_outputs_tools.json at runtime.
 	DynamicTools []map[string]any `json:"dynamic_tools"`
+	// RequiredFieldRemovals maps tool name → list of field names to remove from the
+	// inputSchema.required array. Used when a field that is required in the static
+	// safe_outputs_tools.json should be optional for this specific workflow (e.g. when
+	// allow-body: false is configured for close_discussion or close_issue).
+	RequiredFieldRemovals map[string][]string `json:"required_field_removals,omitempty"`
+	// RequiredFieldAdditions maps tool name → list of field names to add to the
+	// inputSchema.required array. Used when a field that is optional in the static
+	// safe_outputs_tools.json should be required for this specific workflow.
+	RequiredFieldAdditions map[string][]string `json:"required_field_additions,omitempty"`
+}
+
+// computeRequiredFieldRemovals returns a map of tool name → required fields to remove
+// based on the safe-outputs configuration. Currently handles allow-body: false for
+// close_discussion and close_issue.
+func computeRequiredFieldRemovals(safeOutputs *SafeOutputsConfig) map[string][]string {
+	removals := make(map[string][]string)
+	if safeOutputs == nil {
+		return removals
+	}
+	if safeOutputs.CloseDiscussions != nil && safeOutputs.CloseDiscussions.AllowBody != nil && !*safeOutputs.CloseDiscussions.AllowBody {
+		removals["close_discussion"] = []string{"body"}
+	}
+	if safeOutputs.CloseIssues != nil && safeOutputs.CloseIssues.AllowBody != nil && !*safeOutputs.CloseIssues.AllowBody {
+		removals["close_issue"] = []string{"body"}
+	}
+	return removals
+}
+
+// computeRequiredFieldAdditions returns a map of tool name → required fields to add
+// based on the safe-outputs configuration.
+func computeRequiredFieldAdditions(safeOutputs *SafeOutputsConfig) map[string][]string {
+	additions := make(map[string][]string)
+	if safeOutputs == nil {
+		return additions
+	}
+	if safeOutputs.CreateIssues != nil && safeOutputs.CreateIssues.RequireTemporaryID {
+		additions["create_issue"] = []string{"temporary_id"}
+	}
+	if safeOutputs.CreatePullRequests != nil && safeOutputs.CreatePullRequests.RequireTemporaryID {
+		additions["create_pull_request"] = []string{"temporary_id"}
+	}
+	return additions
 }
 
 // generateToolsMetaJSON generates the content for tools_meta.json: a compact file
@@ -286,10 +312,16 @@ func generateToolsMetaJSON(data *WorkflowData, markdownPath string) (string, err
 		dynamicTools = []map[string]any{}
 	}
 
+	// Compute required field removals (e.g. body when allow-body: false).
+	requiredFieldRemovals := computeRequiredFieldRemovals(data.SafeOutputs)
+	requiredFieldAdditions := computeRequiredFieldAdditions(data.SafeOutputs)
+
 	meta := ToolsMeta{
-		DescriptionSuffixes: descriptionSuffixes,
-		RepoParams:          repoParams,
-		DynamicTools:        dynamicTools,
+		DescriptionSuffixes:    descriptionSuffixes,
+		RepoParams:             repoParams,
+		DynamicTools:           dynamicTools,
+		RequiredFieldRemovals:  requiredFieldRemovals,
+		RequiredFieldAdditions: requiredFieldAdditions,
 	}
 
 	result, err := json.MarshalIndent(meta, "", "  ")

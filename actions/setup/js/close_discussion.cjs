@@ -12,6 +12,8 @@ const { isStagedMode } = require("./safe_output_helpers.cjs");
 const { createAuthenticatedGitHubClient } = require("./handler_auth.cjs");
 const { ERR_NOT_FOUND } = require("./error_codes.cjs");
 const { resolveNumberFromTemporaryId } = require("./temporary_id.cjs");
+const { resolveAllowedMentionsFromPayload } = require("./resolve_mentions_from_payload.cjs");
+const { resolveTargetRepoConfig, resolveAndValidateRepo } = require("./repo_helpers.cjs");
 
 /**
  * Get discussion details using GraphQL with pagination for labels
@@ -163,11 +165,24 @@ async function main(config = {}) {
   const requiredTitlePrefix = config.required_title_prefix || "";
   const maxCount = config.max || 10;
   const githubClient = await createAuthenticatedGitHubClient(config);
+  const allowBody = config.allow_body !== false; // default true; false only when explicitly set to false
+  let allowedMentionAliases = [];
+  if (Array.isArray(config.allowedMentionAliases)) {
+    allowedMentionAliases = config.allowedMentionAliases;
+  } else if (config.mentions != null) {
+    allowedMentionAliases = await resolveAllowedMentionsFromPayload(context, githubClient, core, config.mentions);
+  }
+
+  const { defaultTargetRepo, allowedRepos } = resolveTargetRepoConfig(config);
+  if (defaultTargetRepo) {
+    core.info(`Target repository: ${defaultTargetRepo}`);
+  }
+  if (allowedRepos.size > 0) core.info(`Allowed repositories: ${Array.from(allowedRepos).join(", ")}`);
 
   // Check if we're in staged mode
   const isStaged = isStagedMode(config);
 
-  core.info(`Close discussion configuration: max=${maxCount}`);
+  core.info(`Close discussion configuration: max=${maxCount}, allow_body=${allowBody}`);
   if (requiredLabels.length > 0) {
     core.info(`Required labels: ${requiredLabels.join(", ")}`);
   }
@@ -195,6 +210,15 @@ async function main(config = {}) {
     }
 
     processedCount++;
+
+    // Resolve and validate target repository for this item
+    const repoResult = resolveAndValidateRepo(item, defaultTargetRepo, allowedRepos, "discussion");
+    if (!repoResult.success) {
+      core.warning(`Skipping close_discussion: ${repoResult.error}`);
+      return { success: false, error: repoResult.error };
+    }
+    const discussionOwner = repoResult.repoParts.owner;
+    const discussionRepo = repoResult.repoParts.repo;
 
     // Determine discussion number
     let discussionNumber;
@@ -227,7 +251,7 @@ async function main(config = {}) {
 
     try {
       // Fetch discussion details
-      const discussion = await getDiscussionDetails(githubClient, context.repo.owner, context.repo.repo, discussionNumber);
+      const discussion = await getDiscussionDetails(githubClient, discussionOwner, discussionRepo, discussionNumber);
 
       // Validate required labels if configured
       if (requiredLabels.length > 0) {
@@ -271,10 +295,17 @@ async function main(config = {}) {
         };
       }
 
-      // Add comment if body is provided
+      // Add comment if body is provided and allow-body is not false
       let commentUrl;
-      if (item.body) {
-        const sanitizedBody = sanitizeContent(item.body);
+      if (!allowBody) {
+        // allow-body: false — drop any body the agent provided and close without a comment
+        if (item.body) {
+          core.warning(`close_discussion: allow-body is false — dropping non-empty body (length=${item.body.length}) and closing without a comment`);
+        } else {
+          core.info("close_discussion: allow-body is false — closing without a comment");
+        }
+      } else if (item.body) {
+        const sanitizedBody = sanitizeContent(item.body, { allowedAliases: allowedMentionAliases });
         const comment = await addDiscussionComment(githubClient, discussion.id, sanitizedBody);
         core.info(`Added comment to discussion #${discussionNumber}: ${comment.url}`);
         commentUrl = comment.url;

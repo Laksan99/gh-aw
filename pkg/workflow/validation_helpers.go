@@ -21,7 +21,7 @@
 //   - Reduce cognitive overhead when writing new validators
 //
 // For the validation architecture overview, see validation.go.
-// Parse/coercion helpers (parseStringSliceAny, preprocessProtectedFilesField) live in parse_helpers.go.
+// Parse/coercion helpers live in parse_helpers.go and config_preprocessing.go.
 
 package workflow
 
@@ -96,6 +96,55 @@ func validateMountStringFormat(mount string) (source, dest, mode string, err err
 	return parts[0], parts[1], parts[2], nil
 }
 
+// mountValidationKind classifies the result of parsing and validating a mount entry.
+// Callers use it to translate shared parsing results into context-specific errors
+// without re-implementing format, mode, and empty-path branching.
+type mountValidationKind int
+
+const (
+	// mountValidationOK indicates the mount parsed successfully and both paths are non-empty.
+	mountValidationOK mountValidationKind = iota
+	// mountValidationFormatError indicates the mount did not have exactly three colon-separated parts.
+	mountValidationFormatError
+	// mountValidationModeError indicates the mount mode was present but not one of "ro" or "rw".
+	mountValidationModeError
+	// mountValidationEmptySource indicates the mount source path was empty after successful parsing.
+	mountValidationEmptySource
+	// mountValidationEmptyDestination indicates the mount destination path was empty after successful parsing.
+	mountValidationEmptyDestination
+)
+
+// mountParts contains the parsed components of a mount string.
+// Fields may still be populated when validation fails after parsing, such as for
+// invalid modes or empty source/destination paths.
+type mountParts struct {
+	source string
+	dest   string
+	mode   string
+}
+
+// parseMountEntry parses a mount string and classifies the validation result.
+// It returns the parsed parts together with a mountValidationKind so callers can
+// map the shared result to their own error constructors. On format errors the
+// returned parts are empty; on mode and empty-path errors any successfully parsed
+// fields are preserved in mountParts.
+func parseMountEntry(mount string) (mountParts, mountValidationKind) {
+	source, dest, mode, err := validateMountStringFormat(mount)
+	if err != nil {
+		if source == "" && dest == "" && mode == "" {
+			return mountParts{}, mountValidationFormatError
+		}
+		return mountParts{source: source, dest: dest, mode: mode}, mountValidationModeError
+	}
+	if source == "" {
+		return mountParts{source: source, dest: dest, mode: mode}, mountValidationEmptySource
+	}
+	if dest == "" {
+		return mountParts{source: source, dest: dest, mode: mode}, mountValidationEmptyDestination
+	}
+	return mountParts{source: source, dest: dest, mode: mode}, mountValidationOK
+}
+
 // validateStringEnumField checks that a config field, if present, contains one
 // of the allowed string values. Non-string values and unrecognised strings are
 // removed from the map (treated as absent) and a warning is logged. Use this
@@ -104,7 +153,7 @@ func validateMountStringFormat(mount string) (source, dest, mode string, err err
 // GitHub Actions expression strings (e.g. "${{ inputs.policy }}") are accepted
 // without enum validation and passed through unchanged; the resolved value is
 // validated at runtime by the safe-output handler.
-func validateStringEnumField(configData map[string]any, fieldName string, allowed []string, log *logger.Logger) {
+func validateStringEnumField(configData map[string]any, fieldName string, allowed []string, debugLog *logger.Logger) {
 	if configData == nil {
 		return
 	}
@@ -114,22 +163,22 @@ func validateStringEnumField(configData map[string]any, fieldName string, allowe
 	}
 	strVal, ok := val.(string)
 	if !ok {
-		if log != nil {
-			log.Printf("Invalid %s value %v (must be one of %v), ignoring", fieldName, val, allowed)
+		if debugLog != nil {
+			debugLog.Printf("Invalid %s value %v (must be one of %v), ignoring", fieldName, val, allowed)
 		}
 		delete(configData, fieldName)
 		return
 	}
 	// GitHub Actions expressions are validated at runtime by the handler.
 	if containsExpression(strVal) {
-		if log != nil {
-			log.Printf("%s value is a GitHub Actions expression, skipping compile-time enum validation", fieldName)
+		if debugLog != nil {
+			debugLog.Printf("%s value is a GitHub Actions expression, skipping compile-time enum validation", fieldName)
 		}
 		return
 	}
 	if !slices.Contains(allowed, strVal) {
-		if log != nil {
-			log.Printf("Invalid %s value %v (must be one of %v), ignoring", fieldName, val, allowed)
+		if debugLog != nil {
+			debugLog.Printf("Invalid %s value %v (must be one of %v), ignoring", fieldName, val, allowed)
 		}
 		delete(configData, fieldName)
 	}

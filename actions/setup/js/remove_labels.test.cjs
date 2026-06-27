@@ -107,6 +107,95 @@ describe("remove_labels", () => {
       expect(removeLabelCalls[1].name).toBe("enhancement");
     });
 
+    it("should accept structured label entries and remove normalized label names", async () => {
+      const handler = await main({ max: 10 });
+      const removeLabelCalls = [];
+
+      mockGithub.rest.issues.removeLabel = async params => {
+        removeLabelCalls.push(params);
+        return {};
+      };
+
+      const result = await handler(
+        {
+          item_number: 456,
+          labels: [{ name: "bug", rationale: "No longer needed", confidence: "medium" }],
+        },
+        {}
+      );
+
+      expect(result.success).toBe(true);
+      expect(result.number).toBe(456);
+      expect(removeLabelCalls).toHaveLength(1);
+      expect(removeLabelCalls[0].name).toBe("bug");
+    });
+
+    it("should accept issue_number as an alias for item_number", async () => {
+      const handler = await main({ max: 10 });
+      const removeLabelCalls = [];
+
+      mockGithub.rest.issues.removeLabel = async params => {
+        removeLabelCalls.push(params);
+        return {};
+      };
+
+      const result = await handler(
+        {
+          issue_number: 456,
+          labels: ["bug"],
+        },
+        {}
+      );
+
+      expect(result.success).toBe(true);
+      expect(result.number).toBe(456);
+      expect(removeLabelCalls[0].issue_number).toBe(456);
+    });
+
+    it("should accept pr_number as an alias for item_number", async () => {
+      const handler = await main({ max: 10 });
+      const removeLabelCalls = [];
+
+      mockGithub.rest.issues.removeLabel = async params => {
+        removeLabelCalls.push(params);
+        return {};
+      };
+
+      const result = await handler(
+        {
+          pr_number: 789,
+          labels: ["enhancement"],
+        },
+        {}
+      );
+
+      expect(result.success).toBe(true);
+      expect(result.number).toBe(789);
+      expect(removeLabelCalls[0].issue_number).toBe(789);
+    });
+
+    it("should accept pull_number as an alias for item_number", async () => {
+      const handler = await main({ max: 10 });
+      const removeLabelCalls = [];
+
+      mockGithub.rest.issues.removeLabel = async params => {
+        removeLabelCalls.push(params);
+        return {};
+      };
+
+      const result = await handler(
+        {
+          pull_number: 101,
+          labels: ["needs-review"],
+        },
+        {}
+      );
+
+      expect(result.success).toBe(true);
+      expect(result.number).toBe(101);
+      expect(removeLabelCalls[0].issue_number).toBe(101);
+    });
+
     it("should remove labels from an issue from context when item_number not provided", async () => {
       const handler = await main({ max: 10 });
       const removeLabelCalls = [];
@@ -127,6 +216,40 @@ describe("remove_labels", () => {
       expect(result.number).toBe(123);
       expect(result.labelsRemoved).toEqual(["documentation"]);
       expect(result.contextType).toBe("issue");
+    });
+
+    it("should remove labels from workflow_dispatch aw_context when issue payload is absent", async () => {
+      mockContext.eventName = "workflow_dispatch";
+      mockContext.payload = {
+        inputs: {
+          aw_context: JSON.stringify({
+            event_type: "issue_comment",
+            item_type: "issue",
+            item_number: 456,
+            repo: "test-owner/test-repo",
+          }),
+        },
+      };
+
+      const handler = await main({ max: 10 });
+      const removeLabelCalls = [];
+
+      mockGithub.rest.issues.removeLabel = async params => {
+        removeLabelCalls.push(params);
+        return {};
+      };
+
+      const result = await handler(
+        {
+          labels: ["documentation"],
+        },
+        {}
+      );
+
+      expect(result.success).toBe(true);
+      expect(result.number).toBe(456);
+      expect(result.contextType).toBe("issue");
+      expect(removeLabelCalls[0].issue_number).toBe(456);
     });
 
     it("should remove labels from a pull request from context", async () => {

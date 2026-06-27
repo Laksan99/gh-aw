@@ -1,52 +1,50 @@
 ---
-name: Ubuntu Actions Image Analyzer
-description: Weekly analysis of the default Ubuntu Actions runner image and guidance for creating Docker mimics
 on:
   schedule: weekly
-  workflow_dispatch:
-
+  workflow_dispatch: null
 permissions:
-  contents: read
   actions: read
+  contents: read
   issues: read
   pull-requests: read
-
-tracker-id: ubuntu-image-analyzer
-engine: copilot
-imports:
-  - uses: shared/skip-if-issue-open.md
-    with:
-      title-prefix: "[ubuntu-image]"
-      kind: "pr"
-  - uses: shared/daily-pr-base.md
-    with:
-      title-prefix: "[ubuntu-image] "
-      expires: "2d"
-      labels: [documentation, automation, infrastructure]
-  - shared/observability-otlp.md
-strict: true
-
 network:
   allowed:
-    - defaults
-    - github
-
+  - defaults
+  - github
+imports:
+- uses: shared/skip-if-issue-open.md
+  with:
+    kind: pr
+    title-prefix: "[ubuntu-image]"
+- uses: shared/daily-pr-base.md
+  with:
+    expires: 2d
+    labels:
+    - documentation
+    - automation
+    - infrastructure
+    title-prefix: "[ubuntu-image] "
+- shared/otlp.md
+description: Weekly analysis of the default Ubuntu Actions runner image and guidance for creating Docker mimics
+emoji: 🐧
+engine: copilot
+name: Ubuntu Actions Image Analyzer
+strict: true
+timeout-minutes: 30
 tools:
+  bash:
+  - find .github/workflows -name "*.lock.yml" -type f
+  - cat research/ubuntulatest.md
+  - git
   cli-proxy: true
+  edit: null
   github:
     mode: gh-proxy
-    toolsets: [default, actions]
-  edit:
-  bash:
-    - "find .github/workflows -name '*.lock.yml' -type f"
-    - "cat research/ubuntulatest.md"
-    - "git"
-
-timeout-minutes: 30
-
-
+    toolsets:
+    - default
+    - actions
+tracker-id: ubuntu-image-analyzer
 ---
-
 # Ubuntu Actions Image Analyzer
 
 You are an AI agent that analyzes the default Ubuntu Actions runner image and maintains documentation about its contents and how to create Docker images that mimic it.
@@ -70,6 +68,12 @@ Use `gh` CLI to read data from GitHub:
 - `gh run list` - List workflow runs to find logs
 - `gh run view <id> --log` - Download workflow logs
 - `gh api repos/<owner>/<repo>/contents/<path>` - Read files from GitHub repositories
+- Prefer a single raw-content API request redirected to a file
+
+### Command Guardrails (Required)
+- Do **NOT** decode `.content` payloads with `base64 -d`, Python, Node.js, Go, awk, perl, or similar pipelines.
+- Do **NOT** repeatedly retry variations of the same blocked command.
+- If a command fails due to permission/policy, stop that approach immediately and use `report_incomplete` with the blocked command and error.
 
 ### File Editing Tools
 Use these tools to create or modify local files:
@@ -120,7 +124,7 @@ gh run view <run_id> --repo ${{ github.repository }} --log 2>&1 | grep "Included
 
 ### 2. Download Runner Image Documentation
 
-Use `gh api` to download the runner image documentation:
+Use `gh api` to download the runner image documentation as **raw markdown** in one step:
 
 **IMPORTANT**: The URL format from step 1 is:
 ```
@@ -133,14 +137,20 @@ Parse this URL to extract:
 - **ref**: `<branch>` (e.g., `ubuntu24`)
 - **path**: `images/ubuntu/Ubuntu<version>-Readme.md` (e.g., `images/ubuntu/Ubuntu2404-Readme.md`)
 
-Then use `gh api` to fetch the file:
+Then use `gh api` to fetch the file and write it directly to disk:
 
 ```bash
-# Example gh CLI usage
-gh api repos/actions/runner-images/contents/images/ubuntu/Ubuntu2404-Readme.md \
+# Example gh CLI usage (single command, no base64 decode)
+gh api \
   --header "Accept: application/vnd.github.raw" \
-  --header "X-GitHub-Api-Version: 2022-11-28"
+  "repos/actions/runner-images/contents/images/ubuntu/Ubuntu2404-Readme.md?ref=ubuntu24/20260525.161" \
+  > /tmp/gh-aw/agent/ubuntu2404-readme.md
+
+# Validate you got markdown content
+head -120 /tmp/gh-aw/agent/ubuntu2404-readme.md
 ```
+
+If the response is not raw markdown, do not attempt base64 decoding. Stop and use `report_incomplete` with the failing command and response details.
 
 The documentation is a comprehensive markdown file that includes:
 - Installed software and tools

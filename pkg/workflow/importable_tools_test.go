@@ -142,9 +142,10 @@ Uses imported agentic-workflows tool.
 	workflowData := string(lockFileContent)
 
 	// Verify containerized agenticworkflows server is present (per MCP Gateway Specification v1.0.0)
-	// In dev mode, no entrypoint or entrypointArgs (uses container's defaults)
-	if strings.Contains(workflowData, `"entrypointArgs"`) {
-		t.Error("Did not expect entrypointArgs field in dev mode (uses container's CMD)")
+	// In dev mode, agenticworkflows has no entrypoint or entrypointArgs (uses container's defaults).
+	// Note: safeoutputs section always includes entrypoint = "sh" — only agenticworkflows omits it in dev mode.
+	if strings.Contains(workflowData, `"entrypointArgs": ["mcp-server", "--validate-actor"]`) {
+		t.Error("Did not expect release-mode agenticworkflows entrypointArgs in dev mode (uses container's CMD)")
 	}
 
 	if strings.Contains(workflowData, `"--cmd"`) {
@@ -157,9 +158,9 @@ Uses imported agentic-workflows tool.
 		t.Error("Expected compiled workflow to contain localhost/gh-aw:dev container for agentic-workflows in dev mode")
 	}
 
-	// Verify NO entrypoint field (uses container's default ENTRYPOINT)
-	if strings.Contains(workflowData, `"entrypoint"`) {
-		t.Error("Did not expect entrypoint field in dev mode (uses container's ENTRYPOINT)")
+	// Verify NO release-mode agenticworkflows entrypoint (uses container's default ENTRYPOINT in dev mode)
+	if strings.Contains(workflowData, `"entrypoint": "${RUNNER_TEMP}/gh-aw/gh-aw"`) {
+		t.Error("Did not expect release-mode agenticworkflows entrypoint in dev mode (uses container's ENTRYPOINT)")
 	}
 
 	// Verify ${RUNNER_TEMP}/gh-aw is always mounted read-only for security
@@ -801,6 +802,8 @@ permissions:
   issues: read
 tools:
   bash: true
+features:
+  dangerously-disable-sandbox-agent: "controlled environment with no internet access"
 sandbox:
   agent: false
 imports:
@@ -890,6 +893,8 @@ strict: false
 permissions:
   contents: read
   issues: read
+features:
+  dangerously-disable-sandbox-agent: "controlled environment with no internet access"
 sandbox:
   agent: false
 imports:
@@ -962,6 +967,8 @@ permissions:
   issues: read
 tools:
   github: false
+features:
+  dangerously-disable-sandbox-agent: "controlled environment with no internet access"
 sandbox:
   agent: false
 imports:
@@ -1128,9 +1135,8 @@ Uses imported MCP timeout setting.
 	}
 }
 
-// TestImportMaxLimitsFromSharedWorkflow verifies that top-level max-runs and
-// max-effective-tokens can be imported from a shared workflow and resolved from
-// import-schema defaults.
+// TestImportMaxLimitsFromSharedWorkflow verifies that top-level max-runs can be
+// imported from a shared workflow and resolved from import-schema defaults.
 func TestImportMaxLimitsFromSharedWorkflow(t *testing.T) {
 	tempDir := testutil.TempDir(t, "test-*")
 
@@ -1140,12 +1146,8 @@ import-schema:
   max-runs:
     type: integer
     default: 37
-  max-effective-tokens:
-    type: integer
-    default: 424242
 
 max-runs: ${{ github.aw.import-inputs.max-runs }}
-max-effective-tokens: ${{ github.aw.import-inputs.max-effective-tokens }}
 ---
 
 # Shared max limits
@@ -1182,11 +1184,8 @@ permissions:
 	}
 
 	lockContent := string(lockFileContent)
-	if !strings.Contains(lockContent, `"maxRuns":37`) {
+	if !strings.Contains(lockContent, `\"maxRuns\":37`) {
 		t.Errorf("Expected lock file to contain apiProxy.maxRuns from imported workflow, got:\n%s", lockContent)
-	}
-	if !strings.Contains(lockContent, `"maxEffectiveTokens":424242`) {
-		t.Errorf("Expected lock file to contain apiProxy.maxEffectiveTokens from imported workflow, got:\n%s", lockContent)
 	}
 }
 

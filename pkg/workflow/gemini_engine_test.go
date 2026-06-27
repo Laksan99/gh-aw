@@ -23,7 +23,7 @@ func TestGeminiEngine(t *testing.T) {
 	t.Run("capabilities", func(t *testing.T) {
 		capabilities := engine.GetCapabilities()
 		assert.True(t, capabilities.ToolsAllowlist, "Should support tools allowlist")
-		assert.False(t, capabilities.MaxTurns, "Should not support max turns")
+		assert.True(t, capabilities.MaxTurns, "Should support max turns")
 		assert.False(t, capabilities.WebSearch, "Should not support built-in web search")
 	})
 
@@ -97,6 +97,7 @@ func TestGeminiEngineInstallation(t *testing.T) {
 			stepContent := strings.Join(steps[1], "\n")
 			assert.Contains(t, stepContent, "Install Gemini CLI", "Second step should install Gemini CLI")
 			assert.Contains(t, stepContent, "@google/gemini-cli", "Should install @google/gemini-cli package")
+			assert.NotContains(t, stepContent, "NPM_CONFIG_MIN_RELEASE_AGE", "Gemini installation should not set npm release-age cooldown")
 		}
 	})
 
@@ -343,7 +344,7 @@ func TestGeminiEngineFirewallIntegration(t *testing.T) {
 		assert.Contains(t, stepContent, "awf", "Should use AWF when firewall is enabled")
 		// With config file support, domains and apiProxy are in the JSON config
 		assert.Contains(t, stepContent, "allowDomains", "Should include allowDomains in config JSON")
-		assert.Contains(t, stepContent, `"enabled":true`, "Should include apiProxy enabled in config JSON")
+		assert.Contains(t, stepContent, `\"enabled\":true`, "Should include apiProxy enabled in config JSON")
 		assert.Contains(t, stepContent, "GEMINI_API_BASE_URL: http://host.docker.internal:10003", "Should set GEMINI_API_BASE_URL to LLM gateway URL")
 	})
 

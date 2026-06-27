@@ -10,11 +10,15 @@ const {
   AWF_REFLECT_OUTPUT_PATH,
   AWF_REFLECT_TIMEOUT_MS,
   AWF_MODELS_URL_TIMEOUT_MS,
+  AWF_MODELS_URL_MAX_ATTEMPTS,
+  AWF_MODELS_URL_RETRY_BASE_MS,
+  AWF_MODELS_URL_RETRY_MAX_MS,
   GEMINI_MODEL_NAME_PREFIX,
   enrichReflectModels,
   extractModelIds,
   fetchAWFReflect,
   fetchModelsFromUrl,
+  resolveCopilotSDKCustomProviderFromReflect,
 } = require("./awf_reflect.cjs");
 
 describe("awf_reflect.cjs", () => {
@@ -22,8 +26,11 @@ describe("awf_reflect.cjs", () => {
     it("exports expected default values", () => {
       expect(AWF_API_PROXY_REFLECT_URL).toBe("http://api-proxy:10000/reflect");
       expect(AWF_REFLECT_OUTPUT_PATH).toBe("/tmp/gh-aw/sandbox/firewall/awf-reflect.json");
-      expect(AWF_REFLECT_TIMEOUT_MS).toBe(5000);
+      expect(AWF_REFLECT_TIMEOUT_MS).toBe(60000);
       expect(AWF_MODELS_URL_TIMEOUT_MS).toBe(3000);
+      expect(AWF_MODELS_URL_MAX_ATTEMPTS).toBe(5);
+      expect(AWF_MODELS_URL_RETRY_BASE_MS).toBe(250);
+      expect(AWF_MODELS_URL_RETRY_MAX_MS).toBe(2000);
       expect(GEMINI_MODEL_NAME_PREFIX).toBe("models/");
     });
   });
@@ -142,6 +149,9 @@ describe("awf_reflect.cjs", () => {
   describe("fetchModelsFromUrl", () => {
     afterEach(() => {
       vi.unstubAllGlobals();
+      delete process.env.AWF_AUTH_TYPE;
+      delete process.env.AWF_MODELS_URL_OIDC_INITIAL_DELAY_MS;
+      vi.useRealTimers();
     });
 
     it("returns model IDs on successful fetch", async () => {
@@ -171,6 +181,54 @@ describe("awf_reflect.cjs", () => {
       expect(result).toBeNull();
       expect(logs.some(l => l.includes("models fetch error"))).toBe(true);
     });
+
+    it("retries on 503 and eventually succeeds", async () => {
+      vi.stubGlobal(
+        "fetch",
+        vi
+          .fn()
+          .mockResolvedValueOnce({ ok: false, status: 503 })
+          .mockResolvedValueOnce({ ok: false, status: 503 })
+          .mockResolvedValueOnce({ ok: true, status: 200, json: async () => ({ data: [{ id: "gpt-4o" }] }) })
+      );
+
+      const logs = [];
+      const result = await fetchModelsFromUrl("http://api-proxy:10000/v1/models", 1000, msg => logs.push(msg));
+      expect(result).toEqual(["gpt-4o"]);
+      expect(logs.filter(l => l.includes("retrying (attempt")).length).toBe(2);
+      expect(logs.some(l => l.includes("fetched 1 model(s)"))).toBe(true);
+    });
+
+    it("stops retrying after max attempts on repeated 503 responses", async () => {
+      vi.stubGlobal("fetch", vi.fn().mockResolvedValue({ ok: false, status: 503 }));
+
+      const logs = [];
+      const result = await fetchModelsFromUrl("http://api-proxy:10000/v1/models", 1000, msg => logs.push(msg));
+      expect(result).toBeNull();
+      expect(logs.filter(l => l.includes("retrying (attempt")).length).toBe(AWF_MODELS_URL_MAX_ATTEMPTS - 1);
+      expect(logs.some(l => l.includes("models fetch returned 503"))).toBe(true);
+    });
+
+    it("delays initial probe for github-oidc auth when probing api-proxy", async () => {
+      vi.useFakeTimers();
+      process.env.AWF_AUTH_TYPE = "github-oidc";
+      process.env.AWF_MODELS_URL_OIDC_INITIAL_DELAY_MS = "5000";
+
+      const fetchMock = vi.fn().mockResolvedValue({ ok: true, status: 200, json: async () => ({ data: [{ id: "gpt-4o" }] }) });
+      vi.stubGlobal("fetch", fetchMock);
+
+      const logs = [];
+      const run = fetchModelsFromUrl("http://api-proxy:10001/v1/models", 1000, msg => logs.push(msg));
+
+      await vi.advanceTimersByTimeAsync(4999);
+      expect(fetchMock).not.toHaveBeenCalled();
+
+      await vi.advanceTimersByTimeAsync(1);
+      await run;
+
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+      expect(logs.some(l => l.includes("delaying initial models probe"))).toBe(true);
+    });
   });
 
   describe("fetchAWFReflect", () => {
@@ -198,7 +256,7 @@ describe("awf_reflect.cjs", () => {
       const logs = [];
 
       try {
-        await fetchAWFReflect({
+        const result = await fetchAWFReflect({
           reflectUrl: "http://api-proxy:10000/reflect",
           outputPath,
           timeoutMs: 3000,
@@ -206,6 +264,13 @@ describe("awf_reflect.cjs", () => {
           logger: msg => logs.push(msg),
         });
 
+        expect(result).toEqual({
+          ok: true,
+          reflectUrl: "http://api-proxy:10000/reflect",
+          outputPath,
+          bytesWritten: expect.any(Number),
+          reflectData: expect.objectContaining({ endpoints: expect.any(Array) }),
+        });
         const saved = JSON.parse(fs.readFileSync(outputPath, "utf8"));
         expect(saved.endpoints[0].models).toEqual(["gpt-4o", "gpt-4o-mini"]);
         expect(logs.some(l => l.includes("saved "))).toBe(true);
@@ -224,7 +289,13 @@ describe("awf_reflect.cjs", () => {
           timeoutMs: 500,
           logger: msg => logs.push(msg),
         })
-      ).resolves.toBeUndefined();
+      ).resolves.toEqual({
+        ok: false,
+        reflectUrl: "http://api-proxy:10000/reflect",
+        outputPath: "/tmp/gh-aw-test-noop.json",
+        reason: "request_failed",
+        error: "ECONNREFUSED",
+      });
       expect(logs.some(l => l.includes("request failed"))).toBe(true);
     });
 
@@ -238,7 +309,13 @@ describe("awf_reflect.cjs", () => {
           timeoutMs: 500,
           logger: msg => logs.push(msg),
         })
-      ).resolves.toBeUndefined();
+      ).resolves.toEqual({
+        ok: false,
+        reflectUrl: "http://api-proxy:10000/reflect",
+        outputPath: "/tmp/gh-aw-test-noop.json",
+        reason: "unexpected_status",
+        status: 503,
+      });
       expect(logs.some(l => l.includes("unexpected status 503"))).toBe(true);
     });
 
@@ -252,6 +329,84 @@ describe("awf_reflect.cjs", () => {
         logger: msg => collected.push(msg),
       });
       expect(collected.length).toBeGreaterThan(0);
+    });
+  });
+
+  describe("resolveCopilotSDKCustomProviderFromReflect", () => {
+    it("resolves provider baseUrl and model from port when models_url is absent", () => {
+      const reflectData = {
+        endpoints: [{ provider: "copilot", port: 10002, configured: true, models: ["gpt-5.4", "claude-sonnet-4.6"] }],
+      };
+      expect(resolveCopilotSDKCustomProviderFromReflect({ reflectData })).toEqual({
+        model: "gpt-5.4",
+        provider: { type: "openai", baseUrl: "http://api-proxy:10002" },
+      });
+    });
+
+    it("prefers the endpoint matching the configured model", () => {
+      const reflectData = {
+        endpoints: [
+          { provider: "openai", port: 10001, configured: true, models: ["gpt-4o"] },
+          { provider: "anthropic", port: 10002, configured: true, models: ["claude-sonnet-4.6"] },
+        ],
+      };
+      expect(resolveCopilotSDKCustomProviderFromReflect({ reflectData, model: "claude-sonnet-4.6" })).toEqual({
+        model: "claude-sonnet-4.6",
+        provider: { type: "openai", baseUrl: "http://api-proxy:10002" },
+      });
+    });
+
+    it("prefers the endpoint matching the configured provider when model is unset", () => {
+      const reflectData = {
+        endpoints: [
+          { provider: "copilot", port: 10002, configured: true, models: ["claude-sonnet-4.6"] },
+          { provider: "anthropic", port: 10003, configured: true, models: ["claude-sonnet-4.6"] },
+        ],
+      };
+      expect(resolveCopilotSDKCustomProviderFromReflect({ reflectData, provider: "anthropic" })).toEqual({
+        model: "claude-sonnet-4.6",
+        provider: { type: "openai", baseUrl: "http://api-proxy:10003" },
+      });
+    });
+
+    it("derives baseUrl from models_url origin when available", () => {
+      const reflectData = {
+        endpoints: [{ provider: "copilot", port: 10002, configured: true, models: ["gpt-4o"], models_url: "http://172.30.0.30:10002/v1/models" }],
+      };
+      expect(resolveCopilotSDKCustomProviderFromReflect({ reflectData })).toEqual({
+        model: "gpt-4o",
+        provider: { type: "openai", baseUrl: "http://172.30.0.30:10002" },
+      });
+    });
+
+    it("returns null when no configured endpoints exist", () => {
+      const logs = [];
+      const result = resolveCopilotSDKCustomProviderFromReflect({
+        reflectData: { endpoints: [{ provider: "copilot", port: 10002, configured: false, models: [] }] },
+        logger: msg => logs.push(msg),
+      });
+      expect(result).toBeNull();
+      expect(logs.some(l => l.includes("no configured endpoints"))).toBe(true);
+    });
+
+    it("returns null when reflectData is null", () => {
+      const logs = [];
+      const result = resolveCopilotSDKCustomProviderFromReflect({
+        reflectData: null,
+        logger: msg => logs.push(msg),
+      });
+      expect(result).toBeNull();
+      expect(logs.some(l => l.includes("no reflect data provided"))).toBe(true);
+    });
+
+    it("returns null when reflectData is undefined", () => {
+      const logs = [];
+      const result = resolveCopilotSDKCustomProviderFromReflect({
+        reflectData: undefined,
+        logger: msg => logs.push(msg),
+      });
+      expect(result).toBeNull();
+      expect(logs.some(l => l.includes("no reflect data provided"))).toBe(true);
     });
   });
 });

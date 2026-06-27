@@ -376,4 +376,161 @@ describe("assign_milestone (Handler Factory Architecture)", () => {
     expect(result.error).toBe("Either milestone_number or milestone_title must be provided");
     expect(mockGithub.rest.issues.update).not.toHaveBeenCalled();
   });
+
+  describe("target-repo support", () => {
+    it("should use target-repo config for all API calls", async () => {
+      const { main } = require("./assign_milestone.cjs");
+      const handlerWithTarget = await main({
+        max: 10,
+        "target-repo": "external-org/external-repo",
+      });
+
+      mockGithub.rest.issues.update.mockResolvedValue({});
+      const paginateCalls = [];
+      mockGithub.paginate.mockImplementation(async (_method, params, callback) => {
+        paginateCalls.push(params);
+        if (callback) {
+          const done = vi.fn();
+          callback({ data: [] }, done);
+        }
+        return [];
+      });
+
+      const result = await handlerWithTarget({ type: "assign_milestone", issue_number: 42, milestone_number: 5 }, {});
+
+      expect(result.success).toBe(true);
+      expect(mockGithub.rest.issues.update).toHaveBeenCalledWith(expect.objectContaining({ owner: "external-org", repo: "external-repo" }));
+    });
+
+    it("should use context.repo as default when no target-repo configured", async () => {
+      mockGithub.rest.issues.update.mockResolvedValue({});
+
+      const result = await handler({ type: "assign_milestone", issue_number: 42, milestone_number: 5 }, {});
+
+      expect(result.success).toBe(true);
+      expect(mockGithub.rest.issues.update).toHaveBeenCalledWith(expect.objectContaining({ owner: "test-owner", repo: "test-repo" }));
+    });
+
+    it("should use repo from message when allowed_repos is configured", async () => {
+      const { main } = require("./assign_milestone.cjs");
+      const handlerWithAllowedRepos = await main({
+        max: 10,
+        "target-repo": "default-org/default-repo",
+        allowed_repos: ["cross-org/cross-repo"],
+      });
+
+      mockGithub.rest.issues.update.mockResolvedValue({});
+
+      const result = await handlerWithAllowedRepos({ type: "assign_milestone", issue_number: 42, milestone_number: 5, repo: "cross-org/cross-repo" }, {});
+
+      expect(result.success).toBe(true);
+      expect(mockGithub.rest.issues.update).toHaveBeenCalledWith(expect.objectContaining({ owner: "cross-org", repo: "cross-repo" }));
+    });
+
+    it("should reject repo not in allowed_repos list", async () => {
+      const { main } = require("./assign_milestone.cjs");
+      const handlerWithAllowedRepos = await main({
+        max: 10,
+        "target-repo": "default-org/default-repo",
+        allowed_repos: ["allowed-org/allowed-repo"],
+      });
+
+      const result = await handlerWithAllowedRepos({ type: "assign_milestone", issue_number: 42, milestone_number: 5, repo: "unauthorized-org/unauthorized-repo" }, {});
+
+      expect(result.success).toBe(false);
+      expect(result.error).toContain("not in the allowed-repos list");
+    });
+  });
+
+  describe("cross-repo milestone cache isolation", () => {
+    it("should not return cached milestone from repo1 when querying repo2 (cache collision)", async () => {
+      const { main } = require("./assign_milestone.cjs");
+      const crossRepoHandler = await main({
+        max: 20,
+        allowed_repos: ["org/repo1", "org/repo2"],
+      });
+
+      // repo1: v1.0 = #5; repo2: v1.0 = #3 — same title, different numbers
+      mockGithub.paginate.mockImplementation(async (_method, params, callback) => {
+        const data = params.repo === "repo1" ? [{ title: "v1.0", number: 5 }] : [{ title: "v1.0", number: 3 }];
+        if (callback) {
+          const done = vi.fn();
+          callback({ data }, done);
+        }
+        return data;
+      });
+      mockGithub.rest.issues.update.mockResolvedValue({});
+
+      // First call: repo1
+      const result1 = await crossRepoHandler({ type: "assign_milestone", issue_number: 10, milestone_title: "v1.0", repo: "org/repo1" }, {});
+      expect(result1.success).toBe(true);
+      expect(result1.milestone_number).toBe(5);
+
+      // Second call: repo2 — must NOT reuse repo1's cached #5
+      const result2 = await crossRepoHandler({ type: "assign_milestone", issue_number: 20, milestone_title: "v1.0", repo: "org/repo2" }, {});
+      expect(result2.success).toBe(true);
+      expect(result2.milestone_number).toBe(3);
+
+      // The last issues.update call must target repo2 with milestone #3
+      expect(mockGithub.rest.issues.update).toHaveBeenLastCalledWith(expect.objectContaining({ owner: "org", repo: "repo2", milestone: 3 }));
+    });
+
+    it("should not skip repo2 search after repo1 is exhausted (false exhaustion)", async () => {
+      const { main } = require("./assign_milestone.cjs");
+      const crossRepoHandler = await main({
+        max: 20,
+        allowed_repos: ["org/repo1", "org/repo2"],
+      });
+
+      // repo1: no milestones; repo2: sprint-42 = #7
+      mockGithub.paginate.mockImplementation(async (_method, params, callback) => {
+        const data = params.repo === "repo1" ? [] : [{ title: "sprint-42", number: 7 }];
+        if (callback) {
+          const done = vi.fn();
+          callback({ data }, done);
+        }
+        return data;
+      });
+      mockGithub.rest.issues.update.mockResolvedValue({});
+
+      // First call: repo1 — exhausts repo1, milestone not found
+      const result1 = await crossRepoHandler({ type: "assign_milestone", issue_number: 10, milestone_title: "sprint-42", repo: "org/repo1" }, {});
+      expect(result1.success).toBe(false);
+
+      // Second call: repo2 — must still search even though repo1 was exhausted
+      const result2 = await crossRepoHandler({ type: "assign_milestone", issue_number: 20, milestone_title: "sprint-42", repo: "org/repo2" }, {});
+      expect(result2.success).toBe(true);
+      expect(result2.milestone_number).toBe(7);
+    });
+
+    it("should use repo-scoped milestones in error message when title not found", async () => {
+      const { main } = require("./assign_milestone.cjs");
+      const crossRepoHandler = await main({
+        max: 20,
+        allowed_repos: ["org/repo1", "org/repo2"],
+      });
+
+      // repo1: only has "v1.0"; repo2: only has "v2.0"
+      mockGithub.paginate.mockImplementation(async (_method, params, callback) => {
+        const data = params.repo === "repo1" ? [{ title: "v1.0", number: 5 }] : [{ title: "v2.0", number: 3 }];
+        if (callback) {
+          const done = vi.fn();
+          callback({ data }, done);
+        }
+        return data;
+      });
+
+      // Search for "missing" in repo2 — error message should list "v2.0", not "v1.0" from repo1
+      await crossRepoHandler({ type: "assign_milestone", issue_number: 10, milestone_title: "v1.0", repo: "org/repo1" }, {});
+      mockGithub.rest.issues.update.mockResolvedValue({});
+
+      const result = await crossRepoHandler({ type: "assign_milestone", issue_number: 20, milestone_title: "missing", repo: "org/repo2" }, {});
+      expect(result.success).toBe(false);
+      // Warning should list repo2's milestones ("v2.0"), not repo1's ("v1.0")
+      const warnCall = mockCore.warning.mock.calls.find(c => c[0].includes("not found in repository"));
+      expect(warnCall).toBeDefined();
+      expect(warnCall[0]).toContain("v2.0");
+      expect(warnCall[0]).not.toContain("v1.0");
+    });
+  });
 });

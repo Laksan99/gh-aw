@@ -574,6 +574,13 @@ func TestExtractEngineConfigFromJSON(t *testing.T) {
 			expectError: false,
 		},
 		{
+			name:        "codex engine with non-string scalar env vars",
+			engineJSON:  `{"id": "codex", "env": {"STRING_VAR": "value1", "INT_VAR": 1, "FLOAT_VAR": 1000, "LARGE_FLOAT_VAR": 1000000, "BOOL_VAR": true}}`,
+			expectedID:  "codex",
+			expectedEnv: map[string]string{"STRING_VAR": "value1", "INT_VAR": "1", "FLOAT_VAR": "1000", "LARGE_FLOAT_VAR": "1000000", "BOOL_VAR": "true"},
+			expectError: false,
+		},
+		{
 			name:        "invalid JSON",
 			engineJSON:  `{invalid}`,
 			expectError: true,
@@ -692,6 +699,6 @@ Imports a custom inline engine definition from a shared workflow.
 		"lock file should contain Codex installation step")
 	assert.Contains(t, lockStr, `GH_AW_INFO_ENGINE_ID: "codex"`,
 		"lock file should set engine ID to codex")
-	assert.Contains(t, lockStr, "codex ${",
+	assert.Contains(t, lockStr, "codex exec${",
 		"lock file should contain codex exec invocation")
 }

@@ -2,16 +2,16 @@ package workflow
 
 import (
 	"fmt"
-	"maps"
 	"os"
 	"slices"
-	"sort"
 	"strconv"
 	"strings"
 
 	"github.com/github/gh-aw/pkg/console"
 	"github.com/github/gh-aw/pkg/constants"
 	"github.com/github/gh-aw/pkg/logger"
+	"github.com/github/gh-aw/pkg/setutil"
+	"github.com/github/gh-aw/pkg/sliceutil"
 )
 
 var compilerMainJobLog = logger.New("workflow:compiler_main_job")
@@ -24,7 +24,7 @@ func isBuiltinJobName(jobName string) bool {
 // buildMainJob creates the main agent job that runs the AI agent with the configured engine and tools.
 // This job depends on the activation job if it exists, and handles the main workflow logic.
 func (c *Compiler) buildMainJob(data *WorkflowData, activationJobCreated bool) (*Job, error) {
-	log.Printf("Building main job for workflow: %s", data.Name)
+	workflowLog.Printf("Building main job for workflow: %s", data.Name)
 	var steps []string
 
 	// Add setup action steps at the beginning of the job
@@ -65,6 +65,14 @@ func (c *Compiler) buildMainJob(data *WorkflowData, activationJobCreated bool) (
 		// Note: If data.If references custom jobs that DON'T depend on pre_activation,
 		// we keep the condition on the agent job
 	}
+	if activationJobCreated && hasMaxDailyAICGuardrail(data) {
+		guard := &ExpressionNode{Expression: fmt.Sprintf("needs.%s.outputs.daily_ai_credits_exceeded != 'true'", constants.ActivationJobName)}
+		if jobCondition == "" {
+			jobCondition = RenderCondition(guard)
+		} else {
+			jobCondition = RenderCondition(BuildAnd(&ExpressionNode{Expression: stripExpressionWrapper(jobCondition)}, guard))
+		}
+	}
 
 	// Note: workflow_run repository safety check is applied exclusively to activation job
 
@@ -100,7 +108,7 @@ func (c *Compiler) buildMainJob(data *WorkflowData, activationJobCreated bool) (
 	// so the agent job gets them transitively through activation
 	// Custom jobs that depend on agent should run AFTER the agent job, not before it
 	if data.Jobs != nil {
-		for _, jobName := range slices.Sorted(maps.Keys(data.Jobs)) {
+		for _, jobName := range sliceutil.SortedKeys(data.Jobs) {
 			// Skip built-in jobs as they are handled separately and should not become custom dependencies.
 			if isBuiltinJobName(jobName) {
 				continue
@@ -169,20 +177,18 @@ func (c *Compiler) buildMainJob(data *WorkflowData, activationJobCreated bool) (
 	// Exception: skip any built-in that is already in `depends` (e.g., `activation`),
 	// as those expressions are valid and will evaluate correctly.
 	if engineEnvContent != "" {
-		builtinNames := make([]string, 0, len(constants.KnownBuiltInJobNames))
-		for name := range constants.KnownBuiltInJobNames {
-			builtinNames = append(builtinNames, name)
-		}
-		sort.Strings(builtinNames)
-		builtinsWarned := make(map[string]bool)
+		builtinNames := sliceutil.SortedKeys(constants.KnownBuiltInJobNames)
+		builtinsWarned := make(map[string]struct {
+		})
 		for _, builtinJobName := range builtinNames {
 			// Skip built-ins that are already direct dependencies (e.g., activation) —
 			// their outputs are accessible and the expression is valid.
 			if slices.Contains(depends, builtinJobName) {
 				continue
 			}
-			if !builtinsWarned[builtinJobName] && strings.Contains(engineEnvContent, fmt.Sprintf("needs.%s.", builtinJobName)) {
-				builtinsWarned[builtinJobName] = true
+			if !setutil.Contains(builtinsWarned, builtinJobName) && strings.Contains(engineEnvContent, fmt.Sprintf("needs.%s.", builtinJobName)) {
+				builtinsWarned[builtinJobName] = struct {
+				}{}
 				warningMsg := fmt.Sprintf(
 					"engine.env references built-in job '%s' in a needs expression. "+
 						"Built-in jobs are managed by the compiler and cannot be added as direct agent dependencies; "+
@@ -204,9 +210,18 @@ func (c *Compiler) buildMainJob(data *WorkflowData, activationJobCreated bool) (
 		// It is exposed here so that the safe_outputs job can set GH_AW_EFFECTIVE_TOKENS and render
 		// the {effective_tokens_suffix} template expression in footer templates.
 		"effective_tokens": fmt.Sprintf("${{ steps.%s.outputs.effective_tokens }}", constants.ParseMCPGatewayStepID),
-		// effective_tokens_rate_limit_error is true when MCP gateway logs indicate ET budget
-		// exhaustion or API rate limiting attributable to ET constraints.
-		"effective_tokens_rate_limit_error": fmt.Sprintf("${{ steps.%s.outputs.effective_tokens_rate_limit_error || 'false' }}", constants.ParseMCPGatewayStepID),
+		// aic is the total AI Credits cost for the run (1 AIC == 0.01 USD), captured by the
+		// MCP gateway log parser step and passed to downstream jobs for footer rendering.
+		"aic": fmt.Sprintf("${{ steps.%s.outputs.aic }}", constants.ParseMCPGatewayStepID),
+		// ambient_context is the first-request context size metric:
+		// input_tokens + (cache_tokens / 10), where cache tokens are normalized as 10x cheaper.
+		"ambient_context": fmt.Sprintf("${{ steps.%s.outputs.ambient_context }}", constants.ParseMCPGatewayStepID),
+		// ai_credits_rate_limit_error is true when MCP gateway logs indicate AI credits
+		// budget exhaustion or API rate limiting attributable to credit constraints.
+		"ai_credits_rate_limit_error": fmt.Sprintf("${{ steps.%s.outputs.ai_credits_rate_limit_error || 'false' }}", constants.ParseMCPGatewayStepID),
+		// unknown_model_ai_credits is true when the AWF API proxy rejects a request because the
+		// model is not in the built-in pricing table and maxAiCredits is active.
+		"unknown_model_ai_credits": fmt.Sprintf("${{ steps.%s.outputs.unknown_model_ai_credits || 'false' }}", constants.ParseMCPGatewayStepID),
 		// setup-trace-id propagates the shared OTLP trace ID to downstream jobs (detection, safe_outputs, cache, etc.)
 		"setup-trace-id": "${{ steps.setup.outputs.trace-id }}",
 		// setup-span-id propagates the setup span parent so downstream setup spans form one tree.
@@ -244,24 +259,36 @@ func (c *Compiler) buildMainJob(data *WorkflowData, activationJobCreated bool) (
 		compilerMainJobLog.Print("Skipped checkout_pr_success output (workflow lacks contents read access)")
 	}
 
+	// Expose restore step outputs so downstream failure handling can compute whether
+	// any cache-memory restore matched an existing cache entry.
+	if data.CacheMemoryConfig != nil && len(data.CacheMemoryConfig.Caches) > 0 {
+		for i := range data.CacheMemoryConfig.Caches {
+			stepID := fmt.Sprintf("restore_cache_memory_%d", i)
+			outputs[fmt.Sprintf("cache_memory_restore_%d_matched_key", i)] = fmt.Sprintf("${{ steps.%s.outputs.cache-matched-key || '' }}", stepID)
+			outputs[fmt.Sprintf("cache_memory_restore_%d_cache_hit", i)] = fmt.Sprintf("${{ steps.%s.outputs.cache-hit || 'false' }}", stepID)
+		}
+	}
+
 	// Add inference_access_error, mcp_policy_error, agentic_engine_timeout, and
-	// model_not_supported_error outputs for Copilot engine only.
-	// These outputs are set by the detect-copilot-errors step which scans the agent
-	// stdio log for known error patterns in a single JavaScript step
+	// model_not_supported_error outputs for engines that provide an error detection step.
+	// These outputs are written by the host-runner detect-agent-errors step (via the
+	// engine's GetErrorDetectionScriptId script) rather than from inside the AWF container,
+	// because GITHUB_OUTPUT is not accessible inside the sandbox.
 	engine, engineErr := c.getAgenticEngine(data.AI)
 	if engineErr == nil {
-		if _, ok := engine.(*CopilotEngine); ok {
-			outputs["inference_access_error"] = "${{ steps.detect-copilot-errors.outputs.inference_access_error || 'false' }}"
-			compilerMainJobLog.Print("Added inference_access_error output (Copilot engine)")
+		if engine.GetErrorDetectionScriptId() != "" {
+			stepRef := fmt.Sprintf("steps.%s.outputs", constants.DetectAgentErrorsStepID)
+			outputs["inference_access_error"] = fmt.Sprintf("${{ %s.inference_access_error || 'false' }}", stepRef)
+			compilerMainJobLog.Printf("Added inference_access_error output (engine=%s, step=%s)", engine.GetID(), constants.DetectAgentErrorsStepID)
 
-			outputs["mcp_policy_error"] = "${{ steps.detect-copilot-errors.outputs.mcp_policy_error || 'false' }}"
-			compilerMainJobLog.Print("Added mcp_policy_error output (Copilot engine)")
+			outputs["mcp_policy_error"] = fmt.Sprintf("${{ %s.mcp_policy_error || 'false' }}", stepRef)
+			compilerMainJobLog.Printf("Added mcp_policy_error output (engine=%s, step=%s)", engine.GetID(), constants.DetectAgentErrorsStepID)
 
-			outputs["agentic_engine_timeout"] = "${{ steps.detect-copilot-errors.outputs.agentic_engine_timeout || 'false' }}"
-			compilerMainJobLog.Print("Added agentic_engine_timeout output (Copilot engine)")
+			outputs["agentic_engine_timeout"] = fmt.Sprintf("${{ %s.agentic_engine_timeout || 'false' }}", stepRef)
+			compilerMainJobLog.Printf("Added agentic_engine_timeout output (engine=%s, step=%s)", engine.GetID(), constants.DetectAgentErrorsStepID)
 
-			outputs["model_not_supported_error"] = "${{ steps.detect-copilot-errors.outputs.model_not_supported_error || 'false' }}"
-			compilerMainJobLog.Print("Added model_not_supported_error output (Copilot engine)")
+			outputs["model_not_supported_error"] = fmt.Sprintf("${{ %s.model_not_supported_error || 'false' }}", stepRef)
+			compilerMainJobLog.Printf("Added model_not_supported_error output (engine=%s, step=%s)", engine.GetID(), constants.DetectAgentErrorsStepID)
 		}
 	}
 
@@ -272,7 +299,7 @@ func (c *Compiler) buildMainJob(data *WorkflowData, activationJobCreated bool) (
 
 		// Set GH_AW_MCP_LOG_DIR for safe outputs MCP server logging
 		// Store in mcp-logs directory so it's included in mcp-logs artifact
-		env["GH_AW_MCP_LOG_DIR"] = "/tmp/gh-aw/mcp-logs/safeoutputs"
+		env["GH_AW_MCP_LOG_DIR"] = constants.TmpMcpLogsSafeOutputsDir
 
 		// Note: GH_AW_SAFE_OUTPUTS, GH_AW_SAFE_OUTPUTS_CONFIG_PATH, and
 		// GH_AW_SAFE_OUTPUTS_TOOLS_PATH are set via a run step (see generateSetRuntimePathsStep)
@@ -307,6 +334,15 @@ func (c *Compiler) buildMainJob(data *WorkflowData, activationJobCreated bool) (
 		env["GH_AW_WORKFLOW_ID_SANITIZED"] = sanitizedID
 	}
 
+	// Bake the repository project UTC offset (from aw.json) into job env so runtime
+	// JavaScript helpers do not need to read aw.json on the runner.
+	if utcOffset := c.getCompiledProjectUTCOffset(); utcOffset != "" {
+		if env == nil {
+			env = make(map[string]string)
+		}
+		env["GH_AW_PROJECT_UTC"] = fmt.Sprintf("%q", utcOffset)
+	}
+
 	// Generate agent concurrency configuration
 	agentConcurrency := GenerateJobConcurrencyConfig(data)
 
@@ -332,6 +368,53 @@ func (c *Compiler) buildMainJob(data *WorkflowData, activationJobCreated bool) (
 			if level, exists := perms.Get(PermissionContents); !exists || level == PermissionNone {
 				perms.Set(PermissionContents, PermissionRead)
 				permissions = perms.RenderToYAML()
+			}
+		}
+	}
+
+	// Infer permissions required by gh CLI calls in all agent job step sections.
+	// Detects write commands (which are not permitted since the agent job is read-only),
+	// and merges inferred read permissions into the existing permissions block.
+	// Skipped only when the user explicitly opted out of all permissions (permissions: {}).
+	//
+	// Top-level frontmatter sections (pre-steps, steps, pre-agent-steps, post-steps) are
+	// all applied to the agent job and must be fully scanned.
+	// For jobs.agent.* sections, only jobs.agent.setup-steps / jobs.agent.pre-steps are actually injected by
+	// applyBuiltinJobPreSteps; jobs.agent.steps, jobs.agent.pre-agent-steps, and
+	// jobs.agent.post-steps are ignored for built-in jobs, so they are intentionally
+	// excluded to avoid false-positive errors or unneeded permission grants.
+	agentJobName := string(constants.AgentJobName)
+	agentAllScripts := extractRunScriptsFromSectionYAML(data.PreSteps, "pre-steps")
+	agentAllScripts = append(agentAllScripts, extractRunScriptsFromSectionYAML(data.CustomSteps, "steps")...)
+	agentAllScripts = append(agentAllScripts, extractRunScriptsFromSectionYAML(data.PreAgentSteps, "pre-agent-steps")...)
+	agentAllScripts = append(agentAllScripts, extractRunScriptsFromSectionYAML(data.PostSteps, "post-steps")...)
+	if data.Jobs != nil {
+		agentAllScripts = append(agentAllScripts, extractRunScriptsFromJobSection(data.Jobs, agentJobName, "setup-steps")...)
+		agentAllScripts = append(agentAllScripts, extractRunScriptsFromJobSection(data.Jobs, agentJobName, "pre-steps")...)
+	}
+	if len(agentAllScripts) > 0 {
+		writeCmds, err := detectWriteCommandsInShellScripts(agentAllScripts)
+		if err != nil {
+			return nil, err
+		}
+		if len(writeCmds) > 0 {
+			return nil, fmt.Errorf(
+				"agent job uses write gh command(s) [%s]; write operations are not permitted in agent job steps because the agent job runs with read-only permissions. Use safe-outputs for write operations. See: https://github.github.com/gh-aw/reference/safe-outputs/",
+				strings.Join(writeCmds, ", "),
+			)
+		}
+		// Infer read permissions unless the user explicitly zeroed out all permissions.
+		// Check data.Permissions (the original value) since needsContentsRead above may have
+		// already expanded "permissions: {}" into an explicit block.
+		// Uses the same exact-string check as tools.go (the YAML parser always normalizes
+		// "permissions: {}" to this canonical form when parsing the frontmatter).
+		if data.Permissions != "permissions: {}" && permissions != "" {
+			inferred, err := inferPermissionsFromShellScripts(agentAllScripts)
+			if err != nil {
+				return nil, err
+			}
+			if len(inferred) > 0 {
+				permissions = mergeInferredIntoPermissionsYAML(permissions, inferred)
 			}
 		}
 	}

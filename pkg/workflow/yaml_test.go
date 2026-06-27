@@ -217,6 +217,52 @@ on:
 	}
 }
 
+func TestUnquoteYAMLTopLevelKey(t *testing.T) {
+	tests := []struct {
+		name     string
+		input    string
+		key      string
+		expected string
+	}{
+		{
+			name: "unquotes top-level on key",
+			input: `"on":
+  workflow_dispatch:`,
+			key: "on",
+			expected: `on:
+  workflow_dispatch:`,
+		},
+		{
+			name: "does not unquote nested key",
+			input: `parent:
+  "on":
+    value: true`,
+			key: "on",
+			expected: `parent:
+  "on":
+    value: true`,
+		},
+		{
+			name: "no change when top-level key already unquoted",
+			input: `on:
+  push:`,
+			key: "on",
+			expected: `on:
+  push:`,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := UnquoteYAMLTopLevelKey(tt.input, tt.key)
+			if result != tt.expected {
+				t.Errorf("UnquoteYAMLTopLevelKey() failed\nInput:\n%s\n\nExpected:\n%s\n\nGot:\n%s",
+					tt.input, tt.expected, result)
+			}
+		})
+	}
+}
+
 func TestMarshalWithFieldOrder(t *testing.T) {
 	tests := []struct {
 		name           string
@@ -298,6 +344,60 @@ func TestMarshalWithFieldOrder(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestMarshalWithFieldOrder_OrdersNestedEnvWithSecretsRecursively(t *testing.T) {
+	data := map[string]any{
+		"env": map[string]string{
+			"ZETA_WORKFLOW":  "zeta",
+			"ALPHA_WORKFLOW": "alpha",
+		},
+		"secrets": map[string]string{
+			"ZETA_SECRET":  "${{ secrets.ZETA_SECRET }}",
+			"ALPHA_SECRET": "${{ secrets.ALPHA_SECRET }}",
+		},
+		"steps": []any{
+			map[string]any{
+				"name": "Deterministic action",
+				"uses": "actions/checkout@v4",
+				"with": map[string]any{
+					"zeta-input": "zeta",
+					"alpha-input": map[string]any{
+						"zeta-child":  "zeta",
+						"alpha-child": "alpha",
+					},
+				},
+				"env": map[string]string{
+					"ZETA_STEP":  "zeta",
+					"ALPHA_STEP": "alpha",
+				},
+			},
+		},
+	}
+
+	yamlBytes, err := MarshalWithFieldOrder(data, []string{"env", "secrets", "steps"})
+	if err != nil {
+		t.Fatalf("MarshalWithFieldOrder() error = %v", err)
+	}
+
+	yamlStr := string(yamlBytes)
+	assertOrder := func(before, after string) {
+		t.Helper()
+		beforeIndex := strings.Index(yamlStr, before)
+		afterIndex := strings.Index(yamlStr, after)
+		if beforeIndex == -1 || afterIndex == -1 {
+			t.Fatalf("expected both %q and %q in YAML:\n%s", before, after, yamlStr)
+		}
+		if beforeIndex >= afterIndex {
+			t.Fatalf("expected %q before %q in YAML:\n%s", before, after, yamlStr)
+		}
+	}
+
+	assertOrder("  ALPHA_WORKFLOW:", "  ZETA_WORKFLOW:")
+	assertOrder("  ALPHA_SECRET:", "  ZETA_SECRET:")
+	assertOrder("    alpha-input:", "    zeta-input:")
+	assertOrder("      alpha-child:", "      zeta-child:")
+	assertOrder("    ALPHA_STEP:", "    ZETA_STEP:")
 }
 
 func TestExtractTopLevelYAMLSectionWithOrdering(t *testing.T) {

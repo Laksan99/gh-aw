@@ -1,4 +1,6 @@
 ---
+private: true
+emoji: "🔧"
 name: Functional Pragmatist
 description: Identifies opportunities to apply moderate functional programming techniques systematically - immutability, functional options, pure functions, reducing mutation and reusable logic wrappers
 on:
@@ -22,7 +24,7 @@ network:
 imports:
   - shared/reporting.md
 
-  - shared/observability-otlp.md
+  - shared/otlp.md
 safe-outputs:
   create-pull-request:
     title-prefix: "[fp-enhancer] "

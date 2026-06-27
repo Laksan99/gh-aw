@@ -1,4 +1,6 @@
 ---
+private: true
+emoji: "📊"
 on:
   slash_command:
     name: cloclo
@@ -7,6 +9,7 @@ on:
     name: cloclo
     strategy: decentralized
   status-comment: true
+max-daily-ai-credits: 10000
 permissions:
   contents: read
   pull-requests: read
@@ -16,14 +19,17 @@ permissions:
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}-cloclo
   cancel-in-progress: false
+max-turns: 100
 engine:
   id: claude
-  max-turns: 100
 imports:
   - ../skills/jqschema/SKILL.md
   - shared/mcp/serena-go.md
   - shared/reporting.md
-  - shared/observability-otlp.md
+  - shared/otlp.md
+sandbox:
+  agent:
+    sudo: false
 tools:
   cli-proxy: true
   agentic-workflows:
@@ -33,8 +39,6 @@ tools:
   bash: true
   cache-memory:
     key: cloclo-memory-${{ github.workflow }}
-firewall:
-  effective-token-steering: true
 safe-outputs:
   create-pull-request:
     expires: 2d
@@ -46,13 +50,13 @@ safe-outputs:
   add-comment:
     max: 1
   messages:
-    footer: "> 🎤 *Magnifique! Performance by [{workflow_name}]({run_url})*{effective_tokens_suffix}{history_link}"
+    footer: "> 🎤 *Magnifique! Performance by [{workflow_name}]({run_url})*{ai_credits_suffix}{history_link}"
     run-started: "🎵 Comme d'habitude! [{workflow_name}]({run_url}) takes the stage on this {event_type}..."
     run-success: "🎤 Bravo! [{workflow_name}]({run_url}) has delivered a stunning performance! Standing ovation! 🌟"
     run-failure: "🎵 Intermission... [{workflow_name}]({run_url}) {status}. Check the [run logs]({run_url}) for details."
 timeout-minutes: 20
-
-
+features:
+  gh-aw-detection: true
 ---
 
 # /cloclo
@@ -108,7 +112,7 @@ You have access to:
 1. **Serena MCP**: Static analysis and code intelligence capabilities
 2. **gh-aw MCP**: GitHub Agentic Workflows introspection and management
 3. **Playwright**: Browser automation via CLI (`playwright-cli <command>` in bash)
-4. **JQ Schema**: JSON structure discovery tool at `/tmp/gh-aw/jqschema.sh`
+4. **JQ Schema**: JSON structure discovery tool at `./.github/skills/jqschema/jqschema.sh`
 5. **Cache Memory**: Persistent memory storage at `/tmp/gh-aw/cache-memory/` for multi-step reasoning
 6. **Edit Tool**: For file creation and modification
 7. **Bash Tools**: Shell command execution with JQ support

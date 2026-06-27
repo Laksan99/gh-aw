@@ -1,4 +1,5 @@
 ---
+emoji: "📅"
 name: Weekly Issue Summary
 description: Creates weekly summary of issue activity including trends, charts, and insights every Monday
 timeout-minutes: 20
@@ -17,7 +18,9 @@ network:
     - python
     - node
 sandbox:
-  agent: awf  # Firewall enabled (migrated from network.firewall)
+  agent:
+    id: awf
+    sudo: false
 tools:
   cli-proxy: true
   edit:
@@ -36,7 +39,7 @@ imports:
       expires: 1d
   - shared/trends.md
 
-  - shared/observability-otlp.md
+  - shared/otlp.md
 ---
 # Weekly Issue Summary
 

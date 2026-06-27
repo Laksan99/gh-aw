@@ -23,7 +23,7 @@ func TestCrushEngine(t *testing.T) {
 	t.Run("capabilities", func(t *testing.T) {
 		capabilities := engine.GetCapabilities()
 		assert.False(t, capabilities.ToolsAllowlist, "Should not support tools allowlist")
-		assert.False(t, capabilities.MaxTurns, "Should not support max turns")
+		assert.True(t, capabilities.MaxTurns, "Should support max turns")
 		assert.False(t, capabilities.WebSearch, "Should not support built-in web search")
 	})
 
@@ -69,17 +69,15 @@ func TestCrushEngine(t *testing.T) {
 		assert.Contains(t, secrets, "OPENAI_API_KEY", "Should require OPENAI_API_KEY for openai/* models")
 	})
 
-	t.Run("required secrets with copilot-requests feature", func(t *testing.T) {
+	t.Run("required secrets with copilot-requests permission", func(t *testing.T) {
 		workflowData := &WorkflowData{
 			Name:        "test",
 			ParsedTools: &ToolsConfig{},
 			Tools:       map[string]any{},
-			Features: map[string]any{
-				"copilot-requests": true,
-			},
+			Permissions: "permissions:\n  copilot-requests: write",
 		}
 		secrets := engine.GetRequiredSecretNames(workflowData)
-		assert.NotContains(t, secrets, "COPILOT_GITHUB_TOKEN", "Should not require COPILOT_GITHUB_TOKEN when copilot-requests is enabled")
+		assert.NotContains(t, secrets, "COPILOT_GITHUB_TOKEN", "Should not require COPILOT_GITHUB_TOKEN when permissions.copilot-requests is write")
 	})
 
 	t.Run("required secrets with MCP servers", func(t *testing.T) {
@@ -139,15 +137,13 @@ func TestCrushEngine(t *testing.T) {
 		assert.Contains(t, stepContent, "COPILOT_GITHUB_TOKEN", "Should validate COPILOT_GITHUB_TOKEN")
 	})
 
-	t.Run("secret validation step with copilot-requests", func(t *testing.T) {
+	t.Run("secret validation step with copilot-requests permission", func(t *testing.T) {
 		workflowData := &WorkflowData{
-			Name: "test",
-			Features: map[string]any{
-				"copilot-requests": true,
-			},
+			Name:        "test",
+			Permissions: "permissions:\n  copilot-requests: write",
 		}
 		step := engine.GetSecretValidationStep(workflowData)
-		assert.Empty(t, step, "Should skip secret validation when copilot-requests is enabled")
+		assert.Empty(t, step, "Should skip secret validation when permissions.copilot-requests is write")
 	})
 }
 
@@ -252,19 +248,17 @@ func TestCrushEngineExecution(t *testing.T) {
 		assert.Contains(t, stepContent, "NO_PROXY: localhost,127.0.0.1", "Should set NO_PROXY env var")
 	})
 
-	t.Run("basic execution with copilot-requests", func(t *testing.T) {
+	t.Run("basic execution with copilot-requests permission", func(t *testing.T) {
 		workflowData := &WorkflowData{
-			Name: "test-workflow",
-			Features: map[string]any{
-				"copilot-requests": true,
-			},
+			Name:        "test-workflow",
+			Permissions: "permissions:\n  copilot-requests: write",
 		}
 
 		steps := engine.GetExecutionSteps(workflowData, "/tmp/test.log")
 		require.Len(t, steps, 2, "Should generate config step and execution step")
 
 		stepContent := strings.Join(steps[1], "\n")
-		assert.Contains(t, stepContent, "OPENAI_API_KEY: ${{ github.token }}", "Should set OPENAI_API_KEY from github.token when copilot-requests is enabled")
+		assert.Contains(t, stepContent, "OPENAI_API_KEY: ${{ github.token }}", "Should set OPENAI_API_KEY from github.token when permissions.copilot-requests is write")
 	})
 
 	t.Run("with model", func(t *testing.T) {
@@ -413,7 +407,7 @@ func TestCrushEngineFirewallIntegration(t *testing.T) {
 		assert.Contains(t, stepContent, "awf", "Should use AWF when firewall is enabled")
 		// With config file support, domains are in the JSON config (not as CLI flags)
 		assert.Contains(t, stepContent, "allowDomains", "Should include allowDomains in config JSON")
-		assert.Contains(t, stepContent, `"enabled":true`, "Should include apiProxy enabled in config JSON")
+		assert.Contains(t, stepContent, `\"enabled\":true`, "Should include apiProxy enabled in config JSON")
 		assert.Contains(t, stepContent, "GITHUB_COPILOT_BASE_URL: http://host.docker.internal:10002", "Should route copilot/* fallback through Copilot LLM gateway URL")
 	})
 

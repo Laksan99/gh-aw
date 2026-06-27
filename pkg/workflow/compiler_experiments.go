@@ -5,11 +5,12 @@ import (
 	"fmt"
 	"math"
 	"regexp"
-	"sort"
+	"strconv"
 	"strings"
 
 	"github.com/github/gh-aw/pkg/constants"
 	"github.com/github/gh-aw/pkg/logger"
+	"github.com/github/gh-aw/pkg/sliceutil"
 )
 
 var experimentsLog = logger.New("workflow:compiler_experiments")
@@ -264,13 +265,31 @@ func extractGuardrailMetrics(raw any) []GuardrailMetric {
 			continue
 		}
 		name, _ := m["name"].(string)
-		threshold, _ := m["threshold"].(string)
+		direction, _ := m["direction"].(string)
+		threshold := extractGuardrailThreshold(m["threshold"])
 		if name == "" || threshold == "" {
 			continue
 		}
-		result = append(result, GuardrailMetric{Name: name, Threshold: threshold})
+		result = append(result, GuardrailMetric{Name: name, Direction: direction, Threshold: threshold})
 	}
 	return result
+}
+
+func extractGuardrailThreshold(raw any) string {
+	switch v := raw.(type) {
+	case string:
+		return v
+	case float64:
+		return strconv.FormatFloat(v, 'f', -1, 64)
+	case int:
+		return strconv.Itoa(v)
+	case int64:
+		return strconv.FormatInt(v, 10)
+	case uint64:
+		return strconv.FormatUint(v, 10)
+	default:
+		return ""
+	}
 }
 
 // extractIntSlice converts a raw value to a []int, accepting []any of numeric values.
@@ -448,17 +467,17 @@ func buildExperimentSpecJSON(experiments map[string][]string, configs map[string
 		if i > 0 {
 			sb.WriteString(",")
 		}
-		keyBytes, _ := json.Marshal(name)
+		keyBytes, _ := json.Marshal(name) //nolint:jsonmarshalignoredeerror // marshaling a string cannot fail
 		sb.Write(keyBytes)
 		sb.WriteString(":")
 
 		// Use the full config when available so the JS can consume metadata.
 		if cfg, ok := configs[name]; ok && cfg != nil {
-			cfgBytes, _ := json.Marshal(cfg)
+			cfgBytes, _ := json.Marshal(cfg) //nolint:jsonmarshalignoredeerror // ExperimentConfig contains only JSON-safe types (strings, ints, []string)
 			sb.Write(cfgBytes)
 		} else {
 			// Fallback: bare variants array (legacy behaviour).
-			varBytes, _ := json.Marshal(experiments[name])
+			varBytes, _ := json.Marshal(experiments[name]) //nolint:jsonmarshalignoredeerror // marshaling a string slice cannot fail
 			sb.Write(varBytes)
 		}
 	}
@@ -500,11 +519,7 @@ func ExperimentExpressionMappings(experiments map[string][]string) []*Expression
 
 // sortedExperimentNames returns the experiment names in sorted order for deterministic output.
 func sortedExperimentNames(experiments map[string][]string) []string {
-	names := make([]string, 0, len(experiments))
-	for name := range experiments {
-		names = append(names, name)
-	}
-	sort.Strings(names)
+	names := sliceutil.SortedKeys(experiments)
 	return names
 }
 
@@ -642,7 +657,7 @@ func (c *Compiler) buildPushExperimentsStateJob(data *WorkflowData) (*Job, error
 	jobCondition := RenderCondition(BuildAnd(BuildAnd(BuildFunctionCall("always"), notCancelled), activationSucceeded))
 
 	job := &Job{
-		Name:        "push_experiments_state",
+		Name:        pushExperimentsStateJobName,
 		RunsOn:      c.formatFrameworkJobRunsOn(data),
 		If:          jobCondition,
 		Permissions: "permissions:\n      contents: write",

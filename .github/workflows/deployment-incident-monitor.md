@@ -1,4 +1,6 @@
 ---
+private: true
+emoji: "🚨"
 description: Monitors deployment failures and automatically creates deduplicated incident issues with root cause analysis.
 on:
   deployment_status:
@@ -8,9 +10,12 @@ permissions:
   contents: read
   actions: read
   deployments: read
-engine: copilot
+engine:
+  id: copilot
+  copilot-sdk: true
 imports:
-  - shared/observability-otlp.md
+  - shared/reporting.md
+  - shared/otlp.md
 tools:
   cli-proxy: true
   github:
@@ -25,6 +30,9 @@ safe-outputs:
   noop:
 timeout-minutes: 10
 
+sandbox:
+  agent:
+    sudo: false
 ---
 
 # Deployment Incident Monitor

@@ -2,6 +2,7 @@ package constants
 
 import (
 	"io/fs"
+	"os"
 	"path/filepath"
 	"time"
 )
@@ -109,6 +110,12 @@ const (
 	// DefaultMCPInspectorPort is the default port for the MCP inspector (safe-outputs server)
 	DefaultMCPInspectorPort = 3001
 
+	// DefaultCopilotSDKPort is the default localhost port for the Copilot CLI HTTP server
+	// when running in headless SDK mode (copilot-sdk: true). The harness starts a
+	// separate Copilot CLI sidecar with --headless --port <port>, and the SDK connects via
+	// COPILOT_SDK_URI = "http://127.0.0.1:DefaultCopilotSDKPort".
+	DefaultCopilotSDKPort = 3002
+
 	// MinNetworkPort is the minimum valid network port number
 	MinNetworkPort = 1
 
@@ -126,12 +133,20 @@ const (
 
 	// GeminiLLMGatewayPort is the port for the Gemini LLM gateway
 	GeminiLLMGatewayPort = 10003
+
+	// AntigravityLLMGatewayPort is the port for the Antigravity LLM gateway.
+	// Aliased to GeminiLLMGatewayPort because the two share the same port value.
+	AntigravityLLMGatewayPort = GeminiLLMGatewayPort
 )
 
 // DefaultGitHubLockdown is the default value for the GitHub MCP server lockdown setting.
 // Lockdown mode restricts the GitHub MCP server to the triggering repository only.
 // Defaults to false (lockdown disabled).
 const DefaultGitHubLockdown = false
+
+// OTELSentryEndpointSecretName is the well-known secret name used by shared OTLP
+// workflow imports for Sentry endpoint configuration.
+const OTELSentryEndpointSecretName = "GH_AW_OTEL_SENTRY_ENDPOINT"
 
 // AWF (Agentic Workflow Firewall) constants
 
@@ -196,6 +211,11 @@ const DefaultFirewallRegistry = "ghcr.io/github/gh-aw-firewall"
 // Using node:lts-alpine provides the latest LTS version with minimal footprint
 const DefaultNodeAlpineLTSImage = "node:lts-alpine"
 
+// DefaultGhAwNodeImage is the published gh-aw Node container image used for
+// JavaScript-based MCP servers that need Node.js and git plus workspace-mounted
+// repository scripts at runtime.
+const DefaultGhAwNodeImage = "ghcr.io/github/gh-aw-node"
+
 // DefaultPythonAlpineLTSImage is the default Python Alpine LTS container image for MCP servers
 // Using python:alpine provides the latest stable version with minimal footprint
 const DefaultPythonAlpineLTSImage = "python:alpine"
@@ -240,6 +260,10 @@ const DefaultTmpGhAwMount = "/tmp/gh-aw:/tmp/gh-aw:rw"
 // The GITHUB_WORKSPACE environment variable is automatically set by GitHub Actions and passed to the MCP gateway
 const DefaultWorkspaceMount = "\\${GITHUB_WORKSPACE}:\\${GITHUB_WORKSPACE}:rw"
 
+// DefaultSafeOutputsMount is the mount path for safe-outputs runtime files
+// (config.json, tools.json, outputs.jsonl, upload-artifacts/) in the runner temp directory.
+const DefaultSafeOutputsMount = GhAwRootDirShell + "/safeoutputs:" + GhAwRootDirShell + "/safeoutputs:rw"
+
 // Timeout constants using time.Duration for type safety and clear units
 
 // DefaultAgenticWorkflowTimeout is the default timeout for agentic workflow execution
@@ -251,11 +275,24 @@ const DefaultToolTimeout = 60 * time.Second
 // DefaultMCPStartupTimeout is the default timeout for MCP server startup
 const DefaultMCPStartupTimeout = 120 * time.Second
 
-// DefaultMaxEffectiveTokens is the default ET budget enforced by the AWF API proxy.
-const DefaultMaxEffectiveTokens int64 = 25000000
+// DefaultHTTPClientTimeout is the default timeout for internal HTTP clients
+const DefaultHTTPClientTimeout = 30 * time.Second
+
+// DefaultMaxAICredits is the default AI Credits budget enforced by the AWF API proxy.
+const DefaultMaxAICredits int64 = 1000
+
+// DefaultDetectionMaxAICredits is the default AI Credits budget enforced by the
+// AWF API proxy for threat-detection runs.
+const DefaultDetectionMaxAICredits int64 = 400
+
+// DefaultMaxDailyAICredits is the default per-workflow daily AI Credits guardrail.
+const DefaultMaxDailyAICredits = "5000"
 
 // DefaultMaxRuns is the default AWF invocation cap enforced by the AWF API proxy.
 const DefaultMaxRuns = 500
+
+// DefaultMaxTurnCacheMisses is the default AWF consecutive cache-miss guardrail.
+const DefaultMaxTurnCacheMisses = 5
 
 // MCPSessionTimeoutMin is the minimum allowed value for engine.mcp.session-timeout (5 minutes).
 const MCPSessionTimeoutMin = 5 * time.Minute
@@ -293,8 +330,7 @@ var PriorityJobFields = []string{"name", "runs-on", "needs", "if", "permissions"
 var PriorityWorkflowFields = []string{"on", "permissions", "if", "network", "imports", "safe-outputs", "steps"}
 
 // IgnoredFrontmatterFields are fields that should be silently ignored during frontmatter validation
-// NOTE: user-invokable is a GitHub Copilot custom agent field that is not part of the gh-aw schema
-var IgnoredFrontmatterFields = []string{"user-invokable"}
+var IgnoredFrontmatterFields = []string{}
 
 // SharedWorkflowForbiddenFields lists fields that cannot be used in shared/included workflows.
 // These fields are only allowed in main workflows (workflows with an 'on' trigger field).
@@ -304,16 +340,15 @@ var IgnoredFrontmatterFields = []string{"user-invokable"}
 //
 // Forbidden fields fall into these categories:
 //   - Workflow triggers: on (defines it as a main workflow)
-//   - Workflow execution: command, run-name, runs-on, concurrency, if, timeout-minutes, timeout_minutes
+//   - Workflow execution: run-name, runs-on, concurrency, if, timeout-minutes
 //   - Workflow metadata: name, tracker-id, strict
 //   - Workflow features: container, environment, sandbox, features
-//   - Access control: roles, github-token
+//   - Access control: github-token
 //
 // All other fields defined in main_workflow_schema.json can be used in shared workflows
 // and will be properly imported and merged when the shared workflow is imported.
 var SharedWorkflowForbiddenFields = []string{
 	"on",              // Trigger field - only for main workflows
-	"command",         // Command for workflow execution
 	"concurrency",     // Concurrency control
 	"container",       // Container configuration
 	"environment",     // Deployment environment
@@ -321,18 +356,202 @@ var SharedWorkflowForbiddenFields = []string{
 	"github-token",    // GitHub token configuration
 	"if",              // Conditional execution
 	"name",            // Workflow name
-	"roles",           // Role requirements
 	"run-name",        // Run display name
 	"runs-on",         // Runner specification
 	"sandbox",         // Sandbox configuration
 	"strict",          // Strict mode
 	"timeout-minutes", // Timeout in minutes
-	"timeout_minutes", // Timeout in minutes (underscore variant)
 	"tracker-id",      // Tracker ID
 }
 
+// Repository directory path constants
+//
+// These constants define the conventional repository-relative directory paths
+// used by gh-aw for GitHub Actions workflows, agents, and related configuration.
+
+// GithubDir is the root .github directory prefix (with trailing slash).
+// Use this for path prefix comparisons against workspace-relative paths.
+const GithubDir = ".github/"
+
+// WorkflowsDir is the GitHub Actions workflow directory path (without trailing slash).
+// This is the canonical location for workflow markdown and compiled lock YAML files.
+const WorkflowsDir = ".github/workflows"
+
+// WorkflowsDirSlash is WorkflowsDir with a trailing slash.
+// Use this for path prefix matching (e.g. strings.HasPrefix or strings.Contains).
+const WorkflowsDirSlash = WorkflowsDir + "/"
+
+// AgentsDir is the custom GitHub Copilot agent definitions directory (with trailing slash).
+const AgentsDir = ".github/agents/"
+
+// WorkflowsLockYmlGlob is the glob pattern for compiled workflow lock YAML files.
+const WorkflowsLockYmlGlob = WorkflowsDirSlash + "*.lock.yml"
+
+// WorkflowsLockYmlGitAttributesEntry is the .gitattributes entry that marks lock YAML
+// files as generated and sets the merge strategy.
+const WorkflowsLockYmlGitAttributesEntry = WorkflowsLockYmlGlob + " linguist-generated=true merge=ours"
+
+// Temporary runtime directory constants (/tmp/gh-aw tree)
+//
+// These constants define the /tmp/gh-aw directory layout used by the agent
+// and engine harnesses during workflow execution. Paths here are always
+// in the /tmp/gh-aw tree regardless of whether the runner uses RUNNER_TEMP.
+// See also GhAwRootDir / GhAwRootDirShell for the host-side RUNNER_TEMP paths.
+
+// TmpGhAwDir is the root /tmp/gh-aw directory (without trailing slash).
+const TmpGhAwDir = "/tmp/gh-aw"
+
+// TmpGhAwDirSlash is TmpGhAwDir with a trailing slash.
+// Use for path prefix comparisons (e.g. strings.HasPrefix).
+const TmpGhAwDirSlash = TmpGhAwDir + "/"
+
+// TmpGhAwAgentDir is the agent working directory in the /tmp/gh-aw tree.
+const TmpGhAwAgentDir = TmpGhAwDir + "/agent/"
+
+// TmpGhAwAssetsDir is the directory the upload_assets job downloads the
+// safe-outputs assets artifact into. It is the single source of truth shared by
+// the download step (path:) and the upload_assets.cjs consumer script, so the
+// two never disagree on where staged assets live.
+const TmpGhAwAssetsDir = TmpGhAwDir + "/safeoutputs/assets"
+
+// TmpGhAwAssetsDirSlash is TmpGhAwAssetsDir with a trailing slash.
+const TmpGhAwAssetsDirSlash = TmpGhAwAssetsDir + "/"
+
+// AgentStdioLogPath is the path for capturing agent standard I/O log output.
+const AgentStdioLogPath = TmpGhAwDir + "/agent-stdio.log"
+
+// AwPromptsFile is the runtime prompt file path populated by the setup action.
+// Engine harnesses read this file to pass the compiled prompt to the AI engine.
+const AwPromptsFile = TmpGhAwDir + "/aw-prompts/prompt.txt"
+
+// TmpMcpConfigDir is the mcp-config directory in the /tmp/gh-aw tree.
+// Engines that require a writable MCP config directory (e.g. Codex) use this path.
+const TmpMcpConfigDir = TmpGhAwDir + "/mcp-config"
+
+// TmpMcpServersJsonPath is the MCP servers JSON config file in the /tmp tree.
+// Used by engines that resolve the config through the writable /tmp path.
+const TmpMcpServersJsonPath = TmpMcpConfigDir + "/mcp-servers.json"
+
+// TmpMcpConfigLogsDir is the MCP config server log directory.
+const TmpMcpConfigLogsDir = TmpMcpConfigDir + "/logs/"
+
+// TmpMcpLogsDir is the MCP server logs root directory (with trailing slash).
+const TmpMcpLogsDir = TmpGhAwDir + "/mcp-logs/"
+
+// TmpMcpLogsSafeOutputsDir is the safe-outputs MCP server log directory.
+const TmpMcpLogsSafeOutputsDir = TmpGhAwDir + "/mcp-logs/safeoutputs"
+
+// TmpMcpLogsPlaywrightDir is the Playwright MCP server log directory.
+const TmpMcpLogsPlaywrightDir = TmpGhAwDir + "/mcp-logs/playwright"
+
+// TmpMcpLogsMount is the Docker volume mount spec for the MCP logs directory.
+const TmpMcpLogsMount = TmpGhAwDir + "/mcp-logs:" + TmpGhAwDir + "/mcp-logs"
+
+// TmpMcpScriptsLogsDir is the mcp-scripts server log directory (with trailing slash).
+const TmpMcpScriptsLogsDir = TmpGhAwDir + "/mcp-scripts/logs/"
+
+// TmpRepoMemoryDir is the repo-memory data directory (with trailing slash).
+const TmpRepoMemoryDir = TmpGhAwDir + "/repo-memory/"
+
+// TmpCommentMemoryDir is the comment-memory data directory (with trailing slash).
+const TmpCommentMemoryDir = TmpGhAwDir + "/comment-memory/"
+
+// TmpAwBundleGlob is the glob pattern for bundle files produced by the agent.
+const TmpAwBundleGlob = TmpGhAwDir + "/aw-*.bundle"
+
+// TmpAwPatchGlob is the glob pattern for patch files produced by the agent.
+const TmpAwPatchGlob = TmpGhAwDir + "/aw-*.patch"
+
+// TmpGeminiClientErrorGlob is the glob for Gemini client error JSON diagnostic files.
+const TmpGeminiClientErrorGlob = TmpGhAwDir + "/gemini-client-error-*.json"
+
+// TmpAntigravityClientErrorGlob is the glob for Antigravity client error JSON diagnostic files.
+const TmpAntigravityClientErrorGlob = TmpGhAwDir + "/antigravity-client-error-*.json"
+
+// TmpPiAgentDir is the Pi engine agent working directory.
+const TmpPiAgentDir = TmpGhAwDir + "/pi-agent-dir"
+
+// ThreatDetectionLogPath is the threat detection engine log file path.
+const ThreatDetectionLogPath = TmpGhAwDir + "/threat-detection/detection.log"
+
+// ThreatDetectionDir is the threat detection working directory.
+const ThreatDetectionDir = TmpGhAwDir + "/threat-detection"
+
+// ThreatDetectionResultPath is the structured verdict output file written by the
+// external threat-detect binary (features: gh-aw-detection: true). The binary writes
+// a four-field JSON verdict to this path via --output; threat-detect conclude reads it.
+const ThreatDetectionResultPath = TmpGhAwDir + "/threat-detection/detection_result.json"
+
+// TmpProxyLogsDir is the DIFC proxy logs directory (with trailing slash).
+const TmpProxyLogsDir = TmpGhAwDir + "/proxy-logs/"
+
+// TmpProxyTLSDir is the proxy TLS certificates sub-directory (with trailing slash).
+const TmpProxyTLSDir = TmpGhAwDir + "/proxy-logs/proxy-tls/"
+
+// TmpProxyTLSCACert is the proxy TLS CA certificate file path.
+const TmpProxyTLSCACert = TmpGhAwDir + "/proxy-logs/proxy-tls/ca.crt"
+
+// TmpDIFCProxyTLSCACert is the DIFC proxy TLS CA certificate file path.
+const TmpDIFCProxyTLSCACert = TmpGhAwDir + "/difc-proxy-tls/ca.crt"
+
+// TmpAwMcpLogsDir is the aw-mcp server logs directory.
+const TmpAwMcpLogsDir = TmpGhAwDir + "/aw-mcp/logs"
+
+// TmpSandboxAgentLogsDir is the sandbox agent logs directory (with trailing slash).
+const TmpSandboxAgentLogsDir = TmpGhAwDir + "/sandbox/agent/logs/"
+
+// Shell and Actions expression form path constants
+//
+// These complement GhAwRootDirShell and GhAwRootDir for sub-paths commonly
+// referenced in both shell run: blocks and GitHub Actions expression contexts.
+
+// GhAwRootDirShellSlash is GhAwRootDirShell with a trailing slash.
+// Use for path prefix matching in shell expressions (e.g. ${RUNNER_TEMP}/gh-aw/).
+const GhAwRootDirShellSlash = GhAwRootDirShell + "/"
+
+// ShellMcpConfigDir is the mcp-config directory in shell environment variable form.
+const ShellMcpConfigDir = GhAwRootDirShell + "/mcp-config"
+
+// ShellMcpServersJsonPath is the MCP servers JSON config file path in shell form.
+// Used by engines that resolve the config via the host RUNNER_TEMP path.
+const ShellMcpServersJsonPath = GhAwRootDirShell + "/mcp-config/mcp-servers.json"
+
+// GhAwRootDirSlash is GhAwRootDir with a trailing slash (Actions expression form).
+const GhAwRootDirSlash = GhAwRootDir + "/"
+
+// McpServersJsonPathExpr is the MCP servers JSON config path in Actions expression form.
+const McpServersJsonPathExpr = GhAwRootDir + "/mcp-config/mcp-servers.json"
+
+// CodexMcpConfigTomlPath is the Codex MCP config TOML file path in Actions expression form.
+const CodexMcpConfigTomlPath = GhAwRootDir + "/mcp-config/config.toml"
+
+// System path constants
+//
+// Well-known host system paths used by CLI tools and shell completion.
+
+// CopilotBinaryPath is the path to the Copilot CLI binary inside AWF containers.
+const CopilotBinaryPath = "/usr/local/bin/copilot"
+
+// BashCompletionDir is the system-wide bash completion directory.
+const BashCompletionDir = "/etc/bash_completion.d"
+
+// BashCompletionGhAwPath is the gh-aw bash completion file path.
+const BashCompletionGhAwPath = BashCompletionDir + "/gh-aw"
+
+// HomebrewPrefix is the default Homebrew installation prefix on macOS.
+const HomebrewPrefix = "/opt/homebrew"
+
+// UsrLocalPrefix is the standard /usr/local installation prefix.
+const UsrLocalPrefix = "/usr/local"
+
+// GetWorkflowDir returns the workflows directory path.
+// Always uses forward slashes, which are required for git/GitHub paths.
+// GH_AW_WORKFLOWS_DIR overrides the default; any OS-specific separators are normalized.
 func GetWorkflowDir() string {
-	return filepath.Join(".github", "workflows")
+	if dir := os.Getenv("GH_AW_WORKFLOWS_DIR"); dir != "" {
+		return filepath.ToSlash(dir)
+	}
+	return WorkflowsDir
 }
 
 // MaxSymlinkDepth limits recursive symlink resolution when fetching remote files.

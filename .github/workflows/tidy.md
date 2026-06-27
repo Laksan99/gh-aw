@@ -1,4 +1,6 @@
 ---
+private: true
+emoji: "🧹"
 name: Tidy
 description: Automatically formats and tidies code files (Go, JS, TypeScript) when code changes are pushed or on command
 on:
@@ -33,7 +35,7 @@ network:
   allowed: ["defaults", "go"]
 
 imports:
-  - shared/observability-otlp.md
+  - shared/otlp.md
 tools:
   cli-proxy: true
   github:

@@ -11,6 +11,84 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+// TestDispatchWorkflowConfigTargetRepo verifies that dispatch-workflow correctly parses
+// target-repo and allowed-repos fields.
+func TestDispatchWorkflowConfigTargetRepo(t *testing.T) {
+	compiler := NewCompiler()
+
+	tests := []struct {
+		name          string
+		configMap     map[string]any
+		expectedRepo  string
+		expectedRepos []string
+		expectedToken string
+	}{
+		{
+			name: "target-repo and allowed-repos configured",
+			configMap: map[string]any{
+				"dispatch-workflow": map[string]any{
+					"workflows":     []any{"worker"},
+					"target-repo":   "githubnext/gh-aw-side-repo",
+					"allowed-repos": []any{"githubnext/gh-aw-side-repo"},
+					"github-token":  "${{ secrets.TEMP_USER_PAT }}",
+				},
+			},
+			expectedRepo:  "githubnext/gh-aw-side-repo",
+			expectedRepos: []string{"githubnext/gh-aw-side-repo"},
+			expectedToken: "${{ secrets.TEMP_USER_PAT }}",
+		},
+		{
+			name: "multiple allowed repos",
+			configMap: map[string]any{
+				"dispatch-workflow": map[string]any{
+					"workflows":     []any{"worker"},
+					"target-repo":   "org/primary-repo",
+					"allowed-repos": []any{"org/primary-repo", "org/secondary-repo"},
+				},
+			},
+			expectedRepo:  "org/primary-repo",
+			expectedRepos: []string{"org/primary-repo", "org/secondary-repo"},
+			expectedToken: "",
+		},
+		{
+			name: "allowed-repos as GitHub Actions expression",
+			configMap: map[string]any{
+				"dispatch-workflow": map[string]any{
+					"workflows":     []any{"worker"},
+					"target-repo":   "${{ inputs.target_repo }}",
+					"allowed-repos": "${{ inputs['allowed-repos'] }}",
+				},
+			},
+			expectedRepo:  "${{ inputs.target_repo }}",
+			expectedRepos: []string{"${{ inputs['allowed-repos'] }}"},
+			expectedToken: "",
+		},
+		{
+			name: "no cross-repo config",
+			configMap: map[string]any{
+				"dispatch-workflow": map[string]any{
+					"workflows": []any{"worker"},
+					"max":       2,
+				},
+			},
+			expectedRepo:  "",
+			expectedRepos: nil,
+			expectedToken: "",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := compiler.parseDispatchWorkflowConfig(tt.configMap)
+
+			require.NotNil(t, cfg, "config should not be nil")
+			assert.Equal(t, tt.expectedRepo, cfg.TargetRepoSlug, "TargetRepoSlug mismatch")
+			assert.Equal(t, tt.expectedRepos, cfg.AllowedRepos, "AllowedRepos mismatch")
+			assert.Equal(t, tt.expectedToken, cfg.GitHubToken, "GitHubToken mismatch")
+		})
+	}
+}
+
 // TestCreateCodeScanningAlertConfigTargetRepo verifies that create-code-scanning-alert
 // correctly parses target-repo and allowed-repos fields.
 func TestCreateCodeScanningAlertConfigTargetRepo(t *testing.T) {
@@ -153,6 +231,61 @@ func TestPushToPullRequestBranchConfigTargetRepo(t *testing.T) {
 			cfg := compiler.parsePushToPullRequestBranchConfig(tt.configMap)
 
 			require.NotNil(t, cfg, "config should not be nil")
+			assert.Equal(t, tt.expectedRepo, cfg.TargetRepoSlug, "TargetRepoSlug mismatch")
+			assert.Equal(t, tt.expectedRepos, cfg.AllowedRepos, "AllowedRepos mismatch")
+			assert.Equal(t, tt.expectedToken, cfg.GitHubToken, "GitHubToken mismatch")
+		})
+	}
+}
+
+// TestMergePullRequestConfigTargetRepo verifies that merge-pull-request
+// correctly parses target-repo and allowed-repos fields.
+func TestMergePullRequestConfigTargetRepo(t *testing.T) {
+	compiler := NewCompiler()
+
+	tests := []struct {
+		name           string
+		configMap      map[string]any
+		expectedRepo   string
+		expectedRepos  []string
+		expectedToken  string
+		expectedTarget string
+	}{
+		{
+			name: "target, target-repo and allowed-repos configured",
+			configMap: map[string]any{
+				"merge-pull-request": map[string]any{
+					"target":        "*",
+					"target-repo":   "githubnext/gh-aw-side-repo",
+					"allowed-repos": []any{"githubnext/gh-aw-side-repo", "github/docs"},
+					"github-token":  "${{ secrets.TEMP_USER_PAT }}",
+				},
+			},
+			expectedTarget: "*",
+			expectedRepo:   "githubnext/gh-aw-side-repo",
+			expectedRepos:  []string{"githubnext/gh-aw-side-repo", "github/docs"},
+			expectedToken:  "${{ secrets.TEMP_USER_PAT }}",
+		},
+		{
+			name: "no cross-repo config",
+			configMap: map[string]any{
+				"merge-pull-request": map[string]any{
+					"required-labels": []any{"safe-to-merge"},
+				},
+			},
+			expectedTarget: "",
+			expectedRepo:   "",
+			expectedRepos:  nil,
+			expectedToken:  "",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := compiler.parseMergePullRequestConfig(tt.configMap)
+
+			require.NotNil(t, cfg, "config should not be nil")
+			assert.Equal(t, tt.expectedTarget, cfg.Target, "Target mismatch")
 			assert.Equal(t, tt.expectedRepo, cfg.TargetRepoSlug, "TargetRepoSlug mismatch")
 			assert.Equal(t, tt.expectedRepos, cfg.AllowedRepos, "AllowedRepos mismatch")
 			assert.Equal(t, tt.expectedToken, cfg.GitHubToken, "GitHubToken mismatch")
@@ -386,6 +519,45 @@ func TestUpdateIssueGitHubTokenInHandlerConfig(t *testing.T) {
 	assert.Contains(t, allowedRepos, "githubnext/gh-aw-side-repo", "allowed_repos should contain the repo")
 }
 
+// TestMergePullRequestCrossRepoInHandlerConfig verifies that target-repo and allowed-repos
+// are included in the handler manager config JSON for merge-pull-request.
+func TestMergePullRequestCrossRepoInHandlerConfig(t *testing.T) {
+	compiler := NewCompiler()
+
+	workflowData := &WorkflowData{
+		Name: "Test",
+		SafeOutputs: &SafeOutputsConfig{
+			MergePullRequest: &MergePullRequestConfig{
+				BaseSafeOutputConfig: BaseSafeOutputConfig{
+					GitHubToken: "${{ secrets.TEMP_USER_PAT }}",
+				},
+				SafeOutputTargetConfig: SafeOutputTargetConfig{
+					Target:         "*",
+					TargetRepoSlug: "githubnext/gh-aw-side-repo",
+					AllowedRepos:   []string{"githubnext/gh-aw-side-repo"},
+				},
+			},
+		},
+	}
+
+	var steps []string
+	compiler.addHandlerManagerConfigEnvVar(&steps, workflowData)
+
+	require.NotEmpty(t, steps)
+	handlerConfig := extractHandlerConfig(t, strings.Join(steps, ""))
+
+	mergePR, ok := handlerConfig["merge_pull_request"]
+	require.True(t, ok, "merge_pull_request config should be present")
+
+	assert.Equal(t, "*", mergePR["target"], "target should be in handler config")
+
+	assert.Equal(t, "githubnext/gh-aw-side-repo", mergePR["target-repo"], "target-repo should be in handler config")
+
+	allowedRepos, ok := mergePR["allowed_repos"]
+	require.True(t, ok, "allowed_repos should be present")
+	assert.Contains(t, allowedRepos, "githubnext/gh-aw-side-repo", "allowed_repos should contain the repo")
+}
+
 // TestPushToPullRequestBranchCrossRepoInHandlerConfig verifies that target-repo and allowed-repos
 // are included in the handler manager config JSON for push-to-pull-request-branch.
 func TestPushToPullRequestBranchCrossRepoInHandlerConfig(t *testing.T) {
@@ -416,6 +588,42 @@ func TestPushToPullRequestBranchCrossRepoInHandlerConfig(t *testing.T) {
 	assert.Equal(t, "githubnext/gh-aw-side-repo", pushBranch["target-repo"], "target-repo should be in handler config")
 
 	allowedRepos, ok := pushBranch["allowed_repos"]
+	require.True(t, ok, "allowed_repos should be present")
+	assert.Contains(t, allowedRepos, "githubnext/gh-aw-side-repo", "allowed_repos should contain the repo")
+}
+
+// TestDispatchWorkflowCrossRepoInHandlerConfig verifies that target-repo, allowed-repos,
+// and github-token are included in the handler manager config JSON for dispatch-workflow.
+func TestDispatchWorkflowCrossRepoInHandlerConfig(t *testing.T) {
+	compiler := NewCompiler()
+
+	workflowData := &WorkflowData{
+		Name: "Test",
+		SafeOutputs: &SafeOutputsConfig{
+			DispatchWorkflow: &DispatchWorkflowConfig{
+				BaseSafeOutputConfig: BaseSafeOutputConfig{
+					GitHubToken: "${{ secrets.TEMP_USER_PAT }}",
+				},
+				Workflows:      []string{"worker"},
+				TargetRepoSlug: "githubnext/gh-aw-side-repo",
+				AllowedRepos:   []string{"githubnext/gh-aw-side-repo"},
+			},
+		},
+	}
+
+	var steps []string
+	compiler.addHandlerManagerConfigEnvVar(&steps, workflowData)
+
+	require.NotEmpty(t, steps)
+	handlerConfig := extractHandlerConfig(t, strings.Join(steps, ""))
+
+	dispatchWorkflow, ok := handlerConfig["dispatch_workflow"]
+	require.True(t, ok, "dispatch_workflow config should be present")
+
+	assert.Equal(t, "${{ secrets.TEMP_USER_PAT }}", dispatchWorkflow["github-token"], "github-token should be in handler config")
+	assert.Equal(t, "githubnext/gh-aw-side-repo", dispatchWorkflow["target-repo"], "target-repo should be in handler config")
+
+	allowedRepos, ok := dispatchWorkflow["allowed_repos"]
 	require.True(t, ok, "allowed_repos should be present")
 	assert.Contains(t, allowedRepos, "githubnext/gh-aw-side-repo", "allowed_repos should contain the repo")
 }
@@ -519,8 +727,8 @@ func TestHandlerManagerStepPerOutputTokenInHandlerConfig(t *testing.T) {
 	}
 }
 
-// TestParseAllowedReposFromConfig verifies the parseAllowedReposFromConfig helper function.
-func TestParseAllowedReposFromConfig(t *testing.T) {
+// TestParseAllowedRepos verifies the shared array parser for allowed-repos.
+func TestParseAllowedRepos(t *testing.T) {
 	tests := []struct {
 		name     string
 		input    map[string]any
@@ -563,12 +771,95 @@ func TestParseAllowedReposFromConfig(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			result := parseAllowedReposFromConfig(tt.input)
+			result := ParseStringArrayFromConfig(tt.input, "allowed-repos", nil)
 			if tt.expected == nil {
-				assert.Emptyf(t, result, "parseAllowedReposFromConfig should return nil or empty for: %s", tt.name)
+				assert.Emptyf(t, result, "ParseStringArrayFromConfig should return nil or empty for: %s", tt.name)
 			} else {
-				assert.Equal(t, tt.expected, result, "parseAllowedReposFromConfig mismatch")
+				assert.Equal(t, tt.expected, result, "ParseStringArrayFromConfig mismatch")
 			}
+		})
+	}
+}
+
+// TestLinkSubIssueConfigTargetRepo verifies that link-sub-issue correctly parses
+// target-repo and allowed-repos fields, including GitHub Actions expressions for allowed-repos.
+func TestLinkSubIssueConfigTargetRepo(t *testing.T) {
+	compiler := NewCompiler()
+
+	tests := []struct {
+		name          string
+		configMap     map[string]any
+		expectedRepo  string
+		expectedRepos []string
+		expectedToken string
+	}{
+		{
+			name: "target-repo and allowed-repos configured",
+			configMap: map[string]any{
+				"link-sub-issue": map[string]any{
+					"target-repo":   "githubnext/gh-aw-side-repo",
+					"allowed-repos": []any{"githubnext/gh-aw-side-repo"},
+					"github-token":  "${{ secrets.TEMP_USER_PAT }}",
+				},
+			},
+			expectedRepo:  "githubnext/gh-aw-side-repo",
+			expectedRepos: []string{"githubnext/gh-aw-side-repo"},
+			expectedToken: "${{ secrets.TEMP_USER_PAT }}",
+		},
+		{
+			name: "multiple allowed repos",
+			configMap: map[string]any{
+				"link-sub-issue": map[string]any{
+					"target-repo":   "org/primary-repo",
+					"allowed-repos": []any{"org/primary-repo", "org/secondary-repo"},
+				},
+			},
+			expectedRepo:  "org/primary-repo",
+			expectedRepos: []string{"org/primary-repo", "org/secondary-repo"},
+			expectedToken: "",
+		},
+		{
+			name: "allowed-repos as GitHub Actions expression",
+			configMap: map[string]any{
+				"link-sub-issue": map[string]any{
+					"target-repo":   "${{ inputs.target_repo }}",
+					"allowed-repos": "${{ inputs['allowed-repos'] }}",
+				},
+			},
+			expectedRepo:  "${{ inputs.target_repo }}",
+			expectedRepos: []string{"${{ inputs['allowed-repos'] }}"},
+			expectedToken: "",
+		},
+		{
+			name: "no cross-repo config",
+			configMap: map[string]any{
+				"link-sub-issue": map[string]any{
+					"max": 5,
+				},
+			},
+			expectedRepo:  "",
+			expectedRepos: nil,
+			expectedToken: "",
+		},
+		{
+			name: "nil config value",
+			configMap: map[string]any{
+				"link-sub-issue": nil,
+			},
+			expectedRepo:  "",
+			expectedRepos: nil,
+			expectedToken: "",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := compiler.parseLinkSubIssueConfig(tt.configMap)
+
+			require.NotNil(t, cfg, "config should not be nil")
+			assert.Equal(t, tt.expectedRepo, cfg.TargetRepoSlug, "TargetRepoSlug mismatch")
+			assert.Equal(t, tt.expectedRepos, cfg.AllowedRepos, "AllowedRepos mismatch")
+			assert.Equal(t, tt.expectedToken, cfg.GitHubToken, "GitHubToken mismatch")
 		})
 	}
 }

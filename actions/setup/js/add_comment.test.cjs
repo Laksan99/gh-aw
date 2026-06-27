@@ -41,6 +41,12 @@ describe("add_comment", () => {
               html_url: "https://github.com/owner/repo/issues/42#issuecomment-12345",
             },
           }),
+          updateComment: async () => ({
+            data: {
+              id: 12345,
+              html_url: "https://github.com/owner/repo/issues/42#issuecomment-12345",
+            },
+          }),
           listComments: async () => ({ data: [] }),
         },
         pulls: {
@@ -94,6 +100,7 @@ describe("add_comment", () => {
     global.core = originalGlobals.core;
     global.github = originalGlobals.github;
     global.context = originalGlobals.context;
+    delete process.env.GH_AW_COMMENT_ID;
   });
 
   describe("target configuration", () => {
@@ -215,7 +222,7 @@ describe("add_comment", () => {
       expect(result.itemNumber).toBe(28912);
     });
 
-    it("should fail when target is '*' but no item_number provided", async () => {
+    it("should skip (not fail) when target is '*' but no item_number provided", async () => {
       const addCommentScript = fs.readFileSync(path.join(__dirname, "add_comment.cjs"), "utf8");
 
       const handler = await eval(`(async () => { ${addCommentScript}; return await main({ target: '*' }); })()`);
@@ -228,7 +235,26 @@ describe("add_comment", () => {
       const result = await handler(message, {});
 
       expect(result.success).toBe(false);
+      expect(result.skipped).toBe(true);
       expect(result.error).toMatch(/no.*item_number/i);
+    });
+
+    it("should hard-fail (not skip) when target is '*' and explicit pull_request_number is invalid", async () => {
+      const addCommentScript = fs.readFileSync(path.join(__dirname, "add_comment.cjs"), "utf8");
+
+      const handler = await eval(`(async () => { ${addCommentScript}; return await main({ target: '*' }); })()`);
+
+      const message = {
+        type: "add_comment",
+        pull_request_number: "invalid",
+        body: "Test comment with invalid explicit pull_request_number",
+      };
+
+      const result = await handler(message, {});
+
+      expect(result.success).toBe(false);
+      expect(result.skipped).toBeUndefined();
+      expect(result.error).toBeTruthy();
     });
 
     it("should use explicit item_number even with triggering target", async () => {
@@ -602,6 +628,143 @@ describe("add_comment", () => {
           comment_id: 777,
         })
       );
+    });
+
+    it("should update existing status comment when target=status is requested", async () => {
+      const addCommentScript = fs.readFileSync(path.join(__dirname, "add_comment.cjs"), "utf8");
+      process.env.GH_AW_COMMENT_ID = "55555";
+
+      let capturedUpdateParams = null;
+      let createCommentCalled = false;
+      mockGithub.rest.issues.updateComment = async params => {
+        capturedUpdateParams = params;
+        return {
+          data: {
+            id: params.comment_id,
+            html_url: `https://github.com/${params.owner}/${params.repo}/issues/8535#issuecomment-${params.comment_id}`,
+          },
+        };
+      };
+      mockGithub.rest.issues.createComment = async () => {
+        createCommentCalled = true;
+        return {
+          data: {
+            id: 12345,
+            html_url: "https://github.com/owner/repo/issues/8535#issuecomment-12345",
+          },
+        };
+      };
+
+      const handler = await eval(`(async () => { ${addCommentScript}; return await main({ target: 'triggering' }); })()`);
+      const result = await handler({ type: "add_comment", body: "Final output", target: "status" }, {});
+
+      expect(result.success).toBe(true);
+      expect(capturedUpdateParams).toEqual(
+        expect.objectContaining({
+          owner: "owner",
+          repo: "repo",
+          comment_id: 55555,
+        })
+      );
+      expect(createCommentCalled).toBe(false);
+      delete process.env.GH_AW_COMMENT_ID;
+    });
+
+    it("should update existing comment when comment-id alias is provided", async () => {
+      const addCommentScript = fs.readFileSync(path.join(__dirname, "add_comment.cjs"), "utf8");
+
+      let capturedUpdateParams = null;
+      let createCommentCalled = false;
+      mockGithub.rest.issues.updateComment = async params => {
+        capturedUpdateParams = params;
+        return {
+          data: {
+            id: params.comment_id,
+            html_url: `https://github.com/${params.owner}/${params.repo}/issues/8535#issuecomment-${params.comment_id}`,
+          },
+        };
+      };
+      mockGithub.rest.issues.createComment = async () => {
+        createCommentCalled = true;
+        return {
+          data: {
+            id: 12345,
+            html_url: "https://github.com/owner/repo/issues/8535#issuecomment-12345",
+          },
+        };
+      };
+
+      const handler = await eval(`(async () => { ${addCommentScript}; return await main({ target: 'triggering' }); })()`);
+      const result = await handler({ type: "add_comment", body: "Updated output", "comment-id": 55555 }, {});
+
+      expect(result.success).toBe(true);
+      expect(capturedUpdateParams).toEqual(
+        expect.objectContaining({
+          owner: "owner",
+          repo: "repo",
+          comment_id: 55555,
+        })
+      );
+      expect(createCommentCalled).toBe(false);
+    });
+
+    it("should warn and ignore unrecognized message-level target values instead of failing", async () => {
+      const addCommentScript = fs.readFileSync(path.join(__dirname, "add_comment.cjs"), "utf8");
+
+      let warningCalls = [];
+      let createCommentCalled = false;
+      mockCore.warning = msg => {
+        warningCalls.push(msg);
+      };
+      mockGithub.rest.issues.createComment = async () => {
+        createCommentCalled = true;
+        return {
+          data: {
+            id: 12345,
+            html_url: "https://github.com/owner/repo/pull/8535#issuecomment-12345",
+          },
+        };
+      };
+
+      const handler = await eval(`(async () => { ${addCommentScript}; return await main({ target: 'triggering' }); })()`);
+      // Truly unrecognized target value — should warn and proceed (not fail)
+      const result = await handler({ type: "add_comment", body: "Test comment", target: "unknown_value" }, {});
+
+      expect(result.success).toBe(true);
+      expect(createCommentCalled).toBe(true);
+      // Should have warned about the unrecognized target value
+      const targetWarning = warningCalls.find(msg => msg.includes("unknown_value") && msg.includes("target"));
+      expect(targetWarning).toBeTruthy();
+    });
+
+    it("should accept issue and discussion as valid message-level target values without warning", async () => {
+      const addCommentScript = fs.readFileSync(path.join(__dirname, "add_comment.cjs"), "utf8");
+
+      for (const allowedTarget of ["issue", "discussion"]) {
+        let warningCalls = [];
+        let createCommentCalled = false;
+        mockCore.warning = msg => {
+          warningCalls.push(msg);
+        };
+        mockGithub.rest.issues.createComment = async () => {
+          createCommentCalled = true;
+          return {
+            data: {
+              id: 12345,
+              html_url: "https://github.com/owner/repo/pull/8535#issuecomment-12345",
+            },
+          };
+        };
+
+        const handler = await eval(`(async () => { ${addCommentScript}; return await main({ target: 'triggering' }); })()`);
+        const result = await handler({ type: "add_comment", body: "Test comment", target: allowedTarget }, {});
+
+        expect(result.success).toBe(true);
+        expect(createCommentCalled).toBe(true);
+        // Should NOT have warned about an allowed target value
+        const targetWarning = warningCalls.find(msg => msg.includes(allowedTarget) && msg.includes("target") && msg.includes("Ignoring unrecognized"));
+        expect(targetWarning).toBeUndefined();
+      }
     });
   });
 
@@ -1431,7 +1594,7 @@ describe("add_comment", () => {
       expect(result.warning).toContain("not found");
       expect(result.skipped).toBe(true);
       expect(warningCalls.length).toBeGreaterThan(0);
-      expect(warningCalls[0]).toContain("not found");
+      expect(warningCalls.some(w => w.toLowerCase().includes("not found"))).toBe(true);
       expect(errorCalls.length).toBe(0);
     });
 
@@ -1541,6 +1704,104 @@ describe("add_comment", () => {
       expect(result.warning).toBeTruthy();
       expect(result.skipped).toBe(true);
       expect(warningCalls.length).toBeGreaterThan(0);
+    });
+
+    it("should treat locked issue/PR errors as non-fatal warnings", async () => {
+      const addCommentScript = fs.readFileSync(path.join(__dirname, "add_comment.cjs"), "utf8");
+
+      let warningCalls = [];
+      mockCore.warning = msg => {
+        warningCalls.push(msg);
+      };
+
+      let errorCalls = [];
+      mockCore.error = msg => {
+        errorCalls.push(msg);
+      };
+
+      mockGithub.rest.issues.createComment = async () => {
+        const error = new Error("Unable to create comment because issue is locked.");
+        // @ts-ignore
+        error.status = 403;
+        throw error;
+      };
+
+      const handler = await eval(`(async () => { ${addCommentScript}; return await main({}); })()`);
+
+      const message = {
+        type: "add_comment",
+        body: "Test comment",
+      };
+
+      const result = await handler(message, {});
+
+      expect(result.success).toBe(true);
+      expect(result.warning).toContain("locked");
+      expect(result.skipped).toBe(true);
+      expect(warningCalls.length).toBeGreaterThan(0);
+      expect(errorCalls.length).toBe(0);
+    });
+
+    it("should treat conversation locked errors as non-fatal warnings", async () => {
+      const addCommentScript = fs.readFileSync(path.join(__dirname, "add_comment.cjs"), "utf8");
+
+      let warningCalls = [];
+      mockCore.warning = msg => {
+        warningCalls.push(msg);
+      };
+
+      let errorCalls = [];
+      mockCore.error = msg => {
+        errorCalls.push(msg);
+      };
+
+      mockGithub.rest.issues.createComment = async () => {
+        const error = new Error("Conversation is locked");
+        // @ts-ignore
+        error.status = 403;
+        throw error;
+      };
+
+      const handler = await eval(`(async () => { ${addCommentScript}; return await main({}); })()`);
+
+      const result = await handler({ type: "add_comment", body: "Test comment" }, {});
+
+      expect(result.success).toBe(true);
+      expect(result.warning).toContain("locked");
+      expect(result.skipped).toBe(true);
+      expect(warningCalls.length).toBeGreaterThan(0);
+      expect(errorCalls.length).toBe(0);
+    });
+
+    it("should treat HTTP 423 locked errors as non-fatal warnings", async () => {
+      const addCommentScript = fs.readFileSync(path.join(__dirname, "add_comment.cjs"), "utf8");
+
+      let warningCalls = [];
+      mockCore.warning = msg => {
+        warningCalls.push(msg);
+      };
+
+      let errorCalls = [];
+      mockCore.error = msg => {
+        errorCalls.push(msg);
+      };
+
+      mockGithub.rest.issues.createComment = async () => {
+        const error = new Error("Locked");
+        // @ts-ignore
+        error.status = 423;
+        throw error;
+      };
+
+      const handler = await eval(`(async () => { ${addCommentScript}; return await main({}); })()`);
+
+      const result = await handler({ type: "add_comment", body: "Test comment" }, {});
+
+      expect(result.success).toBe(true);
+      expect(result.warning).toContain("locked");
+      expect(result.skipped).toBe(true);
+      expect(warningCalls.length).toBeGreaterThan(0);
+      expect(errorCalls.length).toBe(0);
     });
 
     it("should still fail for non-404 errors", async () => {
@@ -1817,6 +2078,127 @@ describe("add_comment", () => {
       // Should only call GraphQL once (not retry)
       expect(graphqlCallCount).toBe(1);
     });
+
+    it("should return skipped (not fail) when discussion comment fails with Resource not accessible by integration", async () => {
+      const addCommentScript = fs.readFileSync(path.join(__dirname, "add_comment.cjs"), "utf8");
+
+      let warningCalls = [];
+      let errorCalls = [];
+      mockCore.warning = msg => {
+        warningCalls.push(msg);
+      };
+      mockCore.error = msg => {
+        errorCalls.push(msg);
+      };
+
+      // Mock REST API to return 404 (not found as issue/PR)
+      mockGithub.rest.issues.createComment = async () => {
+        const error = new Error("Not Found");
+        // @ts-ignore -- Error type does not include status, but octokit adds it at runtime
+        error.status = 404;
+        throw error;
+      };
+
+      // Mock GraphQL to return the discussion node ID but fail on mutation
+      let graphqlCalls = [];
+      mockGithub.graphql = async (query, vars) => {
+        graphqlCalls.push({ query, vars });
+
+        // First call: fetch discussion node ID
+        if (query.includes("query") && query.includes("discussion(number:")) {
+          return {
+            repository: {
+              discussion: {
+                id: "D_kwDOTest335",
+                url: "https://github.com/owner/repo/discussions/335",
+              },
+            },
+          };
+        }
+
+        // Second call: mutation — simulate "Resource not accessible by integration"
+        if (query.includes("mutation") && query.includes("addDiscussionComment")) {
+          const err = new Error("Request failed due to following response errors:\n - Resource not accessible by integration");
+          throw err;
+        }
+      };
+
+      const handler = await eval(`(async () => { ${addCommentScript}; return await main({ target: 'triggering' }); })()`);
+
+      const message = {
+        type: "add_comment",
+        item_number: 335,
+        body: "Test comment on discussion",
+      };
+
+      const result = await handler(message, {});
+
+      // Should be skipped (not a hard failure) so the safe-outputs job doesn't fail
+      expect(result.success).toBe(false);
+      expect(result.skipped).toBe(true);
+      expect(result.error).toContain("configuration mismatch");
+      expect(result.error).toContain("discussions:write");
+
+      // Warning should be emitted, no error
+      const configMismatchWarning = warningCalls.find(msg => msg.includes("configuration mismatch"));
+      expect(configMismatchWarning).toBeTruthy();
+      expect(errorCalls.length).toBe(0);
+    });
+
+    it("should return skipped when discussion GraphQL errors array contains Resource not accessible", async () => {
+      const addCommentScript = fs.readFileSync(path.join(__dirname, "add_comment.cjs"), "utf8");
+
+      let warningCalls = [];
+      mockCore.warning = msg => {
+        warningCalls.push(msg);
+      };
+
+      // Mock REST API to return 404
+      mockGithub.rest.issues.createComment = async () => {
+        const error = new Error("Not Found");
+        // @ts-ignore
+        error.status = 404;
+        throw error;
+      };
+
+      // GraphQL: discussion exists but mutation fails with errors array
+      mockGithub.graphql = async (query, vars) => {
+        if (query.includes("query") && query.includes("discussion(number:")) {
+          return {
+            repository: {
+              discussion: {
+                id: "D_kwDOTest336",
+                url: "https://github.com/owner/repo/discussions/336",
+              },
+            },
+          };
+        }
+
+        if (query.includes("mutation") && query.includes("addDiscussionComment")) {
+          const err = new Error("Request failed");
+          // @ts-ignore -- Error type does not include errors, but GraphQL errors surface this way at runtime
+          err.errors = [{ type: "FORBIDDEN", message: "Resource not accessible by integration" }];
+          throw err;
+        }
+      };
+
+      const handler = await eval(`(async () => { ${addCommentScript}; return await main({ target: 'triggering' }); })()`);
+
+      const message = {
+        type: "add_comment",
+        item_number: 336,
+        body: "Test comment",
+      };
+
+      const result = await handler(message, {});
+
+      expect(result.success).toBe(false);
+      expect(result.skipped).toBe(true);
+      expect(result.error).toContain("configuration mismatch");
+
+      const configMismatchWarning = warningCalls.find(msg => msg.includes("configuration mismatch"));
+      expect(configMismatchWarning).toBeTruthy();
+    });
   });
 
   describe("temporary ID resolution", () => {
@@ -1924,7 +2306,7 @@ describe("add_comment", () => {
       const result = await handler(message, resolvedTemporaryIds);
 
       expect(result.success).toBe(false);
-      expect(result.error).toContain("Invalid explicit target number specified");
+      expect(result.error).toContain("Invalid item number");
     });
 
     it("should replace temporary IDs in comment body", async () => {
@@ -2163,7 +2545,8 @@ describe("add_comment", () => {
       const bodyIndex = capturedBody.indexOf("Comment body for warning case");
       expect(cautionIndex).toBeGreaterThanOrEqual(0);
       expect(cautionIndex).toBeLessThan(bodyIndex);
-      expect(capturedBody).toContain("**Security scanning requires review**");
+      expect(capturedBody).toContain("agentic threat detected");
+      expect(capturedBody).toContain("<!-- gh-aw-threat-detected -->");
       expect(capturedBody).toContain("> Generated by [Security Test Workflow]");
       expect(capturedBody).toMatch(/> \[!CAUTION\][\s\S]*\n\n> Generated by \[Security Test Workflow\]/);
 
@@ -2393,6 +2776,149 @@ describe("add_comment", () => {
       // PR author mention should be preserved (not neutralized)
       expect(capturedBody).toContain("@PRAuthor");
       expect(capturedBody).not.toContain("`@PRAuthor`");
+    });
+
+    it("should neutralize @copilot mention by default", async () => {
+      const addCommentScript = fs.readFileSync(path.join(__dirname, "add_comment.cjs"), "utf8");
+
+      mockContext.payload = {
+        pull_request: {
+          number: 8535,
+          user: { login: "PRAuthor", type: "User" },
+        },
+      };
+
+      let capturedBody = null;
+      mockGithub.rest.issues.createComment = async params => {
+        capturedBody = params.body;
+        return {
+          data: {
+            id: 12345,
+            html_url: "https://github.com/owner/repo/issues/8535#issuecomment-12345",
+          },
+        };
+      };
+
+      const handler = await eval(`(async () => { ${addCommentScript}; return await main({}); })()`);
+
+      const message = {
+        type: "add_comment",
+        body: "@copilot review all comments",
+      };
+
+      const result = await handler(message, {});
+
+      expect(result.success).toBe(true);
+      expect(capturedBody).toBeDefined();
+      expect(capturedBody).toContain("`@copilot`");
+    });
+
+    it("should preserve @copilot mention when mentions allowlist includes copilot", async () => {
+      const addCommentScript = fs.readFileSync(path.join(__dirname, "add_comment.cjs"), "utf8");
+
+      mockContext.payload = {
+        pull_request: {
+          number: 8535,
+          user: { login: "PRAuthor", type: "User" },
+        },
+      };
+
+      let capturedBody = null;
+      mockGithub.rest.issues.createComment = async params => {
+        capturedBody = params.body;
+        return {
+          data: {
+            id: 12345,
+            html_url: "https://github.com/owner/repo/issues/8535#issuecomment-12345",
+          },
+        };
+      };
+
+      const handler = await eval(`(async () => { ${addCommentScript}; return await main({ mentions: { allowed: ["@copilot"] } }); })()`);
+
+      const message = {
+        type: "add_comment",
+        body: "@copilot review all comments",
+      };
+
+      const result = await handler(message, {});
+
+      expect(result.success).toBe(true);
+      expect(capturedBody).toBeDefined();
+      expect(capturedBody).toContain("@copilot");
+      expect(capturedBody).not.toContain("`@copilot`");
+    });
+
+    it("should escape all mentions when mentions.enabled is false", async () => {
+      const addCommentScript = fs.readFileSync(path.join(__dirname, "add_comment.cjs"), "utf8");
+
+      mockContext.payload = {
+        pull_request: {
+          number: 8535,
+          user: { login: "PRAuthor", type: "User" },
+        },
+      };
+
+      let capturedBody = null;
+      mockGithub.rest.issues.createComment = async params => {
+        capturedBody = params.body;
+        return {
+          data: {
+            id: 12345,
+            html_url: "https://github.com/owner/repo/issues/8535#issuecomment-12345",
+          },
+        };
+      };
+
+      const handler = await eval(`(async () => { ${addCommentScript}; return await main({ mentions: { enabled: false, allowed: ["@copilot"] } }); })()`);
+
+      const message = {
+        type: "add_comment",
+        body: "@copilot ping @PRAuthor",
+      };
+
+      const result = await handler(message, {});
+
+      expect(result.success).toBe(true);
+      expect(capturedBody).toBeDefined();
+      expect(capturedBody).toContain("`@copilot`");
+      expect(capturedBody).toContain("`@PRAuthor`");
+    });
+
+    it("should escape all mentions when mentions is false", async () => {
+      const addCommentScript = fs.readFileSync(path.join(__dirname, "add_comment.cjs"), "utf8");
+
+      mockContext.payload = {
+        pull_request: {
+          number: 8535,
+          user: { login: "PRAuthor", type: "User" },
+        },
+      };
+
+      let capturedBody = null;
+      mockGithub.rest.issues.createComment = async params => {
+        capturedBody = params.body;
+        return {
+          data: {
+            id: 12345,
+            html_url: "https://github.com/owner/repo/issues/8535#issuecomment-12345",
+          },
+        };
+      };
+
+      const handler = await eval(`(async () => { ${addCommentScript}; return await main({ mentions: false }); })()`);
+
+      const message = {
+        type: "add_comment",
+        body: "@copilot ping @PRAuthor",
+      };
+
+      const result = await handler(message, {});
+
+      expect(result.success).toBe(true);
+      expect(capturedBody).toBeDefined();
+      expect(capturedBody).toContain("`@copilot`");
+      expect(capturedBody).toContain("`@PRAuthor`");
     });
 
     it("should fetch and preserve issue author for explicit item_number", async () => {
@@ -2631,6 +3157,69 @@ describe("add_comment", () => {
       // but the key test is that the handler succeeds
       expect(result.isDiscussion).toBe(true);
     });
+
+    it("should deduplicate allowed aliases case-insensitively across parentAuthors and configured mentions", async () => {
+      const addCommentScript = fs.readFileSync(path.join(__dirname, "add_comment.cjs"), "utf8");
+
+      // Issue author is "Alice"; configured mentions also include "alice" (different casing)
+      mockContext.eventName = "issues";
+      mockContext.payload = {
+        issue: {
+          number: 42,
+          user: { login: "Alice", type: "User" },
+        },
+      };
+
+      const infoMessages = [];
+      mockCore.info = msg => infoMessages.push(msg);
+
+      let capturedBody = null;
+      mockGithub.rest.issues.createComment = async ({ body }) => {
+        capturedBody = body;
+        return { data: { id: 12345, html_url: "https://github.com/owner/repo/issues/42#issuecomment-12345" } };
+      };
+
+      // configured mentions includes "alice" (lowercase dup) and "Bob" (unique)
+      const handler = await eval(`(async () => { ${addCommentScript}; return await main({ mentions: { allowed: ["alice", "Bob"] } }); })()`);
+
+      const result = await handler({ type: "add_comment", body: "@Alice @Bob check this out" }, {});
+
+      expect(result.success).toBe(true);
+      expect(capturedBody).toContain("@Alice");
+      expect(capturedBody).toContain("@Bob");
+      expect(infoMessages).toContain("[MENTIONS] Allowing aliases in comment: Alice, Bob");
+    });
+
+    it("should preserve order: parentAuthors first, then configuredMentionAliases", async () => {
+      const addCommentScript = fs.readFileSync(path.join(__dirname, "add_comment.cjs"), "utf8");
+
+      mockContext.eventName = "issues";
+      mockContext.payload = {
+        issue: {
+          number: 42,
+          user: { login: "Charlie", type: "User" },
+        },
+      };
+
+      const infoMessages = [];
+      mockCore.info = msg => infoMessages.push(msg);
+
+      let capturedBody = null;
+      mockGithub.rest.issues.createComment = async ({ body }) => {
+        capturedBody = body;
+        return { data: { id: 12345, html_url: "https://github.com/owner/repo/issues/42#issuecomment-12345" } };
+      };
+
+      const handler = await eval(`(async () => { ${addCommentScript}; return await main({ mentions: { allowed: ["Dave", "Eve"] } }); })()`);
+
+      const result = await handler({ type: "add_comment", body: "@Charlie @Dave @Eve thanks!" }, {});
+
+      expect(result.success).toBe(true);
+      expect(capturedBody).toContain("@Charlie");
+      expect(capturedBody).toContain("@Dave");
+      expect(capturedBody).toContain("@Eve");
+      expect(infoMessages).toContain("[MENTIONS] Allowing aliases in comment: Charlie, Dave, Eve");
+    });
   });
 
   describe("staged mode", () => {
@@ -2776,6 +3365,13 @@ describe("add_comment", () => {
   });
 
   describe("hide-older-comments behavior", () => {
+    it("should normalize workflow ID match lists", async () => {
+      const addCommentScript = fs.readFileSync(path.join(__dirname, "add_comment.cjs"), "utf8");
+      const exports = await eval(`(async () => { ${addCommentScript}; return { normalizeWorkflowIdList }; })()`);
+
+      expect(exports.normalizeWorkflowIdList(["  wf-a  ", "wf-a", "", "  ", "wf-b "])).toEqual(["wf-a", "wf-b"]);
+    });
+
     it("should skip hiding when no workflow ID is set", async () => {
       const addCommentScript = fs.readFileSync(path.join(__dirname, "add_comment.cjs"), "utf8");
 
@@ -2828,6 +3424,182 @@ describe("add_comment", () => {
 
         const message = { type: "add_comment", body: "Comment with hide disabled" };
         const result = await handler(message, {});
+
+        expect(result.success).toBe(true);
+        expect(listCommentsCalled).toBe(false);
+      } finally {
+        if (originalWorkflowId === undefined) {
+          delete process.env.GH_AW_WORKFLOW_ID;
+        } else {
+          process.env.GH_AW_WORKFLOW_ID = originalWorkflowId;
+        }
+      }
+    });
+
+    it("should hide comments matching compiled hide_older_comments_match values", async () => {
+      const addCommentScript = fs.readFileSync(path.join(__dirname, "add_comment.cjs"), "utf8");
+      const originalWorkflowId = process.env.GH_AW_WORKFLOW_ID;
+      process.env.GH_AW_WORKFLOW_ID = "current-workflow";
+
+      try {
+        let hiddenNodeIds = [];
+        mockGithub.rest.issues.listComments = async () => ({
+          data: [
+            {
+              id: 10,
+              node_id: "IC_kwDOTest10",
+              body: "Current\n\n<!-- gh-aw-workflow-id: current-workflow -->",
+            },
+            {
+              id: 11,
+              node_id: "IC_kwDOTest11",
+              body: "Other\n\n<!-- gh-aw-workflow-id: other_workflow -->",
+            },
+            {
+              id: 12,
+              node_id: "IC_kwDOTest12",
+              body: "Unrelated\n\n<!-- gh-aw-workflow-id: unrelated -->",
+            },
+          ],
+        });
+        mockGithub.graphql = async (query, variables) => {
+          if (query.includes("minimizeComment")) hiddenNodeIds.push(variables.nodeId);
+          return { minimizeComment: { minimizedComment: { isMinimized: true } } };
+        };
+        mockGithub.rest.issues.createComment = async () => ({
+          data: { id: 1, html_url: "https://github.com/owner/repo/issues/8535#issuecomment-1" },
+        });
+
+        const handler = await eval(`(async () => { ${addCommentScript}; return await main({ hide_older_comments: "true", hide_older_comments_match: [" other_workflow ", "other_workflow", "", "  "] }); })()`);
+
+        const result = await handler({ type: "add_comment", body: "Comment with compiled match list" }, {});
+
+        expect(result.success).toBe(true);
+        expect(hiddenNodeIds).toContain("IC_kwDOTest10");
+        expect(hiddenNodeIds).toContain("IC_kwDOTest11");
+        expect(hiddenNodeIds).not.toContain("IC_kwDOTest12");
+      } finally {
+        if (originalWorkflowId === undefined) {
+          delete process.env.GH_AW_WORKFLOW_ID;
+        } else {
+          process.env.GH_AW_WORKFLOW_ID = originalWorkflowId;
+        }
+      }
+    });
+
+    it("should hide comments matching hide-older-comments.match values", async () => {
+      const addCommentScript = fs.readFileSync(path.join(__dirname, "add_comment.cjs"), "utf8");
+      const originalWorkflowId = process.env.GH_AW_WORKFLOW_ID;
+      process.env.GH_AW_WORKFLOW_ID = "current-workflow";
+
+      try {
+        let hiddenNodeIds = [];
+        mockGithub.rest.issues.listComments = async () => ({
+          data: [
+            {
+              id: 10,
+              node_id: "IC_kwDOTest10",
+              body: "Current\n\n<!-- gh-aw-workflow-id: current-workflow -->",
+            },
+            {
+              id: 11,
+              node_id: "IC_kwDOTest11",
+              body: "Other\n\n<!-- gh-aw-workflow-id: other_workflow -->",
+            },
+            {
+              id: 12,
+              node_id: "IC_kwDOTest12",
+              body: "Unrelated\n\n<!-- gh-aw-workflow-id: unrelated -->",
+            },
+          ],
+        });
+        mockGithub.graphql = async (query, variables) => {
+          if (query.includes("minimizeComment")) hiddenNodeIds.push(variables.nodeId);
+          return { minimizeComment: { minimizedComment: { isMinimized: true } } };
+        };
+        mockGithub.rest.issues.createComment = async () => ({
+          data: { id: 1, html_url: "https://github.com/owner/repo/issues/8535#issuecomment-1" },
+        });
+
+        const handler = await eval(`(async () => { ${addCommentScript}; return await main({ hide_older_comments: { match: ["other_workflow"] } }); })()`);
+
+        const result = await handler({ type: "add_comment", body: "Comment with match list" }, {});
+
+        expect(result.success).toBe(true);
+        expect(hiddenNodeIds).toContain("IC_kwDOTest10");
+        expect(hiddenNodeIds).toContain("IC_kwDOTest11");
+        expect(hiddenNodeIds).not.toContain("IC_kwDOTest12");
+      } finally {
+        if (originalWorkflowId === undefined) {
+          delete process.env.GH_AW_WORKFLOW_ID;
+        } else {
+          process.env.GH_AW_WORKFLOW_ID = originalWorkflowId;
+        }
+      }
+    });
+
+    it("should hide match-list comments when workflow ID is not set", async () => {
+      const addCommentScript = fs.readFileSync(path.join(__dirname, "add_comment.cjs"), "utf8");
+      const originalWorkflowId = process.env.GH_AW_WORKFLOW_ID;
+      delete process.env.GH_AW_WORKFLOW_ID;
+
+      try {
+        let hiddenNodeIds = [];
+        mockGithub.rest.issues.listComments = async () => ({
+          data: [
+            {
+              id: 11,
+              node_id: "IC_kwDOTest11",
+              body: "Target\n\n<!-- gh-aw-workflow-id: target-wf -->",
+            },
+            {
+              id: 12,
+              node_id: "IC_kwDOTest12",
+              body: "Unrelated\n\n<!-- gh-aw-workflow-id: unrelated -->",
+            },
+          ],
+        });
+        mockGithub.graphql = async (query, variables) => {
+          if (query.includes("minimizeComment")) hiddenNodeIds.push(variables.nodeId);
+          return { minimizeComment: { minimizedComment: { isMinimized: true } } };
+        };
+        mockGithub.rest.issues.createComment = async () => ({
+          data: { id: 1, html_url: "https://github.com/owner/repo/issues/8535#issuecomment-1" },
+        });
+
+        const handler = await eval(`(async () => { ${addCommentScript}; return await main({ hide_older_comments: { match: ["target-wf"] } }); })()`);
+
+        const result = await handler({ type: "add_comment", body: "Comment with match list only" }, {});
+
+        expect(result.success).toBe(true);
+        expect(hiddenNodeIds).toEqual(["IC_kwDOTest11"]);
+      } finally {
+        if (originalWorkflowId === undefined) {
+          delete process.env.GH_AW_WORKFLOW_ID;
+        } else {
+          process.env.GH_AW_WORKFLOW_ID = originalWorkflowId;
+        }
+      }
+    });
+
+    it("should respect hide_older_comments.enabled when object config is used", async () => {
+      const addCommentScript = fs.readFileSync(path.join(__dirname, "add_comment.cjs"), "utf8");
+      const originalWorkflowId = process.env.GH_AW_WORKFLOW_ID;
+      process.env.GH_AW_WORKFLOW_ID = "current-workflow";
+
+      try {
+        let listCommentsCalled = false;
+        mockGithub.rest.issues.listComments = async () => {
+          listCommentsCalled = true;
+          return { data: [] };
+        };
+        mockGithub.rest.issues.createComment = async () => ({
+          data: { id: 1, html_url: "https://github.com/owner/repo/issues/8535#issuecomment-1" },
+        });
+
+        const handler = await eval(`(async () => { ${addCommentScript}; return await main({ hide_older_comments: { enabled: false, match: ["other_workflow"] } }); })()`);
+
+        const result = await handler({ type: "add_comment", body: "Comment with disabled hide" }, {});
 
         expect(result.success).toBe(true);
         expect(listCommentsCalled).toBe(false);

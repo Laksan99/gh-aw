@@ -12,12 +12,16 @@ import (
 
 	"github.com/github/gh-aw/pkg/console"
 	"github.com/github/gh-aw/pkg/constants"
+	"github.com/github/gh-aw/pkg/fileutil"
 	"github.com/github/gh-aw/pkg/logger"
 	"github.com/github/gh-aw/pkg/sliceutil"
 	"github.com/github/gh-aw/pkg/workflow"
 )
 
 var actionsBuildLog = logger.New("cli:actions_build")
+
+// filesConstPattern matches "const FILES = { ... };" blocks in JavaScript source
+var filesConstPattern = regexp.MustCompile(`(?s)const FILES = \{[^}]*\};`)
 
 // ActionsBuildCommand builds all custom GitHub Actions by bundling JavaScript dependencies
 func ActionsBuildCommand() error {
@@ -111,7 +115,7 @@ func ActionsCleanCommand() error {
 		// Clean index.js for actions that use it (except setup)
 		if actionName != "setup" {
 			indexPath := filepath.Join(actionsDir, actionName, "index.js")
-			if _, err := os.Stat(indexPath); err == nil {
+			if fileutil.FileExists(indexPath) {
 				if err := os.Remove(indexPath); err != nil {
 					return fmt.Errorf("failed to remove %s: %w", indexPath, err)
 				}
@@ -268,8 +272,7 @@ func buildAction(actionsDir, actionName string) error {
 
 	// Replace the FILES placeholder in source
 	// Match: const FILES = { ... };
-	filesRegex := regexp.MustCompile(`(?s)const FILES = \{[^}]*\};`)
-	outputContent := filesRegex.ReplaceAllString(string(sourceContent), fmt.Sprintf("const FILES = %s;", strings.TrimSpace(indentedJSON)))
+	outputContent := filesConstPattern.ReplaceAllString(string(sourceContent), fmt.Sprintf("const FILES = %s;", strings.TrimSpace(indentedJSON)))
 
 	// Write output file with restrictive permissions (0600 for security)
 	if err := os.WriteFile(outputPath, []byte(outputContent), constants.FilePermSensitive); err != nil {
@@ -305,7 +308,7 @@ func buildSetupAction(actionsDir, actionName string) error {
 	shDir := filepath.Join(actionPath, "sh")
 
 	// JavaScript files in actions/setup/js/ are the source of truth
-	if _, err := os.Stat(jsDir); err == nil {
+	if fileutil.DirExists(jsDir) {
 		// Count JavaScript files
 		entries, err := os.ReadDir(jsDir)
 		if err == nil {
@@ -320,7 +323,7 @@ func buildSetupAction(actionsDir, actionName string) error {
 	}
 
 	// Shell scripts in actions/setup/sh/ are the source of truth
-	if _, err := os.Stat(shDir); err == nil {
+	if fileutil.DirExists(shDir) {
 		// Count shell scripts
 		entries, err := os.ReadDir(shDir)
 		if err == nil {

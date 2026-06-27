@@ -27,22 +27,33 @@ This command walks you through:
 
 Use 'add' for non-interactive workflow addition.
 
-Examples:
-  ` + string(constants.CLIExtensionPrefix) + ` add-wizard githubnext/agentics/daily-repo-status    # Guided setup
-  ` + string(constants.CLIExtensionPrefix) + ` add-wizard githubnext/agentics/ci-doctor@v1.0.0     # Guided setup with version
-  ` + string(constants.CLIExtensionPrefix) + ` add-wizard ./my-workflow.md                         # Guided setup for local workflow
-  ` + string(constants.CLIExtensionPrefix) + ` add-wizard githubnext/agentics/ci-doctor --engine copilot   # Pre-select engine
-  ` + string(constants.CLIExtensionPrefix) + ` add-wizard githubnext/agentics/ci-doctor --skip-secret      # Skip secret prompt
-
 Workflow specifications:
+  - Two parts: "owner/repo[@version]" (loads repository-root aw.yml package)
+  - Three+ parts without .md: "owner/repo/folder[@version]" (loads nested aw.yml package when present)
   - Three parts: "owner/repo/workflow-name[@version]" (implicitly looks in workflows/ directory)
   - Four+ parts: "owner/repo/workflows/workflow-name.md[@version]" (requires explicit .md extension)
   - GitHub URL: "https://github.com/owner/repo/blob/branch/path/to/workflow.md"
+  - Arbitrary URL: "https://example.com/workflow.md" (fetches and dispatches on Content-Type)
+    - text/markdown → treated as a gh-aw workflow markdown file
+    - application/json → converted from a JSON workflow definition
   - Local file: "./path/to/workflow.md"
   - Version can be tag, branch, or SHA (for remote workflows)
 
 Note: Requires an interactive terminal. Use 'add' for CI/automation environments.
+Note: In GitHub Enterprise repos, shorthand source specs resolve on your enterprise host by default.
+      For github/*, githubnext/*, and microsoft/* sources, shorthand resolves on github.com.
+      Use full https://github.com/... source URLs for other public github.com workflows.
 Note: To create a new workflow from scratch, use the 'new' command instead.`,
+		Example: `  ` + string(constants.CLIExtensionPrefix) + ` add-wizard githubnext/agentics                    # Guided setup for repository-root aw.yml package
+  ` + string(constants.CLIExtensionPrefix) + ` add-wizard githubnext/agentics/packages/repo-assist # Guided setup for nested aw.yml package
+  ` + string(constants.CLIExtensionPrefix) + ` add-wizard githubnext/agentics/daily-repo-status    # Guided setup
+  ` + string(constants.CLIExtensionPrefix) + ` add-wizard githubnext/agentics/ci-doctor@v1.0.0     # Guided setup with version
+  ` + string(constants.CLIExtensionPrefix) + ` add-wizard ./my-workflow.md                         # Guided setup for local workflow
+  ` + string(constants.CLIExtensionPrefix) + ` add-wizard https://example.com/my-workflow.md       # Guided setup from any HTTPS URL
+  ` + string(constants.CLIExtensionPrefix) + ` add-wizard https://example.com/workflow.json        # Import JSON workflow definition with guided setup
+  ` + string(constants.CLIExtensionPrefix) + ` add-wizard githubnext/agentics/ci-doctor --engine copilot   # Pre-select engine
+  ` + string(constants.CLIExtensionPrefix) + ` add-wizard githubnext/agentics/ci-doctor --no-secret        # Skip secret prompt
+`,
 		Args: func(cmd *cobra.Command, args []string) error {
 			if len(args) < 1 {
 				return errors.New("missing workflow specification\n\nRun 'gh aw add-wizard --help' for usage information")
@@ -57,7 +68,9 @@ Note: To create a new workflow from scratch, use the 'new' command instead.`,
 			workflowDir, _ := cmd.Flags().GetString("dir")
 			noStopAfter, _ := cmd.Flags().GetBool("no-stop-after")
 			stopAfter, _ := cmd.Flags().GetString("stop-after")
-			skipSecret, _ := cmd.Flags().GetBool("skip-secret")
+			noSecret, _ := cmd.Flags().GetBool("no-secret")
+			skipSecretLegacy, _ := cmd.Flags().GetBool("skip-secret")
+			skipSecret := noSecret || skipSecretLegacy
 
 			addWizardLog.Printf("Starting add-wizard: workflows=%v, engine=%s, verbose=%v", workflows, engineOverride, verbose)
 
@@ -73,7 +86,16 @@ Note: To create a new workflow from scratch, use the 'new' command instead.`,
 				return errors.New("add-wizard requires an interactive terminal; use 'add' for non-interactive environments")
 			}
 
-			return RunAddInteractive(cmd.Context(), workflows, verbose, engineOverride, noGitattributes, workflowDir, noStopAfter, stopAfter, skipSecret)
+			return RunAddInteractive(cmd.Context(), &AddInteractiveConfig{
+				WorkflowSpecs:   workflows,
+				Verbose:         verbose,
+				EngineOverride:  engineOverride,
+				NoGitattributes: noGitattributes,
+				WorkflowDir:     workflowDir,
+				NoStopAfter:     noStopAfter,
+				StopAfter:       stopAfter,
+				SkipSecret:      skipSecret,
+			})
 		},
 	}
 
@@ -92,8 +114,10 @@ Note: To create a new workflow from scratch, use the 'new' command instead.`,
 	// Add stop-after flag
 	cmd.Flags().String("stop-after", "", "Override stop-after value in the workflow (e.g., '+48h', '2025-12-31 23:59:59')")
 
-	// Add skip-secret flag
+	// Add no-secret flag (--skip-secret is kept as an undocumented alias)
+	cmd.Flags().Bool("no-secret", false, "Skip the API secret prompt (use when the secret is already set at the org or repo level)")
 	cmd.Flags().Bool("skip-secret", false, "Skip the API secret prompt (use when the secret is already set at the org or repo level)")
+	_ = cmd.Flags().MarkHidden("skip-secret")
 
 	// Register completions
 	RegisterEngineFlagCompletion(cmd)

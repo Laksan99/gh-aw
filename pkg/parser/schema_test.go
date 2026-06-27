@@ -332,17 +332,162 @@ func TestValidateMainWorkflowFrontmatterWithSchemaAndLocation_EngineHarnessPatte
 	}
 }
 
-func TestValidateMainWorkflowFrontmatterWithSchemaAndLocation_MaxEffectiveTokensStringMustBePositive(t *testing.T) {
+func TestValidateMainWorkflowFrontmatterWithSchemaAndLocation_EngineDriverPattern(t *testing.T) {
 	t.Parallel()
 
-	invalidFrontmatter := map[string]any{
-		"on":                   "push",
-		"max-effective-tokens": "0",
+	validFrontmatter := map[string]any{
+		"on": "push",
+		"engine": map[string]any{
+			"id":     "copilot",
+			"driver": ".github/drivers/custom_copilot_sdk_driver.cjs",
+		},
 	}
 
-	err := ValidateMainWorkflowFrontmatterWithSchemaAndLocation(invalidFrontmatter, "/tmp/gh-aw/max-effective-tokens-zero-string-test.md")
+	err := ValidateMainWorkflowFrontmatterWithSchemaAndLocation(validFrontmatter, "/tmp/gh-aw/engine-driver-valid-pattern-test.md")
+	if err != nil {
+		t.Fatalf("expected valid engine.driver pattern to pass schema validation, got: %v", err)
+	}
+
+	// Bare basename (no path) should still be valid.
+	basenameDriverFrontmatter := map[string]any{
+		"on": "push",
+		"engine": map[string]any{
+			"id":     "copilot",
+			"driver": "custom_copilot_sdk_driver.cjs",
+		},
+	}
+
+	err = ValidateMainWorkflowFrontmatterWithSchemaAndLocation(basenameDriverFrontmatter, "/tmp/gh-aw/engine-driver-basename-test.md")
+	if err != nil {
+		t.Fatalf("expected bare-basename engine.driver to pass schema validation, got: %v", err)
+	}
+
+	// Python driver should be valid.
+	pythonDriverFrontmatter := map[string]any{
+		"on": "push",
+		"engine": map[string]any{
+			"id":     "copilot",
+			"driver": ".github/drivers/my_driver.py",
+		},
+	}
+
+	err = ValidateMainWorkflowFrontmatterWithSchemaAndLocation(pythonDriverFrontmatter, "/tmp/gh-aw/engine-driver-python-test.md")
+	if err != nil {
+		t.Fatalf("expected Python engine.driver to pass schema validation, got: %v", err)
+	}
+
+	// TypeScript driver should be valid.
+	tsDriverFrontmatter := map[string]any{
+		"on": "push",
+		"engine": map[string]any{
+			"id":     "copilot",
+			"driver": ".github/drivers/my_driver.ts",
+		},
+	}
+
+	err = ValidateMainWorkflowFrontmatterWithSchemaAndLocation(tsDriverFrontmatter, "/tmp/gh-aw/engine-driver-ts-test.md")
+	if err != nil {
+		t.Fatalf("expected TypeScript engine.driver to pass schema validation, got: %v", err)
+	}
+
+	// Ruby driver should be valid.
+	rubyDriverFrontmatter := map[string]any{
+		"on": "push",
+		"engine": map[string]any{
+			"id":     "copilot",
+			"driver": ".github/drivers/my_driver.rb",
+		},
+	}
+
+	err = ValidateMainWorkflowFrontmatterWithSchemaAndLocation(rubyDriverFrontmatter, "/tmp/gh-aw/engine-driver-ruby-test.md")
+	if err != nil {
+		t.Fatalf("expected Ruby engine.driver to pass schema validation, got: %v", err)
+	}
+
+	// Arbitrary command (no extension) should be valid.
+	arbitraryDriverFrontmatter := map[string]any{
+		"on": "push",
+		"engine": map[string]any{
+			"id":     "copilot",
+			"driver": "my-copilot-driver",
+		},
+	}
+
+	err = ValidateMainWorkflowFrontmatterWithSchemaAndLocation(arbitraryDriverFrontmatter, "/tmp/gh-aw/engine-driver-arbitrary-test.md")
+	if err != nil {
+		t.Fatalf("expected arbitrary command engine.driver to pass schema validation, got: %v", err)
+	}
+
+	invalidFrontmatter := map[string]any{
+		"on": "push",
+		"engine": map[string]any{
+			"id":     "copilot",
+			"driver": "../driver.cjs",
+		},
+	}
+
+	err = ValidateMainWorkflowFrontmatterWithSchemaAndLocation(invalidFrontmatter, "/tmp/gh-aw/engine-driver-invalid-pattern-test.md")
 	if err == nil {
-		t.Fatal("expected max-effective-tokens='0' to fail schema validation")
+		t.Fatal("expected invalid engine.driver pattern to fail schema validation")
+	}
+
+	invalidFlagLikeFrontmatter := map[string]any{
+		"on": "push",
+		"engine": map[string]any{
+			"id":     "copilot",
+			"driver": "-driver.cjs",
+		},
+	}
+
+	err = ValidateMainWorkflowFrontmatterWithSchemaAndLocation(invalidFlagLikeFrontmatter, "/tmp/gh-aw/engine-driver-invalid-flaglike-pattern-test.md")
+	if err == nil {
+		t.Fatal("expected flag-like engine.driver pattern to fail schema validation")
+	}
+}
+
+func TestValidateMainWorkflowFrontmatterWithSchemaAndLocation_EnginePermissionMode(t *testing.T) {
+	t.Parallel()
+
+	validFrontmatter := map[string]any{
+		"on": "push",
+		"engine": map[string]any{
+			"id":              "claude",
+			"permission-mode": "auto",
+		},
+	}
+
+	err := ValidateMainWorkflowFrontmatterWithSchemaAndLocation(validFrontmatter, "/tmp/gh-aw/engine-permission-mode-valid-test.md")
+	if err != nil {
+		t.Fatalf("expected valid engine.permission-mode to pass schema validation, got: %v", err)
+	}
+
+	invalidFrontmatter := map[string]any{
+		"on": "push",
+		"engine": map[string]any{
+			"id":              "claude",
+			"permission-mode": "invalid-mode",
+		},
+	}
+
+	err = ValidateMainWorkflowFrontmatterWithSchemaAndLocation(invalidFrontmatter, "/tmp/gh-aw/engine-permission-mode-invalid-test.md")
+	if err == nil {
+		t.Fatal("expected invalid engine.permission-mode to fail schema validation")
+	}
+}
+
+func TestValidateMainWorkflowFrontmatterWithSchemaAndLocation_ToolsEditBoolean(t *testing.T) {
+	t.Parallel()
+
+	frontmatter := map[string]any{
+		"on": "push",
+		"tools": map[string]any{
+			"edit": false,
+		},
+	}
+
+	err := ValidateMainWorkflowFrontmatterWithSchemaAndLocation(frontmatter, "/tmp/gh-aw/tools-edit-boolean-test.md")
+	if err != nil {
+		t.Fatalf("expected tools.edit=false to pass schema validation, got: %v", err)
 	}
 }
 
@@ -352,41 +497,274 @@ func TestValidateMainWorkflowFrontmatterWithSchemaAndLocation_MaxLimitsAllowExpr
 	validFrontmatter := map[string]any{
 		"on":                   "push",
 		"max-runs":             "${{ inputs.max-runs }}",
-		"max-effective-tokens": "${{ inputs.max-effective-tokens }}",
+		"max-ai-credits":       "${{ inputs.max-ai-credits }}",
+		"max-daily-ai-credits": "${{ inputs.max-daily-ai-credits }}",
 	}
 
 	err := ValidateMainWorkflowFrontmatterWithSchemaAndLocation(validFrontmatter, "/tmp/gh-aw/max-limits-expression-test.md")
 	if err != nil {
-		t.Fatalf("expected max-runs/max-effective-tokens expressions to pass schema validation, got: %v", err)
+		t.Fatalf("expected max-runs/max-ai-credits/max-daily-ai-credits expressions to pass schema validation, got: %v", err)
 	}
 }
 
-func TestValidateMainWorkflowFrontmatterWithSchemaAndLocation_FirewallEffectiveTokenSteering(t *testing.T) {
+func TestValidateMainWorkflowFrontmatterWithSchemaAndLocation_MaxLimitsAllowSuffixStrings(t *testing.T) {
+	t.Parallel()
+
+	validFrontmatter := map[string]any{
+		"on":                   "push",
+		"max-ai-credits":       "1k",
+		"max-daily-ai-credits": "100k",
+	}
+
+	err := ValidateMainWorkflowFrontmatterWithSchemaAndLocation(validFrontmatter, "/tmp/gh-aw/max-limits-suffix-test.md")
+	if err != nil {
+		t.Fatalf("expected max-ai-credits/max-daily-ai-credits suffix strings to pass schema validation, got: %v", err)
+	}
+}
+
+func TestValidateMainWorkflowFrontmatterWithSchemaAndLocation_MaxLimitsAllowSuffixStringsCaseVariants(t *testing.T) {
+	t.Parallel()
+
+	validFrontmatter := map[string]any{
+		"on":                   "push",
+		"max-ai-credits":       "2M",
+		"max-daily-ai-credits": "100M",
+	}
+
+	err := ValidateMainWorkflowFrontmatterWithSchemaAndLocation(validFrontmatter, "/tmp/gh-aw/max-limits-suffix-case-variants-test.md")
+	if err != nil {
+		t.Fatalf("expected max-ai-credits/max-daily-ai-credits suffix case variants to pass schema validation, got: %v", err)
+	}
+}
+
+func TestValidateMainWorkflowFrontmatterWithSchemaAndLocation_ThreatDetectionMaxAICreditsExpressionRejected(t *testing.T) {
+	t.Parallel()
+
+	// Expressions are not supported for safe-outputs.threat-detection.max-ai-credits
+	// because the field is stored as int64 and expressions would be silently ignored
+	// by the compiler. The schema enforces numeric-only values to prevent confusion.
+	invalidFrontmatter := map[string]any{
+		"on": "push",
+		"safe-outputs": map[string]any{
+			"threat-detection": map[string]any{
+				"max-ai-credits": "${{ inputs.detection-max-ai-credits }}",
+			},
+		},
+	}
+
+	err := ValidateMainWorkflowFrontmatterWithSchemaAndLocation(invalidFrontmatter, "/tmp/gh-aw/threat-detection-max-ai-credits-expression-test.md")
+	if err == nil {
+		t.Fatal("expected safe-outputs.threat-detection.max-ai-credits expression to fail schema validation (expressions not supported)")
+	}
+}
+
+func TestValidateMainWorkflowFrontmatterWithSchemaAndLocation_ThreatDetectionMaxAICreditsNumericAccepted(t *testing.T) {
+	t.Parallel()
+
+	for name, raw := range map[string]any{
+		"integer":   750,
+		"km-string": "2k",
+		"m-string":  "1M",
+		"neg-one":   -1,
+		"neg-str":   "-1",
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			validFrontmatter := map[string]any{
+				"on": "push",
+				"safe-outputs": map[string]any{
+					"threat-detection": map[string]any{
+						"max-ai-credits": raw,
+					},
+				},
+			}
+
+			err := ValidateMainWorkflowFrontmatterWithSchemaAndLocation(validFrontmatter, "/tmp/gh-aw/threat-detection-max-ai-credits-"+name+"-test.md")
+			if err != nil {
+				t.Fatalf("expected safe-outputs.threat-detection.max-ai-credits=%v (%s) to pass schema validation, got: %v", raw, name, err)
+			}
+		})
+	}
+}
+
+func TestValidateMainWorkflowFrontmatterWithSchemaAndLocation_SafeOutputsStagedExpressionAccepted(t *testing.T) {
 	t.Parallel()
 
 	validFrontmatter := map[string]any{
 		"on": "push",
-		"firewall": map[string]any{
-			"effective-token-steering": true,
+		"safe-outputs": map[string]any{
+			"staged": "${{ inputs.staged }}",
+			"create-issue": map[string]any{
+				"staged": "${{ inputs['issue-staged'] }}",
+			},
 		},
 	}
 
-	err := ValidateMainWorkflowFrontmatterWithSchemaAndLocation(validFrontmatter, "/tmp/gh-aw/firewall-effective-token-steering-valid-test.md")
+	err := ValidateMainWorkflowFrontmatterWithSchemaAndLocation(validFrontmatter, "/tmp/gh-aw/safe-outputs-staged-expression-test.md")
 	if err != nil {
-		t.Fatalf("expected firewall.effective-token-steering to pass schema validation, got: %v", err)
+		t.Fatalf("expected safe-outputs staged expressions to pass schema validation, got: %v", err)
 	}
+}
+
+func TestValidateMainWorkflowFrontmatterWithSchemaAndLocation_MaxAICreditsZeroInvalid(t *testing.T) {
+	t.Parallel()
 
 	invalidFrontmatter := map[string]any{
-		"on": "push",
-		"firewall": map[string]any{
-			"unexpected": true,
-		},
+		"on":             "push",
+		"max-ai-credits": 0,
 	}
 
-	err = ValidateMainWorkflowFrontmatterWithSchemaAndLocation(invalidFrontmatter, "/tmp/gh-aw/firewall-effective-token-steering-invalid-test.md")
+	err := ValidateMainWorkflowFrontmatterWithSchemaAndLocation(invalidFrontmatter, "/tmp/gh-aw/max-ai-credits-zero-integer-test.md")
 	if err == nil {
-		t.Fatal("expected unknown firewall field to fail schema validation")
+		t.Fatal("expected max-ai-credits=0 to fail schema validation")
 	}
+}
+
+func TestValidateMainWorkflowFrontmatterWithSchemaAndLocation_MaxAICreditsNegativeAllowed(t *testing.T) {
+	t.Parallel()
+
+	for name, raw := range map[string]any{
+		"integer": -1,
+		"string":  "-1",
+	} {
+		t.Run(name, func(t *testing.T) {
+			validFrontmatter := map[string]any{
+				"on":             "push",
+				"max-ai-credits": raw,
+			}
+
+			err := ValidateMainWorkflowFrontmatterWithSchemaAndLocation(validFrontmatter, "/tmp/gh-aw/max-ai-credits-negative-"+name+"-test.md")
+			if err != nil {
+				t.Fatalf("expected max-ai-credits=%v (%s) to pass schema validation, got: %v", raw, name, err)
+			}
+		})
+	}
+}
+
+func TestValidateMainWorkflowFrontmatterWithSchemaAndLocation_MaxAICreditsOtherNegativeRejected(t *testing.T) {
+	t.Parallel()
+
+	invalidFrontmatter := map[string]any{
+		"on":             "push",
+		"max-ai-credits": -5,
+	}
+
+	err := ValidateMainWorkflowFrontmatterWithSchemaAndLocation(invalidFrontmatter, "/tmp/gh-aw/max-ai-credits-negative-other-test.md")
+	if err == nil {
+		t.Fatal("expected max-ai-credits=-5 to fail schema validation (only -1 is the disable sentinel)")
+	}
+}
+
+func TestValidateMainWorkflowFrontmatterWithSchemaAndLocation_MaxTurnCacheMissesPositiveAccepted(t *testing.T) {
+	t.Parallel()
+
+	validFrontmatter := map[string]any{
+		"on":                    "push",
+		"max-turn-cache-misses": 5,
+	}
+
+	err := ValidateMainWorkflowFrontmatterWithSchemaAndLocation(validFrontmatter, "/tmp/gh-aw/max-turn-cache-misses-positive-test.md")
+	if err != nil {
+		t.Fatalf("expected max-turn-cache-misses=5 to pass schema validation, got: %v", err)
+	}
+}
+
+func TestValidateMainWorkflowFrontmatterWithSchemaAndLocation_MaxTurnCacheMissesZeroRejected(t *testing.T) {
+	t.Parallel()
+
+	invalidFrontmatter := map[string]any{
+		"on":                    "push",
+		"max-turn-cache-misses": 0,
+	}
+
+	err := ValidateMainWorkflowFrontmatterWithSchemaAndLocation(invalidFrontmatter, "/tmp/gh-aw/max-turn-cache-misses-zero-test.md")
+	if err == nil {
+		t.Fatal("expected max-turn-cache-misses=0 to fail schema validation")
+	}
+}
+
+func TestValidateMainWorkflowFrontmatterWithSchemaAndLocation_MaxDailyAICreditsZeroInvalid(t *testing.T) {
+	t.Parallel()
+
+	invalidFrontmatter := map[string]any{
+		"on":                   "push",
+		"max-daily-ai-credits": 0,
+	}
+
+	err := ValidateMainWorkflowFrontmatterWithSchemaAndLocation(invalidFrontmatter, "/tmp/gh-aw/max-daily-ai-credits-zero-integer-test.md")
+	if err == nil {
+		t.Fatal("expected max-daily-ai-credits=0 to fail schema validation")
+	}
+}
+
+func TestValidateMainWorkflowFrontmatterWithSchemaAndLocation_MaxDailyAICreditsStringZeroInvalid(t *testing.T) {
+	t.Parallel()
+
+	invalidFrontmatter := map[string]any{
+		"on":                   "push",
+		"max-daily-ai-credits": "0",
+	}
+
+	err := ValidateMainWorkflowFrontmatterWithSchemaAndLocation(invalidFrontmatter, "/tmp/gh-aw/max-daily-ai-credits-zero-string-test.md")
+	if err == nil {
+		t.Fatal("expected max-daily-ai-credits='0' to fail schema validation")
+	}
+}
+
+func TestValidateMainWorkflowFrontmatterWithSchemaAndLocation_MaxDailyAICreditsNegativeAllowed(t *testing.T) {
+	t.Parallel()
+
+	validFrontmatter := map[string]any{
+		"on":                   "push",
+		"max-daily-ai-credits": -1,
+	}
+
+	err := ValidateMainWorkflowFrontmatterWithSchemaAndLocation(validFrontmatter, "/tmp/gh-aw/max-daily-ai-credits-negative-test.md")
+	if err != nil {
+		t.Fatalf("expected negative max-daily-ai-credits to pass schema validation, got: %v", err)
+	}
+}
+
+func TestValidateMainWorkflowFrontmatterWithSchemaAndLocation_SandboxAgentPlatform(t *testing.T) {
+	t.Parallel()
+
+	t.Run("valid platform is accepted", func(t *testing.T) {
+		t.Parallel()
+
+		frontmatter := map[string]any{
+			"on": "push",
+			"sandbox": map[string]any{
+				"agent": map[string]any{
+					"id":       "awf",
+					"platform": "ghes",
+				},
+			},
+		}
+
+		err := ValidateMainWorkflowFrontmatterWithSchemaAndLocation(frontmatter, "/tmp/gh-aw/awf-platform-ghes-test.md")
+		if err != nil {
+			t.Fatalf("expected sandbox.agent.platform=ghes to pass schema validation, got: %v", err)
+		}
+	})
+
+	t.Run("unknown platform is rejected", func(t *testing.T) {
+		t.Parallel()
+
+		frontmatter := map[string]any{
+			"on": "push",
+			"sandbox": map[string]any{
+				"agent": map[string]any{
+					"id":       "awf",
+					"platform": "github-enterprise",
+				},
+			},
+		}
+
+		err := ValidateMainWorkflowFrontmatterWithSchemaAndLocation(frontmatter, "/tmp/gh-aw/awf-platform-invalid-test.md")
+		if err == nil {
+			t.Fatal("expected sandbox.agent.platform=github-enterprise to fail schema validation")
+		}
+	})
 }
 
 func TestMainWorkflowSchema_WorkflowDispatchNumberTypeDocumentation(t *testing.T) {
@@ -494,6 +872,83 @@ func TestMainWorkflowSchema_WorkflowDispatchNumberTypeDocumentation(t *testing.T
 	}
 }
 
+func TestMainWorkflowSchema_WorkflowCallAndDispatchInputDefsDisallowUnknownKeys(t *testing.T) {
+	t.Parallel()
+
+	schemaContent, err := os.ReadFile("schemas/main_workflow_schema.json")
+	if err != nil {
+		t.Fatalf("failed to read schema: %v", err)
+	}
+
+	var schema map[string]any
+	if err := json.Unmarshal(schemaContent, &schema); err != nil {
+		t.Fatalf("failed to parse schema json: %v", err)
+	}
+
+	getMapAtPath := func(t *testing.T, root map[string]any, path ...any) map[string]any {
+		t.Helper()
+		var cur any = root
+		for _, p := range path {
+			switch step := p.(type) {
+			case string:
+				m, ok := cur.(map[string]any)
+				if !ok {
+					t.Fatalf("expected map before key %q", step)
+				}
+				next, ok := m[step]
+				if !ok {
+					t.Fatalf("missing key %q in path", step)
+				}
+				cur = next
+			case int:
+				arr, ok := cur.([]any)
+				if !ok {
+					t.Fatalf("expected array before index %d", step)
+				}
+				if step < 0 || step >= len(arr) {
+					t.Fatalf("index %d out of range in path", step)
+				}
+				cur = arr[step]
+			default:
+				t.Fatalf("unsupported path step type %T", p)
+			}
+		}
+
+		out, ok := cur.(map[string]any)
+		if !ok {
+			t.Fatalf("expected map at target path, got %T", cur)
+		}
+		return out
+	}
+
+	paths := []struct {
+		name string
+		path []any
+	}{
+		{
+			name: "on.workflow_call.inputs.<id>",
+			path: []any{"properties", "on", "oneOf", 1, "properties", "workflow_call", "oneOf", 1, "properties", "inputs", "additionalProperties"},
+		},
+		{
+			name: "on.workflow_call.secrets.<id>",
+			path: []any{"properties", "on", "oneOf", 1, "properties", "workflow_call", "oneOf", 1, "properties", "secrets", "additionalProperties"},
+		},
+		{
+			name: "safe-outputs.dispatch_repository.<tool>.inputs.<id>",
+			path: []any{"properties", "safe-outputs", "properties", "dispatch_repository", "additionalProperties", "properties", "inputs", "additionalProperties"},
+		},
+	}
+
+	for _, tc := range paths {
+		t.Run(tc.name, func(t *testing.T) {
+			subschema := getMapAtPath(t, schema, tc.path...)
+			if subschema["additionalProperties"] != false {
+				t.Fatalf("%s should set additionalProperties to false", tc.name)
+			}
+		})
+	}
+}
+
 func TestMainWorkflowSchema_CreatePullRequestAllowedBaseBranches(t *testing.T) {
 	t.Parallel()
 
@@ -591,6 +1046,13 @@ func TestMainWorkflowSchema_CreatePullRequestAllowedBaseBranches(t *testing.T) {
 	if gotItemType, _ := items["type"].(string); gotItemType != "string" {
 		t.Fatalf("'allowed-base-branches.items' should be type string, got: %v", items["type"])
 	}
+
+	if _, ok := createPullRequestProperties["max-patch-size"].(map[string]any); !ok {
+		t.Fatal("'max-patch-size' not found under safe-outputs.create-pull-request")
+	}
+	if _, ok := createPullRequestProperties["max-patch-files"].(map[string]any); !ok {
+		t.Fatal("'max-patch-files' not found under safe-outputs.create-pull-request")
+	}
 }
 
 func TestGetSafeOutputTypeKeys(t *testing.T) {
@@ -636,6 +1098,7 @@ func TestGetSafeOutputTypeKeys(t *testing.T) {
 		"runs-on",
 		"messages",
 		"needs",
+		"timeout-minutes",
 	}
 
 	for _, meta := range metaFields {
@@ -649,6 +1112,83 @@ func TestGetSafeOutputTypeKeys(t *testing.T) {
 		if keys[i-1] > keys[i] {
 			t.Errorf("GetSafeOutputTypeKeys() keys are not sorted: %s > %s", keys[i-1], keys[i])
 		}
+	}
+}
+
+func TestMainWorkflowSchema_CreateDiscussionRequiredCategoryAllowed(t *testing.T) {
+	t.Parallel()
+
+	frontmatter := map[string]any{
+		"on": "daily",
+		"safe-outputs": map[string]any{
+			"create-discussion": map[string]any{
+				"category":                "Ideas",
+				"close-older-discussions": true,
+				"required-category":       "Ideas",
+			},
+		},
+	}
+
+	if err := validateWithSchema(frontmatter, mainWorkflowSchema, "main workflow file"); err != nil {
+		t.Fatalf("expected create-discussion.required-category to pass schema validation, got: %v", err)
+	}
+}
+
+func TestMainWorkflowSchemaPushToPullRequestBranchHasMaxPatchSize(t *testing.T) {
+	schemaPath := "schemas/main_workflow_schema.json"
+	schemaContent, err := os.ReadFile(schemaPath)
+	if err != nil {
+		t.Fatalf("failed to read schema: %v", err)
+	}
+
+	var schemaMap map[string]any
+	if err := json.Unmarshal(schemaContent, &schemaMap); err != nil {
+		t.Fatalf("failed to parse schema json: %v", err)
+	}
+
+	properties, ok := schemaMap["properties"].(map[string]any)
+	if !ok {
+		t.Fatal("'properties' not found in main workflow schema")
+	}
+
+	safeOutputs, ok := properties["safe-outputs"].(map[string]any)
+	if !ok {
+		t.Fatal("'safe-outputs' not found in main workflow schema")
+	}
+
+	safeOutputsProps, ok := safeOutputs["properties"].(map[string]any)
+	if !ok {
+		t.Fatal("'safe-outputs.properties' not found in main workflow schema")
+	}
+
+	pushCfg, ok := safeOutputsProps["push-to-pull-request-branch"].(map[string]any)
+	if !ok {
+		t.Fatal("'safe-outputs.push-to-pull-request-branch' not found")
+	}
+
+	pushOneOf, ok := pushCfg["oneOf"].([]any)
+	if !ok || len(pushOneOf) == 0 {
+		t.Fatal("'safe-outputs.push-to-pull-request-branch.oneOf' not found")
+	}
+
+	var pushProperties map[string]any
+	for _, candidate := range pushOneOf {
+		candidateMap, ok := candidate.(map[string]any)
+		if !ok {
+			continue
+		}
+		p, ok := candidateMap["properties"].(map[string]any)
+		if ok {
+			pushProperties = p
+			break
+		}
+	}
+	if pushProperties == nil {
+		t.Fatal("'safe-outputs.push-to-pull-request-branch' object schema with properties not found")
+	}
+
+	if _, ok := pushProperties["max-patch-size"].(map[string]any); !ok {
+		t.Fatal("'max-patch-size' not found under safe-outputs.push-to-pull-request-branch")
 	}
 }
 
@@ -715,6 +1255,163 @@ func TestValidateMainWorkflowFrontmatterWithSchemaAndLocation_GitHubAppClientID(
 	err := ValidateMainWorkflowFrontmatterWithSchemaAndLocation(frontmatter, "/tmp/gh-aw/client-id-schema-test.md")
 	if err != nil {
 		t.Fatalf("expected client-id in github-app to pass schema validation, got: %v", err)
+	}
+}
+
+func TestValidateMainWorkflowFrontmatterWithSchemaAndLocation_OTLPGitHubAppImplicitOIDC(t *testing.T) {
+	frontmatter := map[string]any{
+		"name": "OTLP implicit OIDC github-app config",
+		"on": map[string]any{
+			"issues": map[string]any{
+				"types": []any{"opened"},
+			},
+		},
+		"observability": map[string]any{
+			"otlp": map[string]any{
+				"github-app": map[string]any{},
+			},
+		},
+	}
+
+	err := ValidateMainWorkflowFrontmatterWithSchemaAndLocation(frontmatter, "/tmp/gh-aw/otlp-github-app-implicit-oidc-schema-test.md")
+	if err != nil {
+		t.Fatalf("expected empty observability.otlp.github-app to pass schema validation for implicit OIDC, got: %v", err)
+	}
+}
+
+func TestValidateMainWorkflowFrontmatterWithSchemaAndLocation_OTLPCustomAttributes(t *testing.T) {
+	frontmatter := map[string]any{
+		"name": "OTLP custom attributes config",
+		"on": map[string]any{
+			"issues": map[string]any{
+				"types": []any{"opened"},
+			},
+		},
+		"observability": map[string]any{
+			"otlp": map[string]any{
+				"attributes": map[string]any{
+					"langfuse.session.id": "{{ gh-aw.episode.id }}",
+					"langfuse.user.id":    "{{ github.actor }}",
+					"deployment.stage":    "production",
+				},
+			},
+		},
+	}
+
+	err := ValidateMainWorkflowFrontmatterWithSchemaAndLocation(frontmatter, "/tmp/gh-aw/otlp-custom-attributes-schema-test.md")
+	if err != nil {
+		t.Fatalf("expected observability.otlp.attributes to pass schema validation, got: %v", err)
+	}
+}
+
+func TestValidateMainWorkflowFrontmatterWithSchemaAndLocation_OTLPResourceAttributes(t *testing.T) {
+	frontmatter := map[string]any{
+		"name": "OTLP resource attributes config",
+		"on": map[string]any{
+			"issues": map[string]any{
+				"types": []any{"opened"},
+			},
+		},
+		"observability": map[string]any{
+			"otlp": map[string]any{
+				"resource-attributes": map[string]any{
+					"my.target-repo": "${{ github.repository }}",
+					"my.event":       "${{ github.event_name }}",
+				},
+			},
+		},
+	}
+
+	err := ValidateMainWorkflowFrontmatterWithSchemaAndLocation(frontmatter, "/tmp/gh-aw/otlp-resource-attributes-schema-test.md")
+	if err != nil {
+		t.Fatalf("expected observability.otlp.resource-attributes to pass schema validation, got: %v", err)
+	}
+}
+
+func TestValidateMainWorkflowFrontmatterWithSchemaAndLocation_OTLPGitHubAppAudienceRejected(t *testing.T) {
+	frontmatter := map[string]any{
+		"name": "OTLP github-app audience rejection",
+		"on": map[string]any{
+			"issues": map[string]any{
+				"types": []any{"opened"},
+			},
+		},
+		"observability": map[string]any{
+			"otlp": map[string]any{
+				"github-app": map[string]any{
+					"audience": "https://collector.example.com",
+				},
+			},
+		},
+	}
+
+	err := ValidateMainWorkflowFrontmatterWithSchemaAndLocation(frontmatter, "/tmp/gh-aw/otlp-github-app-audience-reject-schema-test.md")
+	if err == nil {
+		t.Fatal("expected observability.otlp.github-app.audience to fail schema validation")
+	}
+	errText := err.Error()
+	if !strings.Contains(errText, "audience") ||
+		(!strings.Contains(errText, "github-app") && !strings.Contains(errText, "Unknown property")) {
+		t.Fatalf("expected schema validation error to reference unsupported github-app.audience syntax, got: %v", err)
+	}
+}
+
+func TestValidateMainWorkflowFrontmatterWithSchemaAndLocation_OTLPGitHubAppPermissionsRejected(t *testing.T) {
+	frontmatter := map[string]any{
+		"name": "OTLP github-app permissions rejection",
+		"on": map[string]any{
+			"issues": map[string]any{
+				"types": []any{"opened"},
+			},
+		},
+		"observability": map[string]any{
+			"otlp": map[string]any{
+				"github-app": map[string]any{
+					"permissions": map[string]any{
+						"contents": "read",
+					},
+				},
+			},
+		},
+	}
+
+	err := ValidateMainWorkflowFrontmatterWithSchemaAndLocation(frontmatter, "/tmp/gh-aw/otlp-github-app-permissions-reject-schema-test.md")
+	if err == nil {
+		t.Fatal("expected observability.otlp.github-app.permissions to fail schema validation")
+	}
+	errText := err.Error()
+	if !strings.Contains(errText, "permissions") ||
+		(!strings.Contains(errText, "github-app") && !strings.Contains(errText, "Unknown property")) {
+		t.Fatalf("expected schema validation error to reference unsupported github-app.permissions syntax, got: %v", err)
+	}
+}
+
+func TestValidateMainWorkflowFrontmatterWithSchemaAndLocation_OTLPGitHubAppLegacyTypeRejected(t *testing.T) {
+	frontmatter := map[string]any{
+		"name": "OTLP legacy github-oidc type rejection",
+		"on": map[string]any{
+			"issues": map[string]any{
+				"types": []any{"opened"},
+			},
+		},
+		"observability": map[string]any{
+			"otlp": map[string]any{
+				"github-app": map[string]any{
+					"type":     "github-oidc",
+					"audience": "https://collector.example.com",
+				},
+			},
+		},
+	}
+
+	err := ValidateMainWorkflowFrontmatterWithSchemaAndLocation(frontmatter, "/tmp/gh-aw/otlp-github-app-legacy-type-schema-test.md")
+	if err == nil {
+		t.Fatal("expected legacy observability.otlp.github-app.type: github-oidc to fail schema validation")
+	}
+	errText := err.Error()
+	if !strings.Contains(errText, "type") ||
+		(!strings.Contains(errText, "github-app") && !strings.Contains(errText, "Unknown properties")) {
+		t.Fatalf("expected schema validation error to reference unsupported legacy github-app.type syntax, got: %v", err)
 	}
 }
 
@@ -1123,6 +1820,153 @@ func TestMainWorkflowSchema_ProtectedFilesObjectFormStructure(t *testing.T) {
 	}
 }
 
+func TestMainWorkflowSchema_SandboxAgentModelFallback(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		name          string
+		modelFallback any
+	}{
+		{name: "boolean", modelFallback: false},
+		{name: "expression", modelFallback: "${{ inputs.model-fallback }}"},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			validFrontmatter := map[string]any{
+				"name": "sandbox-agent-model-fallback",
+				"on": map[string]any{
+					"workflow_dispatch": map[string]any{},
+				},
+				"permissions": map[string]any{
+					"contents": "read",
+				},
+				"engine": "copilot",
+				"sandbox": map[string]any{
+					"agent": map[string]any{
+						"id":             "awf",
+						"model-fallback": tc.modelFallback,
+					},
+				},
+			}
+
+			err := ValidateMainWorkflowFrontmatterWithSchemaAndLocation(validFrontmatter, "/tmp/gh-aw/sandbox-agent-model-fallback-test.md")
+			if err != nil {
+				t.Fatalf("expected sandbox.agent.model-fallback to pass schema validation, got: %v", err)
+			}
+		})
+	}
+}
+
+// TestMainWorkflowSchema_SandboxAgentSudo is a regression guard for #41679.
+// The JSON schema already contains sandbox.agent.sudo; these tests ensure it
+// stays accepted and that the legacy network-isolation field stays rejected,
+// preventing future drift between the Go struct YAML tags and the schema.
+func TestMainWorkflowSchema_SandboxAgentSudo(t *testing.T) {
+	t.Parallel()
+
+	t.Run("sudo: false is accepted", func(t *testing.T) {
+		t.Parallel()
+
+		frontmatter := map[string]any{
+			"on":     "push",
+			"engine": "copilot",
+			"sandbox": map[string]any{
+				"agent": map[string]any{
+					"id":   "awf",
+					"sudo": false,
+				},
+			},
+		}
+
+		err := ValidateMainWorkflowFrontmatterWithSchemaAndLocation(frontmatter, "/tmp/gh-aw/sandbox-agent-sudo-false-test.md")
+		if err != nil {
+			t.Fatalf("expected sandbox.agent.sudo: false to pass schema validation, got: %v", err)
+		}
+	})
+
+	t.Run("sudo: true is accepted", func(t *testing.T) {
+		t.Parallel()
+
+		frontmatter := map[string]any{
+			"on":     "push",
+			"engine": "copilot",
+			"sandbox": map[string]any{
+				"agent": map[string]any{
+					"id":   "awf",
+					"sudo": true,
+				},
+			},
+		}
+
+		err := ValidateMainWorkflowFrontmatterWithSchemaAndLocation(frontmatter, "/tmp/gh-aw/sandbox-agent-sudo-true-test.md")
+		if err != nil {
+			t.Fatalf("expected sandbox.agent.sudo: true to pass schema validation, got: %v", err)
+		}
+	})
+
+	t.Run("sudo without id is accepted", func(t *testing.T) {
+		t.Parallel()
+
+		frontmatter := map[string]any{
+			"on":     "push",
+			"engine": "copilot",
+			"sandbox": map[string]any{
+				"agent": map[string]any{
+					"sudo": false,
+				},
+			},
+		}
+
+		err := ValidateMainWorkflowFrontmatterWithSchemaAndLocation(frontmatter, "/tmp/gh-aw/sandbox-agent-sudo-no-id-test.md")
+		if err != nil {
+			t.Fatalf("expected sandbox.agent.sudo: false (without id) to pass schema validation, got: %v", err)
+		}
+	})
+
+	t.Run("network-isolation (old field) is rejected", func(t *testing.T) {
+		t.Parallel()
+
+		frontmatter := map[string]any{
+			"on":     "push",
+			"engine": "copilot",
+			"sandbox": map[string]any{
+				"agent": map[string]any{
+					"id":                "awf",
+					"network-isolation": true,
+				},
+			},
+		}
+
+		err := ValidateMainWorkflowFrontmatterWithSchemaAndLocation(frontmatter, "/tmp/gh-aw/sandbox-agent-network-isolation-test.md")
+		if err == nil {
+			t.Error("expected sandbox.agent.network-isolation to be rejected (field was renamed to sudo)")
+		}
+	})
+
+	t.Run("non-boolean sudo is rejected", func(t *testing.T) {
+		t.Parallel()
+
+		frontmatter := map[string]any{
+			"on":     "push",
+			"engine": "copilot",
+			"sandbox": map[string]any{
+				"agent": map[string]any{
+					"id":   "awf",
+					"sudo": "false",
+				},
+			},
+		}
+
+		err := ValidateMainWorkflowFrontmatterWithSchemaAndLocation(frontmatter, "/tmp/gh-aw/sandbox-agent-sudo-string-test.md")
+		if err == nil {
+			t.Error("expected sandbox.agent.sudo with string value to be rejected by schema validation")
+		}
+	})
+}
+
 // TestValidateWithSchema_YAMLIntegerTypes verifies that validateWithSchema accepts
 // YAML-native integer types (uint64/int64) when the schema expects number/integer.
 func TestValidateWithSchema_YAMLIntegerTypes(t *testing.T) {
@@ -1146,5 +1990,228 @@ func TestValidateWithSchema_YAMLIntegerTypes(t *testing.T) {
 	err := validateWithSchema(frontmatter, schema, "yaml integer types")
 	if err != nil {
 		t.Errorf("validateWithSchema should accept YAML integer types, got: %v", err)
+	}
+}
+
+func TestValidateMainWorkflowSchema_TimeoutMinutesTemplatableInteger(t *testing.T) {
+	t.Parallel()
+
+	frontmatter := map[string]any{
+		"name": "templated-timeout-test",
+		"on": map[string]any{
+			"workflow_dispatch": map[string]any{},
+		},
+		"timeout-minutes": "${{ inputs.workflow_timeout }}",
+		"jobs": map[string]any{
+			"build": map[string]any{
+				"runs-on":         "ubuntu-latest",
+				"timeout-minutes": "${{ inputs.job_timeout }}",
+				"steps": []any{
+					map[string]any{"run": "echo hello"},
+				},
+			},
+		},
+	}
+
+	err := ValidateMainWorkflowFrontmatterWithSchemaAndLocation(frontmatter, "/tmp/timeout-templatable.md")
+	if err != nil {
+		t.Fatalf("expected templated timeout-minutes values to pass schema validation, got: %v", err)
+	}
+}
+
+func TestMainWorkflowSchema_GitHubAllowedSupportsToolCallLimits(t *testing.T) {
+	t.Parallel()
+
+	schemaContent, err := os.ReadFile("schemas/main_workflow_schema.json")
+	if err != nil {
+		t.Fatalf("failed to read schema: %v", err)
+	}
+
+	var schema map[string]any
+	if err := json.Unmarshal(schemaContent, &schema); err != nil {
+		t.Fatalf("failed to parse schema json: %v", err)
+	}
+
+	properties := schema["properties"].(map[string]any)
+	tools := properties["tools"].(map[string]any)
+	toolsProps := tools["properties"].(map[string]any)
+	github := toolsProps["github"].(map[string]any)
+	githubOneOf := github["oneOf"].([]any)
+
+	var githubObjectSchema map[string]any
+	for _, item := range githubOneOf {
+		candidate, ok := item.(map[string]any)
+		if !ok {
+			continue
+		}
+		if candidate["type"] == "object" {
+			githubObjectSchema = candidate
+			break
+		}
+	}
+	if githubObjectSchema == nil {
+		t.Fatal("tools.github object schema not found")
+	}
+
+	allowed := githubObjectSchema["properties"].(map[string]any)["allowed"].(map[string]any)
+	items := allowed["items"].(map[string]any)
+	itemOneOf := items["oneOf"].([]any)
+
+	var objectBranch map[string]any
+	for _, branch := range itemOneOf {
+		candidate, ok := branch.(map[string]any)
+		if !ok {
+			continue
+		}
+		if candidate["type"] == "object" {
+			objectBranch = candidate
+			break
+		}
+	}
+	if objectBranch == nil {
+		t.Fatal("tools.github.allowed object entry schema not found")
+	}
+
+	entryProps := objectBranch["properties"].(map[string]any)
+	maxCalls, hasMaxCalls := entryProps["max-calls"].(map[string]any)
+	if !hasMaxCalls {
+		t.Fatal("tools.github.allowed[].max-calls schema not found")
+	}
+	if maxCalls["type"] != "integer" {
+		t.Fatalf("expected max-calls type integer, got: %v", maxCalls["type"])
+	}
+	if maxCalls["minimum"] != float64(1) {
+		t.Fatalf("expected max-calls minimum 1, got: %v", maxCalls["minimum"])
+	}
+	if _, hasMaxAlias := entryProps["max"]; hasMaxAlias {
+		t.Fatal("tools.github.allowed[].max alias should not be present")
+	}
+}
+
+// TestValidateMainWorkflowFrontmatterWithSchemaAndLocation_AwfApiProxyTargets verifies that
+// the sandbox.agent.targets frontmatter section is validated by the schema, accepting
+// valid authHeader strings and rejecting non-string values.
+func TestValidateMainWorkflowFrontmatterWithSchemaAndLocation_AwfApiProxyTargets(t *testing.T) {
+	t.Run("valid string authHeader for openai is accepted", func(t *testing.T) {
+		frontmatter := map[string]any{
+			"on":     "push",
+			"engine": "codex",
+			"sandbox": map[string]any{
+				"agent": map[string]any{
+					"targets": map[string]any{
+						"openai": map[string]any{
+							"authHeader": "api-key",
+						},
+					},
+				},
+			},
+		}
+		err := ValidateMainWorkflowFrontmatterWithSchemaAndLocation(frontmatter, "/tmp/gh-aw/awf-auth-header-openai-test.md")
+		if err != nil {
+			t.Errorf("valid openai authHeader should be accepted, got error: %v", err)
+		}
+	})
+
+	t.Run("valid string authHeader for anthropic is accepted", func(t *testing.T) {
+		frontmatter := map[string]any{
+			"on":     "push",
+			"engine": "claude",
+			"sandbox": map[string]any{
+				"agent": map[string]any{
+					"targets": map[string]any{
+						"anthropic": map[string]any{
+							"authHeader": "api-key",
+						},
+					},
+				},
+			},
+		}
+		err := ValidateMainWorkflowFrontmatterWithSchemaAndLocation(frontmatter, "/tmp/gh-aw/awf-auth-header-anthropic-test.md")
+		if err != nil {
+			t.Errorf("valid anthropic authHeader should be accepted, got error: %v", err)
+		}
+	})
+
+	t.Run("non-string authHeader is rejected", func(t *testing.T) {
+		frontmatter := map[string]any{
+			"on":     "push",
+			"engine": "codex",
+			"sandbox": map[string]any{
+				"agent": map[string]any{
+					"targets": map[string]any{
+						"openai": map[string]any{
+							"authHeader": 42,
+						},
+					},
+				},
+			},
+		}
+		err := ValidateMainWorkflowFrontmatterWithSchemaAndLocation(frontmatter, "/tmp/gh-aw/awf-auth-header-invalid-test.md")
+		if err == nil {
+			t.Error("non-string authHeader should be rejected by schema validation")
+		}
+	})
+
+	t.Run("unknown provider in targets is rejected", func(t *testing.T) {
+		frontmatter := map[string]any{
+			"on":     "push",
+			"engine": "codex",
+			"sandbox": map[string]any{
+				"agent": map[string]any{
+					"targets": map[string]any{
+						"unknown-provider": map[string]any{
+							"authHeader": "api-key",
+						},
+					},
+				},
+			},
+		}
+		err := ValidateMainWorkflowFrontmatterWithSchemaAndLocation(frontmatter, "/tmp/gh-aw/awf-unknown-provider-test.md")
+		if err == nil {
+			t.Error("unknown provider in sandbox.agent.targets should be rejected")
+		}
+	})
+}
+
+// TestValidateMainWorkflowFrontmatter_OnPermissionsVulnerabilityAlerts validates that
+// vulnerability-alerts is accepted as a scope in on.permissions (regression for #40063).
+func TestValidateMainWorkflowFrontmatter_OnPermissionsVulnerabilityAlerts(t *testing.T) {
+	frontmatter := map[string]any{
+		"on": map[string]any{
+			"schedule":          []any{map[string]any{"cron": "0 0 * * *"}},
+			"workflow_dispatch": nil,
+			"permissions": map[string]any{
+				"vulnerability-alerts": "read",
+			},
+			"steps": []any{
+				map[string]any{
+					"id":  "check",
+					"run": "echo checking",
+				},
+			},
+		},
+		"engine": "copilot",
+	}
+	err := ValidateMainWorkflowFrontmatterWithSchemaAndLocation(frontmatter, "/tmp/gh-aw/on-permissions-vulnerability-alerts-test.md")
+	if err != nil {
+		t.Errorf("vulnerability-alerts: read should be accepted in on.permissions, got error: %v", err)
+	}
+}
+
+// TestValidateMainWorkflowFrontmatter_OnPermissionsUnknownScopeRejected validates that
+// unknown scopes in on.permissions are still rejected.
+func TestValidateMainWorkflowFrontmatter_OnPermissionsUnknownScopeRejected(t *testing.T) {
+	frontmatter := map[string]any{
+		"on": map[string]any{
+			"workflow_dispatch": nil,
+			"permissions": map[string]any{
+				"unknown-scope": "read",
+			},
+		},
+		"engine": "copilot",
+	}
+	err := ValidateMainWorkflowFrontmatterWithSchemaAndLocation(frontmatter, "/tmp/gh-aw/on-permissions-unknown-scope-test.md")
+	if err == nil {
+		t.Error("unknown scope in on.permissions should be rejected by schema validation")
 	}
 }

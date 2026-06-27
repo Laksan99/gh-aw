@@ -198,6 +198,7 @@ Import the configuration:
 on:
   issues:
     types: [opened]
+
 permissions:
   contents: read
   actions: read
@@ -460,8 +461,10 @@ Define jobs in shared files under `.github/workflows/shared/` and import them:
 ```aw wrap
 ---
 on: issues
+
 permissions:
   contents: read
+
 imports:
   - shared/slack-notify.md
   - shared/jira-integration.md
@@ -515,7 +518,7 @@ When `GH_AW_SAFE_OUTPUTS_STAGED === 'true'`, skip the real operation and display
 
 ## Related Documentation
 
-- [Deterministic & Agentic Patterns](/gh-aw/guides/deterministic-agentic-patterns/) - Mixing computation and AI reasoning
+- [DeterministicOps](/gh-aw/patterns/deterministic-ops/) - Mixing computation and AI reasoning
 - [Safe Outputs](/gh-aw/reference/safe-outputs/) - Built-in safe output types
 - [MCPs](/gh-aw/guides/mcps/) - Model Context Protocol setup
 - [Frontmatter](/gh-aw/reference/frontmatter/) - All configuration options

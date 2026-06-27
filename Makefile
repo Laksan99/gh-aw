@@ -9,6 +9,19 @@ endif
 VERSION ?= $(shell git describe --tags --always --dirty)
 DOCKER_IMAGE=ghcr.io/github/gh-aw
 DOCKER_PLATFORMS=linux/amd64,linux/arm64
+BASE_REF ?= origin/main
+JS_IMPACTED_TEST_EXCLUDES=--exclude '**/*.integration.test.cjs' --exclude '**/frontmatter_hash_github_api.test.cjs'
+CI_WORKFLOW_FILE ?= ci.yml
+CI_COVERAGE_ARTIFACT_PATTERN ?= ci-integration-coverage-*
+CI_COVERAGE_DIR ?= /tmp/gh-aw-ci-coverage
+CI_COVERAGE_ENABLED ?= 1
+CI_COVERAGE_SOURCE_BRANCH ?= main
+CI_RUN_ID ?=
+CI_UNIT_WORKFLOW_FILE ?= cgo.yml
+CI_UNIT_TEST_ARTIFACT_PATTERN ?= test-result-cgo-unit
+CI_UNIT_RUN_ID ?=
+GO_IMPACTED_TEST_MAX_SECONDS ?= 60
+GO_IMPACTED_TEST_PATTERN_MAX_CHARS ?= 8000
 
 # Build flags
 LDFLAGS=-ldflags "-s -w -X main.version=$(VERSION)"
@@ -151,7 +164,7 @@ bench-performance:
 	@echo ""
 	@echo "Also running CLI helper benchmarks..."
 	@go test -bench='Benchmark(ExtractWorkflowNameFromFile|FindIncludesInContent)$$' \
-		-benchmem -benchtime=3x -run=^$$ ./pkg/cli >> bench_performance.txt
+		-benchmem -benchtime=1s -run=^$$ ./pkg/cli >> bench_performance.txt
 	@echo ""
 	@echo "Performance benchmark results saved to bench_performance.txt"
 
@@ -195,11 +208,12 @@ security-scan: security-gosec security-govulncheck
 .PHONY: security-gosec
 security-gosec:
 	@echo "Running gosec security scanner..."
-	@command -v gosec >/dev/null || go install github.com/securego/gosec/v2/cmd/gosec@v2.23.0
+	@command -v gosec >/dev/null || go install github.com/securego/gosec/v2/cmd/gosec@v2.27.1
 	@# Exclusions configured in .golangci.yml (linters-settings.gosec.exclude)
 	@# Keep this list in sync with .golangci.yml for consistency
 	@GOPATH=$$(go env GOPATH); \
 	PATH="$$GOPATH/bin:$$PATH" gosec -fmt=json -out=gosec-report.json -stdout -exclude-generated -track-suppressions \
+		-nosec-require-rules -nosec-require-justification \
 		-exclude=G101,G115,G204,G602,G301,G302,G304,G306 \
 		./...
 	@echo "✓ Gosec scan complete (results in gosec-report.json)"
@@ -207,14 +221,187 @@ security-gosec:
 .PHONY: security-govulncheck
 security-govulncheck:
 	@echo "Running govulncheck..."
-	@command -v govulncheck >/dev/null || go install golang.org/x/vuln/cmd/govulncheck@latest
-	govulncheck ./...
+	go run golang.org/x/vuln/cmd/govulncheck ./...
 	@echo "✓ Govulncheck complete"
+
+.PHONY: security-govulncheck-sarif
+security-govulncheck-sarif:
+	@echo "Running govulncheck (SARIF output)..."
+	go run -mod=readonly golang.org/x/vuln/cmd/govulncheck -format sarif ./... > govulncheck-results.sarif; ret=$$?; [ $$ret -eq 0 ] || [ $$ret -eq 3 ]
+	@echo "✓ Govulncheck complete (results in govulncheck-results.sarif)"
 
 # Test JavaScript files
 .PHONY: test-js
 test-js: build-js
 	cd actions/setup/js && npm run test:js -- --no-file-parallelism
+
+# Test impacted JavaScript unit tests only (excluding integration tests)
+.PHONY: test-impacted-js
+test-impacted-js: build-js
+	@BASE_COMMIT=$$(git merge-base $(BASE_REF) HEAD 2>/dev/null); \
+	if [ -z "$$BASE_COMMIT" ]; then \
+		echo "Error: unable to determine merge-base from BASE_REF=$(BASE_REF)."; \
+		echo "Set BASE_REF explicitly, for example: make test-impacted-js BASE_REF=origin/main"; \
+		exit 1; \
+	fi; \
+	CHANGED_JS_FILES=$$(git diff --name-only --diff-filter=ACMR "$$BASE_COMMIT"..HEAD -- actions/setup/js | grep -E '\.(cjs|js|mjs|ts)$$' || true); \
+	if [ -z "$$CHANGED_JS_FILES" ]; then \
+		echo "No changed JavaScript/TypeScript files under actions/setup/js; skipping impacted JS tests."; \
+		exit 0; \
+	fi; \
+	echo "Running impacted JavaScript unit tests for changed files: $$CHANGED_JS_FILES"; \
+	cd actions/setup/js && printf '%s\n' "$$CHANGED_JS_FILES" | sed 's|^actions/setup/js/||' | tr '\n' '\0' | xargs -0 -r npm run test:js -- --no-file-parallelism --passWithNoTests $(JS_IMPACTED_TEST_EXCLUDES)
+
+# Test impacted Go unit tests only (excluding integration tests)
+.PHONY: test-impacted-go
+test-impacted-go:
+	@BASE_COMMIT=$$(git merge-base $(BASE_REF) HEAD 2>/dev/null); \
+	if [ -z "$$BASE_COMMIT" ]; then \
+		echo "Error: unable to determine merge-base from BASE_REF=$(BASE_REF)."; \
+		echo "Set BASE_REF explicitly, for example: make test-impacted-go BASE_REF=origin/main"; \
+		exit 1; \
+	fi; \
+	CHANGED_GO_FILES=$$(git diff --name-only --diff-filter=ACMR "$$BASE_COMMIT"..HEAD | grep -E '\.go$$' || true); \
+	if [ -z "$$CHANGED_GO_FILES" ]; then \
+		echo "No changed Go files; skipping impacted Go tests."; \
+		exit 0; \
+	fi; \
+	COVERAGE_SOURCE_BRANCH="$(CI_COVERAGE_SOURCE_BRANCH)"; \
+	COVERAGE_GO_PACKAGES=""; \
+	if [ "$(CI_COVERAGE_ENABLED)" != "1" ]; then \
+		echo "CI coverage correlation disabled (CI_COVERAGE_ENABLED=$(CI_COVERAGE_ENABLED)); using changed-file package selection."; \
+	elif ! command -v gh >/dev/null 2>&1 || ! command -v jq >/dev/null 2>&1; then \
+		echo "CI coverage correlation requires gh and jq; using changed-file package selection."; \
+	else \
+		RUN_ID="$(CI_RUN_ID)"; \
+		if [ -z "$$RUN_ID" ]; then \
+			RUN_ID=$$(gh run list --workflow "$(CI_WORKFLOW_FILE)" --branch "$$COVERAGE_SOURCE_BRANCH" --status success --limit 1 --json databaseId --jq '.[0].databaseId' 2>/dev/null || true); \
+		fi; \
+		if [ -n "$$RUN_ID" ]; then \
+			rm -rf "$(CI_COVERAGE_DIR)"; \
+			mkdir -p "$(CI_COVERAGE_DIR)"; \
+			if gh run download "$$RUN_ID" --pattern "$(CI_COVERAGE_ARTIFACT_PATTERN)" --dir "$(CI_COVERAGE_DIR)" >/dev/null 2>&1; then \
+				COVERAGE_FILES=$$(find "$(CI_COVERAGE_DIR)" -type f -name 'coverage-integration-*.out' 2>/dev/null || true); \
+				if [ -n "$$COVERAGE_FILES" ]; then \
+					CHANGED_FILE_LIST="$(CI_COVERAGE_DIR)/changed-go-files.txt"; \
+					printf '%s\n' "$$CHANGED_GO_FILES" > "$$CHANGED_FILE_LIST"; \
+					for coverage_file in $$COVERAGE_FILES; do \
+						MATCHED_CHANGED_FILE=$$(awk -F: 'NR>1 {print $$1}' "$$coverage_file" | sed 's|^github.com/github/gh-aw/||' | grep -Fx -f "$$CHANGED_FILE_LIST" | head -n 1 || true); \
+						if [ -n "$$MATCHED_CHANGED_FILE" ]; then \
+							SAFE_NAME=$$(basename "$$coverage_file" .out | sed 's|^coverage-integration-||'); \
+							RESULT_FILE=$$(find "$(CI_COVERAGE_DIR)" -type f -name "test-result-integration-$$SAFE_NAME.json" | head -n 1); \
+							if [ -n "$$RESULT_FILE" ]; then \
+								PACKAGES=$$(jq -r 'select(.Package != null) | .Package' "$$RESULT_FILE" | sort -u | sed 's|^github.com/github/gh-aw|.|'); \
+								if [ -n "$$PACKAGES" ]; then \
+									COVERAGE_GO_PACKAGES=$$(printf '%s\n%s\n' "$$COVERAGE_GO_PACKAGES" "$$PACKAGES" | sed '/^$$/d' | sort -u); \
+								fi; \
+							fi; \
+						fi; \
+					done; \
+				else \
+					echo "No CI coverage profiles found in downloaded artifacts; using changed-file package selection."; \
+				fi; \
+			else \
+				echo "Unable to download CI coverage artifacts for run $$RUN_ID; using changed-file package selection."; \
+			fi; \
+		else \
+			echo "No successful CI run found for branch $$COVERAGE_SOURCE_BRANCH; using changed-file package selection."; \
+		fi; \
+	fi; \
+	if [ -n "$$COVERAGE_GO_PACKAGES" ]; then \
+		CHANGED_GO_PACKAGES="$$COVERAGE_GO_PACKAGES"; \
+		echo "Running impacted Go unit tests from CI coverage correlation: $$CHANGED_GO_PACKAGES"; \
+	else \
+		CHANGED_GO_PACKAGES=$$(printf '%s\n' "$$CHANGED_GO_FILES" | while IFS= read -r file; do dirname "$$file"; done | sort -u | sed 's|^|./|'); \
+		echo "Running impacted Go unit tests in changed-file packages: $$CHANGED_GO_PACKAGES"; \
+	fi; \
+	SELECTED_GO_TESTS=""; \
+	if command -v gh >/dev/null 2>&1 && command -v jq >/dev/null 2>&1; then \
+		UNIT_RUN_ID="$(CI_UNIT_RUN_ID)"; \
+		if [ -z "$$UNIT_RUN_ID" ]; then \
+			UNIT_RUN_ID=$$(gh run list --workflow "$(CI_UNIT_WORKFLOW_FILE)" --branch "$$COVERAGE_SOURCE_BRANCH" --status success --limit 1 --json databaseId --jq '.[0].databaseId' 2>/dev/null || true); \
+		fi; \
+		if [ -n "$$UNIT_RUN_ID" ]; then \
+			UNIT_RESULT_DIR="$(CI_COVERAGE_DIR)/unit-results"; \
+			rm -rf "$$UNIT_RESULT_DIR"; \
+			mkdir -p "$$UNIT_RESULT_DIR"; \
+			if gh run download "$$UNIT_RUN_ID" --pattern "$(CI_UNIT_TEST_ARTIFACT_PATTERN)" --dir "$$UNIT_RESULT_DIR" >/dev/null 2>&1; then \
+				UNIT_RESULT_FILE=$$(find "$$UNIT_RESULT_DIR" -type f -name '*.json' | head -n 1); \
+				if [ -n "$$UNIT_RESULT_FILE" ]; then \
+					IMPACTED_PACKAGE_FILE="$(CI_COVERAGE_DIR)/impacted-go-packages.txt"; \
+					printf '%s\n' "$$CHANGED_GO_PACKAGES" | sed 's|^\./|github.com/github/gh-aw/|' > "$$IMPACTED_PACKAGE_FILE"; \
+					IMPACTED_TEST_CANDIDATES="$(CI_COVERAGE_DIR)/impacted-go-test-candidates.tsv"; \
+					jq -r 'select(.Action == "pass" and .Package != null and .Test != null and (.Test | contains("/") | not) and .Elapsed != null) | [.Package, .Test, (.Elapsed | tostring)] | @tsv' "$$UNIT_RESULT_FILE" \
+						| awk 'NR==FNR { pkgs[$$1] = 1; next } $$1 in pkgs { print }' "$$IMPACTED_PACKAGE_FILE" - \
+						| sort -u > "$$IMPACTED_TEST_CANDIDATES"; \
+					if [ -s "$$IMPACTED_TEST_CANDIDATES" ]; then \
+						SELECTED_GO_TESTS="$(CI_COVERAGE_DIR)/selected-impacted-go-tests.tsv"; \
+						awk 'BEGIN { srand() } { print rand() "\t" $$0 }' "$$IMPACTED_TEST_CANDIDATES" \
+							| sort -k1,1n \
+							| cut -f2- \
+							| awk -F'\t' -v max="$(GO_IMPACTED_TEST_MAX_SECONDS)" 'BEGIN { total = 0; selected = 0 } { elapsed = $$3 + 0; if (selected == 0 || total + elapsed <= max) { print; total += elapsed; selected++ } }' \
+							| sort -t"	" -k1,1 -k2,2 > "$$SELECTED_GO_TESTS"; \
+						if [ -s "$$SELECTED_GO_TESTS" ]; then \
+							ESTIMATED_DURATION=$$(awk -F'\t' '{ total += $$3 } END { printf "%.3f", total }' "$$SELECTED_GO_TESTS"); \
+							echo "Running sampled impacted Go unit tests (estimated $$ESTIMATED_DURATION seconds, max $(GO_IMPACTED_TEST_MAX_SECONDS)s):"; \
+							awk -F'\t' '{ print "  " $$1 " " $$2 " (" $$3 "s)" }' "$$SELECTED_GO_TESTS"; \
+						else \
+							SELECTED_GO_TESTS=""; \
+						fi; \
+					fi; \
+				else \
+					echo "No unit test result artifact JSON found in run $$UNIT_RUN_ID; running impacted packages instead."; \
+				fi; \
+			else \
+				echo "Unable to download unit test results for run $$UNIT_RUN_ID; running impacted packages instead."; \
+			fi; \
+		else \
+			echo "No successful $(CI_UNIT_WORKFLOW_FILE) run found for branch $$COVERAGE_SOURCE_BRANCH; running impacted packages instead."; \
+		fi; \
+	else \
+		echo "Random impacted test sampling requires gh and jq; running impacted packages instead."; \
+	fi; \
+	if [ -n "$$SELECTED_GO_TESTS" ]; then \
+		awk -F'\t' ' \
+			BEGIN { current_pkg = ""; pattern = ""; max_chars = '$(GO_IMPACTED_TEST_PATTERN_MAX_CHARS)' + 0; if (max_chars <= 0) max_chars = 8000 } \
+			function flush_pattern() { \
+				if (current_pkg != "" && pattern != "") print current_pkg "\t^(" pattern ")$$"; \
+			} \
+			{ \
+				if ($$1 != current_pkg) { \
+					flush_pattern(); \
+					current_pkg = $$1; \
+					pattern = $$2; \
+				} else { \
+					next_pattern = pattern "|" $$2; \
+					if (length(next_pattern) > max_chars) { \
+						flush_pattern(); \
+						pattern = $$2; \
+					} else { \
+						pattern = next_pattern; \
+					} \
+				} \
+			} \
+			END { \
+				flush_pattern(); \
+			} \
+		' "$$SELECTED_GO_TESTS" | while IFS="	" read -r pkg pattern; do \
+			if [ "$${#pattern}" -gt 30000 ]; then \
+				echo "Running impacted Go unit tests in $$pkg (pattern too long, running full package)"; \
+				go test -v -parallel=4 -timeout=10m -short "$$pkg" || exit 1; \
+			else \
+				echo "Running impacted Go unit tests in $$pkg with pattern $$pattern"; \
+				go test -v -parallel=4 -timeout=10m -short -run "$$pattern" "$$pkg" || exit 1; \
+			fi; \
+		done || exit 1; \
+		exit 0; \
+	fi; \
+	# Use -short to exclude integration tests and keep execution to unit-test scope. \
+	printf '%s\n' "$$CHANGED_GO_PACKAGES" | tr '\n' '\0' | xargs -0 -r go test -v -parallel=4 -timeout=10m -short
+
+# Test both impacted JavaScript and Go unit tests
+.PHONY: test-impacted
+test-impacted: test-impacted-js test-impacted-go
 
 # Install JavaScript dependencies
 .PHONY: deps-js
@@ -390,9 +577,8 @@ check-node-version:
 tools: ## Install build-time tools from tools.go
 	@echo "Installing build tools..."
 	@go install github.com/rhysd/actionlint/cmd/actionlint@v1.7.11
-	@go install github.com/securego/gosec/v2/cmd/gosec@v2.23.0
+	@go install github.com/securego/gosec/v2/cmd/gosec@v2.27.1
 	@go install golang.org/x/tools/gopls@v0.21.1
-	@go install golang.org/x/vuln/cmd/govulncheck@v1.1.4
 	@echo "✓ Tools installed successfully"
 
 # Install golangci-lint binary (avoiding GPL dependencies in go.mod)
@@ -400,7 +586,7 @@ tools: ## Install build-time tools from tools.go
 .PHONY: install-golangci-lint
 install-golangci-lint:
 	@echo "Installing golangci-lint binary..."
-	@GOLANGCI_LINT_VERSION="v2.8.0"; \
+	@GOLANGCI_LINT_VERSION="v2.12.2"; \
 	GOPATH=$$(go env GOPATH); \
 	GOOS=$$(go env GOOS); \
 	GOARCH=$$(go env GOARCH); \
@@ -417,17 +603,42 @@ install-golangci-lint:
 	fi; \
 	DOWNLOAD_URL="https://github.com/golangci/golangci-lint/releases/download/$$GOLANGCI_LINT_VERSION/golangci-lint-$${GOLANGCI_LINT_VERSION#v}-$$GOOS-$$GOARCH.tar.gz"; \
 	TEMP_DIR=$$(mktemp -d); \
+	ARCHIVE="$$TEMP_DIR/golangci-lint.tar.gz"; \
+	EXTRACT_DIR="$$TEMP_DIR/extract"; \
+	MAX_ATTEMPTS=3; \
+	RETRY_DELAY=2; \
 	trap "rm -rf $$TEMP_DIR" EXIT; \
 	echo "Downloading golangci-lint $$GOLANGCI_LINT_VERSION for $$GOOS/$$GOARCH..."; \
-	if curl -sSL "$$DOWNLOAD_URL" | tar -xz -C "$$TEMP_DIR"; then \
-		mkdir -p "$$GOPATH/bin"; \
-		mv "$$TEMP_DIR"/golangci-lint-*/$$BINARY_NAME "$$GOPATH/bin/$$BINARY_NAME"; \
-		chmod +x "$$GOPATH/bin/$$BINARY_NAME"; \
-		echo "✓ golangci-lint $$GOLANGCI_LINT_VERSION installed to $$GOPATH/bin/$$BINARY_NAME"; \
-	else \
-		echo "Error: Failed to download golangci-lint from $$DOWNLOAD_URL"; \
-		exit 1; \
-	fi
+	for attempt in $$(seq 1 $$MAX_ATTEMPTS); do \
+		rm -f "$$ARCHIVE"; \
+		rm -rf "$$EXTRACT_DIR"; \
+		mkdir -p "$$EXTRACT_DIR"; \
+		if curl --fail --silent --show-error --location "$$DOWNLOAD_URL" -o "$$ARCHIVE"; then \
+			MAGIC_BYTES=$$(od -An -tx1 -N2 "$$ARCHIVE" | tr -d '[:space:]'); \
+			if [ "$$MAGIC_BYTES" != "1f8b" ]; then \
+				echo "Warning: Downloaded golangci-lint archive is not a gzip stream (attempt $$attempt/$$MAX_ATTEMPTS)"; \
+			elif ! tar -tzf "$$ARCHIVE" >/dev/null 2>&1; then \
+				echo "Warning: Downloaded golangci-lint archive failed validation (attempt $$attempt/$$MAX_ATTEMPTS)"; \
+			elif tar -xzf "$$ARCHIVE" -C "$$EXTRACT_DIR" && \
+				mkdir -p "$$GOPATH/bin" && \
+				mv "$$EXTRACT_DIR"/golangci-lint-*/$$BINARY_NAME "$$GOPATH/bin/$$BINARY_NAME" && \
+				chmod +x "$$GOPATH/bin/$$BINARY_NAME"; then \
+				echo "✓ golangci-lint $$GOLANGCI_LINT_VERSION installed to $$GOPATH/bin/$$BINARY_NAME"; \
+				exit 0; \
+			else \
+				echo "Warning: Failed to extract or install golangci-lint archive (attempt $$attempt/$$MAX_ATTEMPTS)"; \
+			fi; \
+		else \
+			echo "Warning: Failed to download golangci-lint archive (attempt $$attempt/$$MAX_ATTEMPTS)"; \
+		fi; \
+		if [ "$$attempt" -lt "$$MAX_ATTEMPTS" ]; then \
+			echo "Retrying golangci-lint download in $$RETRY_DELAY seconds..."; \
+			sleep $$RETRY_DELAY; \
+			RETRY_DELAY=$$((RETRY_DELAY * 2)); \
+		fi; \
+	done; \
+	echo "Error: Failed to download a valid golangci-lint archive from $$DOWNLOAD_URL after $$MAX_ATTEMPTS attempts"; \
+	exit 1
 
 # License compliance checking
 .PHONY: license-check
@@ -494,13 +705,15 @@ golint:
 # Run custom Go analysis linters (pkg/linters)
 # Builds and runs linters defined in cmd/linters against the full repository.
 # Override the large-function line limit with: make golint-custom MAX_LINES=80
+# Limit the analyzer set with: make golint-custom LINTER_FLAGS="-errstringmatch -test=false"
 MAX_LINES ?= 60
+LINTER_FLAGS ?=
 .PHONY: golint-custom
 golint-custom:
 	@echo "Building custom linters..."
 	@go build -o /tmp/gh-aw-linters ./cmd/linters
 	@echo "Running custom linters (largefunc max-lines=$(MAX_LINES))..."
-	@/tmp/gh-aw-linters -largefunc.max-lines=$(MAX_LINES) ./cmd/... ./pkg/...
+	@/tmp/gh-aw-linters $(LINTER_FLAGS) -largefunc.max-lines=$(MAX_LINES) ./cmd/... ./pkg/...
 
 # Run incremental linter (only changed files since BASE_REF)
 # This provides 50-75% faster linting on PRs by only checking changed files
@@ -566,6 +779,7 @@ fmt-cjs:
 fmt-json:
 	@echo "→ Formatting JSON files..."
 	@cd actions/setup/js && npm run format:pkg-json --silent >/dev/null 2>&1
+	@npx prettier --write 'pkg/cli/data/models.json' 'actions/setup/js/models.json' --ignore-path .prettierignore --log-level=error 2>&1
 	@echo "✓ JSON files formatted"
 
 # Check formatting
@@ -608,6 +822,43 @@ lint-errors:
 	@echo "Running error message quality linter..."
 	@go run scripts/lint_error_messages.go
 
+.PHONY: validate-model-alias-chains
+validate-model-alias-chains:
+	@echo "Validating built-in model alias resolution chains..."
+	@node scripts/validate-model-alias-chains.js
+
+# Validate model_multipliers.json has no placeholder or null multipliers (R-REG-007)
+# See docs/src/content/docs/specs/effective-tokens-specification.md §Model Multiplier Registry
+.PHONY: validate-registry
+validate-registry:
+	@echo "Validating model_multipliers.json (R-REG-007: no placeholder or null multipliers)..."
+	@go test ./pkg/cli/... -run TestModelMultipliersNoPlaceholders -count=1
+
+# Validate the gh-aw OpenTelemetry compatibility contract from specs/otel-observability-spec.md.
+# This is intentionally focused and isolated: schema/frontmatter acceptance, compiler env plumbing,
+# raw OTLP JSONL mirrors, and shipped GenAI compatibility attributes.
+.PHONY: validate-otel-contract
+validate-otel-contract:
+	@echo "Validating gh-aw OpenTelemetry compatibility contract..."
+	@go test ./pkg/parser ./pkg/workflow -run 'TestValidateMainWorkflowFrontmatterWithSchemaAndLocation_OTLP(CustomAttributes|ResourceAttributes|GitHubAppImplicitOIDC)|TestInjectOTLPConfig|TestApplyTraceContextEnvToMap' -count=1
+	@cd actions/setup/js && npm run test:js -- otel_contract.test.cjs send_otlp_span.test.cjs --no-file-parallelism >/dev/null
+	@echo "✓ OpenTelemetry compatibility contract validated"
+
+MODELS_DEV_MODELS_JSON_URL ?= https://models.dev/catalog.json
+
+.PHONY: refresh-models-json
+refresh-models-json:
+	@echo "Refreshing models.json from $(MODELS_DEV_MODELS_JSON_URL)..."
+	@set -e; \
+	tmp=$$(mktemp); \
+	src=$$(mktemp); \
+	trap 'rm -f "$$tmp" "$$src"' EXIT; \
+	curl -fsSL "$(MODELS_DEV_MODELS_JSON_URL)" -o "$$src"; \
+	jq '{providers: ((.providers // {}) | with_entries(select(.key | test("^(anthropic|openai|github-copilot)$$"))) | with_entries(.value |= {models: ((.models // {}) | with_entries(.value |= {cost: ((.cost // {}) | with_entries(select(.value != null and ((.value | type) == "number" or (.value | type) == "string"))) | with_entries(if (.value | type) == "number" then .value |= (./1000000 | tostring) else . end))}) )}))}' "$$src" > "$$tmp"; \
+	cp "$$tmp" pkg/cli/data/models.json; \
+	cp "$$tmp" actions/setup/js/models.json; \
+	echo "✓ Refreshed pkg/cli/data/models.json and actions/setup/js/models.json (catalog providers: anthropic, openai, github-copilot)"
+
 # Check file sizes and function counts
 .PHONY: check-file-sizes
 check-file-sizes:
@@ -619,9 +870,15 @@ check-file-sizes:
 check-validator-sizes:
 	@bash scripts/check-validator-sizes.sh
 
+# Lint action shell scripts — ensure no python/python3 invocations in actions/**/*.sh
+.PHONY: lint-action-sh
+lint-action-sh:
+	@echo "Checking action shell scripts for python/python3 invocations..."
+	@bash scripts/check-action-sh-no-python.sh
+
 # Validate all project files
 .PHONY: lint
-lint: fmt-check fmt-check-json lint-cjs golint
+lint: fmt-check fmt-check-json lint-cjs golint validate-model-alias-chains lint-action-sh
 	@echo "✓ All validations passed"
 
 # Install the binary locally
@@ -663,7 +920,7 @@ build-docs: deps-docs
 .PHONY: dev-docs
 dev-docs: deps-docs
 	@echo "Starting Astro development server..."
-	@cd docs && npm run dev
+	@cd docs && npm run dev -- --host 127.0.0.1 --port 4321
 
 .PHONY: preview-docs
 preview-docs: build-docs
@@ -701,7 +958,7 @@ sync-action-scripts:
 .PHONY: recompile
 recompile: build
 	./$(BINARY_NAME) init --codespaces ""
-	./$(BINARY_NAME) compile --validate --verbose --purge --stats
+	./$(BINARY_NAME) compile --validate --verbose --purge
 #	./$(BINARY_NAME) compile --dir pkg/cli/workflows --validate --verbose --purge
 
 # Compile workflows under pkg/cli/workflows
@@ -756,6 +1013,21 @@ pull-main:
 	@echo "Pulling latest changes..."
 	@git pull
 
+.PHONY: merge-main
+merge-main:
+	@echo "Formatting before merge..."
+	@$(MAKE) fmt
+	@echo "Fetching latest main..."
+	@git fetch origin main
+	@echo "Merging origin/main..."
+	@git merge origin/main || (echo "Merge conflicts detected. Resolve conflicts in .go and .cjs files, stage with git add, then run: make build && make recompile && git commit && make fmt" && exit 1)
+	@echo "Building after merge..."
+	@$(MAKE) build
+	@echo "Recompiling workflows..."
+	@$(MAKE) recompile
+	@echo "Formatting after merge..."
+	@$(MAKE) fmt
+
 # Generate Software Bill of Materials (SBOM)
 .PHONY: sbom
 sbom:
@@ -776,7 +1048,7 @@ sbom:
 
 # Agent should run this task before finishing its turns
 .PHONY: agent-finish
-agent-finish: deps-dev fmt lint build build-wasm test-all fix recompile dependabot generate-schema-docs generate-agent-factory security-scan
+agent-finish: deps-dev fmt lint build build-wasm test-all validate-otel-contract fix recompile dependabot generate-schema-docs generate-agent-factory security-scan
 	@echo "Agent finished tasks successfully."
 
 # Lightweight pre-PR gate — run before every report_progress / create_pull_request call.
@@ -802,6 +1074,9 @@ help:
 	@echo "  test-unit        - Run Go unit tests only (faster)"
 	@echo "  test-security    - Run security regression tests"
 	@echo "  test-js          - Run JavaScript tests"
+	@echo "  test-impacted-js - Run impacted JavaScript unit tests for current branch changes"
+	@echo "  test-impacted-go - Run impacted Go unit tests for current branch changes"
+	@echo "  test-impacted    - Run impacted JavaScript and Go unit tests for current branch changes"
 	@echo "  test-all         - Run all tests (Go, JavaScript, and wasm golden)"
 	@echo "  test-wasm-golden - Run wasm golden tests (Go string API path)"
 	@echo "  test-wasm        - Build wasm and run Node.js golden comparison test"
@@ -840,11 +1115,14 @@ help:
 	@echo "  lint-cjs         - Lint JavaScript (.cjs) and JSON files in actions/setup/js"
 	@echo "  lint-json        - Lint JSON files in pkg directory (excluding actions/setup/js)"
 	@echo "  lint-errors      - Lint error messages for quality compliance"
+	@echo "  validate-otel-contract - Validate the gh-aw OpenTelemetry compatibility contract"
+	@echo "  lint-action-sh   - Lint action shell scripts for python/python3 invocations"
 	@echo "  check-file-sizes - Check Go file sizes and function counts (informational)"
 	@echo "  check-validator-sizes - Check *_validation.go files against the 768-line hard limit"
 	@echo "  security-scan    - Run all security scans (gosec, govulncheck)"
 	@echo "  security-gosec   - Run gosec Go security scanner"
 	@echo "  security-govulncheck - Run govulncheck for known vulnerabilities"
+	@echo "  security-govulncheck-sarif - Run govulncheck and output SARIF report (govulncheck-results.sarif)"
 	@echo "  actionlint       - Validate workflows with actionlint (depends on build)"
 	@echo "  lint-lock        - Run lock-file-only lint with gh aw lint (depends on build)"
 	@echo "  validate-workflows - Validate compiled workflow lock files (depends on build)"
@@ -854,6 +1132,7 @@ help:
 	@echo "  update           - Update GitHub Actions and workflows, sync action pins, and rebuild binary"
 	@echo "  fix              - Apply automatic codemod-style fixes to workflow files (depends on build)"
 	@echo "  recompile        - Recompile all workflow files (runs init, depends on build)"
+	@echo "  merge-main       - Format, merge main, recompile workflows, and format again"
 	@echo "  compile-cli-workflows - Compile workflows in pkg/cli/workflows (builds binary if missing)"
 	@echo "  dependabot       - Generate Dependabot manifests for npm dependencies in workflows"
 	@echo "  generate-schema-docs - Generate frontmatter full reference documentation from JSON schema"

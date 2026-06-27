@@ -1,4 +1,6 @@
 ---
+private: true
+emoji: "🏆"
 name: Daily Community Attribution Updater
 description: Maintains a live community contributions section in README.md and an all-time Community Contributors wiki page by attributing all community-labeled issues using the five-tier attribution strategy
 on:
@@ -6,6 +8,7 @@ on:
     - cron: daily
   workflow_dispatch:
 
+max-daily-ai-credits: 10000
 permissions:
   contents: read
   pull-requests: read
@@ -20,14 +23,18 @@ network:
   allowed:
     - defaults
 
+sandbox:
+  agent:
+    sudo: false
 tools:
   cli-proxy: true
   github:
-    mode: "local"
+    mode: gh-proxy
     toolsets: [issues]
   repo-memory:
     wiki: true
     description: "All-time Community Contributors list"
+    max-patch-size: 102400  # 100KB; default (10KB) is too small for the full contributors list
   bash:
     - "gh pr list *"
     - "gh issue list *"
@@ -66,7 +73,7 @@ experiments:
 
 imports:
   - shared/community-attribution.md
-  - shared/observability-otlp.md
+  - shared/otlp.md
   - shared/issue-dedup.md
 
 steps:
@@ -283,9 +290,8 @@ steps:
       echo "Data available in $DATA_DIR/:"
       echo "  attribution_by_author.json          — Tier 0-2 issues grouped by author (agent-ready)"
       echo "  readme_community_section_tier012.md — pre-formatted README section (Tier 0-2 only)"
-
-firewall:
-  effective-token-steering: true
+features:
+  gh-aw-detection: true
 ---
 
 # Daily Community Attribution Updater
@@ -326,7 +332,7 @@ cat /tmp/gh-aw/repo-memory-default/Community-Contributors.md
 
 ## Workflow
 
-{{#if experiments.prompt_style == "concise"}}
+{{#if experiments.prompt_style == 'concise'}}
 ### 1. Attribute Issues
 
 Read `attribution_by_author.json` (Tier 0–2, pre-grouped and pre-sorted — do not
@@ -351,7 +357,7 @@ Any candidate still unresolved after Tier 3 becomes a **Tier 4**
 are deferred to the next run — do not attempt to process them.
 {{#endif}}
 
-{{#if experiments.prompt_style == "concise"}}
+{{#if experiments.prompt_style == 'concise'}}
 ### 2. Update Wiki Page
 
 Read the existing wiki at `/tmp/gh-aw/repo-memory-default/Community-Contributors.md`
@@ -402,13 +408,12 @@ Write the updated content back to
 `/tmp/gh-aw/repo-memory-default/Community-Contributors.md` using the edit tool.
 {{#endif}}
 
-{{#if experiments.prompt_style == "concise"}}
+{{#if experiments.prompt_style == 'concise'}}
 ### 3. Build Community Section
 
 Start from `readme_community_section_tier012.md` (pre-formatted Tier 0-2 content).
-Insert Tier 3 entries (sorted, alphabetical author order). Append
-`### ⚠️ Attribution Candidates Need Review` section for Tier 4 items. Leave a
-blank line after `</details>`.
+Insert Tier 3 entries (sorted, alphabetical author order). Ignore Tier 4 items
+in `README.md` output. Leave a blank line after `</details>`.
 {{#else}}
 ### 3. Build the Community Contributions Section
 
@@ -442,21 +447,11 @@ above) so that the next markdown header renders correctly.
 - **`_(direct issue)_`** (Tier 0): issue closed as `COMPLETED`, no PR linkage
 - _(no suffix)_ (Tier 1/2): PR closes the issue via native close reference or keyword
 - **`_(via follow-up #M)_`** (Tier 3): indirect chain through a follow-up issue
-- Omit issues that cannot be attributed (see Attribution Candidates section below)
-
-If there are unattributed candidates (Tier 4), append after the `</details>` blank line:
-
-```markdown
-### ⚠️ Attribution Candidates Need Review
-
-The following community issues were closed but could not be automatically
-linked to a specific merged PR. Please verify whether they should be credited:
-
-- **@author** for [Issue title](#N) — closed DATE
-```
+- Omit issues that cannot be attributed (Tier 4); do not render an attribution
+  candidates section in `README.md`
 {{#endif}}
 
-{{#if experiments.prompt_style == "concise"}}
+{{#if experiments.prompt_style == 'concise'}}
 ### 4. Update README.md
 
 Replace `## 🌍 Community Contributions` in `README.md` with the new content
@@ -471,7 +466,7 @@ section if it does not yet exist.
 Use the edit tool to make the change in-place.
 {{#endif}}
 
-{{#if experiments.prompt_style == "concise"}}
+{{#if experiments.prompt_style == 'concise'}}
 ### 5. Open Pull Request
 
 If `README.md` or wiki changed: call `create_pull_request` with title
@@ -509,7 +504,7 @@ and the Community Contributors wiki page.
 ```
 {{#endif}}
 
-{{#if experiments.prompt_style == "concise"}}
+{{#if experiments.prompt_style == 'concise'}}
 ## Token Budget
 
 - Read each data file once only; use `cat` on pre-formatted files — no bash pipelines
@@ -532,7 +527,7 @@ This workflow uses the Copilot engine — max-turns is not available. Follow the
 - **Do not access any external URLs** — use only GitHub MCP `issue_read` for GitHub data; do not call `gh api` or any external HTTP endpoints directly
 {{#endif}}
 
-{{#if experiments.prompt_style == "concise"}}
+{{#if experiments.prompt_style == 'concise'}}
 ### 6. Report Failures
 
 On error: call `create_issue` safe-output tool with a brief title and body.

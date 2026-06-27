@@ -3,13 +3,16 @@
 package workflow
 
 import (
+	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"testing"
 
 	"github.com/github/gh-aw/pkg/testutil"
+	"github.com/goccy/go-yaml"
 )
 
 func TestCompileWorkflowWithInvalidYAML(t *testing.T) {
@@ -406,6 +409,22 @@ Test content.`,
 			expectPointer:   true,
 			description:     "missing colon shows formatted output",
 		},
+		{
+			name: "error_on_line_2_included_in_snippet",
+			content: `---
+private
+engine: copilot
+on: push
+---
+
+# Test
+
+Test content.`,
+			expectedLineCol: "[2:1]", // Line 2 in file (first frontmatter line, missing colon)
+			expectedInError: []string{"missing ':' after key", "private"},
+			expectPointer:   true,
+			description:     "error on line 2 (first frontmatter line) must appear in the code snippet",
+		},
 	}
 
 	for _, tt := range tests {
@@ -546,6 +565,100 @@ Content.`,
 				t.Errorf("%s: error should contain 'error:' type indicator, got: %s", tt.description, errorStr)
 			}
 		})
+	}
+}
+
+// TestInvalidEngineReportedBeforeImportErrors verifies that an invalid engine: value
+// is reported immediately, even when imports also fail. Previously the import error
+// would shadow the engine typo.
+func TestInvalidEngineReportedBeforeImportErrors(t *testing.T) {
+	tmpDir := testutil.TempDir(t, "engine-before-import-test")
+
+	content := `---
+engine: copiilot
+imports:
+  - shared/skip-if-issue-open.md
+on: push
+---
+
+# Test
+
+Content.`
+	testFile := filepath.Join(tmpDir, "test.md")
+	if err := os.WriteFile(testFile, []byte(content), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	compiler := NewCompiler()
+	err := compiler.CompileWorkflow(testFile)
+	if err == nil {
+		t.Fatal("expected compilation to fail")
+	}
+
+	errorStr := err.Error()
+
+	// Should report the invalid engine, not the missing import
+	if !strings.Contains(errorStr, "invalid engine") {
+		t.Errorf("error should contain 'invalid engine' (reported before import errors), got: %s", errorStr)
+	}
+
+	// Should include a "Did you mean: copilot?" suggestion
+	if !strings.Contains(errorStr, "Did you mean: copilot?") {
+		t.Errorf("error should include the exact suggestion line, got: %s", errorStr)
+	}
+
+	// Should preserve filename:line:col formatting for editor navigation.
+	if !strings.Contains(errorStr, testFile) {
+		t.Errorf("error should include the source file path, got: %s", errorStr)
+	}
+	if !regexp.MustCompile(regexp.QuoteMeta(testFile) + `:\d+:\d+: error:`).MatchString(errorStr) {
+		t.Errorf("error should have filename:line:col format, got: %s", errorStr)
+	}
+
+	// Should NOT report the missing import (engine error is primary)
+	if strings.Contains(errorStr, "import file not found") {
+		t.Errorf("import error should be suppressed when engine is invalid, got: %s", errorStr)
+	}
+}
+
+// TestImportNotFoundHint verifies that a tailored hint is shown when an import cannot be resolved.
+func TestImportNotFoundHint(t *testing.T) {
+	tmpDir := testutil.TempDir(t, "import-hint-test")
+
+	content := `---
+engine: copilot
+imports:
+  - shared/missing-file.md
+on: push
+---
+
+# Test
+
+Content.`
+	testFile := filepath.Join(tmpDir, "test.md")
+	if err := os.WriteFile(testFile, []byte(content), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	compiler := NewCompiler()
+	err := compiler.CompileWorkflow(testFile)
+	if err == nil {
+		t.Fatal("expected compilation to fail")
+	}
+
+	errorStr := err.Error()
+
+	// Should show the import error
+	if !strings.Contains(errorStr, "import file not found") {
+		t.Errorf("error should contain 'import file not found', got: %s", errorStr)
+	}
+
+	// Should include a helpful hint pointing to the import path
+	if !strings.Contains(errorStr, "hint:") {
+		t.Errorf("error should contain a hint, got: %s", errorStr)
+	}
+	if !strings.Contains(errorStr, "shared/missing-file.md") {
+		t.Errorf("hint should mention the import path 'shared/missing-file.md', got: %s", errorStr)
 	}
 }
 
@@ -787,6 +900,52 @@ Test content.`
 	// Check for environment in output
 	if !strings.Contains(yamlStr, "environment:") {
 		t.Error("Expected environment in generated YAML")
+	}
+}
+
+func TestGenerateYAMLWithEnvironmentValueContainingColonSpace(t *testing.T) {
+	tmpDir := testutil.TempDir(t, "yaml-env-colon-space-test")
+
+	frontmatter := `---
+name: Test Workflow
+on: push
+permissions:
+  contents: read
+engine:
+  id: copilot
+  env:
+    ANTHROPIC_CUSTOM_HEADERS: "x-aw-gw-github-repo: ${{ github.repository }}"
+strict: false
+---
+
+# Test Workflow
+
+Test content.`
+
+	testFile := filepath.Join(tmpDir, "test.md")
+	if err := os.WriteFile(testFile, []byte(frontmatter), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	compiler := NewCompiler()
+	if err := compiler.CompileWorkflow(testFile); err != nil {
+		t.Fatalf("CompileWorkflow() error: %v", err)
+	}
+
+	lockFile := filepath.Join(tmpDir, "test.lock.yml")
+	content, err := os.ReadFile(lockFile)
+	if err != nil {
+		t.Fatalf("Failed to read lock file: %v", err)
+	}
+	yamlStr := string(content)
+
+	if !strings.Contains(yamlStr, `ANTHROPIC_CUSTOM_HEADERS: "x-aw-gw-github-repo: ${{ github.repository }}"`) {
+		t.Fatalf("Expected quoted env value in generated YAML, got:\n%s", yamlStr)
+	}
+
+	var parsed map[string]any
+	if err := yaml.Unmarshal(content, &parsed); err != nil {
+		t.Fatalf("Generated lock file should be valid YAML: %v\nYAML:\n%s", err, yamlStr)
 	}
 }
 
@@ -1351,18 +1510,28 @@ func TestLockMetadataVersionInReleaseBuilds(t *testing.T) {
 		name          string
 		isRelease     bool
 		version       string
+		actionTag     string
 		expectVersion bool
 	}{
 		{
 			name:          "dev build should not include version",
 			isRelease:     false,
 			version:       "dev",
+			actionTag:     "",
 			expectVersion: false,
 		},
 		{
 			name:          "release build should include version",
 			isRelease:     true,
 			version:       "v0.1.2",
+			actionTag:     "",
+			expectVersion: true,
+		},
+		{
+			name:          "action-tag compile should include current ref",
+			isRelease:     false,
+			version:       "401bd13",
+			actionTag:     "v9.9.9",
 			expectVersion: true,
 		},
 	}
@@ -1389,6 +1558,7 @@ Test prompt.
 
 			// Compile the workflow
 			compiler := NewCompiler()
+			compiler.SetActionTag(tt.actionTag)
 			err := compiler.CompileWorkflow(workflowPath)
 			if err != nil {
 				t.Fatalf("Failed to compile workflow: %v", err)
@@ -1436,5 +1606,87 @@ Test prompt.
 				}
 			}
 		})
+	}
+}
+
+func TestCompileWorkflowMetadataIncludesEngineVersionsAndRunnerIdentifier(t *testing.T) {
+	tmpDir := testutil.TempDir(t, "lock-metadata-engine-versions")
+
+	workflowContent := `---
+engine:
+  id: copilot
+  copilot-sdk: true
+runs-on:
+  - self-hosted
+  - linux
+on: issues
+---
+# Test Workflow
+
+Test prompt.
+`
+	workflowPath := filepath.Join(tmpDir, "metadata-engine-versions.md")
+	if err := os.WriteFile(workflowPath, []byte(workflowContent), 0o644); err != nil {
+		t.Fatalf("Failed to write workflow file: %v", err)
+	}
+
+	compiler := NewCompiler()
+	if err := compiler.CompileWorkflow(workflowPath); err != nil {
+		t.Fatalf("Failed to compile workflow: %v", err)
+	}
+
+	lockFile := strings.TrimSuffix(workflowPath, ".md") + ".lock.yml"
+	lockContent, err := os.ReadFile(lockFile)
+	if err != nil {
+		t.Fatalf("Failed to read lock file: %v", err)
+	}
+
+	var metadataLine string
+	var manifestLine string
+	for line := range strings.SplitSeq(string(lockContent), "\n") {
+		if trimmed, ok := strings.CutPrefix(line, "# gh-aw-metadata: "); ok {
+			metadataLine = trimmed
+		}
+		if trimmed, ok := strings.CutPrefix(line, "# gh-aw-manifest: "); ok {
+			manifestLine = trimmed
+		}
+	}
+	if metadataLine == "" {
+		t.Fatal("Could not find gh-aw-metadata in lock file")
+	}
+	if strings.Contains(metadataLine, "\n") {
+		t.Fatal("Expected gh-aw-metadata payload to remain a single-line JSON string")
+	}
+
+	var metadata LockMetadata
+	if err := json.Unmarshal([]byte(metadataLine), &metadata); err != nil {
+		t.Fatalf("Failed to parse lock metadata JSON: %v", err)
+	}
+
+	if got := metadata.EngineVersions["copilot"]; got == "" {
+		t.Fatal("Expected copilot version in metadata engine_versions")
+	}
+	if got := metadata.EngineVersions["copilot-sdk"]; got == "" {
+		t.Fatal("Expected copilot-sdk version in metadata engine_versions when copilot-sdk is enabled")
+	}
+	if metadata.AgentImageRunner != `["self-hosted","linux"]` {
+		t.Fatalf("Expected serialized array runner identifier, got: %q", metadata.AgentImageRunner)
+	}
+
+	if manifestLine == "" {
+		t.Fatal("Could not find gh-aw-manifest in lock file")
+	}
+	if strings.Contains(manifestLine, "\n") {
+		t.Fatal("Expected gh-aw-manifest payload to remain a single-line JSON string")
+	}
+	var manifest map[string]any
+	if err := json.Unmarshal([]byte(manifestLine), &manifest); err != nil {
+		t.Fatalf("Failed to parse gh-aw-manifest JSON: %v", err)
+	}
+	if _, exists := manifest["engine_versions"]; exists {
+		t.Fatal("gh-aw-manifest must not duplicate engine_versions metadata")
+	}
+	if _, exists := manifest["agent_image_runner"]; exists {
+		t.Fatal("gh-aw-manifest must not duplicate agent_image_runner metadata")
 	}
 }

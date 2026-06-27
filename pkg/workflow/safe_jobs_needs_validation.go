@@ -7,6 +7,7 @@ import (
 
 	"github.com/github/gh-aw/pkg/constants"
 	"github.com/github/gh-aw/pkg/logger"
+	"github.com/github/gh-aw/pkg/setutil"
 	"github.com/github/gh-aw/pkg/stringutil"
 )
 
@@ -47,7 +48,7 @@ func validateSafeJobNeeds(data *WorkflowData) error {
 		normalizedJobName := stringutil.NormalizeSafeOutputIdentifier(originalName)
 		for i, need := range jobConfig.Needs {
 			normalizedNeed := stringutil.NormalizeSafeOutputIdentifier(need)
-			if !validIDs[normalizedNeed] {
+			if !setutil.Contains(validIDs, normalizedNeed) {
 				return fmt.Errorf(
 					"safe-outputs.jobs.%s: unknown needs target %q\n\nValid dependency targets for custom safe-jobs are:\n%s\n\n"+
 						"Custom safe-jobs cannot depend on workflow control jobs such as 'conclusion' or 'activation'",
@@ -80,9 +81,12 @@ func validateSafeJobNeeds(data *WorkflowData) error {
 
 // computeValidSafeJobNeeds returns the set of job IDs that custom safe-jobs are
 // allowed to depend on, based on the workflow configuration.
-func computeValidSafeJobNeeds(data *WorkflowData) map[string]bool {
-	valid := map[string]bool{
-		string(constants.AgentJobName): true, // agent is always present
+func computeValidSafeJobNeeds(data *WorkflowData) map[string]struct {
+} {
+	valid := map[string]struct {
+	}{
+		string(constants.AgentJobName): { // agent is always present
+		},
 	}
 
 	if data.SafeOutputs == nil {
@@ -94,28 +98,33 @@ func computeValidSafeJobNeeds(data *WorkflowData) map[string]bool {
 	// custom actions, or user-provided steps are configured. Custom safe-jobs (safe-outputs.jobs)
 	// compile to separate jobs and do NOT create steps in the consolidated job.
 	if consolidatedSafeOutputsJobWillExist(data.SafeOutputs) {
-		valid[string(constants.SafeOutputsJobName)] = true
+		valid[string(constants.SafeOutputsJobName)] = struct {
+		}{}
 	}
 
 	// detection job exists when threat detection is enabled
 	if IsDetectionJobEnabled(data.SafeOutputs) {
-		valid[string(constants.DetectionJobName)] = true
+		valid[string(constants.DetectionJobName)] = struct {
+		}{}
 	}
 
 	// upload_assets job exists when upload-asset is configured
 	if data.SafeOutputs.UploadAssets != nil {
-		valid[string(constants.UploadAssetsJobName)] = true
+		valid[string(constants.UploadAssetsJobName)] = struct {
+		}{}
 	}
 
 	// unlock job exists when lock-for-agent is enabled
 	if data.LockForAgent {
-		valid[string(constants.UnlockJobName)] = true
+		valid[string(constants.UnlockJobName)] = struct {
+		}{}
 	}
 
 	// other custom safe-job names (normalized) are also valid targets
 	for jobName := range data.SafeOutputs.Jobs {
 		normalized := stringutil.NormalizeSafeOutputIdentifier(jobName)
-		valid[normalized] = true
+		valid[normalized] = struct {
+		}{}
 	}
 
 	safeJobsNeedsValidationLog.Printf("Computed valid safe-job needs targets: %d total", len(valid))
@@ -146,7 +155,8 @@ func consolidatedSafeOutputsJobWillExist(safeOutputs *SafeOutputsConfig) bool {
 }
 
 // formatValidNeedsTargets returns a human-readable, sorted list of valid need targets.
-func formatValidNeedsTargets(validIDs map[string]bool) string {
+func formatValidNeedsTargets(validIDs map[string]struct {
+}) string {
 	targets := make([]string, 0, len(validIDs))
 	for id := range validIDs {
 		targets = append(targets, "  - "+id)
@@ -185,7 +195,7 @@ func detectSafeJobCycles(jobs map[string]*SafeJobConfig) error {
 		}
 		if state[node] == visiting {
 			// Build the cycle description using original names where available
-			cycleNodes := make([]string, 0, len(path)+1)
+			cycleNodes := make([]string, 0, safeAllocationCapacity(len(path), 1))
 			for _, p := range path {
 				if orig, ok := originalNames[p]; ok {
 					cycleNodes = append(cycleNodes, orig)

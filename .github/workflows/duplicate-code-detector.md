@@ -1,4 +1,6 @@
 ---
+private: true
+emoji: "🔍"
 name: Duplicate Code Detector
 description: Identifies duplicate code patterns across the codebase and suggests refactoring opportunities
 on:
@@ -16,7 +18,7 @@ network:
     - api.github.com
 imports:
   - shared/go-source-analysis.md
-  - shared/observability-otlp.md
+  - shared/otlp.md
 safe-outputs:
   create-issue:
     expires: 2d

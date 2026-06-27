@@ -20,11 +20,13 @@ const { getAssignToAgentAssigned, getAssignToAgentErrors, getAssignToAgentErrorC
 const { getCreateAgentSessionNumber, getCreateAgentSessionUrl, writeCreateAgentSessionSummary } = require("./create_agent_session.cjs");
 const { createReviewBuffer } = require("./pr_review_buffer.cjs");
 const { sanitizeContent } = require("./sanitize_content.cjs");
+const { resolveAllowedMentionsFromPayload } = require("./resolve_mentions_from_payload.cjs");
 const { createManifestLogger, ensureManifestExists, extractCreatedItemFromResult, writeTemporaryIdMapFile } = require("./safe_output_manifest.cjs");
 const { loadCustomSafeOutputJobTypes, loadCustomSafeOutputScriptHandlers, loadCustomSafeOutputActionHandlers, isStagedMode } = require("./safe_output_helpers.cjs");
 const { emitSafeOutputActionOutputs } = require("./safe_outputs_action_outputs.cjs");
 const { listCommentMemoryFiles, COMMENT_MEMORY_DIR } = require("./comment_memory_helpers.cjs");
 const { checkRateLimitHeadroom } = require("./rate_limit_helpers.cjs");
+const { redactSensitiveConfig } = require("./safe_outputs_config_redact.cjs");
 const nodePath = require("path");
 const fs = require("fs");
 
@@ -66,6 +68,7 @@ const HANDLER_MAP = {
   create_agent_session: "./create_agent_session.cjs",
   create_code_scanning_alert: "./create_code_scanning_alert.cjs",
   autofix_code_scanning_alert: "./autofix_code_scanning_alert.cjs",
+  create_check_run: "./create_check_run.cjs",
   dispatch_workflow: "./dispatch_workflow.cjs",
   dispatch_repository: "./dispatch_repository.cjs",
   call_workflow: "./call_workflow.cjs",
@@ -96,6 +99,113 @@ const STANDALONE_STEP_TYPES = new Set(["upload_asset", "noop"]);
  * If any of these fail, the remaining non-code-push messages are cancelled with a clear reason.
  */
 const CODE_PUSH_TYPES = new Set(["push_to_pull_request_branch", "create_pull_request"]);
+
+// Threat-detection warn-mode requirement IDs from safe-outputs specification:
+// - WTD2: Convertible outputs must be mapped to a reviewable type.
+// - WTD3: Non-reviewable outputs must be aborted.
+const WTD2_REQUIREMENT_ID = "WTD2";
+const WTD3_REQUIREMENT_ID = "WTD3";
+
+/**
+ * Safe output types that remain reviewable in threat-detection warn mode.
+ * Reviewable means the handler creates visible artifacts (issues, comments, pull requests, review items)
+ * that humans can inspect before any follow-up automation or merge decision.
+ * If a new safe output type is added:
+ * - place it here when it follows that same review-first model;
+ * - place it in THREAT_WARNING_CONVERTIBLE_TYPES when it must be remapped to a reviewable type;
+ * - place it in THREAT_WARNING_ABORT_TYPES when it performs non-reviewable mutation.
+ * @type {Set<string>}
+ */
+const THREAT_WARNING_REVIEWABLE_TYPES = new Set([
+  "create_issue",
+  "add_comment",
+  "create_pull_request",
+  "comment_memory",
+  "update_issue",
+  "create_discussion",
+  "update_discussion",
+  "update_pull_request",
+  "create_pull_request_review_comment",
+  "submit_pull_request_review",
+  "reply_to_pull_request_review_comment",
+  "create_project_status_update",
+  "update_release",
+  "create_code_scanning_alert",
+  "create_check_run",
+  "create_missing_tool_issue",
+  "missing_tool",
+  "create_missing_data_issue",
+  "missing_data",
+  "create_report_incomplete_issue",
+  "report_incomplete",
+]);
+
+/**
+ * Safe output types that require conversion to a reviewable type in warn mode.
+ * Kept as a Map (instead of a single constant) because multiple convertible mappings
+ * may be added over time as safe output types evolve.
+ * @type {Map<string, string>}
+ */
+const THREAT_WARNING_CONVERTIBLE_TYPES = new Map([["push_to_pull_request_branch", "create_pull_request"]]);
+
+/**
+ * Safe output types that must be aborted in threat-detection warn mode.
+ * These handlers perform non-reviewable state-changing operations (merge/close/assign/dispatch/etc.)
+ * that cannot be safely inspected before execution and are often irreversible after execution.
+ * If a new safe output type performs direct state mutation without a review artifact, classify it here.
+ * @type {Set<string>}
+ */
+const THREAT_WARNING_ABORT_TYPES = new Set([
+  "noop",
+  "close_issue",
+  "link_sub_issue",
+  "close_discussion",
+  "close_pull_request",
+  "merge_pull_request",
+  "mark_pull_request_as_ready_for_review",
+  "resolve_pull_request_review_thread",
+  "add_labels",
+  "remove_labels",
+  "add_reviewer",
+  "assign_milestone",
+  "assign_to_agent",
+  "assign_to_user",
+  "unassign_from_user",
+  "hide_comment",
+  "set_issue_type",
+  "set_issue_field",
+  "create_project",
+  "update_project",
+  "upload_asset",
+  "upload_artifact",
+  "dispatch_workflow",
+  "dispatch_repository",
+  "call_workflow",
+  "autofix_code_scanning_alert",
+  "create_agent_session",
+]);
+
+/**
+ * Resolve threat warning policy for a safe output type.
+ * @param {string} messageType
+ * @returns {{policy: "reviewable" | "convertible" | "abort" | "none", mappedType?: string}}
+ */
+function getThreatWarningPolicy(messageType) {
+  if (THREAT_WARNING_ABORT_TYPES.has(messageType)) {
+    return { policy: "abort" };
+  }
+  const mappedType = THREAT_WARNING_CONVERTIBLE_TYPES.get(messageType);
+  if (mappedType) {
+    return { policy: "convertible", mappedType };
+  }
+  if (THREAT_WARNING_REVIEWABLE_TYPES.has(messageType)) {
+    return { policy: "reviewable" };
+  }
+  // Unknown types return "none". In warning mode this is currently allow-with-warning
+  // to preserve backward compatibility for custom/extension handlers, but new built-in
+  // safe output types should be explicitly classified in one of the policy sets above.
+  return { policy: "none" };
+}
 
 function buildCommentMemoryMessagesFromFiles(existingMessages, config) {
   if (!config.comment_memory) {
@@ -160,7 +270,7 @@ function loadConfig() {
 
   try {
     const config = JSON.parse(process.env.GH_AW_SAFE_OUTPUTS_HANDLER_CONFIG);
-    core.info(`Loaded config from GH_AW_SAFE_OUTPUTS_HANDLER_CONFIG: ${JSON.stringify(config)}`);
+    core.info(`Loaded config from GH_AW_SAFE_OUTPUTS_HANDLER_CONFIG: ${JSON.stringify(redactSensitiveConfig(config))}`);
     // Normalize config keys: convert hyphens to underscores
     return Object.fromEntries(Object.entries(config).map(([k, v]) => [k.replace(/-/g, "_"), v]));
   } catch (error) {
@@ -176,9 +286,10 @@ const PR_REVIEW_HANDLER_TYPES = new Set(["create_pull_request_review_comment", "
  * Calls each handler's factory function (main) to get message processors
  * @param {Object} config - Safe outputs configuration
  * @param {Object} prReviewBuffer - Shared PR review buffer instance
+ * @param {string[]} [resolvedAllowedMentionAliases] - Pre-resolved mention aliases shared across handlers
  * @returns {Promise<Map<string, Function>>} Map of type to message handler function
  */
-async function loadHandlers(config, prReviewBuffer) {
+async function loadHandlers(config, prReviewBuffer, resolvedAllowedMentionAliases = []) {
   const messageHandlers = new Map();
 
   core.info("Loading and initializing safe output handlers based on configuration...");
@@ -192,6 +303,15 @@ async function loadHandlers(config, prReviewBuffer) {
         if (handlerModule && typeof handlerModule.main === "function") {
           // Call the factory function with config to get the message handler
           const handlerConfig = { ...(config[type] || {}) };
+
+          // Pass top-level mentions policy through so handlers can preserve
+          // the same allowed mention aliases used during collection.
+          if (handlerConfig.mentions == null && config.mentions != null) {
+            handlerConfig.mentions = config.mentions;
+          }
+          if (handlerConfig.mentions != null && handlerConfig.allowedMentionAliases == null && Array.isArray(resolvedAllowedMentionAliases)) {
+            handlerConfig.allowedMentionAliases = resolvedAllowedMentionAliases;
+          }
 
           // Inject shared PR review buffer into handlers that need it
           if (PR_REVIEW_HANDLER_TYPES.has(type)) {
@@ -373,6 +493,107 @@ function formatManifestLogMessage(item) {
   return `📝 Manifest: logged ${item.type}`;
 }
 
+function logCreatedItemFromResult(onItemCreated, messageType, result) {
+  if (!onItemCreated) {
+    return;
+  }
+  if (Array.isArray(result)) {
+    for (const item of result) {
+      const createdItem = extractCreatedItemFromResult(messageType, item);
+      if (createdItem) {
+        core.info(formatManifestLogMessage(createdItem));
+        onItemCreated(createdItem);
+      }
+    }
+    return;
+  }
+  const createdItem = extractCreatedItemFromResult(messageType, result);
+  if (createdItem) {
+    core.info(formatManifestLogMessage(createdItem));
+    onItemCreated(createdItem);
+  }
+}
+
+/**
+ * Retroactively mark buffered review results as failed when the finalization POST fails.
+ * Both submit_pull_request_review and create_pull_request_review_comment return
+ * success:true during message processing (they only buffer), so the failure must be
+ * reflected here to ensure the Processing Summary shows the correct counts.
+ *
+ * @param {Array<{type: string, success: boolean, error?: string}>} results - Processing results to mutate
+ * @param {string} errorMessage - Error message to attach to the rolled-back results
+ */
+function rollbackReviewResults(results, errorMessage) {
+  for (const r of results) {
+    if ((r.type === "submit_pull_request_review" || r.type === "create_pull_request_review_comment") && r.success === true) {
+      r.success = false;
+      r.error = `Review finalization failed: ${errorMessage}`;
+    }
+  }
+}
+
+/**
+ * Mark buffered review results as skipped when the PR is locked and submission was
+ * soft-skipped (success:true, skipped:true). Both submit_pull_request_review and
+ * create_pull_request_review_comment handlers buffer during message processing, so
+ * the skip must be back-propagated here so the Processing Summary reflects the actual
+ * outcome (skipped) rather than a misleading success count.
+ *
+ * Note: uses `skipReason` (not `reason`) so that the step-summary generator does not
+ * treat these entries as delegated-step skips and omit them from the output.
+ *
+ * @param {Array<{type: string, success: boolean, skipped?: boolean, skipReason?: string}>} results - Processing results to mutate
+ * @param {string} skipReason - Human-readable reason for the skip
+ */
+function skipReviewResults(results, skipReason) {
+  for (const r of results) {
+    if ((r.type === "submit_pull_request_review" || r.type === "create_pull_request_review_comment") && r.success === true) {
+      r.skipped = true;
+      r.skipReason = skipReason;
+    }
+  }
+}
+
+/**
+ * Determine whether a processing result is a non-skipped, non-deferred, non-cancelled failure.
+ *
+ * @param {{success?: boolean, deferred?: boolean, skipped?: boolean, cancelled?: boolean}|null|undefined} result
+ * @returns {boolean}
+ */
+function isFailedProcessingResult(result) {
+  return Boolean(result?.success === false && !result?.deferred && !result?.skipped && !result?.cancelled);
+}
+
+/** Types whose failures are surfaced as warnings rather than failing the safe_outputs job. */
+const REPORT_ONLY_FAILURE_TYPES = new Set(["assign_to_agent", "upload_artifact"]);
+
+/**
+ * Determine whether a failed result should be reported without failing the safe_outputs job.
+ * Agent assignment can fail after other safe outputs already succeeded, so those failures
+ * are surfaced through dedicated outputs and summaries instead of failing the entire job.
+ * Artifact uploads are best-effort and non-critical: a failed upload should not fail an
+ * otherwise-successful run.
+ *
+ * @param {{type?: string, success?: boolean, deferred?: boolean, skipped?: boolean, cancelled?: boolean}|null|undefined} result
+ * @returns {boolean}
+ */
+function isReportOnlyFailureResult(result) {
+  return isFailedProcessingResult(result) && !!(result?.type && REPORT_ONLY_FAILURE_TYPES.has(result.type));
+}
+
+/**
+ * Partition processing results into fatal and report-only failures.
+ *
+ * @param {Array<{type?: string, success?: boolean, deferred?: boolean, skipped?: boolean, cancelled?: boolean, error?: string}>} results
+ * @returns {{fatalFailures: Array<any>, reportOnlyFailures: Array<any>}}
+ */
+function partitionFailureResults(results) {
+  const failedResults = results.filter(isFailedProcessingResult);
+  const reportOnlyFailures = failedResults.filter(r => REPORT_ONLY_FAILURE_TYPES.has(r?.type ?? ""));
+  const fatalFailures = failedResults.filter(r => !REPORT_ONLY_FAILURE_TYPES.has(r?.type ?? ""));
+  return { fatalFailures, reportOnlyFailures };
+}
+
 /**
  * Process all messages from agent output in the order they appear
  * Dispatches each message to the appropriate handler while maintaining shared state (temporary ID map)
@@ -385,6 +606,7 @@ function formatManifestLogMessage(item) {
  */
 async function processMessages(messageHandlers, messages, onItemCreated = null) {
   const results = [];
+  const detectionConclusion = process.env.GH_AW_DETECTION_CONCLUSION || "";
 
   // Collect missing_tool, missing_data, noop, and report_incomplete messages first
   const missings = collectMissingMessages(messages);
@@ -441,20 +663,32 @@ async function processMessages(messageHandlers, messages, onItemCreated = null) 
       continue;
     }
 
-    // Fail-fast: if a previous code-push operation failed, cancel non-code-push messages.
-    // Exception: add_comment messages are allowed through so the status comment still reaches
-    // the user — they will be annotated with a failure note (see effectiveMessage logic below).
-    if (codePushFailures.length > 0 && !CODE_PUSH_TYPES.has(messageType) && messageType !== "add_comment") {
-      const cancelReason = `Cancelled: code push operation failed (${codePushFailures[0].type}: ${codePushFailures[0].error})`;
-      core.info(`⏭ Message ${i + 1} (${messageType}) cancelled — ${cancelReason}`);
-      results.push({
-        type: messageType,
-        messageIndex: i,
-        success: false,
-        cancelled: true,
-        reason: cancelReason,
-      });
-      continue;
+    if (detectionConclusion === "warning") {
+      const threatPolicy = getThreatWarningPolicy(messageType);
+      if (threatPolicy.policy === "abort") {
+        const errorCode = "threat_detected_abort_policy";
+        const error = `Threat-detection warn policy aborted "${messageType}" (Requirement ${WTD3_REQUIREMENT_ID}): non-reviewable outputs must not be applied when detection conclusion is warning.`;
+        core.warning(`🚫 ${error}`);
+        results.push({
+          type: messageType,
+          messageIndex: i,
+          success: false,
+          cancelled: true,
+          threatDetected: true,
+          errorCode,
+          error,
+        });
+        continue;
+      }
+      if (threatPolicy.policy === "convertible") {
+        // Conversion execution is implemented in the handler for the convertible type.
+        // Keep THREAT_WARNING_CONVERTIBLE_TYPES and handler conversion logic in sync.
+        // Current mapping: push_to_pull_request_branch -> create_pull_request
+        // (implemented in push_to_pull_request_branch.cjs warning-mode review flow).
+        core.info(`Threat-detection warn policy conversion required for "${messageType}" -> "${threatPolicy.mappedType}" (${WTD2_REQUIREMENT_ID})`);
+      } else if (threatPolicy.policy === "none") {
+        core.warning(`Threat-detection warn policy has no explicit classification for "${messageType}"; allowing handler execution by default`);
+      }
     }
 
     const messageHandler = messageHandlers.get(messageType);
@@ -597,7 +831,7 @@ async function processMessages(messageHandlers, messages, onItemCreated = null) 
         // Track code-push failures for fail-fast behaviour
         if (CODE_PUSH_TYPES.has(messageType)) {
           codePushFailures.push({ type: messageType, error: errorMsg });
-          core.warning(`⚠️ Code push operation '${messageType}' failed — remaining safe outputs will be cancelled`);
+          core.warning(`⚠️ Code push operation '${messageType}' failed — continuing with remaining safe outputs (add_comment messages will include a failure note)`);
         }
         continue;
       }
@@ -713,23 +947,7 @@ async function processMessages(messageHandlers, messages, onItemCreated = null) 
       });
 
       // Log to manifest if this was a create operation
-      if (onItemCreated) {
-        if (Array.isArray(result)) {
-          for (const item of result) {
-            const createdItem = extractCreatedItemFromResult(messageType, item);
-            if (createdItem) {
-              core.info(formatManifestLogMessage(createdItem));
-              onItemCreated(createdItem);
-            }
-          }
-        } else {
-          const createdItem = extractCreatedItemFromResult(messageType, result);
-          if (createdItem) {
-            core.info(formatManifestLogMessage(createdItem));
-            onItemCreated(createdItem);
-          }
-        }
-      }
+      logCreatedItemFromResult(onItemCreated, messageType, result);
 
       core.info(`✓ Message ${i + 1} (${messageType}) completed successfully`);
     } catch (error) {
@@ -743,7 +961,7 @@ async function processMessages(messageHandlers, messages, onItemCreated = null) 
       // Track code-push failures for fail-fast behaviour
       if (CODE_PUSH_TYPES.has(messageType)) {
         codePushFailures.push({ type: messageType, error: getErrorMessage(error) });
-        core.warning(`⚠️ Code push operation '${messageType}' failed — remaining safe outputs will be cancelled`);
+        core.warning(`⚠️ Code push operation '${messageType}' failed — continuing with remaining safe outputs (add_comment messages will include a failure note)`);
       }
     }
   }
@@ -831,13 +1049,7 @@ async function processMessages(messageHandlers, messages, onItemCreated = null) 
           }
 
           // Log to manifest after deferred retry success
-          if (onItemCreated) {
-            const createdItem = extractCreatedItemFromResult(deferred.type, result);
-            if (createdItem) {
-              core.info(formatManifestLogMessage(createdItem));
-              onItemCreated(createdItem);
-            }
-          }
+          logCreatedItemFromResult(onItemCreated, deferred.type, result);
         }
       } catch (error) {
         core.error(`✗ Retry of message ${deferred.messageIndex + 1} (${deferred.type}) failed: ${getErrorMessage(error)}`);
@@ -884,6 +1096,8 @@ function getContentToCheck(messageType, message, result) {
       return message.body || "";
     case "comment_memory":
       return result?.managedBody || message.body || "";
+    case "create_pull_request":
+      return result?.managedBody || message.body || "";
     default:
       return null;
   }
@@ -898,7 +1112,7 @@ function getContentToCheck(messageType, message, result) {
  * @param {string} updatedBody - Updated body content with resolved temp IDs
  * @returns {Promise<void>}
  */
-async function updateIssueBody(github, context, repo, issueNumber, updatedBody) {
+async function updateIssueBody(github, context, repo, issueNumber, updatedBody, allowedMentionAliases = []) {
   const [owner, repoName] = repo.split("/");
 
   core.info(`Updating issue ${repo}#${issueNumber} body with resolved temporary IDs`);
@@ -907,10 +1121,34 @@ async function updateIssueBody(github, context, repo, issueNumber, updatedBody) 
     owner,
     repo: repoName,
     issue_number: issueNumber,
-    body: sanitizeContent(updatedBody),
+    body: sanitizeContent(updatedBody, { allowedAliases: allowedMentionAliases }),
   });
 
   core.info(`✓ Updated issue ${repo}#${issueNumber}`);
+}
+
+/**
+ * Update the body of a pull request with resolved temporary IDs
+ * @param {any} github - GitHub API client
+ * @param {any} context - GitHub Actions context
+ * @param {string} repo - Repository in "owner/repo" format
+ * @param {number} prNumber - Pull request number to update
+ * @param {string} updatedBody - Updated body content with resolved temp IDs
+ * @returns {Promise<void>}
+ */
+async function updatePullRequestBody(github, context, repo, prNumber, updatedBody, allowedMentionAliases = []) {
+  const [owner, repoName] = repo.split("/");
+
+  core.info(`Updating pull request ${repo}#${prNumber} body with resolved temporary IDs`);
+
+  await github.rest.pulls.update({
+    owner,
+    repo: repoName,
+    pull_number: prNumber,
+    body: sanitizeContent(updatedBody, { allowedAliases: allowedMentionAliases }),
+  });
+
+  core.info(`✓ Updated pull request ${repo}#${prNumber}`);
 }
 
 /**
@@ -922,7 +1160,7 @@ async function updateIssueBody(github, context, repo, issueNumber, updatedBody) 
  * @param {string} updatedBody - Updated body content with resolved temp IDs
  * @returns {Promise<void>}
  */
-async function updateDiscussionBody(github, context, repo, discussionNumber, updatedBody) {
+async function updateDiscussionBody(github, context, repo, discussionNumber, updatedBody, allowedMentionAliases = []) {
   const [owner, repoName] = repo.split("/");
 
   core.info(`Updating discussion ${repo}#${discussionNumber} body with resolved temporary IDs`);
@@ -960,7 +1198,7 @@ async function updateDiscussionBody(github, context, repo, discussionNumber, upd
 
   await github.graphql(mutation, {
     discussionId,
-    body: sanitizeContent(updatedBody),
+    body: sanitizeContent(updatedBody, { allowedAliases: allowedMentionAliases }),
   });
 
   core.info(`✓ Updated discussion ${repo}#${discussionNumber}`);
@@ -976,12 +1214,12 @@ async function updateDiscussionBody(github, context, repo, discussionNumber, upd
  * @param {boolean} isDiscussion - Whether this is a discussion comment
  * @returns {Promise<void>}
  */
-async function updateCommentBody(github, context, repo, commentId, updatedBody, isDiscussion = false) {
+async function updateCommentBody(github, context, repo, commentId, updatedBody, isDiscussion = false, allowedMentionAliases = []) {
   const [owner, repoName] = repo.split("/");
 
   core.info(`Updating comment ${commentId} body with resolved temporary IDs`);
 
-  const sanitizedBody = sanitizeContent(updatedBody);
+  const sanitizedBody = sanitizeContent(updatedBody, { allowedAliases: allowedMentionAliases });
 
   if (isDiscussion) {
     // For discussion comments, we need to use GraphQL
@@ -1023,7 +1261,7 @@ async function updateCommentBody(github, context, repo, commentId, updatedBody, 
  * @param {Map<string, string>} [artifactUrlMap] - Optional artifact URL map for resolving artifact references
  * @returns {Promise<number>} Number of successful updates
  */
-async function processSyntheticUpdates(github, context, trackedOutputs, temporaryIdMap, artifactUrlMap) {
+async function processSyntheticUpdates(github, context, trackedOutputs, temporaryIdMap, artifactUrlMap, allowedMentionAliases = []) {
   let updateCount = 0;
 
   core.info(`\n=== Processing Synthetic Updates ===`);
@@ -1056,17 +1294,17 @@ async function processSyntheticUpdates(github, context, trackedOutputs, temporar
             // Update based on the original type
             switch (tracked.type) {
               case "create_issue":
-                await updateIssueBody(github, context, tracked.result.repo, tracked.result.number, updatedContent);
+                await updateIssueBody(github, context, tracked.result.repo, tracked.result.number, updatedContent, allowedMentionAliases);
                 updateCount++;
                 break;
               case "create_discussion":
-                await updateDiscussionBody(github, context, tracked.result.repo, tracked.result.number, updatedContent);
+                await updateDiscussionBody(github, context, tracked.result.repo, tracked.result.number, updatedContent, allowedMentionAliases);
                 updateCount++;
                 break;
               case "add_comment":
                 // Update comment using the tracked comment ID
                 if (tracked.result.commentId) {
-                  await updateCommentBody(github, context, tracked.result.repo, tracked.result.commentId, updatedContent, tracked.result.isDiscussion);
+                  await updateCommentBody(github, context, tracked.result.repo, tracked.result.commentId, updatedContent, tracked.result.isDiscussion, allowedMentionAliases);
                   updateCount++;
                 } else {
                   core.debug(`Skipping synthetic update for comment - comment ID not tracked`);
@@ -1074,11 +1312,15 @@ async function processSyntheticUpdates(github, context, trackedOutputs, temporar
                 break;
               case "comment_memory":
                 if (tracked.result.commentId) {
-                  await updateCommentBody(github, context, tracked.result.repo, tracked.result.commentId, updatedContent, false);
+                  await updateCommentBody(github, context, tracked.result.repo, tracked.result.commentId, updatedContent, false, allowedMentionAliases);
                   updateCount++;
                 } else {
                   core.debug(`Skipping synthetic update for comment_memory - comment ID not tracked`);
                 }
+                break;
+              case "create_pull_request":
+                await updatePullRequestBody(github, context, tracked.result.repo, tracked.result.number, updatedContent, allowedMentionAliases);
+                updateCount++;
                 break;
               default:
                 core.debug(`Unknown output type: ${tracked.type}`);
@@ -1155,8 +1397,10 @@ async function main() {
       prReviewBuffer.setFooterMode(footerConfig);
     }
 
+    const allowedMentionAliases = config.mentions != null ? await resolveAllowedMentionsFromPayload(context, github, core, config.mentions) : [];
+
     // Load and initialize handlers based on configuration (factory pattern)
-    const messageHandlers = await loadHandlers(config, prReviewBuffer);
+    const messageHandlers = await loadHandlers(config, prReviewBuffer, allowedMentionAliases);
 
     if (messageHandlers.size === 0) {
       core.info("No handlers loaded - nothing to process");
@@ -1190,16 +1434,34 @@ async function main() {
       } else {
         core.info("Submitting PR review (body-only, no inline comments)");
       }
+      let reviewFailureError = null;
       try {
         const reviewResult = await prReviewBuffer.submitReview();
         if (reviewResult.success && !reviewResult.skipped) {
+          logCreatedItemFromResult(logCreatedItem, "submit_pull_request_review", reviewResult);
           core.info(`✓ PR review submitted successfully: ${reviewResult.review_url}`);
+        } else if (reviewResult.success && reviewResult.skipped) {
+          const skipReason = reviewResult.reason || "PR review submission skipped";
+          core.warning(`⚠ ${skipReason}`);
+          if (reviewResult.pr_locked) {
+            core.setOutput("pr_locked", "true");
+          }
+          skipReviewResults(processingResult.results, skipReason);
         } else if (!reviewResult.success) {
-          core.warning(`✗ Failed to submit PR review: ${reviewResult.error}`);
+          reviewFailureError = reviewResult.error || "PR review finalization failed";
+          core.error(`✗ Failed to submit PR review: ${reviewFailureError}`);
         }
       } catch (reviewError) {
-        const errorMessage = reviewError instanceof Error ? reviewError.message : String(reviewError);
-        core.warning(`✗ Exception while submitting PR review: ${errorMessage}`);
+        reviewFailureError = reviewError instanceof Error ? reviewError.message : String(reviewError);
+        core.error(`✗ Exception while submitting PR review: ${reviewFailureError}`);
+      }
+
+      // Roll back per-message success counts when the finalization POST failed.
+      // Both submit_pull_request_review and create_pull_request_review_comment handlers
+      // return success:true during message processing (they only buffer), so the failure
+      // must be reflected here to ensure the Processing Summary shows the correct counts.
+      if (reviewFailureError !== null) {
+        rollbackReviewResults(processingResult.results, reviewFailureError);
       }
     }
 
@@ -1217,7 +1479,7 @@ async function main() {
       // Convert temp ID map back to Map
       const temporaryIdMap = new Map(Object.entries(processingResult.temporaryIdMap));
 
-      syntheticUpdateCount = await processSyntheticUpdates(github, context, processingResult.outputsWithUnresolvedIds, temporaryIdMap, processingResult.artifactUrlMap);
+      syntheticUpdateCount = await processSyntheticUpdates(github, context, processingResult.outputsWithUnresolvedIds, temporaryIdMap, processingResult.artifactUrlMap, allowedMentionAliases);
     }
 
     // Write step summaries for all processed safe-outputs
@@ -1225,7 +1487,9 @@ async function main() {
 
     // Log summary
     const successCount = processingResult.results.filter(r => r.success).length;
-    const failureCount = processingResult.results.filter(r => !r.success && !r.deferred && !r.skipped && !r.cancelled).length;
+    const { fatalFailures, reportOnlyFailures } = partitionFailureResults(processingResult.results);
+    const failureCount = fatalFailures.length;
+    const reportOnlyFailureCount = reportOnlyFailures.length;
     const cancelledCount = processingResult.results.filter(r => r.cancelled).length;
     const deferredCount = processingResult.results.filter(r => r.deferred).length;
     const skippedStandaloneResults = processingResult.results.filter(r => r.skipped && r.reason === "Handled by standalone step");
@@ -1237,6 +1501,9 @@ async function main() {
     core.info(`Total messages: ${processingResult.results.length}`);
     core.info(`Successful: ${successCount}`);
     core.info(`Failed: ${failureCount}`);
+    if (reportOnlyFailureCount > 0) {
+      core.info(`Reported assignment failures: ${reportOnlyFailureCount}`);
+    }
     if (cancelledCount > 0) {
       core.info(`Cancelled (code push failed): ${cancelledCount}`);
     }
@@ -1268,11 +1535,13 @@ async function main() {
 
     if (failureCount > 0) {
       core.warning(`${failureCount} message(s) failed to process`);
-      const failedItems = processingResult.results
-        .filter(r => !r.success && !r.deferred && !r.skipped && !r.cancelled)
-        .map(r => `  - ${r.type}: ${r.error || "Unknown error"}`)
-        .join("\n");
+      const failedItemLines = fatalFailures.map(r => `  - ${r.type}: ${r.error || "Unknown error"}`);
+      const failedItems = failedItemLines.join("\n");
       core.setFailed(`${failureCount} safe output(s) failed:\n${failedItems}`);
+    }
+    if (reportOnlyFailureCount > 0) {
+      const reportOnlyTypes = [...new Set(reportOnlyFailures.map(r => r.type || "unknown"))];
+      core.warning(`${reportOnlyFailureCount} non-fatal safe output(s) failed but were reported without failing safe_outputs: ${reportOnlyTypes.join(", ")}`);
     }
     if (cancelledCount > 0) {
       core.warning(`${cancelledCount} message(s) were cancelled because a code push operation failed`);
@@ -1382,4 +1651,16 @@ async function main() {
   }
 }
 
-module.exports = { main, loadConfig, loadHandlers, processMessages, buildCommentMemoryMessagesFromFiles };
+module.exports = {
+  main,
+  loadConfig,
+  loadHandlers,
+  processMessages,
+  buildCommentMemoryMessagesFromFiles,
+  rollbackReviewResults,
+  skipReviewResults,
+  logCreatedItemFromResult,
+  isFailedProcessingResult,
+  isReportOnlyFailureResult,
+  partitionFailureResults,
+};

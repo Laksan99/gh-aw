@@ -84,9 +84,6 @@ DESTINATION="${INPUT_DESTINATION:-${GH_AW_ROOT}/actions}"
 # Get safe-output-custom-tokens flag from input (default: false)
 SAFE_OUTPUT_CUSTOM_TOKENS_ENABLED="${INPUT_SAFE_OUTPUT_CUSTOM_TOKENS:-false}"
 
-# Get safe-output-artifact-client flag from input (default: false)
-SAFE_OUTPUT_ARTIFACT_CLIENT_ENABLED="${INPUT_SAFE_OUTPUT_ARTIFACT_CLIENT:-false}"
-
 debug_log "Copying activation files to ${DESTINATION}"
 debug_log "Safe-output custom tokens support: ${SAFE_OUTPUT_CUSTOM_TOKENS_ENABLED}"
 
@@ -178,19 +175,6 @@ fi
 
 echo "Successfully copied ${FILE_COUNT} files to ${DESTINATION}"
 
-# Export model multipliers JSON as GH_AW_MODEL_MULTIPLIERS environment variable.
-# This makes the per-model effective token multipliers available to JavaScript
-# actions running in subsequent steps so they can compute Effective Tokens (ET).
-MODEL_MULTIPLIERS_FILE="${DESTINATION}/model_multipliers.json"
-if [ -f "${MODEL_MULTIPLIERS_FILE}" ] && [ -n "${GITHUB_ENV:-}" ]; then
-  {
-    echo "GH_AW_MODEL_MULTIPLIERS<<EOF_MODEL_MULTIPLIERS"
-    cat "${MODEL_MULTIPLIERS_FILE}"
-    echo "EOF_MODEL_MULTIPLIERS"
-  } >> "${GITHUB_ENV}"
-  debug_log "Exported GH_AW_MODEL_MULTIPLIERS from ${MODEL_MULTIPLIERS_FILE}"
-fi
-
 # Copy prompt markdown files to their expected directory
 PROMPTS_DEST="${GH_AW_ROOT}/prompts"
 debug_log "Copying prompt markdown files to ${PROMPTS_DEST}"
@@ -226,6 +210,7 @@ MCP_SCRIPTS_FILES=(
   "mcp_scripts_tool_factory.cjs"
   "mcp_scripts_validation.cjs"
   "mcp_server_core.cjs"
+  "mcp_dependencies_manager.cjs"
   "mcp_logger.cjs"
   "mcp_http_transport.cjs"
   "mcp_http_server_runner.cjs"
@@ -237,6 +222,7 @@ MCP_SCRIPTS_FILES=(
   "read_buffer.cjs"
   "generate_mcp_scripts_config.cjs"
   "setup_globals.cjs"
+  "runtime_features.cjs"
   "github_rate_limit_logger.cjs"
   "error_helpers.cjs"
   "error_codes.cjs"
@@ -279,13 +265,18 @@ create_dir "${SAFE_OUTPUTS_DEST}"
 SAFE_OUTPUTS_FILES=(
   "safe_outputs_mcp_server.cjs"
   "safe_outputs_mcp_server_http.cjs"
+  "safe_outputs_mcp_arguments.cjs"
   "safe_outputs_bootstrap.cjs"
   "safe_outputs_tools_loader.cjs"
   "safe_outputs_config.cjs"
+  "safe_outputs_config_redact.cjs"
   "safe_outputs_handlers.cjs"
+  "symlink_guard.cjs"
+  "intent_probe.cjs"
   "allowed_extensions_helpers.cjs"
   "safe_outputs_append.cjs"
   "mcp_server_core.cjs"
+  "mcp_dependencies_manager.cjs"
   "mcp_logger.cjs"
   "mcp_http_transport.cjs"
   "mcp_http_server_runner.cjs"
@@ -299,11 +290,14 @@ SAFE_OUTPUTS_FILES=(
   "messages.cjs"
   "messages_core.cjs"
   "messages_footer.cjs"
+  "compact_numbers.cjs"
+  "model_aliases.cjs"
   "messages_header.cjs"
   "messages_run_status.cjs"
   "messages_staged.cjs"
   "messages_close_discussion.cjs"
-  "effective_tokens.cjs"
+  "threat_detection_warning.cjs"
+  "model_costs.cjs"
   "estimate_tokens.cjs"
   "generate_git_patch.cjs"
   "generate_git_bundle.cjs"
@@ -314,11 +308,13 @@ SAFE_OUTPUTS_FILES=(
   "write_large_content_to_file.cjs"
   "generate_compact_schema.cjs"
   "setup_globals.cjs"
+  "runtime_features.cjs"
   "github_rate_limit_logger.cjs"
   "error_helpers.cjs"
   "error_codes.cjs"
   "constants.cjs"
   "git_helpers.cjs"
+  "checkout_manifest.cjs"
   "github_api_helpers.cjs"
   "find_repo_checkout.cjs"
   "mcp_enhanced_errors.cjs"
@@ -330,13 +326,21 @@ SAFE_OUTPUTS_FILES=(
   "missing_messages_helper.cjs"
   "firewall_blocked_domains.cjs"
   "render_template.cjs"
+  "ai_credits_context.cjs"
+  "numeric_limits.cjs"
   "is_truthy.cjs"
   "template_branch.cjs"
   "gateway_difc_filtered.cjs"
   "missing_info_formatter.cjs"
+  "sanitize_content.cjs"
   "sanitize_content_core.cjs"
+  "slash_command_matcher.cjs"
+  "sanitize_title.cjs"
+  "issue_title_dedup.cjs"
+  "levenshtein_distance.cjs"
   "markdown_code_region_balancer.cjs"
   "temporary_id.cjs"
+  "invocation_context_helpers.cjs"
 )
 
 SAFE_OUTPUTS_COUNT=0
@@ -377,8 +381,12 @@ else
   echo "::warning::Safe-outputs MCP entry point not found: safe-outputs-mcp-server.cjs"
 fi
 
-# Copy safe_outputs_tools.json to tools.json (required by safe-outputs server)
+# Copy safe_outputs_tools.json to both canonical and runtime names
 if [ -f "${JS_SOURCE_DIR}/safe_outputs_tools.json" ]; then
+  cp "${JS_SOURCE_DIR}/safe_outputs_tools.json" "${SAFE_OUTPUTS_DEST}/safe_outputs_tools.json"
+  debug_log "Copied safe-outputs tools definition: safe_outputs_tools.json"
+  SAFE_OUTPUTS_COUNT=$((SAFE_OUTPUTS_COUNT + 1))
+
   cp "${JS_SOURCE_DIR}/safe_outputs_tools.json" "${SAFE_OUTPUTS_DEST}/tools.json"
   debug_log "Copied safe-outputs tools definition: tools.json"
   SAFE_OUTPUTS_COUNT=$((SAFE_OUTPUTS_COUNT + 1))
@@ -394,39 +402,32 @@ if [ ! -f "${SAFE_OUTPUTS_DEST}/config.json" ]; then
   debug_log "Created empty config.json for safe-outputs server"
 fi
 
-echo "Successfully copied ${SAFE_OUTPUTS_COUNT} safe-outputs files to ${SAFE_OUTPUTS_DEST}"
-
-# Install @actions/artifact package if upload-artifact safe output is configured.
-# upload_artifact.cjs uses DefaultArtifactClient to upload via Actions REST API directly.
-if [ "${SAFE_OUTPUT_ARTIFACT_CLIENT_ENABLED}" = "true" ]; then
-  echo "Artifact client enabled - installing @actions/artifact package in ${DESTINATION}..."
-  cd "${DESTINATION}"
-
-  # Check if npm is available
-  if ! command -v npm &> /dev/null; then
-    echo "::error::npm is not available. Cannot install @actions/artifact package."
-    exit 1
-  fi
-
-  # Create a minimal package.json if it doesn't exist
-  if [ ! -f "package.json" ]; then
-    echo '{"private": true}' > package.json
-  fi
-
-  # Install @actions/artifact package
-  npm install --ignore-scripts --no-save --loglevel=error @actions/artifact@^6.0.0 2>&1 | grep -v "npm WARN" || true
-  if [ -d "node_modules/@actions/artifact" ]; then
-    echo "✓ Successfully installed @actions/artifact package"
-  else
-    echo "::error::Failed to install @actions/artifact package"
-    exit 1
-  fi
-
-  # Return to original directory
-  cd - > /dev/null
+# Copy configure_git_credentials.sh to safeoutputs so the gh-aw-node container can run it
+# The container's entrypoint (start_safe_outputs_mcp.sh) calls this script to configure
+# git identity and safe.directory
+GIT_CREDENTIALS_SCRIPT="${SH_SOURCE_DIR}/configure_git_credentials.sh"
+if [ -f "${GIT_CREDENTIALS_SCRIPT}" ]; then
+  cp "${GIT_CREDENTIALS_SCRIPT}" "${SAFE_OUTPUTS_DEST}/configure_git_credentials.sh"
+  chmod +x "${SAFE_OUTPUTS_DEST}/configure_git_credentials.sh"
+  debug_log "Copied git credentials script to safe-outputs: configure_git_credentials.sh"
 else
-  debug_log "Artifact client not enabled - skipping @actions/artifact installation"
+  echo "::error::configure_git_credentials.sh not found at ${GIT_CREDENTIALS_SCRIPT}"
+  exit 1
 fi
+
+# Copy start_safe_outputs_mcp.sh to safeoutputs so the gh-aw-node container entrypoint can run it
+# This script configures git (via configure_git_credentials.sh) and launches the MCP server
+START_SAFE_OUTPUTS_SCRIPT="${SH_SOURCE_DIR}/start_safe_outputs_mcp.sh"
+if [ -f "${START_SAFE_OUTPUTS_SCRIPT}" ]; then
+  cp "${START_SAFE_OUTPUTS_SCRIPT}" "${SAFE_OUTPUTS_DEST}/start_safe_outputs_mcp.sh"
+  chmod +x "${SAFE_OUTPUTS_DEST}/start_safe_outputs_mcp.sh"
+  debug_log "Copied safe-outputs entrypoint script: start_safe_outputs_mcp.sh"
+else
+  echo "::error::start_safe_outputs_mcp.sh not found at ${START_SAFE_OUTPUTS_SCRIPT}"
+  exit 1
+fi
+
+echo "Successfully copied ${SAFE_OUTPUTS_COUNT} safe-outputs files to ${SAFE_OUTPUTS_DEST}"
 
 # Send OTLP job setup span when configured (non-fatal).
 # Delegates to action_setup_otlp.cjs (same file used by actions/setup/index.js)

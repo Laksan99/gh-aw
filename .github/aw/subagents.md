@@ -4,23 +4,7 @@ description: Guide for defining inline sub-agents in workflow markdown files —
 
 # Inline Sub-Agents
 
-Inline sub-agents let you define specialised agents directly inside a workflow markdown file. At runtime the sub-agent sections are extracted from the prompt (after `{{#runtime-import}}` macros are resolved) and written to the engine-specific agents directory so the engine CLI can discover and invoke them.
-
----
-
-## Enabling the Feature
-
-Inline sub-agent extraction and restoration steps are enabled by default:
-
-```yaml
----
-engine: copilot
----
-```
-
-> `features.inline-agents` is deprecated and should be removed. Inline sub-agent extraction is always on, so this field is unnecessary.
->
-> `inline-sub-agents: false` is not supported and fails compilation. Remove the field.
+Define specialised agents directly in a workflow markdown file. At runtime, sub-agent sections are extracted (after `{{#runtime-import}}` macros resolve) and written to the engine-specific agents directory for the engine CLI to discover.
 
 ---
 
@@ -87,12 +71,10 @@ The engine is detected at compile time from the `engine:` field and injected as 
 
 ## MCP Access in Sub-Agents
 
-Sub-agents **do not have their own MCP servers**. They run within the parent workflow's agent environment but without independent tool configuration.
+Sub-agents **do not have their own MCP servers** — they run within the parent's agent environment without independent tool config. To give them file system and shell access, enable on the parent workflow:
 
-For sub-agents to perform useful work they typically need access to the file system and shell. The following tools must be enabled on the parent workflow:
-
-- **`cli-proxy: true`** — enables the GitHub CLI proxy so the sub-agent can make authenticated GitHub API calls via `gh`. Strongly recommended for any sub-agent that reads or writes repository content.
-- **`tools.github.mode: gh-proxy`** — routes GitHub API calls through the gh proxy sidecar; required for the sub-agent to operate on private repositories or to use the GitHub MCP toolset.
+- **`cli-proxy: true`** — GitHub CLI proxy for authenticated `gh` calls. Recommended for any sub-agent that reads/writes repo content.
+- **`tools.github.mode: gh-proxy`** — routes GitHub API calls through the gh proxy sidecar; required for private repos or the GitHub MCP toolset.
 
 ```yaml
 ---
@@ -108,11 +90,11 @@ tools:
 
 ## When to Use Sub-Agents
 
-Sub-agents are most useful in two scenarios:
+Two main scenarios:
 
 ### 1 — Parallel specialised tasks with smaller models
 
-Break a large workflow into parallel units of work, each handled by a small, cheap model, and then use the parent (large) model to reason over the aggregated results:
+Break a large workflow into parallel units handled by small/cheap models, then let the parent (large) model reason over the aggregated results:
 
 ```markdown
 # Investigate: Repository Health
@@ -155,11 +137,33 @@ resemble API keys, tokens, or passwords. Report any findings with the
 file name and approximate line number.
 ```
 
-The parent model (e.g. Claude Sonnet or Copilot) orchestrates, while the sub-agents do the heavy lifting with a `small` model at lower cost.
+The parent model orchestrates; sub-agents do the heavy lifting with `small` at lower cost.
 
 ### 2 — Reusable specialised helpers
 
-Extract a repetitive sub-task (file summarisation, commit-message generation, code explanation) into a named sub-agent that the main prompt can call by name, keeping the main prompt concise.
+Extract repetitive sub-tasks (file summarisation, commit-message generation, code explanation) into a named sub-agent the main prompt calls by name.
+
+---
+
+## Planner-Worker Pattern
+
+Split work to control cost and keep context quality high:
+
+- **Main/frontier agent (planner-orchestrator):** forms hypotheses, decides what evidence is needed, picks workers, synthesises conclusions
+- **Worker sub-agents (usually `model: small`):** bounded retrieval, extraction, classification, verification, one-shot summarisation
+
+Prompt workers narrowly and evidence-first (e.g. "return exact error messages and line references"), not broad analysis.
+
+Worker outputs should be compact and structured. Do not return raw logs or large file dumps to the orchestrator.
+
+### Bounded delegation rules
+
+- keep delegation one level deep unless gh-aw explicitly supports and validates deeper topology
+- avoid recursive or open-ended sub-agent fan-out
+- cap per-run worker fan-out so high-volume events cannot trigger runaway cost
+- stop early with `noop` or safe output when a cheap worker can confidently classify a known/duplicate/stale/low-value case
+
+See also: [token-optimization.md](token-optimization.md) and [workflow-patterns.md](workflow-patterns.md).
 
 ---
 
@@ -199,6 +203,4 @@ changes. Return a bulleted list, one bullet per file.
 
 - Sub-agents do not support `engine:`, `tools:`, `network:`, or `mcp-servers:` fields — those are stripped at runtime.
 - Sub-agents cannot define their own safe-output jobs.
-- `features.inline-agents` is deprecated and should be removed; inline sub-agent upload/restore is always generated.
-- `inline-sub-agents: false` is rejected at compile time; inline sub-agents cannot be disabled.
 - Sub-agent blocks must appear in the main workflow file body; they are not resolved inside imported shared files.

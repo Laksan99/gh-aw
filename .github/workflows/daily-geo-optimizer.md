@@ -1,15 +1,21 @@
 ---
+private: true
+emoji: "🌍"
 description: Daily GEO (Generative Engine Optimization) audit of the README and documentation site using geo-optimizer-skill
 on:
   schedule: daily
   workflow_dispatch:
+max-daily-ai-credits: 10000
 permissions:
   contents: read
   issues: read
   pull-requests: read
   discussions: read
+  copilot-requests: write
 tracker-id: daily-geo-optimizer
-engine: copilot
+engine:
+  id: copilot
+  copilot-sdk: true
 strict: true
 timeout-minutes: 30
 tools:
@@ -25,8 +31,6 @@ tools:
     - "jq *"
     - "find *"
     - "grep *"
-features:
-  copilot-requests: true
 if: needs.geo_audit.result == 'success'
 jobs:
   geo_audit:
@@ -35,10 +39,10 @@ jobs:
       contents: read
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7.0.0
 
       - name: Setup Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v6.2.0
         with:
           python-version: "3.11"
 
@@ -46,23 +50,23 @@ jobs:
         run: pip install geo-optimizer-skill
 
       - name: Create results directory
-        run: mkdir -p /tmp/gh-aw/geo-optimizer
+        run: mkdir -p /tmp/gh-aw/agent/geo-optimizer
 
       - name: Audit documentation site homepage
         run: |
           geo audit --url https://github.github.com/gh-aw/ --format json \
-            > /tmp/gh-aw/geo-optimizer/docs-site-audit.json 2>&1 || true
+            > /tmp/gh-aw/agent/geo-optimizer/docs-site-audit.json 2>&1 || true
 
       - name: Audit documentation sitemap
         run: |
           geo audit --sitemap https://github.github.com/gh-aw/sitemap.xml \
             --max-urls 20 --format json \
-            > /tmp/gh-aw/geo-optimizer/docs-sitemap-audit.json 2>&1 || true
+            > /tmp/gh-aw/agent/geo-optimizer/docs-sitemap-audit.json 2>&1 || true
 
       - name: Audit README via GitHub repository page
         run: |
           geo audit --url https://github.com/${{ github.repository }} --format json \
-            > /tmp/gh-aw/geo-optimizer/readme-audit.json 2>&1 || true
+            > /tmp/gh-aw/agent/geo-optimizer/readme-audit.json 2>&1 || true
 
       - name: Write audit metadata
         run: |
@@ -76,7 +80,7 @@ jobs:
             "readme_url": "https://github.com/${{ github.repository }}",
             "repository": "${{ github.repository }}",
           }
-          path = "/tmp/gh-aw/geo-optimizer/metadata.json"
+          path = "/tmp/gh-aw/agent/geo-optimizer/metadata.json"
           with open(path, "w") as f:
             json.dump(metadata, f, indent=2)
           print(f"Wrote metadata to {path}")
@@ -86,7 +90,7 @@ jobs:
         uses: actions/upload-artifact@v7.0.1
         with:
           name: geo-optimizer-results
-          path: /tmp/gh-aw/geo-optimizer
+          path: /tmp/gh-aw/agent/geo-optimizer
           if-no-files-found: error
           retention-days: 3
 
@@ -95,7 +99,7 @@ steps:
     uses: actions/download-artifact@v8.0.1
     with:
       name: geo-optimizer-results
-      path: /tmp/gh-aw/geo-optimizer
+      path: /tmp/gh-aw/agent/geo-optimizer
 
 imports:
   - uses: shared/daily-audit-base.md
@@ -103,9 +107,12 @@ imports:
       title-prefix: "[geo-optimizer] "
       expires: 3d
 
-  - shared/observability-otlp.md
-firewall:
-  effective-token-steering: true
+  - shared/otlp.md
+features:
+  gh-aw-detection: true
+sandbox:
+  agent:
+    sudo: false
 ---
 
 {{#runtime-import? .github/shared-instructions.md}}
@@ -122,7 +129,7 @@ You are the GEO (Generative Engine Optimization) audit agent. Your task is to an
 
 ## Your Mission
 
-Analyze the GEO audit results downloaded from the `geo-optimizer-results` artifact into `/tmp/gh-aw/geo-optimizer/` and create a GitHub Discussion summarizing the findings and actionable recommendations to improve AI-engine citation coverage for this project.
+Analyze the GEO audit results downloaded from the `geo-optimizer-results` artifact into `/tmp/gh-aw/agent/geo-optimizer/` and create a GitHub Discussion summarizing the findings and actionable recommendations to improve AI-engine citation coverage for this project.
 
 ---
 
@@ -131,7 +138,7 @@ Analyze the GEO audit results downloaded from the `geo-optimizer-results` artifa
 Read all JSON files from the results directory:
 
 ```bash
-ls /tmp/gh-aw/geo-optimizer/
+ls /tmp/gh-aw/agent/geo-optimizer/
 ```
 
 - `docs-site-audit.json` — full GEO audit of `https://github.github.com/gh-aw/`

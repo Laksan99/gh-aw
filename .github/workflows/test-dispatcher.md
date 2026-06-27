@@ -1,17 +1,21 @@
 ---
+private: true
+emoji: "🧪"
 on:
   workflow_dispatch:
+timeout-minutes: 10
 permissions:
   contents: read
   issues: read
 imports:
-  - shared/observability-otlp.md
+  - shared/otlp.md
 safe-outputs:
   dispatch-workflow:
     workflows:
       - test-workflow
     max: 1
-
+features:
+  gh-aw-detection: true
 ---
 
 # Test Dispatcher Workflow

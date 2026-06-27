@@ -3,6 +3,7 @@
 package workflow
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -10,6 +11,7 @@ import (
 	"testing"
 
 	"github.com/github/gh-aw/pkg/stringutil"
+	"github.com/stretchr/testify/require"
 )
 
 func TestGenerateMaintenanceCron(t *testing.T) {
@@ -144,6 +146,49 @@ func TestGenerateMaintenanceWorkflow_WithExpires(t *testing.T) {
 			expectWorkflowGenerated: true,
 			expectError:             false,
 		},
+		{
+			name: "with noop report-as-issue default - should generate workflow",
+			workflowDataList: []*WorkflowData{
+				{
+					Name: "noop-default-workflow",
+					SafeOutputs: &SafeOutputsConfig{
+						NoOp: &NoOpConfig{},
+					},
+				},
+			},
+			expectWorkflowGenerated: true,
+			expectError:             false,
+		},
+		{
+			name: "with noop report-as-issue false - should NOT generate workflow",
+			workflowDataList: []*WorkflowData{
+				{
+					Name: "noop-disabled-report-workflow",
+					SafeOutputs: &SafeOutputsConfig{
+						NoOp: &NoOpConfig{
+							ReportAsIssue: strPtr("false"),
+						},
+					},
+				},
+			},
+			expectWorkflowGenerated: false,
+			expectError:             false,
+		},
+		{
+			name: "with noop report-as-issue true - should generate workflow",
+			workflowDataList: []*WorkflowData{
+				{
+					Name: "noop-explicit-report-workflow",
+					SafeOutputs: &SafeOutputsConfig{
+						NoOp: &NoOpConfig{
+							ReportAsIssue: strPtr("true"),
+						},
+					},
+				},
+			},
+			expectWorkflowGenerated: true,
+			expectError:             false,
+		},
 	}
 
 	for _, tt := range tests {
@@ -152,7 +197,15 @@ func TestGenerateMaintenanceWorkflow_WithExpires(t *testing.T) {
 			tmpDir := t.TempDir()
 
 			// Call GenerateMaintenanceWorkflow
-			err := GenerateMaintenanceWorkflow(tt.workflowDataList, tmpDir, "v1.0.0", ActionModeDev, "", false, nil, "")
+			err := GenerateMaintenanceWorkflow(context.Background(), GenerateMaintenanceWorkflowOptions{
+				WorkflowDataList: tt.workflowDataList,
+				WorkflowDir:      tmpDir,
+				Version:          "v1.0.0",
+				ActionMode:       ActionModeDev,
+				ActionTag:        "",
+				RepoConfig:       nil,
+				RepoSlug:         "",
+			})
 
 			// Check error expectation
 			if tt.expectError && err == nil {
@@ -175,6 +228,71 @@ func TestGenerateMaintenanceWorkflow_WithExpires(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestScanWorkflowsForExpires_TriggerReason(t *testing.T) {
+	t.Run("no triggers", func(t *testing.T) {
+		hasExpires, minExpires, triggerReason := scanWorkflowsForExpires([]*WorkflowData{
+			{
+				Name:        "no-safe-outputs",
+				SafeOutputs: nil,
+			},
+		})
+		require.False(t, hasExpires)
+		require.Equal(t, 0, minExpires)
+		require.Empty(t, triggerReason)
+	})
+
+	t.Run("captures first trigger reason", func(t *testing.T) {
+		hasExpires, minExpires, triggerReason := scanWorkflowsForExpires([]*WorkflowData{
+			{
+				Name: "first-trigger",
+				SafeOutputs: &SafeOutputsConfig{
+					CreateIssues: &CreateIssuesConfig{
+						Expires: 72,
+					},
+				},
+			},
+			{
+				Name: "second-trigger",
+				SafeOutputs: &SafeOutputsConfig{
+					CreateDiscussions: &CreateDiscussionsConfig{
+						Expires: 24,
+					},
+				},
+			},
+		})
+		require.True(t, hasExpires)
+		require.Equal(t, 24, minExpires)
+		require.Contains(t, triggerReason, "first-trigger")
+		require.Contains(t, triggerReason, "safe_outputs.create_issues.expires=72h")
+		require.NotContains(t, triggerReason, "second-trigger")
+	})
+}
+
+func TestGenerateMaintenanceWorkflow_CreatesWorkflowDirRecursively(t *testing.T) {
+	tmpDir := t.TempDir()
+	workflowDir := filepath.Join(tmpDir, "nested", "workflows")
+
+	err := GenerateMaintenanceWorkflow(context.Background(), GenerateMaintenanceWorkflowOptions{
+		WorkflowDataList: []*WorkflowData{
+			{
+				Name: "test-workflow",
+				SafeOutputs: &SafeOutputsConfig{
+					CreateDiscussions: &CreateDiscussionsConfig{
+						Expires: 24,
+					},
+				},
+			},
+		},
+		WorkflowDir: workflowDir,
+		Version:     "dev",
+		ActionMode:  ActionModeDev,
+	})
+	require.NoError(t, err)
+
+	_, statErr := os.Stat(filepath.Join(workflowDir, "agentics-maintenance.yml"))
+	require.NoError(t, statErr)
 }
 
 func TestGenerateMaintenanceWorkflow_DeletesExistingFile(t *testing.T) {
@@ -241,7 +359,15 @@ func TestGenerateMaintenanceWorkflow_DeletesExistingFile(t *testing.T) {
 			}
 
 			// Call GenerateMaintenanceWorkflow
-			err := GenerateMaintenanceWorkflow(tt.workflowDataList, tmpDir, "v1.0.0", ActionModeDev, "", false, nil, "")
+			err := GenerateMaintenanceWorkflow(context.Background(), GenerateMaintenanceWorkflowOptions{
+				WorkflowDataList: tt.workflowDataList,
+				WorkflowDir:      tmpDir,
+				Version:          "v1.0.0",
+				ActionMode:       ActionModeDev,
+				ActionTag:        "",
+				RepoConfig:       nil,
+				RepoSlug:         "",
+			})
 			if err != nil {
 				t.Errorf("Unexpected error: %v", err)
 			}
@@ -273,7 +399,15 @@ func TestGenerateMaintenanceWorkflow_OperationJobConditions(t *testing.T) {
 	}
 
 	tmpDir := t.TempDir()
-	err := GenerateMaintenanceWorkflow(workflowDataList, tmpDir, "v1.0.0", ActionModeDev, "", false, nil, "")
+	err := GenerateMaintenanceWorkflow(context.Background(), GenerateMaintenanceWorkflowOptions{
+		WorkflowDataList: workflowDataList,
+		WorkflowDir:      tmpDir,
+		Version:          "v1.0.0",
+		ActionMode:       ActionModeDev,
+		ActionTag:        "",
+		RepoConfig:       nil,
+		RepoSlug:         "",
+	})
 	if err != nil {
 		t.Fatalf("Unexpected error: %v", err)
 	}
@@ -282,6 +416,10 @@ func TestGenerateMaintenanceWorkflow_OperationJobConditions(t *testing.T) {
 		t.Fatalf("Expected maintenance workflow to be generated: %v", err)
 	}
 	yaml := string(content)
+	require.Contains(t, yaml, "This file defines the generated agentic maintenance workflow for this repository.")
+	require.Contains(t, yaml, "This workflow is generated automatically when workflows use expiring safe outputs")
+	require.Contains(t, yaml, `{"maintenance": false}`)
+	require.Contains(t, yaml, "https://github.github.com/gh-aw/reference/ephemerals/#manual-maintenance-operations")
 
 	operationSkipCondition := `github.event_name != 'workflow_dispatch' && github.event_name != 'workflow_call' || inputs.operation == ''`
 	operationRunCondition := `(github.event_name == 'workflow_dispatch' || github.event_name == 'workflow_call') && inputs.operation != '' && inputs.operation != 'safe_outputs' && inputs.operation != 'create_labels' && inputs.operation != 'activity_report' && inputs.operation != 'close_agentic_workflows_issues' && inputs.operation != 'clean_cache_memories' && inputs.operation != 'update_pull_request_branches' && inputs.operation != 'validate' && inputs.operation != 'forecast'`
@@ -433,8 +571,8 @@ func TestGenerateMaintenanceWorkflow_OperationJobConditions(t *testing.T) {
 	if !strings.Contains(yaml, "--start-date -1w") {
 		t.Errorf("Job activity_report gh aw logs command should include --start-date -1w in:\n%s", yaml)
 	}
-	if !strings.Contains(yaml, "--count 100") {
-		t.Errorf("Job activity_report gh aw logs command should include --count 100 in:\n%s", yaml)
+	if !strings.Contains(yaml, "--count 500") {
+		t.Errorf("Job activity_report gh aw logs command should include --count 500 in:\n%s", yaml)
 	}
 	if !strings.Contains(yaml, "--format markdown") {
 		t.Errorf("Job activity_report gh aw logs command should include --format markdown in:\n%s", yaml)
@@ -470,29 +608,59 @@ func TestGenerateMaintenanceWorkflow_OperationJobConditions(t *testing.T) {
 	if !strings.Contains(yaml, "Generate forecast report") {
 		t.Errorf("Job forecast_report should include forecast generation step in:\n%s", yaml)
 	}
-	if !strings.Contains(yaml, "Restore forecast report logs cache") {
-		t.Errorf("Job forecast_report should restore logs cache before warm-up in:\n%s", yaml)
-	}
-	if !strings.Contains(yaml, "Save forecast report logs cache") {
-		t.Errorf("Job forecast_report should save logs cache after forecast generation in:\n%s", yaml)
-	}
 	if !strings.Contains(yaml, "${GH_AW_CMD_PREFIX} forecast") {
 		t.Errorf("Job forecast_report should run gh aw forecast directly in:\n%s", yaml)
 	}
-	if !strings.Contains(yaml, "${GH_AW_CMD_PREFIX} logs --repo \"${{ github.repository }}\" --start-date -30d --count 1500") {
-		t.Errorf("Job forecast_report should warm logs cache with 30-day lookback and expanded count in:\n%s", yaml)
+	if !strings.Contains(yaml, "Restore forecast report logs cache") {
+		t.Errorf("Job forecast_report should restore logs cache before running forecast in:\n%s", yaml)
 	}
-	if !strings.Contains(yaml, "Missing run summary cache in .github/aw/logs after gh aw logs warm-up; cannot run forecast.") {
-		t.Errorf("Job forecast_report should fail when run summary cache is missing after warm-up in:\n%s", yaml)
+	if !strings.Contains(yaml, "Save forecast report logs cache") {
+		t.Errorf("Job forecast_report should save logs cache after running forecast in:\n%s", yaml)
 	}
-	if !strings.Contains(yaml, "--repo \"${{ github.repository }}\" --json") {
-		t.Errorf("Job forecast_report gh aw forecast command should include --repo and --json in:\n%s", yaml)
+	if !strings.Contains(yaml, "Debug forecast logs folder") {
+		t.Errorf("Job forecast_report should include a debug step that lists forecast logs folder files in:\n%s", yaml)
+	}
+	if !strings.Contains(yaml, "find ./.github/aw/logs -type f | sort") {
+		t.Errorf("Job forecast_report debug step should list files from ./.github/aw/logs in:\n%s", yaml)
+	}
+	if !strings.Contains(yaml, "./.github/aw/logs") {
+		t.Errorf("Job forecast_report cache should target ./.github/aw/logs in:\n%s", yaml)
+	}
+	if !strings.Contains(yaml, "${{ runner.os }}-forecast-report-logs-${{ github.repository }}-${{ github.ref_name }}-${{ github.run_id }}") {
+		t.Errorf("Job forecast_report cache save step should use the explicit forecast logs cache key in:\n%s", yaml)
+	}
+	if strings.Contains(yaml, "${GH_AW_CMD_PREFIX} logs --repo \"${{ github.repository }}\" --start-date -30d --count 1500 --artifacts agent") {
+		t.Errorf("Job forecast_report should not pre-download full logs before running forecast in:\n%s", yaml)
+	}
+	if !strings.Contains(yaml, "--repo \"$GITHUB_REPOSITORY\" --timeout 30 --verbose --json") {
+		t.Errorf("Job forecast_report gh aw forecast command should include --repo, --timeout, --verbose, and --json in:\n%s", yaml)
 	}
 	if !strings.Contains(yaml, "shell: bash") {
 		t.Errorf("Job forecast_report should explicitly use bash shell for stderr filtering in:\n%s", yaml)
 	}
-	if !strings.Contains(yaml, "${GH_AW_CMD_PREFIX} forecast --repo \"${{ github.repository }}\" --json 2> >(grep -Fv \"forecast is an experimental command and may change without notice\" >&2) > ./.cache/gh-aw/forecast/report.json") {
-		t.Errorf("Job forecast_report gh aw forecast command should filter the experimental warning while preserving stderr in:\n%s", yaml)
+	if !strings.Contains(yaml, "timeout-minutes: 30") {
+		t.Errorf("Job forecast_report should set a 30-minute timeout on the forecast generation step in:\n%s", yaml)
+	}
+	if !strings.Contains(yaml, "DEBUG: \"*\"") {
+		t.Errorf("Job forecast_report should enable DEBUG=* in:\n%s", yaml)
+	}
+	if !strings.Contains(yaml, "${GH_AW_CMD_PREFIX} forecast --repo \"$GITHUB_REPOSITORY\" --timeout 30 --verbose --json > ./.cache/gh-aw/forecast/report.json") {
+		t.Errorf("Job forecast_report gh aw forecast command should run in verbose mode and write report output in:\n%s", yaml)
+	}
+	if strings.Contains(yaml, "2> >(grep -Fv \"forecast is an experimental command and may change without notice\" >&2)") {
+		t.Errorf("Job forecast_report should not filter forecast stderr in:\n%s", yaml)
+	}
+	if strings.Contains(yaml, "timeout 10m ${GH_AW_CMD_PREFIX} forecast") {
+		t.Errorf("Job forecast_report should not use shell timeout wrapper for forecast command anymore in:\n%s", yaml)
+	}
+	if !strings.Contains(yaml, "echo '{\"outcome\":\"timeout\",\"message\":\"Forecast computation timed out after 30 minutes.\"}' > ./.cache/gh-aw/forecast/error.json") {
+		t.Errorf("Job forecast_report should record timeout errors for issue creation in:\n%s", yaml)
+	}
+	if !strings.Contains(yaml, "if: ${{ always() }}") {
+		t.Errorf("Job forecast_report should always run follow-up issue/cache steps even when forecast fails in:\n%s", yaml)
+	}
+	if !strings.Contains(yaml, "FORECAST_STEP_OUTCOME: ${{ steps.generate_forecast_report.outcome }}") {
+		t.Errorf("Job forecast_report issue generation step should pass forecast step outcome to create_forecast_issue.cjs in:\n%s", yaml)
 	}
 	if !strings.Contains(yaml, "const { main } = require('${{ runner.temp }}/gh-aw/actions/create_forecast_issue.cjs');") {
 		t.Errorf("Job forecast_report issue generation step should call create_forecast_issue.cjs in:\n%s", yaml)
@@ -613,7 +781,15 @@ func TestGenerateMaintenanceWorkflow_DisableAgenticWorkflowJob(t *testing.T) {
 	cfg := &RepoConfig{
 		Maintenance: &MaintenanceConfig{LabelTriggers: &trueVal},
 	}
-	err := GenerateMaintenanceWorkflow(workflowDataList, tmpDir, "v1.0.0", ActionModeDev, "", false, cfg, "")
+	err := GenerateMaintenanceWorkflow(context.Background(), GenerateMaintenanceWorkflowOptions{
+		WorkflowDataList: workflowDataList,
+		WorkflowDir:      tmpDir,
+		Version:          "v1.0.0",
+		ActionMode:       ActionModeDev,
+		ActionTag:        "",
+		RepoConfig:       cfg,
+		RepoSlug:         "",
+	})
 	if err != nil {
 		t.Fatalf("Unexpected error: %v", err)
 	}
@@ -760,7 +936,15 @@ func TestGenerateMaintenanceWorkflow_LabelTriggers_Disabled(t *testing.T) {
 	cfg := &RepoConfig{
 		Maintenance: &MaintenanceConfig{LabelTriggers: &falseVal},
 	}
-	err := GenerateMaintenanceWorkflow(workflowDataList, tmpDir, "v1.0.0", ActionModeDev, "", false, cfg, "")
+	err := GenerateMaintenanceWorkflow(context.Background(), GenerateMaintenanceWorkflowOptions{
+		WorkflowDataList: workflowDataList,
+		WorkflowDir:      tmpDir,
+		Version:          "v1.0.0",
+		ActionMode:       ActionModeDev,
+		ActionTag:        "",
+		RepoConfig:       cfg,
+		RepoSlug:         "",
+	})
 	if err != nil {
 		t.Fatalf("Unexpected error: %v", err)
 	}
@@ -803,7 +987,15 @@ func TestGenerateMaintenanceWorkflow_LabelTriggers_Default(t *testing.T) {
 
 	tmpDir := t.TempDir()
 	// Default: LabelTriggers is nil (omitted) → treated as false (opt-in semantics) → jobs absent
-	err := GenerateMaintenanceWorkflow(workflowDataList, tmpDir, "v1.0.0", ActionModeDev, "", false, nil, "")
+	err := GenerateMaintenanceWorkflow(context.Background(), GenerateMaintenanceWorkflowOptions{
+		WorkflowDataList: workflowDataList,
+		WorkflowDir:      tmpDir,
+		Version:          "v1.0.0",
+		ActionMode:       ActionModeDev,
+		ActionTag:        "",
+		RepoConfig:       nil,
+		RepoSlug:         "",
+	})
 	if err != nil {
 		t.Fatalf("Unexpected error: %v", err)
 	}
@@ -844,7 +1036,15 @@ func TestGenerateMaintenanceWorkflow_LabelTriggers_ExplicitTrue(t *testing.T) {
 	cfg := &RepoConfig{
 		Maintenance: &MaintenanceConfig{LabelTriggers: &trueVal},
 	}
-	err := GenerateMaintenanceWorkflow(workflowDataList, tmpDir, "v1.0.0", ActionModeDev, "", false, cfg, "")
+	err := GenerateMaintenanceWorkflow(context.Background(), GenerateMaintenanceWorkflowOptions{
+		WorkflowDataList: workflowDataList,
+		WorkflowDir:      tmpDir,
+		Version:          "v1.0.0",
+		ActionMode:       ActionModeDev,
+		ActionTag:        "",
+		RepoConfig:       cfg,
+		RepoSlug:         "",
+	})
 	if err != nil {
 		t.Fatalf("Unexpected error: %v", err)
 	}
@@ -904,7 +1104,15 @@ func TestGenerateMaintenanceWorkflow_PushTrigger(t *testing.T) {
 
 	t.Run("dev mode includes push trigger on main for workflow md files", func(t *testing.T) {
 		tmpDir := t.TempDir()
-		err := GenerateMaintenanceWorkflow(workflowDataList, tmpDir, "v1.0.0", ActionModeDev, "", false, nil, "")
+		err := GenerateMaintenanceWorkflow(context.Background(), GenerateMaintenanceWorkflowOptions{
+			WorkflowDataList: workflowDataList,
+			WorkflowDir:      tmpDir,
+			Version:          "v1.0.0",
+			ActionMode:       ActionModeDev,
+			ActionTag:        "",
+			RepoConfig:       nil,
+			RepoSlug:         "",
+		})
 		if err != nil {
 			t.Fatalf("Unexpected error: %v", err)
 		}
@@ -928,7 +1136,15 @@ func TestGenerateMaintenanceWorkflow_PushTrigger(t *testing.T) {
 	t.Run("dev mode uses custom default branch from buildMaintenanceWorkflowYAML", func(t *testing.T) {
 		// Call buildMaintenanceWorkflowYAML directly to test the branch substitution
 		// without needing a live GitHub API call (FetchDefaultBranch falls back to "main" with no slug)
-		yaml := buildMaintenanceWorkflowYAML("37 */2 * * *", "Every 2 hours", 1, "ubuntu-slim", ActionModeDev, "v1.0.0", "", nil, nil, "develop", false)
+		yaml := buildMaintenanceWorkflowYAML(context.Background(), buildMaintenanceWorkflowYAMLOptions{
+			cronSchedule:   "37 */2 * * *",
+			scheduleDesc:   "Every 2 hours",
+			minExpiresDays: 1,
+			runsOnValue:    "ubuntu-slim",
+			actionMode:     ActionModeDev,
+			version:        "v1.0.0",
+			defaultBranch:  "develop",
+		})
 		if !strings.Contains(yaml, "      - develop") {
 			t.Errorf("Push trigger should use the provided default branch 'develop', got:\n%s", yaml[:min(500, len(yaml))])
 		}
@@ -939,7 +1155,15 @@ func TestGenerateMaintenanceWorkflow_PushTrigger(t *testing.T) {
 
 	t.Run("release mode does not include push trigger", func(t *testing.T) {
 		tmpDir := t.TempDir()
-		err := GenerateMaintenanceWorkflow(workflowDataList, tmpDir, "v1.0.0", ActionModeRelease, "", false, nil, "")
+		err := GenerateMaintenanceWorkflow(context.Background(), GenerateMaintenanceWorkflowOptions{
+			WorkflowDataList: workflowDataList,
+			WorkflowDir:      tmpDir,
+			Version:          "v1.0.0",
+			ActionMode:       ActionModeRelease,
+			ActionTag:        "",
+			RepoConfig:       nil,
+			RepoSlug:         "",
+		})
 		if err != nil {
 			t.Fatalf("Unexpected error: %v", err)
 		}
@@ -956,7 +1180,15 @@ func TestGenerateMaintenanceWorkflow_PushTrigger(t *testing.T) {
 
 	t.Run("close-expired-entities and secret-validation exclude push events", func(t *testing.T) {
 		tmpDir := t.TempDir()
-		err := GenerateMaintenanceWorkflow(workflowDataList, tmpDir, "v1.0.0", ActionModeDev, "", false, nil, "")
+		err := GenerateMaintenanceWorkflow(context.Background(), GenerateMaintenanceWorkflowOptions{
+			WorkflowDataList: workflowDataList,
+			WorkflowDir:      tmpDir,
+			Version:          "v1.0.0",
+			ActionMode:       ActionModeDev,
+			ActionTag:        "",
+			RepoConfig:       nil,
+			RepoSlug:         "",
+		})
 		if err != nil {
 			t.Fatalf("Unexpected error: %v", err)
 		}
@@ -983,7 +1215,15 @@ func TestGenerateMaintenanceWorkflow_PushTrigger(t *testing.T) {
 
 	t.Run("compile-workflows runs on push events (no push exclusion)", func(t *testing.T) {
 		tmpDir := t.TempDir()
-		err := GenerateMaintenanceWorkflow(workflowDataList, tmpDir, "v1.0.0", ActionModeDev, "", false, nil, "")
+		err := GenerateMaintenanceWorkflow(context.Background(), GenerateMaintenanceWorkflowOptions{
+			WorkflowDataList: workflowDataList,
+			WorkflowDir:      tmpDir,
+			Version:          "v1.0.0",
+			ActionMode:       ActionModeDev,
+			ActionTag:        "",
+			RepoConfig:       nil,
+			RepoSlug:         "",
+		})
 		if err != nil {
 			t.Fatalf("Unexpected error: %v", err)
 		}
@@ -1007,6 +1247,71 @@ func TestGenerateMaintenanceWorkflow_PushTrigger(t *testing.T) {
 		if !strings.Contains(jobSection, "github.workflow }}-compile-workflows-${{ github.repository") {
 			t.Errorf("Job compile-workflows should have a scoped concurrency group, but got:\n%s", jobSection)
 		}
+		if !strings.Contains(yaml, "compile --validate --no-emit --verbose") {
+			t.Errorf("Workflow should run pre-compile validation with --no-emit, but did not. Generated YAML:\n%s", yaml)
+		}
+		if strings.Contains(yaml, "compile --validate --validate-images --verbose") {
+			t.Errorf("Workflow should not require --validate-images in compile-workflows, but generated YAML includes it:\n%s", yaml)
+		}
+		if strings.Contains(yaml, "        env:\n        with:\n") {
+			t.Errorf("Workflow should not emit an empty env block in compile-workflows, but generated YAML includes one:\n%s", yaml)
+		}
+	})
+
+	t.Run("compile-workflows can create pull requests with custom token secret", func(t *testing.T) {
+		const compileJobSectionSearchRange = 500
+		tmpDir := t.TempDir()
+		repoConfig := &RepoConfig{
+			Maintenance: &MaintenanceConfig{
+				Compile: &MaintenanceCompileConfig{
+					CreatePullRequestGitHubToken: "MAINTENANCE_TOKEN",
+				},
+			},
+		}
+		err := GenerateMaintenanceWorkflow(context.Background(), GenerateMaintenanceWorkflowOptions{
+			WorkflowDataList: workflowDataList,
+			WorkflowDir:      tmpDir,
+			Version:          "v1.0.0",
+			ActionMode:       ActionModeDev,
+			ActionTag:        "",
+			RepoConfig:       repoConfig,
+			RepoSlug:         "",
+		})
+		if err != nil {
+			t.Fatalf("Unexpected error: %v", err)
+		}
+		content, err := os.ReadFile(filepath.Join(tmpDir, "agentics-maintenance.yml"))
+		if err != nil {
+			t.Fatalf("Expected maintenance workflow to be generated: %v", err)
+		}
+		yaml := string(content)
+
+		compileIdx := strings.Index(yaml, "\n  compile-workflows:")
+		if compileIdx == -1 {
+			t.Fatal("Job compile-workflows not found in generated workflow")
+		}
+		jobSection := yaml[compileIdx : compileIdx+compileJobSectionSearchRange]
+		if !strings.Contains(jobSection, "contents: read") {
+			t.Errorf("compile-workflows should keep contents: read permission, got:\n%s", jobSection)
+		}
+		if !strings.Contains(jobSection, "issues: write") {
+			t.Errorf("compile-workflows should keep issues: write permission, got:\n%s", jobSection)
+		}
+		if strings.Contains(jobSection, "pull-requests: write") {
+			t.Errorf("compile-workflows should not request pull-requests: write in PR mode, got:\n%s", jobSection)
+		}
+		if strings.Contains(jobSection, "contents: write") {
+			t.Errorf("compile-workflows should not request contents: write in PR mode, got:\n%s", jobSection)
+		}
+		if !strings.Contains(yaml, "GH_AW_MAINTENANCE_GITHUB_TOKEN: ${{ secrets.MAINTENANCE_TOKEN }}") {
+			t.Errorf("workflow should use configured maintenance github token secret, got:\n%s", yaml)
+		}
+		if !strings.Contains(yaml, "github-token: ${{ env.GH_AW_MAINTENANCE_GITHUB_TOKEN }}") {
+			t.Errorf("workflow should pass maintenance token to github-script, got:\n%s", yaml)
+		}
+		if strings.Contains(yaml, "GH_AW_WORKFLOW_RECOMPILE_CREATE_PULL_REQUEST") {
+			t.Errorf("workflow should not emit a separate PR mode env var, got:\n%s", yaml)
+		}
 	})
 }
 
@@ -1024,7 +1329,15 @@ func TestGenerateMaintenanceWorkflow_ActionTag(t *testing.T) {
 
 	t.Run("release mode with action-tag uses remote ref", func(t *testing.T) {
 		tmpDir := t.TempDir()
-		err := GenerateMaintenanceWorkflow(workflowDataList, tmpDir, "v1.0.0", ActionModeRelease, "v0.47.4", false, nil, "")
+		err := GenerateMaintenanceWorkflow(context.Background(), GenerateMaintenanceWorkflowOptions{
+			WorkflowDataList: workflowDataList,
+			WorkflowDir:      tmpDir,
+			Version:          "v1.0.0",
+			ActionMode:       ActionModeRelease,
+			ActionTag:        "v0.47.4",
+			RepoConfig:       nil,
+			RepoSlug:         "",
+		})
 		if err != nil {
 			t.Fatalf("Unexpected error: %v", err)
 		}
@@ -1060,7 +1373,15 @@ func TestGenerateMaintenanceWorkflow_ActionTag(t *testing.T) {
 			},
 		}
 
-		err := GenerateMaintenanceWorkflow(workflowDataListWithResolver, tmpDir, "v1.0.0", ActionModeRelease, "v0.47.4", false, nil, "")
+		err := GenerateMaintenanceWorkflow(context.Background(), GenerateMaintenanceWorkflowOptions{
+			WorkflowDataList: workflowDataListWithResolver,
+			WorkflowDir:      tmpDir,
+			Version:          "v1.0.0",
+			ActionMode:       ActionModeRelease,
+			ActionTag:        "v0.47.4",
+			RepoConfig:       nil,
+			RepoSlug:         "",
+		})
 		if err != nil {
 			t.Fatalf("Unexpected error: %v", err)
 		}
@@ -1079,7 +1400,15 @@ func TestGenerateMaintenanceWorkflow_ActionTag(t *testing.T) {
 
 	t.Run("dev mode ignores action-tag and uses local path", func(t *testing.T) {
 		tmpDir := t.TempDir()
-		err := GenerateMaintenanceWorkflow(workflowDataList, tmpDir, "v1.0.0", ActionModeDev, "v0.47.4", false, nil, "")
+		err := GenerateMaintenanceWorkflow(context.Background(), GenerateMaintenanceWorkflowOptions{
+			WorkflowDataList: workflowDataList,
+			WorkflowDir:      tmpDir,
+			Version:          "v1.0.0",
+			ActionMode:       ActionModeDev,
+			ActionTag:        "v0.47.4",
+			RepoConfig:       nil,
+			RepoSlug:         "",
+		})
 		if err != nil {
 			t.Fatalf("Unexpected error: %v", err)
 		}
@@ -1095,7 +1424,7 @@ func TestGenerateMaintenanceWorkflow_ActionTag(t *testing.T) {
 
 func TestGenerateInstallCLISteps(t *testing.T) {
 	t.Run("dev mode generates Setup Go and Build gh-aw steps", func(t *testing.T) {
-		result := generateInstallCLISteps(ActionModeDev, "v1.0.0", "", nil)
+		result := generateInstallCLISteps(context.Background(), ActionModeDev, "v1.0.0", "", nil)
 		if !strings.Contains(result, "Setup Go") {
 			t.Errorf("Dev mode should include Setup Go step, got:\n%s", result)
 		}
@@ -1108,8 +1437,8 @@ func TestGenerateInstallCLISteps(t *testing.T) {
 	})
 
 	t.Run("release mode generates setup-cli action step", func(t *testing.T) {
-		result := generateInstallCLISteps(ActionModeRelease, "v1.0.0", "", nil)
-		if !strings.Contains(result, "github/gh-aw/actions/setup-cli@v1.0.0") {
+		result := generateInstallCLISteps(context.Background(), ActionModeRelease, "v1.0.0", "", nil)
+		if !strings.Contains(result, "github/gh-aw-actions/setup-cli@v1.0.0") {
 			t.Errorf("Release mode should use setup-cli action with version, got:\n%s", result)
 		}
 		if !strings.Contains(result, "version: v1.0.0") {
@@ -1121,7 +1450,7 @@ func TestGenerateInstallCLISteps(t *testing.T) {
 	})
 
 	t.Run("release mode uses actionTag over version", func(t *testing.T) {
-		result := generateInstallCLISteps(ActionModeRelease, "v1.0.0", "v2.0.0", nil)
+		result := generateInstallCLISteps(context.Background(), ActionModeRelease, "v1.0.0", "v2.0.0", nil)
 		if !strings.Contains(result, "setup-cli@v2.0.0") {
 			t.Errorf("Release mode should use actionTag v2.0.0, got:\n%s", result)
 		}
@@ -1130,11 +1459,11 @@ func TestGenerateInstallCLISteps(t *testing.T) {
 	t.Run("release mode with resolver uses SHA-pinned setup-cli reference", func(t *testing.T) {
 		tmpDir := t.TempDir()
 		cache := NewActionCache(tmpDir)
-		cache.Set("github/gh-aw/actions/setup-cli", "v1.0.0", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+		cache.Set("github/gh-aw-actions/setup-cli", "v1.0.0", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
 		resolver := NewActionResolver(cache)
 
-		result := generateInstallCLISteps(ActionModeRelease, "v1.0.0", "", resolver)
-		expectedRef := "github/gh-aw/actions/setup-cli@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa # v1.0.0"
+		result := generateInstallCLISteps(context.Background(), ActionModeRelease, "v1.0.0", "", resolver)
+		expectedRef := "github/gh-aw-actions/setup-cli@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa # v1.0.0"
 		if !strings.Contains(result, expectedRef) {
 			t.Errorf("Release mode with resolver should use SHA-pinned setup-cli reference %q, got:\n%s", expectedRef, result)
 		}
@@ -1150,7 +1479,7 @@ func TestGenerateInstallCLISteps(t *testing.T) {
 		cache.Set("github/gh-aw-actions/setup-cli", "v1.0.0", "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb")
 		resolver := NewActionResolver(cache)
 
-		result := generateInstallCLISteps(ActionModeAction, "v1.0.0", "", resolver)
+		result := generateInstallCLISteps(context.Background(), ActionModeAction, "v1.0.0", "", resolver)
 		expectedRef := "github/gh-aw-actions/setup-cli@bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb # v1.0.0"
 		if !strings.Contains(result, expectedRef) {
 			t.Errorf("Action mode with resolver should use SHA-pinned setup-cli reference %q, got:\n%s", expectedRef, result)
@@ -1162,8 +1491,8 @@ func TestGenerateInstallCLISteps(t *testing.T) {
 	})
 
 	t.Run("release mode without resolver falls back to tag reference", func(t *testing.T) {
-		result := generateInstallCLISteps(ActionModeRelease, "v1.0.0", "", nil)
-		if !strings.Contains(result, "github/gh-aw/actions/setup-cli@v1.0.0") {
+		result := generateInstallCLISteps(context.Background(), ActionModeRelease, "v1.0.0", "", nil)
+		if !strings.Contains(result, "github/gh-aw-actions/setup-cli@v1.0.0") {
 			t.Errorf("Release mode without resolver should fall back to tag reference, got:\n%s", result)
 		}
 	})
@@ -1192,7 +1521,15 @@ func TestGenerateMaintenanceWorkflow_RunOperationCLICodegen(t *testing.T) {
 
 	t.Run("dev mode run_operation uses build from source", func(t *testing.T) {
 		tmpDir := t.TempDir()
-		err := GenerateMaintenanceWorkflow(workflowDataList, tmpDir, "v1.0.0", ActionModeDev, "", false, nil, "")
+		err := GenerateMaintenanceWorkflow(context.Background(), GenerateMaintenanceWorkflowOptions{
+			WorkflowDataList: workflowDataList,
+			WorkflowDir:      tmpDir,
+			Version:          "v1.0.0",
+			ActionMode:       ActionModeDev,
+			ActionTag:        "",
+			RepoConfig:       nil,
+			RepoSlug:         "",
+		})
 		if err != nil {
 			t.Fatalf("Unexpected error: %v", err)
 		}
@@ -1211,7 +1548,15 @@ func TestGenerateMaintenanceWorkflow_RunOperationCLICodegen(t *testing.T) {
 
 	t.Run("release mode run_operation uses setup-cli action not gh extension install", func(t *testing.T) {
 		tmpDir := t.TempDir()
-		err := GenerateMaintenanceWorkflow(workflowDataList, tmpDir, "v1.0.0", ActionModeRelease, "v1.0.0", false, nil, "")
+		err := GenerateMaintenanceWorkflow(context.Background(), GenerateMaintenanceWorkflowOptions{
+			WorkflowDataList: workflowDataList,
+			WorkflowDir:      tmpDir,
+			Version:          "v1.0.0",
+			ActionMode:       ActionModeRelease,
+			ActionTag:        "v1.0.0",
+			RepoConfig:       nil,
+			RepoSlug:         "",
+		})
 		if err != nil {
 			t.Fatalf("Unexpected error: %v", err)
 		}
@@ -1223,7 +1568,7 @@ func TestGenerateMaintenanceWorkflow_RunOperationCLICodegen(t *testing.T) {
 		if strings.Contains(yaml, "gh extension install") {
 			t.Errorf("Release mode should NOT use gh extension install, got:\n%s", yaml)
 		}
-		if !strings.Contains(yaml, "github/gh-aw/actions/setup-cli@v1.0.0") {
+		if !strings.Contains(yaml, "github/gh-aw-actions/setup-cli@v1.0.0") {
 			t.Errorf("Release mode run_operation should use setup-cli action, got:\n%s", yaml)
 		}
 		if !strings.Contains(yaml, "GH_AW_CMD_PREFIX: gh aw") {
@@ -1233,7 +1578,15 @@ func TestGenerateMaintenanceWorkflow_RunOperationCLICodegen(t *testing.T) {
 
 	t.Run("dev mode compile_workflows uses same codegen as run_operation", func(t *testing.T) {
 		tmpDir := t.TempDir()
-		err := GenerateMaintenanceWorkflow(workflowDataList, tmpDir, "v1.0.0", ActionModeDev, "", false, nil, "")
+		err := GenerateMaintenanceWorkflow(context.Background(), GenerateMaintenanceWorkflowOptions{
+			WorkflowDataList: workflowDataList,
+			WorkflowDir:      tmpDir,
+			Version:          "v1.0.0",
+			ActionMode:       ActionModeDev,
+			ActionTag:        "",
+			RepoConfig:       nil,
+			RepoSlug:         "",
+		})
 		if err != nil {
 			t.Fatalf("Unexpected error: %v", err)
 		}
@@ -1276,14 +1629,22 @@ func TestGenerateMaintenanceWorkflow_SetupCLISHAPinning(t *testing.T) {
 	t.Run("release mode with resolver SHA-pins setup-cli in run_operation", func(t *testing.T) {
 		tmpDir := t.TempDir()
 		cache := NewActionCache(tmpDir)
-		cache.Set("github/gh-aw/actions/setup-cli", "v1.0.0", setupCLISHA)
+		cache.Set("github/gh-aw-actions/setup-cli", "v1.0.0", setupCLISHA)
 		// Also seed the setup action to keep the test hermetic (GenerateMaintenanceWorkflow
 		// calls ResolveSetupActionReference with the same resolver, which would otherwise
 		// attempt a real gh api call on a cache miss).
 		cache.Set("github/gh-aw/actions/setup", "v1.0.0", "dddddddddddddddddddddddddddddddddddddddd")
 		resolver := NewActionResolver(cache)
 
-		err := GenerateMaintenanceWorkflow(workflowDataListWithResolver(resolver), tmpDir, "v1.0.0", ActionModeRelease, "v1.0.0", false, nil, "")
+		err := GenerateMaintenanceWorkflow(context.Background(), GenerateMaintenanceWorkflowOptions{
+			WorkflowDataList: workflowDataListWithResolver(resolver),
+			WorkflowDir:      tmpDir,
+			Version:          "v1.0.0",
+			ActionMode:       ActionModeRelease,
+			ActionTag:        "v1.0.0",
+			RepoConfig:       nil,
+			RepoSlug:         "",
+		})
 		if err != nil {
 			t.Fatalf("Unexpected error: %v", err)
 		}
@@ -1292,7 +1653,7 @@ func TestGenerateMaintenanceWorkflow_SetupCLISHAPinning(t *testing.T) {
 			t.Fatalf("Expected maintenance workflow to be generated: %v", err)
 		}
 		yaml := string(content)
-		expectedRef := "github/gh-aw/actions/setup-cli@" + setupCLISHA + " # v1.0.0"
+		expectedRef := "github/gh-aw-actions/setup-cli@" + setupCLISHA + " # v1.0.0"
 		if !strings.Contains(yaml, expectedRef) {
 			t.Errorf("Expected SHA-pinned setup-cli reference %q in generated workflow, got:\n%s", expectedRef, yaml)
 		}
@@ -1322,7 +1683,15 @@ func TestGenerateMaintenanceWorkflow_RepoConfig(t *testing.T) {
 		cfg := &RepoConfig{
 			Maintenance: &MaintenanceConfig{RunsOn: RunsOnValue{"my-custom-runner"}},
 		}
-		err := GenerateMaintenanceWorkflow(makeList(), tmpDir, "v1.0.0", ActionModeDev, "", false, cfg, "")
+		err := GenerateMaintenanceWorkflow(context.Background(), GenerateMaintenanceWorkflowOptions{
+			WorkflowDataList: makeList(),
+			WorkflowDir:      tmpDir,
+			Version:          "v1.0.0",
+			ActionMode:       ActionModeDev,
+			ActionTag:        "",
+			RepoConfig:       cfg,
+			RepoSlug:         "",
+		})
 		if err != nil {
 			t.Fatalf("Unexpected error: %v", err)
 		}
@@ -1345,7 +1714,15 @@ func TestGenerateMaintenanceWorkflow_RepoConfig(t *testing.T) {
 		cfg := &RepoConfig{
 			Maintenance: &MaintenanceConfig{RunsOn: RunsOnValue{"self-hosted", "linux"}},
 		}
-		err := GenerateMaintenanceWorkflow(makeList(), tmpDir, "v1.0.0", ActionModeDev, "", false, cfg, "")
+		err := GenerateMaintenanceWorkflow(context.Background(), GenerateMaintenanceWorkflowOptions{
+			WorkflowDataList: makeList(),
+			WorkflowDir:      tmpDir,
+			Version:          "v1.0.0",
+			ActionMode:       ActionModeDev,
+			ActionTag:        "",
+			RepoConfig:       cfg,
+			RepoSlug:         "",
+		})
 		if err != nil {
 			t.Fatalf("Unexpected error: %v", err)
 		}
@@ -1367,7 +1744,15 @@ func TestGenerateMaintenanceWorkflow_RepoConfig(t *testing.T) {
 			t.Fatalf("Failed to write pre-existing file: %v", err)
 		}
 		cfg := &RepoConfig{MaintenanceDisabled: true}
-		err := GenerateMaintenanceWorkflow(makeList(), tmpDir, "v1.0.0", ActionModeDev, "", false, cfg, "")
+		err := GenerateMaintenanceWorkflow(context.Background(), GenerateMaintenanceWorkflowOptions{
+			WorkflowDataList: makeList(),
+			WorkflowDir:      tmpDir,
+			Version:          "v1.0.0",
+			ActionMode:       ActionModeDev,
+			ActionTag:        "",
+			RepoConfig:       cfg,
+			RepoSlug:         "",
+		})
 		if err != nil {
 			t.Fatalf("Unexpected error: %v", err)
 		}
@@ -1379,7 +1764,15 @@ func TestGenerateMaintenanceWorkflow_RepoConfig(t *testing.T) {
 	t.Run("maintenance disabled skips generation even with expires", func(t *testing.T) {
 		tmpDir := t.TempDir()
 		cfg := &RepoConfig{MaintenanceDisabled: true}
-		err := GenerateMaintenanceWorkflow(makeList(), tmpDir, "v1.0.0", ActionModeDev, "", false, cfg, "")
+		err := GenerateMaintenanceWorkflow(context.Background(), GenerateMaintenanceWorkflowOptions{
+			WorkflowDataList: makeList(),
+			WorkflowDir:      tmpDir,
+			Version:          "v1.0.0",
+			ActionMode:       ActionModeDev,
+			ActionTag:        "",
+			RepoConfig:       cfg,
+			RepoSlug:         "",
+		})
 		if err != nil {
 			t.Fatalf("Unexpected error: %v", err)
 		}
@@ -1401,7 +1794,15 @@ func TestGenerateMaintenanceWorkflow_RepoConfig(t *testing.T) {
 		}
 		cfg := &RepoConfig{MaintenanceDisabled: true}
 		// The function must succeed (no error), even though a warning is printed.
-		err := GenerateMaintenanceWorkflow(list, tmpDir, "v1.0.0", ActionModeDev, "", false, cfg, "")
+		err := GenerateMaintenanceWorkflow(context.Background(), GenerateMaintenanceWorkflowOptions{
+			WorkflowDataList: list,
+			WorkflowDir:      tmpDir,
+			Version:          "v1.0.0",
+			ActionMode:       ActionModeDev,
+			ActionTag:        "",
+			RepoConfig:       cfg,
+			RepoSlug:         "",
+		})
 		if err != nil {
 			t.Fatalf("Expected no error when maintenance is disabled with expires, got: %v", err)
 		}
@@ -1426,6 +1827,14 @@ func TestCollectSideRepoTargets(t *testing.T) {
 		{
 			name: "workflow without checkout returns empty",
 			workflows: []*WorkflowData{
+				{Name: "wf", CheckoutConfigs: nil},
+			},
+			expectedRepos: nil,
+		},
+		{
+			name: "nil workflow entry is ignored",
+			workflows: []*WorkflowData{
+				nil,
 				{Name: "wf", CheckoutConfigs: nil},
 			},
 			expectedRepos: nil,
@@ -1506,12 +1915,12 @@ func TestCollectSideRepoTargets(t *testing.T) {
 				return
 			}
 			// Use a set-based comparison so the test is not sensitive to ordering.
-			gotSet := make(map[string]bool, len(got))
+			gotSet := make(map[string]struct{}, len(got))
 			for _, r := range got {
-				gotSet[r] = true
+				gotSet[r] = struct{}{}
 			}
 			for _, repo := range tt.expectedRepos {
-				if !gotSet[repo] {
+				if _, ok := gotSet[repo]; !ok {
 					t.Errorf("expected target %q not found in results %v", repo, got)
 				}
 			}
@@ -1673,7 +2082,15 @@ func TestGenerateSideRepoMaintenanceWorkflow(t *testing.T) {
 			},
 		}
 
-		err := GenerateMaintenanceWorkflow(workflowDataList, tmpDir, "v1.0.0", ActionModeDev, "", false, nil, "")
+		err := GenerateMaintenanceWorkflow(context.Background(), GenerateMaintenanceWorkflowOptions{
+			WorkflowDataList: workflowDataList,
+			WorkflowDir:      tmpDir,
+			Version:          "v1.0.0",
+			ActionMode:       ActionModeDev,
+			ActionTag:        "",
+			RepoConfig:       nil,
+			RepoSlug:         "",
+		})
 		if err != nil {
 			t.Fatalf("Unexpected error: %v", err)
 		}
@@ -1727,7 +2144,15 @@ func TestGenerateSideRepoMaintenanceWorkflow(t *testing.T) {
 			},
 		}
 
-		err := GenerateMaintenanceWorkflow(workflowDataList, tmpDir, "v1.0.0", ActionModeDev, "", false, nil, "")
+		err := GenerateMaintenanceWorkflow(context.Background(), GenerateMaintenanceWorkflowOptions{
+			WorkflowDataList: workflowDataList,
+			WorkflowDir:      tmpDir,
+			Version:          "v1.0.0",
+			ActionMode:       ActionModeDev,
+			ActionTag:        "",
+			RepoConfig:       nil,
+			RepoSlug:         "",
+		})
 		if err != nil {
 			t.Fatalf("Unexpected error: %v", err)
 		}
@@ -1756,7 +2181,15 @@ func TestGenerateSideRepoMaintenanceWorkflow(t *testing.T) {
 			},
 		}
 
-		err := GenerateMaintenanceWorkflow(workflowDataList, tmpDir, "v1.0.0", ActionModeDev, "", false, nil, "")
+		err := GenerateMaintenanceWorkflow(context.Background(), GenerateMaintenanceWorkflowOptions{
+			WorkflowDataList: workflowDataList,
+			WorkflowDir:      tmpDir,
+			Version:          "v1.0.0",
+			ActionMode:       ActionModeDev,
+			ActionTag:        "",
+			RepoConfig:       nil,
+			RepoSlug:         "",
+		})
 		if err != nil {
 			t.Fatalf("Unexpected error: %v", err)
 		}
@@ -1801,7 +2234,15 @@ func TestGenerateSideRepoMaintenanceWorkflow(t *testing.T) {
 			},
 		}
 
-		err := GenerateMaintenanceWorkflow(workflowDataList, tmpDir, "v1.0.0", ActionModeDev, "", false, nil, "")
+		err := GenerateMaintenanceWorkflow(context.Background(), GenerateMaintenanceWorkflowOptions{
+			WorkflowDataList: workflowDataList,
+			WorkflowDir:      tmpDir,
+			Version:          "v1.0.0",
+			ActionMode:       ActionModeDev,
+			ActionTag:        "",
+			RepoConfig:       nil,
+			RepoSlug:         "",
+		})
 		if err != nil {
 			t.Fatalf("Unexpected error: %v", err)
 		}
@@ -1830,7 +2271,15 @@ func TestGenerateSideRepoMaintenanceWorkflow(t *testing.T) {
 			},
 		}
 
-		err := GenerateMaintenanceWorkflow(workflowDataList, tmpDir, "v1.0.0", ActionModeDev, "", false, nil, "")
+		err := GenerateMaintenanceWorkflow(context.Background(), GenerateMaintenanceWorkflowOptions{
+			WorkflowDataList: workflowDataList,
+			WorkflowDir:      tmpDir,
+			Version:          "v1.0.0",
+			ActionMode:       ActionModeDev,
+			ActionTag:        "",
+			RepoConfig:       nil,
+			RepoSlug:         "",
+		})
 		if err != nil {
 			t.Fatalf("Unexpected error: %v", err)
 		}
@@ -1875,7 +2324,15 @@ func TestGenerateSideRepoMaintenanceWorkflow(t *testing.T) {
 			},
 		}
 
-		err := GenerateMaintenanceWorkflow(workflowDataList, tmpDir, "v1.0.0", ActionModeDev, "", false, nil, "")
+		err := GenerateMaintenanceWorkflow(context.Background(), GenerateMaintenanceWorkflowOptions{
+			WorkflowDataList: workflowDataList,
+			WorkflowDir:      tmpDir,
+			Version:          "v1.0.0",
+			ActionMode:       ActionModeDev,
+			ActionTag:        "",
+			RepoConfig:       nil,
+			RepoSlug:         "",
+		})
 		if err != nil {
 			t.Fatalf("Unexpected error: %v", err)
 		}
@@ -1889,6 +2346,159 @@ func TestGenerateSideRepoMaintenanceWorkflow(t *testing.T) {
 		newFile := filepath.Join(tmpDir, "agentics-maintenance-new-org-new-repo.yml")
 		if _, statErr := os.Stat(newFile); statErr != nil {
 			t.Errorf("New side-repo maintenance file should exist: %v", statErr)
+		}
+	})
+}
+
+func TestAllCopilotWorkflowsUseOrgBilling(t *testing.T) {
+	orgBillingPermission := "permissions:\n  copilot-requests: write"
+
+	t.Run("empty list returns false", func(t *testing.T) {
+		result := allCopilotWorkflowsUseOrgBilling([]*WorkflowData{})
+		if result {
+			t.Error("Expected false for empty list")
+		}
+	})
+
+	t.Run("nil entries are skipped", func(t *testing.T) {
+		result := allCopilotWorkflowsUseOrgBilling([]*WorkflowData{nil, nil})
+		if result {
+			t.Error("Expected false when all entries are nil")
+		}
+	})
+
+	t.Run("single copilot workflow with org billing returns true", func(t *testing.T) {
+		data := []*WorkflowData{
+			{Name: "wf1", Permissions: orgBillingPermission},
+		}
+		if !allCopilotWorkflowsUseOrgBilling(data) {
+			t.Error("Expected true when single Copilot workflow has copilot-requests: write")
+		}
+	})
+
+	t.Run("single copilot workflow without org billing returns false", func(t *testing.T) {
+		data := []*WorkflowData{
+			{Name: "wf1"},
+		}
+		if allCopilotWorkflowsUseOrgBilling(data) {
+			t.Error("Expected false when Copilot workflow lacks copilot-requests: write")
+		}
+	})
+
+	t.Run("all copilot workflows with org billing returns true", func(t *testing.T) {
+		data := []*WorkflowData{
+			{Name: "wf1", Permissions: orgBillingPermission},
+			{Name: "wf2", Permissions: orgBillingPermission},
+		}
+		if !allCopilotWorkflowsUseOrgBilling(data) {
+			t.Error("Expected true when all Copilot workflows have copilot-requests: write")
+		}
+	})
+
+	t.Run("mixed copilot workflows returns false", func(t *testing.T) {
+		data := []*WorkflowData{
+			{Name: "wf1", Permissions: orgBillingPermission},
+			{Name: "wf2"},
+		}
+		if allCopilotWorkflowsUseOrgBilling(data) {
+			t.Error("Expected false when only some Copilot workflows have copilot-requests: write")
+		}
+	})
+
+	t.Run("non-copilot engines are ignored", func(t *testing.T) {
+		data := []*WorkflowData{
+			{Name: "wf1", Permissions: orgBillingPermission},
+			{Name: "wf2", EngineConfig: &EngineConfig{ID: "openai"}},
+		}
+		if !allCopilotWorkflowsUseOrgBilling(data) {
+			t.Error("Expected true when non-Copilot workflows are ignored and all Copilot workflows have org billing")
+		}
+	})
+
+	t.Run("only non-copilot engines returns false", func(t *testing.T) {
+		data := []*WorkflowData{
+			{Name: "wf1", EngineConfig: &EngineConfig{ID: "openai"}},
+		}
+		if allCopilotWorkflowsUseOrgBilling(data) {
+			t.Error("Expected false when no Copilot workflows found")
+		}
+	})
+}
+
+func TestGenerateMaintenanceWorkflow_CopilotOrgBilling(t *testing.T) {
+	orgBillingPermission := "permissions:\n  copilot-requests: write"
+	// SafeOutputs with Expires is required for the maintenance workflow to be generated.
+	safeOutputsWithExpires := &SafeOutputsConfig{
+		CreateIssues: &CreateIssuesConfig{Expires: 48},
+	}
+
+	t.Run("org billing mode sets GH_AW_COPILOT_ORG_BILLING in secret-validation step", func(t *testing.T) {
+		tmpDir := t.TempDir()
+		workflowDataList := []*WorkflowData{
+			{Name: "wf1", Permissions: orgBillingPermission, SafeOutputs: safeOutputsWithExpires},
+		}
+		err := GenerateMaintenanceWorkflow(context.Background(), GenerateMaintenanceWorkflowOptions{
+			WorkflowDataList: workflowDataList,
+			WorkflowDir:      tmpDir,
+			Version:          "v1.0.0",
+			ActionMode:       ActionModeDev,
+		})
+		if err != nil {
+			t.Fatalf("Unexpected error: %v", err)
+		}
+		content, err := os.ReadFile(filepath.Join(tmpDir, "agentics-maintenance.yml"))
+		if err != nil {
+			t.Fatalf("Expected maintenance workflow to be generated: %v", err)
+		}
+		if !strings.Contains(string(content), `GH_AW_COPILOT_ORG_BILLING: "true"`) {
+			t.Errorf("Expected GH_AW_COPILOT_ORG_BILLING to be set in org billing mode, got:\n%s", string(content))
+		}
+	})
+
+	t.Run("non-org billing mode does not set GH_AW_COPILOT_ORG_BILLING", func(t *testing.T) {
+		tmpDir := t.TempDir()
+		workflowDataList := []*WorkflowData{
+			{Name: "wf1", SafeOutputs: safeOutputsWithExpires},
+		}
+		err := GenerateMaintenanceWorkflow(context.Background(), GenerateMaintenanceWorkflowOptions{
+			WorkflowDataList: workflowDataList,
+			WorkflowDir:      tmpDir,
+			Version:          "v1.0.0",
+			ActionMode:       ActionModeDev,
+		})
+		if err != nil {
+			t.Fatalf("Unexpected error: %v", err)
+		}
+		content, err := os.ReadFile(filepath.Join(tmpDir, "agentics-maintenance.yml"))
+		if err != nil {
+			t.Fatalf("Expected maintenance workflow to be generated: %v", err)
+		}
+		if strings.Contains(string(content), "GH_AW_COPILOT_ORG_BILLING") {
+			t.Errorf("Expected GH_AW_COPILOT_ORG_BILLING to be absent in non-org billing mode, got:\n%s", string(content))
+		}
+	})
+
+	t.Run("mixed billing mode does not set GH_AW_COPILOT_ORG_BILLING", func(t *testing.T) {
+		tmpDir := t.TempDir()
+		workflowDataList := []*WorkflowData{
+			{Name: "wf1", Permissions: orgBillingPermission, SafeOutputs: safeOutputsWithExpires},
+			{Name: "wf2", SafeOutputs: safeOutputsWithExpires},
+		}
+		err := GenerateMaintenanceWorkflow(context.Background(), GenerateMaintenanceWorkflowOptions{
+			WorkflowDataList: workflowDataList,
+			WorkflowDir:      tmpDir,
+			Version:          "v1.0.0",
+			ActionMode:       ActionModeDev,
+		})
+		if err != nil {
+			t.Fatalf("Unexpected error: %v", err)
+		}
+		content, err := os.ReadFile(filepath.Join(tmpDir, "agentics-maintenance.yml"))
+		if err != nil {
+			t.Fatalf("Expected maintenance workflow to be generated: %v", err)
+		}
+		if strings.Contains(string(content), "GH_AW_COPILOT_ORG_BILLING") {
+			t.Errorf("Expected GH_AW_COPILOT_ORG_BILLING to be absent in mixed billing mode, got:\n%s", string(content))
 		}
 	})
 }

@@ -28,16 +28,20 @@ name: "My Workflow"
 # (optional)
 description: "Description of the workflow"
 
+# Optional emoji to represent the workflow visually in listings and UI surfaces.
+# (optional)
+emoji: "example-value"
+
 # Optional source reference indicating where this workflow was added from. Format:
 # owner/repo/path@ref (e.g., githubnext/agentics/workflows/ci-doctor.md@v1.0.0).
 # Rendered as a comment in the generated lock file.
 # (optional)
 source: "example-value"
 
-# Optional workflow location redirect for add/add-wizard/update. Format: workflow spec or GitHub
+# Optional workflow location redirect for updates. Format: workflow spec or GitHub
 # URL (e.g., owner/repo/path@ref or
-# https://github.com/owner/repo/blob/main/path.md). When present, remote add/add-wizard/update
-# follows this location and writes/rewrites source.
+# https://github.com/owner/repo/blob/main/path.md). When present, update follows
+# this location and rewrites source.
 # (optional)
 redirect: "example-value"
 
@@ -152,14 +156,6 @@ on:
     name: []
       # Array items: Command name without leading slash
 
-    # Trigger compilation strategy for slash commands.
-    # - "inline" (default): compile comment/body listeners directly in this workflow
-    # - "centralized" (experimental): compile this workflow as
-    #   workflow_dispatch-centric and route slash command events via the generated
-    #   central trigger workflow.
-    # (optional)
-    strategy: "centralized"
-
     # Events where the command should be active. Default is all comment-related events
     # ('*'). Use GitHub Actions event names.
     # (optional)
@@ -174,6 +170,13 @@ on:
     # least one). Use GitHub Actions event names.
     events: []
       # Array items: GitHub Actions event name.
+
+    # Slash command trigger compilation strategy. 'inline' (default) compiles direct
+    # comment listeners in this workflow. 'centralized' compiles this workflow as
+    # workflow_dispatch-centric and routes slash events via the generated central
+    # trigger workflow.
+    # (optional)
+    strategy: "inline"
 
   # DEPRECATED: Use 'slash_command' instead. Special command trigger for /command
   # workflows (e.g., '/my-bot' in issue comments). Creates conditions to match slash
@@ -282,6 +285,13 @@ on:
     # permissions required for label removal are also omitted.
     # (optional)
     remove_label: true
+
+    # Label command trigger compilation strategy. 'inline' (default) compiles direct
+    # labeled listeners in this workflow. 'decentralized' compiles this workflow as
+    # workflow_dispatch-centric and routes labeled events via the generated
+    # agentic_commands.yml workflow.
+    # (optional)
+    strategy: "inline"
 
   # Push event trigger that runs the workflow when code is pushed to the repository
   # (optional)
@@ -924,6 +934,18 @@ on:
   skip-bots: []
     # Array items: string
 
+  # Skip workflow execution when an event-specific payload author_association field
+  # (for example: github.event.comment.author_association,
+  # github.event.issue.author_association,
+  # github.event.pull_request.author_association) matches configured associations
+  # for specific events. Keys are event names (for example: issue_comment,
+  # pull_request_review_comment, issues, pull_request). Values accept a single
+  # string or an array of strings. Association values are case-insensitive in
+  # frontmatter.
+  # (optional)
+  skip-author-associations:
+    {}
+
   # Repository access roles required to trigger agentic workflows. Defaults to
   # ['admin', 'maintainer', 'write'] for security. Use 'all' to allow any
   # authenticated user (⚠️ security consideration).
@@ -1077,6 +1099,11 @@ on:
     # mint a GitHub App token.
     # (optional)
     private-key: "example-value"
+
+    # If true, skip token minting when client-id/private-key resolve to empty strings
+    # at runtime. Defaults to false.
+    # (optional)
+    ignore-if-missing: true
 
     # Optional owner of the GitHub App installation (defaults to current repository
     # owner if not specified)
@@ -1337,12 +1364,21 @@ on:
     # (optional)
     statuses: "read"
 
-  # When set to false, disables the frontmatter hash check step in the activation
-  # job. Default is true (check is enabled). Useful when the workflow source files
-  # are managed outside the default GitHub repo context (e.g. cross-repo org
-  # rulesets) and the stale check is not needed.
+  # Controls the stale lock file check in the activation job. Set to false to
+  # disable the check, true (default) to enable frontmatter hash checking, or "full"
+  # to check both frontmatter and body hashes. Use "full" when prompt-body edits
+  # should also trigger recompilation detection. Useful when the workflow source
+  # files are managed outside the default GitHub repo context (e.g. cross-repo org
+  # rulesets) and the stale check is not needed (set false), or when comprehensive
+  # drift detection is required (set "full").
   # (optional)
+  # Accepted formats:
+
+  # Format 1: boolean
   stale-check: true
+
+  # Format 2: string
+  stale-check: "full"
 
 # GitHub token permissions for the workflow. Controls what the GITHUB_TOKEN can
 # access during execution. Use the principle of least privilege - only grant the
@@ -1371,6 +1407,11 @@ permissions:
   # create/update checks, none: no access)
   # (optional)
   checks: "read"
+
+  # Permission level for Copilot requests (write/none only). Set to write to allow
+  # Copilot inference via the GitHub Actions token.
+  # (optional)
+  copilot-requests: "write"
 
   # Permission for repository contents (read: view files, write: modify
   # files/branches, none: no access)
@@ -1503,12 +1544,38 @@ runs-on:
 
 # Runner for all framework/generated jobs (activation, pre-activation,
 # safe-outputs, unlock, APM, etc.). Provides a compile-stable override for
-# generated job runners without requiring a safe-outputs section. Overridden by
+# generated job runners without requiring a safe-outputs section. Supports the
+# same string, array, and runner-group object forms as runs-on. Overridden by
 # safe-outputs.runs-on when both are set. Defaults to 'ubuntu-slim'. Use this when
 # your infrastructure does not provide the default runner or when you need
 # consistent runner selection across all jobs.
 # (optional)
+# Accepted formats:
+
+# Format 1: Simple runner label string. Use for standard GitHub-hosted runners
+# (e.g., 'ubuntu-latest', 'windows-latest', 'macos-latest') or self-hosted runner
+# labels. Most common form for agentic workflows.
 runs-on-slim: "example-value"
+
+# Format 2: Array of runner labels for selection with fallbacks. GitHub Actions
+# will use the first available runner that matches any label in the array. Useful
+# for high-availability setups or when multiple runner types are acceptable.
+runs-on-slim: []
+  # Array items: string
+
+# Format 3: Runner group configuration for GitHub-hosted runners. Use this form to
+# target specific runner groups (e.g., larger runners with more CPU/memory) or
+# self-hosted runner pools with specific label requirements. Agentic workflows may
+# benefit from larger runners for complex AI processing tasks.
+runs-on-slim:
+  # Runner group name for self-hosted runners or GitHub-hosted runner groups
+  # (optional)
+  group: "example-value"
+
+  # List of runner labels for self-hosted runners or GitHub-hosted runner selection
+  # (optional)
+  labels: []
+    # Array of strings
 
 # Workflow timeout in minutes (GitHub Actions standard field). Defaults to 20
 # minutes for agentic workflows. Has sensible defaults and can typically be
@@ -1521,8 +1588,7 @@ runs-on-slim: "example-value"
 # Format 1: integer
 timeout-minutes: 1
 
-# Format 2: GitHub Actions expression that resolves to an integer (e.g. '${{
-# inputs.timeout }}')
+# Format 2: GitHub Actions expression that resolves to an integer at runtime
 timeout-minutes: "example-value"
 
 # Concurrency control to limit concurrent workflow runs (GitHub Actions standard
@@ -1562,6 +1628,12 @@ concurrency:
   # (optional)
   cancel-in-progress: true
 
+  # Pending run queue behavior for this concurrency group. 'single' (default) allows
+  # one pending run and replaces older pending runs. 'max' allows up to 100 pending
+  # runs in FIFO order.
+  # (optional)
+  queue: "single"
+
   # Additional discriminator expression appended to compiler-generated job-level
   # concurrency groups (agent, output jobs). Use this when multiple workflow
   # instances are dispatched concurrently with different inputs (fan-out pattern) to
@@ -1583,12 +1655,6 @@ env:
 # Format 2: string
 env: "example-value"
 
-# Deprecated switch for inline sub-agent support. Inline sub-agents are enabled
-# by default. Setting this to false is not supported and causes a compilation
-# error.
-# (optional)
-inline-sub-agents: true
-
 # Feature flags and configuration options for experimental or optional features in
 # the workflow. Each feature can be a boolean flag or a string value. The
 # 'action-tag' feature (string) specifies the tag or SHA to use when referencing
@@ -1597,16 +1663,15 @@ inline-sub-agents: true
 features:
   {}
 
-# Named model alias definitions with ordered fallback lists, resolved recursively
-# by AWF. Each key is an alias name (use empty string "" for the default policy).
-# Each value is an ordered list of vendor/modelid glob patterns or other alias
-# names to try in sequence. Entries defined here are merged on top of the builtin
-# aliases; the main workflow file always wins over imported aliases. Builtin
-# aliases include: sonnet, haiku, opus, gpt-5, gpt-5-mini, gpt-5-codex,
-# gemini-flash, gemini-pro, small, mini, large, auto.
+# Custom model pricing data in the same structure as models.json. Merged with the
+# built-in models.json at runtime; frontmatter entries override matching models
+# and fill gaps for unknown models. Useful for custom or private models, or to
+# adjust pricing for AI Credits cost accounting.
 # (optional)
 models:
-  {}
+  # Provider-keyed map of model pricing data.
+  providers:
+    {}
 
 # A/B testing experiments. Each key is an experiment name; the value is either an
 # array of two or more variant strings (bare-array form) or an object with a
@@ -1632,18 +1697,6 @@ experiments:
   # than cache.
   # (optional)
   storage: "cache"
-
-# DEPRECATED: Use 'disable-model-invocation' instead. Controls whether the custom
-# agent should infer additional context from the conversation. This field is
-# maintained for backward compatibility with existing custom agent files.
-# (optional)
-infer: true
-
-# Controls whether the custom agent should disable model invocation. When set to
-# true, the agent will not make additional model calls. This is the preferred
-# field name for custom agent files (replaces the deprecated 'infer' field).
-# (optional)
-disable-model-invocation: true
 
 # Secret values passed to workflow execution. Secrets can be defined as simple
 # strings (GitHub Actions expressions) or objects with 'value' and 'description'
@@ -1752,6 +1805,13 @@ network:
     # 'linux-distros' (apt/yum), 'playwright' (browser testing), 'defaults' (basic
     # infrastructure).
 
+  # When true and the workflow uses workflow_call, expose a network_allowed string
+  # input on the compiled lock file. The caller-supplied value is unioned with
+  # network.allowed at runtime, supporting ecosystem identifiers (for example
+  # 'rust') or comma-separated domains.
+  # (optional)
+  allowed-input: true
+
   # List of blocked domains or ecosystem identifiers (e.g., 'python', 'node',
   # 'tracker.example.com'). Blocked domains take precedence over allowed domains.
   # (optional)
@@ -1808,6 +1868,12 @@ sandbox:
     # (optional)
     version: "example-value"
 
+    # AWF platform.type override. Declares the GitHub deployment type so AWF can
+    # apply deterministic Copilot auth behavior without relying on host heuristics.
+    # Omit to let AWF use its default host heuristic behavior.
+    # (optional)
+    platform: "ghes"
+
     # Container mounts to add when using AWF. Each mount is specified using Docker
     # mount syntax: 'source:destination:mode' where mode can be 'ro' (read-only) or
     # 'rw' (read-write). Example: '/host/path:/container/path:ro'
@@ -1819,6 +1885,18 @@ sandbox:
     # to AWF. If not specified, AWF's default memory limit is used.
     # (optional)
     memory: "example-value"
+
+    # Enable or disable model fallback for unresolved model selections. Set to false
+    # for BYOK Azure OpenAI deployments to prevent deployment-name rewriting. Supports
+    # literal boolean or GitHub Actions expression.
+    # (optional)
+    # Accepted formats:
+
+    # Format 1: boolean
+    model-fallback: true
+
+    # Format 2: GitHub Actions expression that resolves to a boolean at runtime
+    model-fallback: "example-value"
 
     # Custom sandbox runtime configuration. Note: Network configuration is controlled
     # by the top-level 'network' field, not here.
@@ -1851,6 +1929,28 @@ sandbox:
       # Enable weaker nested sandbox mode (recommended: true for Docker access)
       # (optional)
       enableWeakerNestedSandbox: true
+
+    # Per-provider API proxy target overrides. Settings are compiled into the AWF
+    # config JSON.
+    # (optional)
+    targets:
+      # AWF API proxy target configuration for a single LLM provider.
+      # (optional)
+      openai:
+        # Custom authentication header name to use when forwarding requests to this
+        # provider's API. Overrides the provider default ("Authorization" for OpenAI,
+        # "x-api-key" for Anthropic). Example: "api-key" for Azure OpenAI gateways.
+        # (optional)
+        authHeader: "example-value"
+
+      # AWF API proxy target configuration for a single LLM provider.
+      # (optional)
+      anthropic:
+        # Custom authentication header name to use when forwarding requests to this
+        # provider's API. Overrides the provider default ("Authorization" for OpenAI,
+        # "x-api-key" for Anthropic). Example: "api-key" for Azure OpenAI gateways.
+        # (optional)
+        authHeader: "example-value"
 
   # Legacy custom Sandbox Runtime configuration (use agent.config instead). Note:
   # Network configuration is controlled by the top-level 'network' field, not here.
@@ -1990,14 +2090,14 @@ post-steps: []
 # Accepted formats:
 
 # Format 1: Engine name: built-in ('claude', 'codex', 'copilot', 'gemini',
-# 'crush') or a named catalog entry
+# 'opencode', 'crush', 'pi') or a named catalog entry
 engine: "example-value"
 
 # Format 2: Extended engine configuration object with advanced options for model
 # selection, turn limiting, environment variables, and custom steps
 engine:
-  # AI engine identifier: built-in ('claude', 'codex', 'copilot', 'gemini', 'crush')
-  # or a named catalog entry
+  # AI engine identifier: built-in ('claude', 'codex', 'copilot', 'gemini',
+  # 'opencode', 'crush', 'pi') or a named catalog entry
   id: "example-value"
 
   # Optional version of the AI engine action (e.g., 'beta', 'stable', 20). Has
@@ -2013,17 +2113,10 @@ engine:
   # (optional)
   model: "example-value"
 
-  # Maximum number of chat iterations per run. Helps prevent runaway loops and
-  # control costs. Has sensible defaults and can typically be omitted. Note: Only
-  # supported by the claude engine.
+  # Claude permission mode override. Defaults to acceptEdits (or auto when
+  # tools.edit is false).
   # (optional)
-  # Accepted formats:
-
-  # Format 1: Maximum number of chat iterations per run as an integer value
-  max-turns: 1
-
-  # Format 2: Maximum number of chat iterations per run as a string value
-  max-turns: "example-value"
+  permission-mode: "auto"
 
   # Maximum number of continuations for multi-run autopilot mode. Default is 1
   # (single run, no autopilot). Values greater than 1 enable --autopilot mode for
@@ -2055,6 +2148,12 @@ engine:
     # (optional)
     cancel-in-progress: true
 
+    # Pending run queue behavior for this concurrency group. 'single' (default) allows
+    # one pending run and replaces older pending runs. 'max' allows up to 100 pending
+    # runs in FIFO order.
+    # (optional)
+    queue: "single"
+
   # Custom user agent string for GitHub MCP server configuration (codex engine only)
   # (optional)
   user-agent: "example-value"
@@ -2077,6 +2176,56 @@ engine:
   env:
     {}
 
+  # Engine-level authentication configuration for AWF API proxy sidecar integration
+  # (for example, Azure OpenAI via GitHub OIDC). Values are mapped to AWF_AUTH_*
+  # environment variables.
+  # (optional)
+  auth:
+    # Authentication type. Currently only 'github-oidc' is supported.
+    type: "github-oidc"
+
+    # OIDC audience to request from GitHub Actions for token exchange.
+    # (optional)
+    audience: "example-value"
+
+    # Optional Azure tenant ID for token exchange.
+    # (optional)
+    azure-tenant-id: "example-value"
+
+    # Optional Azure client ID for token exchange.
+    # (optional)
+    azure-client-id: "example-value"
+
+    # Optional Azure OAuth scope (defaults to
+    # https://cognitiveservices.azure.com/.default in AWF sidecar).
+    # (optional)
+    azure-scope: "example-value"
+
+    # Optional Azure cloud name (for example, public, usgovernment, china).
+    # (optional)
+    azure-cloud: "example-value"
+
+    # Optional WIF provider discriminator. Recognized values are 'azure' and
+    # 'anthropic'.
+    # (optional)
+    provider: "example-value"
+
+    # Anthropic WIF federation rule ID (e.g., fdrl_...).
+    # (optional)
+    federation-rule-id: "example-value"
+
+    # Anthropic WIF organization ID (e.g., org_...).
+    # (optional)
+    organization-id: "example-value"
+
+    # Anthropic WIF service account ID (e.g., svac_...).
+    # (optional)
+    service-account-id: "example-value"
+
+    # Anthropic WIF workspace ID (e.g., ws_...).
+    # (optional)
+    workspace-id: "example-value"
+
   # Additional TOML configuration text that will be appended to the generated
   # config.toml in the action (codex engine only)
   # (optional)
@@ -2094,9 +2243,9 @@ engine:
   # (optional)
   api-target: "example-value"
 
-  # Custom model token weights for effective token computation. Overrides or extends
-  # the built-in model multipliers from model_multipliers.json. Useful for custom
-  # models or adjusted cost ratios.
+  # Custom model token weights for AI Credits cost ratio adjustment. Overrides or
+  # extends built-in model cost defaults. Useful for custom models or adjusted cost
+  # ratios.
   # (optional)
   token-weights:
     # Per-model cost multipliers relative to the reference model (claude-sonnet-4.5 =
@@ -2165,6 +2314,20 @@ engine:
     # (optional)
     tool-timeout: "example-value"
 
+  # Enables the experimental GitHub Copilot SDK integration (copilot engine only).
+  # When true, the harness starts a separate headless Copilot CLI sidecar on the
+  # configured localhost port and sets COPILOT_SDK_URI on child processes.
+  # (optional)
+  copilot-sdk: true
+
+  # Custom Copilot SDK driver script or command (copilot engine only). Setting this
+  # field implies `copilot-sdk: true`. Accepts a relative path from the workspace
+  # root with a supported language extension (.js, .cjs, .mjs, .py, .ts, .mts, .rb),
+  # e.g. `.github/drivers/my_driver.py`, or a bare command name without an extension
+  # for an arbitrary executable in PATH.
+  # (optional)
+  copilot-sdk-driver: "example-value"
+
 # Format 3: Inline engine definition: specifies a runtime adapter and optional
 # provider settings directly in the workflow frontmatter, without requiring a
 # named catalog entry
@@ -2172,7 +2335,7 @@ engine:
   # Runtime adapter reference for the inline engine definition
   runtime:
     # Runtime adapter identifier (e.g. 'codex', 'claude', 'copilot', 'gemini',
-    # 'crush')
+    # 'opencode', 'crush', 'pi')
     id: "example-value"
 
     # Optional version of the runtime adapter (e.g. '0.105.0', 'beta')
@@ -2255,7 +2418,8 @@ engine:
 # Format 4: Engine definition: full declarative metadata for a named engine entry
 # (used in builtin engine shared workflow files such as @builtin:engines/*.md)
 engine:
-  # Unique engine identifier (e.g. 'copilot', 'claude', 'codex', 'gemini', 'crush')
+  # Unique engine identifier (e.g. 'copilot', 'claude', 'codex', 'gemini',
+  # 'opencode', 'crush', 'pi')
   id: "example-value"
 
   # Human-readable display name for the engine
@@ -2353,17 +2517,88 @@ engine:
   options:
     {}
 
-# Maximum effective-token (ET) budget for AWF API proxy enforcement. Defaults to
-# 25000000 when omitted.
+# Format 5: MCP gateway configuration for shared workflows. Declares engine.mcp
+# settings (tool-timeout, session-timeout) that consumers inherit during import
+# without specifying an engine identifier. The engine is always inherited from the
+# importing workflow.
+engine:
+  # Engine-level MCP gateway configuration. Settings here apply to the MCP gateway
+  # used by this engine.
+  mcp:
+    # Session timeout for MCP gateway sessions as a Go duration string (e.g. "30m",
+    # "4h", "24h"). Must be at least 5m (no upper bound). Omitted or empty uses the
+    # effective gateway default (precedence: this field > MCP_GATEWAY_SESSION_TIMEOUT
+    # env var > built-in default 6h).
+    # (optional)
+    session-timeout: "example-value"
+
+    # Timeout for individual MCP tool calls as a Go duration string (e.g. "30s", "2m",
+    # "10m"). Must be between 10s and 600s inclusive. Omitted or empty uses the
+    # gateway built-in default (60s). Use a higher value for slow MCP backends such as
+    # full-text search over large indexes.
+    # (optional)
+    tool-timeout: "example-value"
+
+# Format 6: Engine object with only a model preference (no engine.id). Allows
+# workflow authors to express a model-size hint (e.g. 'small', 'large') without
+# committing to a specific engine. The runtime selects an appropriate engine using
+# its default, and the model preference is applied to it.
+engine:
+  # Model preference or size category (e.g. 'small', 'large', 'gpt-4.1'). Applied to
+  # the default engine when engine.id is not specified.
+  model: "example-value"
+
+# AWF turn cap (`max_turns`) applied consistently across all agentic engines.
+# Supports GitHub Actions expressions (e.g. '${{ inputs.max-turns }}') for
+# reusable workflow_call workflows.
 # (optional)
 # Accepted formats:
 
 # Format 1: integer
-max-effective-tokens: 1
+max-turns: 1
 
-# Format 2: Numeric string or GitHub Actions expression that resolves to an
-# integer at runtime
-max-effective-tokens: "example-value"
+# Format 2: GitHub Actions expression that resolves to an integer at runtime
+max-turns: "example-value"
+
+# Copilot SDK safeguard threshold for repeated tool denials before stopping
+# inference. Defaults to 5 when omitted. Supports GitHub Actions expressions (for
+# example, '${{ inputs.max-tool-denials }}'). Supported only with engine 'copilot'
+# and engine.copilot-sdk: true.
+# (optional)
+# Accepted formats:
+
+# Format 1: integer
+max-tool-denials: 1
+
+# Format 2: GitHub Actions expression that resolves to an integer at runtime
+max-tool-denials: "example-value"
+
+# Per-run AI Credits budget control for firewall cost enforcement. Enabled by
+# default at 1000 (1k) when omitted. Set to -1 to disable both budget enforcement
+# and token steering. Supports GitHub Actions expressions.
+# (optional)
+# Accepted formats:
+
+# Format 1: Configuration object
+
+# Format 2: integer
+max-ai-credits: 1
+
+# Format 3: string
+max-ai-credits: "example-value"
+
+# 24-hour AI Credits guardrail for runs triggered by the same user. Omit the field
+# to leave the guardrail disabled. Supports GitHub Actions expressions.
+# (optional)
+# Accepted formats:
+
+# Format 1: Configuration object
+
+# Format 2: integer
+max-daily-ai-credits: 1
+
+# Format 3: string
+max-daily-ai-credits: "example-value"
 
 # MCP server definitions
 # (optional)
@@ -2392,11 +2627,11 @@ tools:
 
   # Format 4: GitHub tools object configuration with restricted function access
   github:
-    # List of allowed GitHub API functions (e.g., 'create_issue', 'update_issue',
-    # 'add_comment')
+    # List of allowed GitHub API functions. Each entry can be a string tool name
+    # (e.g., 'issue_read') or an object with per-tool limits (e.g., {name:
+    # 'issue_read', max-calls: 1})
     # (optional)
     allowed: []
-      # Array of strings
 
     # GitHub access mode. Prefer 'gh-proxy' for better performance (uses
     # pre-authenticated gh CLI prompt guidance). Legacy MCP transport values 'local'
@@ -2465,13 +2700,13 @@ tools:
 
     # Guard policy: repository access configuration. Restricts which repositories the
     # agent can access. Use 'all' to allow all repos, 'public' for public repositories
-    # only, or an array of repository patterns (e.g., 'owner/repo', 'owner/*',
-    # 'owner/prefix*').
+    # only, '${{ github.repository }}' for the current repository, or an array of
+    # repository patterns (e.g., 'owner/repo', 'owner/*', 'owner/prefix*').
     # (optional)
     # Accepted formats:
 
-    # Format 1: Allow access to all repositories ('all') or only public repositories
-    # ('public')
+    # Format 1: Allow access to all repositories ('all'), only public repositories
+    # ('public'), or the current repository ('${{ github.repository }}')
     allowed-repos: "all"
 
     # Format 2: Allow access to specific repositories using patterns (e.g.,
@@ -2590,6 +2825,11 @@ tools:
       # mint a GitHub App token.
       # (optional)
       private-key: "example-value"
+
+      # If true, skip token minting when client-id/private-key resolve to empty strings
+      # at runtime. Defaults to false.
+      # (optional)
+      ignore-if-missing: true
 
       # Optional owner of the GitHub App installation (defaults to current repository
       # owner if not specified)
@@ -2811,7 +3051,10 @@ tools:
   # Format 1: Enable edit tool
   edit: null
 
-  # Format 2: Edit tool configuration object
+  # Format 2: Boolean to explicitly enable (true) or disable (false) the edit tool.
+  edit: true
+
+  # Format 3: Edit tool configuration object
   edit:
     {}
 
@@ -2957,6 +3200,24 @@ tools:
     # (optional)
     staged: true
 
+    # Internal hidden feature. Optional list of declarative sample payloads that
+    # exercise this safe-output handler. Used by the hidden `gh aw compile
+    # --use-samples` flag to replace the agentic step with a deterministic replay
+    # through the safe-outputs MCP server. Each entry should conform to the
+    # corresponding MCP tool inputSchema; recognized sidecar keys (currently `patch`
+    # for create-pull-request and push-to-pull-request-branch) are stripped before
+    # schema validation and consumed by the replay driver.
+    # (optional)
+    # Accepted formats:
+
+    # Format 1: array
+    samples: []
+      # Array items: object
+
+    # Format 2: object
+    samples:
+      {}
+
   # Format 2: Enable (true) or disable (false) comment-memory.
   comment-memory: true
 
@@ -3036,7 +3297,7 @@ tools:
     file-glob: []
       # Array items: string
 
-    # Maximum size per file in bytes (default: 10240 = 10KB)
+    # Maximum size per file in bytes (default: 102400 = 100KB)
     # (optional)
     max-file-size: 1
 
@@ -3044,7 +3305,7 @@ tools:
     # (optional)
     max-file-count: 1
 
-    # Maximum total patch size in bytes (default: 10240 = 10KB, max: 102400 = 100KB).
+    # Maximum total patch size in bytes (default: 10240 = 10KB, max: 1048576 = 1MB).
     # The total size of the git diff must not exceed this value.
     # (optional)
     max-patch-size: 1
@@ -3069,13 +3330,14 @@ tools:
     allowed-extensions: []
       # Array of strings
 
+    # When true, all .json files are pretty-printed (2-space indent) before being
+    # committed, making them human-readable in the repository (default: false)
+    # (optional)
+    format-json: true
+
   # Format 4: Array of repo-memory configurations for multiple memory locations
   repo-memory: []
     # Array items: object
-
-# Command name for the workflow
-# (optional)
-command: "example-value"
 
 # Cache configuration for workflow (uses actions/cache syntax)
 # (optional)
@@ -3178,6 +3440,13 @@ safe-outputs:
     allowed-labels: []
       # Array of strings
 
+    # Optional list of issue field names that can be modified by create-issue field
+    # updates. If omitted or empty, any issue field may be set. Use ['*'] to
+    # explicitly allow all.
+    # (optional)
+    allowed-fields: []
+      # Array of strings
+
     # GitHub usernames to assign the created issue to. Can be a single username string
     # or array of usernames. Use 'copilot' to assign to GitHub Copilot.
     # (optional)
@@ -3204,6 +3473,19 @@ safe-outputs:
 
     # Format 2: GitHub Actions expression that resolves to an integer at runtime
     max: "example-value"
+
+    # Title-based deduplication for create-issue. Set to true for exact title
+    # matching, or provide a non-negative integer to deduplicate by Levenshtein edit
+    # distance (e.g., 1 allows one-character differences). Applies within-run and
+    # against open/recently-closed repository issues.
+    # (optional)
+    # Accepted formats:
+
+    # Format 1: boolean
+    deduplicate-by-title: true
+
+    # Format 2: integer
+    deduplicate-by-title: 1
 
     # Target repository in format 'owner/repo' for cross-repository issue creation.
     # Takes precedence over trial target repo settings.
@@ -3280,6 +3562,29 @@ safe-outputs:
     # (optional)
     staged: true
 
+    # Internal hidden feature. Optional list of declarative sample payloads that
+    # exercise this safe-output handler. Used by the hidden `gh aw compile
+    # --use-samples` flag to replace the agentic step with a deterministic replay
+    # through the safe-outputs MCP server. Each entry should conform to the
+    # corresponding MCP tool inputSchema; recognized sidecar keys (currently `patch`
+    # for create-pull-request and push-to-pull-request-branch) are stripped before
+    # schema validation and consumed by the replay driver.
+    # (optional)
+    # Accepted formats:
+
+    # Format 1: array
+    samples: []
+      # Array items: object
+
+    # Format 2: object
+    samples:
+      {}
+
+    # When true, strip backticks from recognized issue-closing keywords (e.g. `Closes
+    # #1` → Closes #1) in body fields for this output type.
+    # (optional)
+    normalize-closing-keywords: true
+
   # Format 2: Enable issue creation with default configuration
   create-issue: null
 
@@ -3331,6 +3636,24 @@ safe-outputs:
     # (optional)
     staged: true
 
+    # Internal hidden feature. Optional list of declarative sample payloads that
+    # exercise this safe-output handler. Used by the hidden `gh aw compile
+    # --use-samples` flag to replace the agentic step with a deterministic replay
+    # through the safe-outputs MCP server. Each entry should conform to the
+    # corresponding MCP tool inputSchema; recognized sidecar keys (currently `patch`
+    # for create-pull-request and push-to-pull-request-branch) are stripped before
+    # schema validation and consumed by the replay driver.
+    # (optional)
+    # Accepted formats:
+
+    # Format 1: array
+    samples: []
+      # Array items: object
+
+    # Format 2: object
+    samples:
+      {}
+
   # Format 2: Enable agent session creation with default configuration
   create-agent-task: null
 
@@ -3381,6 +3704,24 @@ safe-outputs:
     # specific output type (preview mode)
     # (optional)
     staged: true
+
+    # Internal hidden feature. Optional list of declarative sample payloads that
+    # exercise this safe-output handler. Used by the hidden `gh aw compile
+    # --use-samples` flag to replace the agentic step with a deterministic replay
+    # through the safe-outputs MCP server. Each entry should conform to the
+    # corresponding MCP tool inputSchema; recognized sidecar keys (currently `patch`
+    # for create-pull-request and push-to-pull-request-branch) are stripped before
+    # schema validation and consumed by the replay driver.
+    # (optional)
+    # Accepted formats:
+
+    # Format 1: array
+    samples: []
+      # Array items: object
+
+    # Format 2: object
+    samples:
+      {}
 
   # Format 2: Enable agent session creation with default configuration
   create-agent-session: null
@@ -3494,6 +3835,24 @@ safe-outputs:
     # (optional)
     staged: true
 
+    # Internal hidden feature. Optional list of declarative sample payloads that
+    # exercise this safe-output handler. Used by the hidden `gh aw compile
+    # --use-samples` flag to replace the agentic step with a deterministic replay
+    # through the safe-outputs MCP server. Each entry should conform to the
+    # corresponding MCP tool inputSchema; recognized sidecar keys (currently `patch`
+    # for create-pull-request and push-to-pull-request-branch) are stripped before
+    # schema validation and consumed by the replay driver.
+    # (optional)
+    # Accepted formats:
+
+    # Format 1: array
+    samples: []
+      # Array items: object
+
+    # Format 2: object
+    samples:
+      {}
+
   # Format 2: Enable project management with default configuration (max=10)
   update-project: null
 
@@ -3588,6 +3947,24 @@ safe-outputs:
     # (optional)
     staged: true
 
+    # Internal hidden feature. Optional list of declarative sample payloads that
+    # exercise this safe-output handler. Used by the hidden `gh aw compile
+    # --use-samples` flag to replace the agentic step with a deterministic replay
+    # through the safe-outputs MCP server. Each entry should conform to the
+    # corresponding MCP tool inputSchema; recognized sidecar keys (currently `patch`
+    # for create-pull-request and push-to-pull-request-branch) are stripped before
+    # schema validation and consumed by the replay driver.
+    # (optional)
+    # Accepted formats:
+
+    # Format 1: array
+    samples: []
+      # Array items: object
+
+    # Format 2: object
+    samples:
+      {}
+
   # Format 2: Enable project creation with default configuration (max=1)
   create-project: null
 
@@ -3633,6 +4010,24 @@ safe-outputs:
     # (optional)
     staged: true
 
+    # Internal hidden feature. Optional list of declarative sample payloads that
+    # exercise this safe-output handler. Used by the hidden `gh aw compile
+    # --use-samples` flag to replace the agentic step with a deterministic replay
+    # through the safe-outputs MCP server. Each entry should conform to the
+    # corresponding MCP tool inputSchema; recognized sidecar keys (currently `patch`
+    # for create-pull-request and push-to-pull-request-branch) are stripped before
+    # schema validation and consumed by the replay driver.
+    # (optional)
+    # Accepted formats:
+
+    # Format 1: array
+    samples: []
+      # Array items: object
+
+    # Format 2: object
+    samples:
+      {}
+
   # Format 2: Enable project status updates with default configuration (max=1)
   create-project-status-update: null
 
@@ -3657,11 +4052,11 @@ safe-outputs:
     # (optional)
     category: null
 
-    # Minimum required length of the discussion body content (before
-    # footer/metadata) in characters. If a create_discussion message body is
-    # shorter than this value, the safe-outputs job fails.
+    # Minimum required length of the discussion body content (before footer/metadata)
+    # in characters. If a create_discussion message body is shorter than this value,
+    # the safe-outputs job fails.
     # (optional)
-    min-body-length: 200
+    min-body-length: 1
 
     # Optional list of labels to attach to created discussions. Also used for matching
     # when close-older-discussions is enabled - discussions must have ALL specified
@@ -3718,6 +4113,12 @@ safe-outputs:
     # (optional)
     close-older-key: "example-value"
 
+    # Required category for matching when close-older-discussions is enabled. Only
+    # discussions in this category will be considered when searching for older
+    # discussions to close.
+    # (optional)
+    required-category: "example-value"
+
     # When true (default), fallback to creating an issue if discussion creation fails
     # due to permissions. The fallback issue will include a note indicating it was
     # intended to be a discussion. If close-older-discussions is enabled, the
@@ -3758,6 +4159,24 @@ safe-outputs:
     # specific output type (preview mode)
     # (optional)
     staged: true
+
+    # Internal hidden feature. Optional list of declarative sample payloads that
+    # exercise this safe-output handler. Used by the hidden `gh aw compile
+    # --use-samples` flag to replace the agentic step with a deterministic replay
+    # through the safe-outputs MCP server. Each entry should conform to the
+    # corresponding MCP tool inputSchema; recognized sidecar keys (currently `patch`
+    # for create-pull-request and push-to-pull-request-branch) are stripped before
+    # schema validation and consumed by the replay driver.
+    # (optional)
+    # Accepted formats:
+
+    # Format 1: array
+    samples: []
+      # Array items: object
+
+    # Format 2: object
+    samples:
+      {}
 
   # Format 2: Enable discussion creation with default configuration
   create-discussion: null
@@ -3804,10 +4223,34 @@ safe-outputs:
     # (optional)
     target-repo: "example-value"
 
+    # List of additional repositories in format 'owner/repo' that discussions can be
+    # closed in. The target repository is always implicitly allowed.
+    # (optional)
+    allowed-repos: []
+      # Array of strings
+
     # If true, emit step summary messages instead of making GitHub API calls for this
     # specific output type (preview mode)
     # (optional)
     staged: true
+
+    # Internal hidden feature. Optional list of declarative sample payloads that
+    # exercise this safe-output handler. Used by the hidden `gh aw compile
+    # --use-samples` flag to replace the agentic step with a deterministic replay
+    # through the safe-outputs MCP server. Each entry should conform to the
+    # corresponding MCP tool inputSchema; recognized sidecar keys (currently `patch`
+    # for create-pull-request and push-to-pull-request-branch) are stripped before
+    # schema validation and consumed by the replay driver.
+    # (optional)
+    # Accepted formats:
+
+    # Format 1: array
+    samples: []
+      # Array items: object
+
+    # Format 2: object
+    samples:
+      {}
 
   # Format 2: Enable discussion closing with default configuration
   close-discussion: null
@@ -3860,6 +4303,12 @@ safe-outputs:
     # (optional)
     target-repo: "example-value"
 
+    # List of additional repositories in format 'owner/repo' that discussions can be
+    # updated in. The target repository is always implicitly allowed.
+    # (optional)
+    allowed-repos: []
+      # Array of strings
+
     # Controls whether AI-generated footer is added when updating the discussion body.
     # When false, the visible footer content is omitted. Defaults to true. Only
     # applies when 'body' is enabled.
@@ -3870,6 +4319,24 @@ safe-outputs:
     # specific output type (preview mode)
     # (optional)
     staged: true
+
+    # Internal hidden feature. Optional list of declarative sample payloads that
+    # exercise this safe-output handler. Used by the hidden `gh aw compile
+    # --use-samples` flag to replace the agentic step with a deterministic replay
+    # through the safe-outputs MCP server. Each entry should conform to the
+    # corresponding MCP tool inputSchema; recognized sidecar keys (currently `patch`
+    # for create-pull-request and push-to-pull-request-branch) are stripped before
+    # schema validation and consumed by the replay driver.
+    # (optional)
+    # Accepted formats:
+
+    # Format 1: array
+    samples: []
+      # Array items: object
+
+    # Format 2: object
+    samples:
+      {}
 
     # GitHub token to use for this specific output type. Overrides global github-token
     # if specified.
@@ -3930,6 +4397,24 @@ safe-outputs:
     # (optional)
     staged: true
 
+    # Internal hidden feature. Optional list of declarative sample payloads that
+    # exercise this safe-output handler. Used by the hidden `gh aw compile
+    # --use-samples` flag to replace the agentic step with a deterministic replay
+    # through the safe-outputs MCP server. Each entry should conform to the
+    # corresponding MCP tool inputSchema; recognized sidecar keys (currently `patch`
+    # for create-pull-request and push-to-pull-request-branch) are stripped before
+    # schema validation and consumed by the replay driver.
+    # (optional)
+    # Accepted formats:
+
+    # Format 1: array
+    samples: []
+      # Array items: object
+
+    # Format 2: object
+    samples:
+      {}
+
     # Reason for closing the issue (default: completed)
     # (optional)
     state-reason: "completed"
@@ -3975,6 +4460,12 @@ safe-outputs:
     # (optional)
     target-repo: "example-value"
 
+    # List of additional repositories in format 'owner/repo' that pull requests can be
+    # closed in. The target repository is always implicitly allowed.
+    # (optional)
+    allowed-repos: []
+      # Array of strings
+
     # GitHub token to use for this specific output type. Overrides global github-token
     # if specified.
     # (optional)
@@ -3984,6 +4475,24 @@ safe-outputs:
     # specific output type (preview mode)
     # (optional)
     staged: true
+
+    # Internal hidden feature. Optional list of declarative sample payloads that
+    # exercise this safe-output handler. Used by the hidden `gh aw compile
+    # --use-samples` flag to replace the agentic step with a deterministic replay
+    # through the safe-outputs MCP server. Each entry should conform to the
+    # corresponding MCP tool inputSchema; recognized sidecar keys (currently `patch`
+    # for create-pull-request and push-to-pull-request-branch) are stripped before
+    # schema validation and consumed by the replay driver.
+    # (optional)
+    # Accepted formats:
+
+    # Format 1: array
+    samples: []
+      # Array items: object
+
+    # Format 2: object
+    samples:
+      {}
 
   # Format 2: Enable pull request closing with default configuration
   close-pull-request: null
@@ -4026,6 +4535,12 @@ safe-outputs:
     # (optional)
     target-repo: "example-value"
 
+    # List of additional repositories in format 'owner/repo' that pull requests can be
+    # marked as ready in. The target repository is always implicitly allowed.
+    # (optional)
+    allowed-repos: []
+      # Array of strings
+
     # GitHub token to use for this specific output type. Overrides global github-token
     # if specified.
     # (optional)
@@ -4035,6 +4550,24 @@ safe-outputs:
     # specific output type (preview mode)
     # (optional)
     staged: true
+
+    # Internal hidden feature. Optional list of declarative sample payloads that
+    # exercise this safe-output handler. Used by the hidden `gh aw compile
+    # --use-samples` flag to replace the agentic step with a deterministic replay
+    # through the safe-outputs MCP server. Each entry should conform to the
+    # corresponding MCP tool inputSchema; recognized sidecar keys (currently `patch`
+    # for create-pull-request and push-to-pull-request-branch) are stripped before
+    # schema validation and consumed by the replay driver.
+    # (optional)
+    # Accepted formats:
+
+    # Format 1: array
+    samples: []
+      # Array items: object
+
+    # Format 2: object
+    samples:
+      {}
 
   # Format 2: Enable marking pull requests as ready for review with default
   # configuration
@@ -4089,16 +4622,33 @@ safe-outputs:
 
     # When true, minimizes/hides all previous comments from the same agentic workflow
     # (identified by tracker-id) before creating the new comment. Supports literal
-    # boolean or GitHub Actions expression (e.g. '${{ inputs.hide-older-comments }}').
-    # Default: false.
+    # boolean, GitHub Actions expression (e.g. '${{ inputs.hide-older-comments }}'),
+    # or object form for advanced matching. Default: false.
     # (optional)
     # Accepted formats:
 
-    # Format 1: boolean
-    hide-older-comments: true
+    # Format 1: A boolean value that may also be specified as a GitHub Actions
+    # expression string that resolves to a boolean at runtime (e.g. '${{
+    # inputs.my-flag }}').
 
-    # Format 2: GitHub Actions expression that resolves to a boolean at runtime
-    hide-older-comments: "example-value"
+    # Format 2: object
+    hide-older-comments:
+      # Enable or disable hide-older-comments when using object form. Defaults to true
+      # when omitted.
+      # (optional)
+      # Accepted formats:
+
+      # Format 1: boolean
+      enabled: true
+
+      # Format 2: GitHub Actions expression that resolves to a boolean at runtime
+      enabled: "example-value"
+
+      # Additional workflow-id values to fully match when selecting older comments to
+      # hide.
+      # (optional)
+      match: []
+        # Array of strings
 
     # List of allowed reasons for hiding older comments when hide-older-comments is
     # enabled. Default: all reasons allowed (spam, abuse, off_topic, outdated,
@@ -4137,10 +4687,44 @@ safe-outputs:
     # (optional)
     github-token: "${{ secrets.GITHUB_TOKEN }}"
 
+    # Conjunctive label constraint: ALL of these labels must be present on the
+    # issue/PR for the operation to proceed.
+    # (optional)
+    required-labels: []
+      # Array of strings
+
+    # Title prefix constraint: the issue/PR title must start with this prefix for the
+    # operation to proceed.
+    # (optional)
+    required-title-prefix: "example-value"
+
     # If true, emit step summary messages instead of making GitHub API calls for this
     # specific output type (preview mode)
     # (optional)
     staged: true
+
+    # Internal hidden feature. Optional list of declarative sample payloads that
+    # exercise this safe-output handler. Used by the hidden `gh aw compile
+    # --use-samples` flag to replace the agentic step with a deterministic replay
+    # through the safe-outputs MCP server. Each entry should conform to the
+    # corresponding MCP tool inputSchema; recognized sidecar keys (currently `patch`
+    # for create-pull-request and push-to-pull-request-branch) are stripped before
+    # schema validation and consumed by the replay driver.
+    # (optional)
+    # Accepted formats:
+
+    # Format 1: array
+    samples: []
+      # Array items: object
+
+    # Format 2: object
+    samples:
+      {}
+
+    # When true, strip backticks from recognized issue-closing keywords (e.g. `Closes
+    # #1` → Closes #1) in body fields for this output type.
+    # (optional)
+    normalize-closing-keywords: true
 
   # Format 2: Enable issue comment creation with default configuration
   add-comment: null
@@ -4164,6 +4748,11 @@ safe-outputs:
 
     # Format 2: GitHub Actions expression that resolves to an integer at runtime
     max: "example-value"
+
+    # Optional prefix to prepend to the pull request branch name (e.g. "signed/").
+    # Applied before the agent-specified or auto-generated branch name.
+    # (optional)
+    branch-prefix: "example-value"
 
     # Optional prefix for the pull request title
     # (optional)
@@ -4262,7 +4851,9 @@ safe-outputs:
     allow-empty: true
 
     # Target repository in format 'owner/repo' for cross-repository pull request
-    # creation. Takes precedence over trial target repo settings.
+    # creation, or '*' to let the agent choose the target repository at runtime
+    # (requires checkout: configs with path: for each possible target). Takes
+    # precedence over trial target repo settings.
     # (optional)
     target-repo: "example-value"
 
@@ -4313,6 +4904,22 @@ safe-outputs:
     # (optional)
     base-branch: "example-value"
 
+    # Optional list of allowed source branch patterns (glob syntax, e.g. 'feature/*',
+    # 'release/*'). When configured, the effective create_pull_request branch must
+    # match one of these patterns. Accepts an array or a GitHub Actions expression
+    # resolving to a comma-separated list (e.g. '${{ inputs[\'allowed-branches\']
+    # }}').
+    # (optional)
+    # Accepted formats:
+
+    # Format 1: Array of source branch patterns (glob syntax supported)
+    allowed-branches: []
+      # Array items: string
+
+    # Format 2: GitHub Actions expression resolving to a comma-separated list of
+    # source branch patterns (e.g. '${{ inputs[\'allowed-branches\'] }}')
+    allowed-branches: "example-value"
+
     # Optional list of allowed base branch patterns (glob syntax, e.g. 'main',
     # 'release/*'). When configured, the agent may provide a `base` field in
     # create_pull_request output to override base-branch for a single run, but only if
@@ -4329,6 +4936,17 @@ safe-outputs:
     # Format 2: GitHub Actions expression resolving to a comma-separated list of base
     # branch patterns (e.g. '${{ inputs[\'allowed-base-branches\'] }}')
     allowed-base-branches: "example-value"
+
+    # Maximum allowed size for git patches in kilobytes (KB) for create-pull-request
+    # only. Overrides safe-outputs max-patch-size for this output type. Defaults to
+    # 4096 KB (4 MB) when unset.
+    # (optional)
+    max-patch-size: 1
+
+    # Maximum allowed number of unique files in a create-pull-request patch. Overrides
+    # safe-outputs max-patch-files for this output type. Defaults to 100 when unset.
+    # (optional)
+    max-patch-files: 1
 
     # Controls whether AI-generated footer is added to the pull request. When false,
     # the visible footer content is omitted but XML markers (workflow-id, tracker-id,
@@ -4352,6 +4970,20 @@ safe-outputs:
     # (optional)
     auto-close-issue: null
 
+    # When true, automatically close older open pull requests with the same
+    # workflow-id marker (or close-older-key when set) with a comment linking to the
+    # new PR. Maximum 10 PRs will be closed. Only runs if PR creation succeeds.
+    # (optional)
+    close-older-pull-requests: null
+
+    # Optional explicit deduplication key for close-older-pull-requests matching. When
+    # set, a `<!-- gh-aw-close-key: <value> -->` marker is embedded in the PR body and
+    # used as the primary key for searching and filtering older PRs instead of the
+    # workflow-id markers. The value is normalized to identifier style (lowercase
+    # alphanumeric, dashes, underscores).
+    # (optional)
+    close-older-key: "example-value"
+
     # Token used to push an empty commit after PR creation to trigger CI events. Works
     # around the GITHUB_TOKEN limitation where pushes don't trigger workflow runs.
     # Defaults to the magic secret GH_AW_CI_TRIGGER_TOKEN if set in the repository.
@@ -4360,22 +4992,25 @@ safe-outputs:
     # (optional)
     github-token-for-extra-empty-commit: "example-value"
 
-    # Controls protected-file protection. String form: blocked (default), allowed, or
-    # fallback-to-issue — or a GitHub Actions expression for reusable workflows.
-    # Object form: { policy, exclude } to customise the protected-file set.
+    # Controls protected-file protection. String form: request_review (default),
+    # blocked, allowed, or fallback-to-issue — or a GitHub Actions expression for
+    # reusable workflows. Object form: { policy, exclude } to customise the
+    # protected-file set.
     # (optional)
     # Accepted formats:
 
-    # Format 1: Controls protected-file protection. blocked (default): hard-block any
-    # patch that modifies package manifests (e.g. package.json, go.mod), engine
-    # instruction files (e.g. AGENTS.md, CLAUDE.md) or .github/ files. allowed: allow
-    # all changes. fallback-to-issue: push the branch but create a review issue
-    # instead of a PR, so a human can review the manifest changes before merging.
+    # Format 1: Controls protected-file protection. request_review (default): create
+    # the PR but prepend a caution block and submit a REQUEST_CHANGES review for
+    # manual scrutiny. blocked: hard-block any patch that modifies package manifests
+    # (e.g. package.json, go.mod), engine instruction files (e.g. AGENTS.md,
+    # CLAUDE.md) or .github/ files. allowed: allow all changes. fallback-to-issue:
+    # push the branch but create a review issue instead of a PR, so a human can review
+    # the manifest changes before merging.
     protected-files: "blocked"
 
-    # Format 2: GitHub Actions expression that resolves to 'blocked', 'allowed', or
-    # 'fallback-to-issue' at runtime. Use in reusable workflow_call workflows to
-    # parameterise the policy per caller.
+    # Format 2: GitHub Actions expression that resolves to 'blocked', 'allowed',
+    # 'fallback-to-issue', or 'request_review' at runtime. Use in reusable
+    # workflow_call workflows to parameterise the policy per caller.
     protected-files: "example-value"
 
     # Format 3: Object form for granular control over the protected-file set. Use the
@@ -4385,13 +5020,14 @@ safe-outputs:
       # (optional)
       # Accepted formats:
 
-      # Format 1: Protection policy. blocked (default): hard-block any patch that
-      # modifies protected files. allowed: allow all changes. fallback-to-issue: push
-      # the branch but create a review issue instead of a PR.
+      # Format 1: Protection policy. request_review (default): create the PR but prepend
+      # a caution block and submit a REQUEST_CHANGES review. blocked: hard-block any
+      # patch that modifies protected files. allowed: allow all changes.
+      # fallback-to-issue: push the branch but create a review issue instead of a PR.
       policy: "blocked"
 
-      # Format 2: GitHub Actions expression that resolves to 'blocked', 'allowed', or
-      # 'fallback-to-issue' at runtime.
+      # Format 2: GitHub Actions expression that resolves to 'blocked', 'allowed',
+      # 'fallback-to-issue', or 'request_review' at runtime.
       policy: "example-value"
 
       # List of filenames or path prefixes to remove from the default protected-file
@@ -4442,26 +5078,51 @@ safe-outputs:
     excluded-files: []
       # Array of strings
 
-    # Transport format for packaging changes. "bundle" (default) uses git bundle.
-    # "am" uses git format-patch/git am. Accepts a GitHub Actions expression for reusable
+    # Transport format for packaging changes. "bundle" (default) uses git bundle. "am"
+    # uses git format-patch/git am. Accepts a GitHub Actions expression for reusable
     # workflows.
     # (optional)
     # Accepted formats:
 
     # Format 1: Transport format for packaging changes. "bundle" (default) uses git
-    # bundle. "am" uses git format-patch/git am, while "bundle" preserves merge commit
-    # topology, per-commit authorship, and merge-resolution-only content.
-    patch-format: "bundle"
+    # bundle, which preserves merge commit topology, per-commit authorship, and
+    # merge-resolution-only content. "am" uses git format-patch/git am.
+    patch-format: "am"
 
     # Format 2: GitHub Actions expression that resolves to 'am' or 'bundle' at
     # runtime. Use in reusable workflow_call workflows to parameterise the transport
     # format per caller.
     patch-format: "example-value"
 
+    # When true (default), signed commits are required and pushes use GitHub's
+    # createCommitOnBranch GraphQL mutation so GitHub signs them. Set to false to use
+    # git push directly for repositories that do not require signed commits; this also
+    # allows pushing merge commits that GraphQL cannot represent.
+    # (optional)
+    signed-commits: true
+
     # If true, emit step summary messages instead of making GitHub API calls for this
     # specific output type (preview mode)
     # (optional)
     staged: true
+
+    # Internal hidden feature. Optional list of declarative sample payloads that
+    # exercise this safe-output handler. Used by the hidden `gh aw compile
+    # --use-samples` flag to replace the agentic step with a deterministic replay
+    # through the safe-outputs MCP server. Each entry should conform to the
+    # corresponding MCP tool inputSchema; recognized sidecar keys (currently `patch`
+    # for create-pull-request and push-to-pull-request-branch) are stripped before
+    # schema validation and consumed by the replay driver.
+    # (optional)
+    # Accepted formats:
+
+    # Format 1: array
+    samples: []
+      # Array items: object
+
+    # Format 2: object
+    samples:
+      {}
 
     # When true, adds workflows: write to the GitHub App token permissions. Required
     # when allowed-files targets .github/workflows/ paths. Requires
@@ -4469,6 +5130,11 @@ safe-outputs:
     # GitHub App-only permission and cannot be granted via GITHUB_TOKEN.
     # (optional)
     allow-workflows: true
+
+    # When true, strip backticks from recognized issue-closing keywords (e.g. `Closes
+    # #1` → Closes #1) in body fields for this output type.
+    # (optional)
+    normalize-closing-keywords: true
 
   # Format 2: Enable pull request creation with default configuration
   create-pull-request: null
@@ -4523,6 +5189,35 @@ safe-outputs:
     # specific output type (preview mode)
     # (optional)
     staged: true
+
+    # Internal hidden feature. Optional list of declarative sample payloads that
+    # exercise this safe-output handler. Used by the hidden `gh aw compile
+    # --use-samples` flag to replace the agentic step with a deterministic replay
+    # through the safe-outputs MCP server. Each entry should conform to the
+    # corresponding MCP tool inputSchema; recognized sidecar keys (currently `patch`
+    # for create-pull-request and push-to-pull-request-branch) are stripped before
+    # schema validation and consumed by the replay driver.
+    # (optional)
+    # Accepted formats:
+
+    # Format 1: array
+    samples: []
+      # Array items: object
+
+    # Format 2: object
+    samples:
+      {}
+
+    # All of these labels must be present on the target item for this operation to
+    # proceed
+    # (optional)
+    required-labels: []
+      # Array of strings
+
+    # The target item's title must start with this prefix for this operation to
+    # proceed
+    # (optional)
+    required-title-prefix: "example-value"
 
   # Format 2: Enable PR review comment creation with default configuration
   create-pull-request-review-comment: null
@@ -4608,6 +5303,35 @@ safe-outputs:
     # (optional)
     staged: true
 
+    # Internal hidden feature. Optional list of declarative sample payloads that
+    # exercise this safe-output handler. Used by the hidden `gh aw compile
+    # --use-samples` flag to replace the agentic step with a deterministic replay
+    # through the safe-outputs MCP server. Each entry should conform to the
+    # corresponding MCP tool inputSchema; recognized sidecar keys (currently `patch`
+    # for create-pull-request and push-to-pull-request-branch) are stripped before
+    # schema validation and consumed by the replay driver.
+    # (optional)
+    # Accepted formats:
+
+    # Format 1: array
+    samples: []
+      # Array items: object
+
+    # Format 2: object
+    samples:
+      {}
+
+    # All of these labels must be present on the target item for this operation to
+    # proceed
+    # (optional)
+    required-labels: []
+      # Array of strings
+
+    # The target item's title must start with this prefix for this operation to
+    # proceed
+    # (optional)
+    required-title-prefix: "example-value"
+
   # Format 2: Enable PR review submission with default configuration
   submit-pull-request-review: null
 
@@ -4656,17 +5380,48 @@ safe-outputs:
     # (optional)
     staged: true
 
+    # Internal hidden feature. Optional list of declarative sample payloads that
+    # exercise this safe-output handler. Used by the hidden `gh aw compile
+    # --use-samples` flag to replace the agentic step with a deterministic replay
+    # through the safe-outputs MCP server. Each entry should conform to the
+    # corresponding MCP tool inputSchema; recognized sidecar keys (currently `patch`
+    # for create-pull-request and push-to-pull-request-branch) are stripped before
+    # schema validation and consumed by the replay driver.
+    # (optional)
+    # Accepted formats:
+
+    # Format 1: array
+    samples: []
+      # Array items: object
+
+    # Format 2: object
+    samples:
+      {}
+
+    # All of these labels must be present on the target item for this operation to
+    # proceed
+    # (optional)
+    required-labels: []
+      # Array of strings
+
+    # The target item's title must start with this prefix for this operation to
+    # proceed
+    # (optional)
+    required-title-prefix: "example-value"
+
   # Format 2: Enable with default configuration
   reply-to-pull-request-review-comment: null
 
-  # Enable AI agents to resolve review threads on the triggering pull request after
-  # addressing feedback.
+  # Enable AI agents to resolve review threads on pull requests after addressing
+  # feedback. Supports cross-repository resolution via target, target-repo, and
+  # allowed-repos.
   # (optional)
   # Accepted formats:
 
-  # Format 1: Configuration for resolving review threads on pull requests.
-  # Resolution is scoped to the triggering PR only — threads on other PRs cannot be
-  # resolved.
+  # Format 1: Configuration for resolving review threads on pull requests. By
+  # default, resolution is scoped to the triggering PR only. When target,
+  # target-repo, or allowed-repos are specified, cross-repository thread resolution
+  # is supported.
   resolve-pull-request-review-thread:
     # Maximum number of review threads to resolve (default: 10) Supports integer or
     # GitHub Actions expression (e.g. '${{ inputs.max }}').
@@ -4679,6 +5434,26 @@ safe-outputs:
     # Format 2: GitHub Actions expression that resolves to an integer at runtime
     max: "example-value"
 
+    # Target PR for thread resolution: 'triggering' (default, current PR), '*' (any
+    # PR, requires pull_request_number in agent output), or explicit PR number (e.g.
+    # ${{ github.event.inputs.pr_number }}). Required when workflow is not triggered
+    # by a pull request (e.g. workflow_dispatch).
+    # (optional)
+    target: "example-value"
+
+    # Target repository in format 'owner/repo' for cross-repository PR review thread
+    # resolution. Takes precedence over trial target repo settings.
+    # (optional)
+    target-repo: "example-value"
+
+    # List of additional repositories in format 'owner/repo' that PR review threads
+    # can be resolved in. When specified, the agent can use a 'repo' field in the
+    # output to specify which repository to resolve threads in. The target repository
+    # (current or target-repo) is always implicitly allowed.
+    # (optional)
+    allowed-repos: []
+      # Array of strings
+
     # GitHub token to use for this specific output type. Overrides global github-token
     # if specified.
     # (optional)
@@ -4688,6 +5463,35 @@ safe-outputs:
     # specific output type (preview mode)
     # (optional)
     staged: true
+
+    # Internal hidden feature. Optional list of declarative sample payloads that
+    # exercise this safe-output handler. Used by the hidden `gh aw compile
+    # --use-samples` flag to replace the agentic step with a deterministic replay
+    # through the safe-outputs MCP server. Each entry should conform to the
+    # corresponding MCP tool inputSchema; recognized sidecar keys (currently `patch`
+    # for create-pull-request and push-to-pull-request-branch) are stripped before
+    # schema validation and consumed by the replay driver.
+    # (optional)
+    # Accepted formats:
+
+    # Format 1: array
+    samples: []
+      # Array items: object
+
+    # Format 2: object
+    samples:
+      {}
+
+    # All of these labels must be present on the target item for this operation to
+    # proceed
+    # (optional)
+    required-labels: []
+      # Array of strings
+
+    # The target item's title must start with this prefix for this operation to
+    # proceed
+    # (optional)
+    required-title-prefix: "example-value"
 
   # Format 2: Enable review thread resolution with default configuration
   resolve-pull-request-review-thread: null
@@ -4739,6 +5543,24 @@ safe-outputs:
     # (optional)
     staged: true
 
+    # Internal hidden feature. Optional list of declarative sample payloads that
+    # exercise this safe-output handler. Used by the hidden `gh aw compile
+    # --use-samples` flag to replace the agentic step with a deterministic replay
+    # through the safe-outputs MCP server. Each entry should conform to the
+    # corresponding MCP tool inputSchema; recognized sidecar keys (currently `patch`
+    # for create-pull-request and push-to-pull-request-branch) are stripped before
+    # schema validation and consumed by the replay driver.
+    # (optional)
+    # Accepted formats:
+
+    # Format 1: array
+    samples: []
+      # Array items: object
+
+    # Format 2: object
+    samples:
+      {}
+
   # Format 2: Enable code scanning alert creation with default configuration
   # (unlimited findings)
   create-code-scanning-alert: null
@@ -4771,9 +5593,290 @@ safe-outputs:
     # (optional)
     staged: true
 
+    # Internal hidden feature. Optional list of declarative sample payloads that
+    # exercise this safe-output handler. Used by the hidden `gh aw compile
+    # --use-samples` flag to replace the agentic step with a deterministic replay
+    # through the safe-outputs MCP server. Each entry should conform to the
+    # corresponding MCP tool inputSchema; recognized sidecar keys (currently `patch`
+    # for create-pull-request and push-to-pull-request-branch) are stripped before
+    # schema validation and consumed by the replay driver.
+    # (optional)
+    # Accepted formats:
+
+    # Format 1: array
+    samples: []
+      # Array items: object
+
+    # Format 2: object
+    samples:
+      {}
+
   # Format 2: Enable code scanning autofix creation with default configuration (max:
   # 10)
   autofix-code-scanning-alert: null
+
+  # Enable AI agents to create GitHub Check Runs that surface analysis results in
+  # the PR checks UI. Requires checks: write permission.
+  # (optional)
+  # Accepted formats:
+
+  # Format 1: Configuration for creating GitHub Check Runs to surface agent analysis
+  # results on commits and pull requests
+  create-check-run:
+    # Check run name shown in the GitHub Checks UI (e.g., 'Security Analysis'). If
+    # omitted, defaults to the workflow name.
+    # (optional)
+    name: "My Workflow"
+
+    # Maximum number of check runs to create per workflow run (default: 1). Supports
+    # integer or GitHub Actions expression (e.g. '${{ inputs.max }}').
+    # (optional)
+    # Accepted formats:
+
+    # Format 1: integer
+    max: 1
+
+    # Format 2: GitHub Actions expression that resolves to an integer at runtime
+    max: "example-value"
+
+    # GitHub token to use for this specific output type. Overrides global github-token
+    # if specified.
+    # (optional)
+    github-token: "${{ secrets.GITHUB_TOKEN }}"
+
+    # If true, emit step summary messages instead of making GitHub API calls for this
+    # specific output type (preview mode)
+    # (optional)
+    staged: true
+
+    # Internal hidden feature. Optional list of declarative sample payloads that
+    # exercise this safe-output handler. Used by the hidden `gh aw compile
+    # --use-samples` flag to replace the agentic step with a deterministic replay
+    # through the safe-outputs MCP server. Each entry should conform to the
+    # corresponding MCP tool inputSchema; recognized sidecar keys (currently `patch`
+    # for create-pull-request and push-to-pull-request-branch) are stripped before
+    # schema validation and consumed by the replay driver.
+    # (optional)
+    # Accepted formats:
+
+    # Format 1: array
+    samples: []
+      # Array items: object
+
+    # Format 2: object
+    samples:
+      {}
+
+    # GitHub App credentials for minting an installation access token scoped to
+    # checks:write for this handler. When set, a short-lived token is minted before
+    # the handler runs and revoked afterwards.
+    # (optional)
+    github-app:
+      # Deprecated alias for client-id. GitHub App ID/client ID (e.g., '${{ vars.APP_ID
+      # }}').
+      # (optional)
+      app-id: "example-value"
+
+      # GitHub App client ID (e.g., '${{ vars.APP_ID }}'). Required to mint a GitHub App
+      # token.
+      # (optional)
+      client-id: "example-value"
+
+      # GitHub App private key (e.g., '${{ secrets.APP_PRIVATE_KEY }}'). Required to
+      # mint a GitHub App token.
+      # (optional)
+      private-key: "example-value"
+
+      # If true, skip token minting when client-id/private-key resolve to empty strings
+      # at runtime. Defaults to false.
+      # (optional)
+      ignore-if-missing: true
+
+      # Optional owner of the GitHub App installation (defaults to current repository
+      # owner if not specified)
+      # (optional)
+      owner: "example-value"
+
+      # Optional list of repositories to grant access to (defaults to current repository
+      # if not specified)
+      # (optional)
+      repositories: []
+        # Array of strings
+
+      # Optional extra GitHub App-only permissions to merge into the minted token. Takes
+      # effect for tools.github.github-app and safe-outputs.github-app; ignored in
+      # on.github-app and the top-level github-app fallback. Use to add GitHub App-only
+      # scopes (e.g. members, organization-administration) not expressible via standard
+      # handler declarations.
+      # (optional)
+      permissions:
+        # Permission level for repository administration (read/none; "write" is rejected
+        # by the compiler). GitHub App-only permission for repository administration.
+        # (optional)
+        administration: "read"
+
+        # Permission level for Codespaces (read/none; "write" is rejected by the
+        # compiler). GitHub App-only permission.
+        # (optional)
+        codespaces: "read"
+
+        # Permission level for Codespaces lifecycle administration (read/none; "write" is
+        # rejected by the compiler). GitHub App-only permission.
+        # (optional)
+        codespaces-lifecycle-admin: "read"
+
+        # Permission level for Codespaces metadata (read/none; "write" is rejected by the
+        # compiler). GitHub App-only permission.
+        # (optional)
+        codespaces-metadata: "read"
+
+        # Permission level for user email addresses (read/none; "write" is rejected by the
+        # compiler). GitHub App-only permission.
+        # (optional)
+        email-addresses: "read"
+
+        # Permission level for repository environments (read/none; "write" is rejected by
+        # the compiler). GitHub App-only permission.
+        # (optional)
+        environments: "read"
+
+        # Permission level for git signing (read/none; "write" is rejected by the
+        # compiler). GitHub App-only permission.
+        # (optional)
+        git-signing: "read"
+
+        # Permission level for organization members (read/none; "write" is rejected by the
+        # compiler). Required for org team membership API calls.
+        # (optional)
+        members: "read"
+
+        # Permission level for organization administration (read/none; "write" is rejected
+        # by the compiler). GitHub App-only permission.
+        # (optional)
+        organization-administration: "read"
+
+        # Permission level for organization announcement banners (read/none; "write" is
+        # rejected by the compiler). GitHub App-only permission.
+        # (optional)
+        organization-announcement-banners: "read"
+
+        # Permission level for organization Codespaces (read/none; "write" is rejected by
+        # the compiler). GitHub App-only permission.
+        # (optional)
+        organization-codespaces: "read"
+
+        # Permission level for organization Copilot (read/none; "write" is rejected by the
+        # compiler). GitHub App-only permission.
+        # (optional)
+        organization-copilot: "read"
+
+        # Permission level for organization custom org roles (read/none; "write" is
+        # rejected by the compiler). GitHub App-only permission.
+        # (optional)
+        organization-custom-org-roles: "read"
+
+        # Permission level for organization custom properties (read/none; "write" is
+        # rejected by the compiler). GitHub App-only permission.
+        # (optional)
+        organization-custom-properties: "read"
+
+        # Permission level for organization custom repository roles (read/none; "write" is
+        # rejected by the compiler). GitHub App-only permission.
+        # (optional)
+        organization-custom-repository-roles: "read"
+
+        # Permission level for organization events (read/none; "write" is rejected by the
+        # compiler). GitHub App-only permission.
+        # (optional)
+        organization-events: "read"
+
+        # Permission level for organization webhooks (read/none; "write" is rejected by
+        # the compiler). GitHub App-only permission.
+        # (optional)
+        organization-hooks: "read"
+
+        # Permission level for organization members management (read/none; "write" is
+        # rejected by the compiler). GitHub App-only permission.
+        # (optional)
+        organization-members: "read"
+
+        # Permission level for organization packages (read/none; "write" is rejected by
+        # the compiler). GitHub App-only permission.
+        # (optional)
+        organization-packages: "read"
+
+        # Permission level for organization personal access token requests (read/none;
+        # "write" is rejected by the compiler). GitHub App-only permission.
+        # (optional)
+        organization-personal-access-token-requests: "read"
+
+        # Permission level for organization personal access tokens (read/none; "write" is
+        # rejected by the compiler). GitHub App-only permission.
+        # (optional)
+        organization-personal-access-tokens: "read"
+
+        # Permission level for organization plan (read/none; "write" is rejected by the
+        # compiler). GitHub App-only permission.
+        # (optional)
+        organization-plan: "read"
+
+        # Permission level for organization self-hosted runners (read/none; "write" is
+        # rejected by the compiler). GitHub App-only permission.
+        # (optional)
+        organization-self-hosted-runners: "read"
+
+        # Permission level for organization user blocking (read/none; "write" is rejected
+        # by the compiler). GitHub App-only permission.
+        # (optional)
+        organization-user-blocking: "read"
+
+        # Permission level for repository custom properties (read/none; "write" is
+        # rejected by the compiler). GitHub App-only permission.
+        # (optional)
+        repository-custom-properties: "read"
+
+        # Permission level for repository webhooks (read/none; "write" is rejected by the
+        # compiler). GitHub App-only permission.
+        # (optional)
+        repository-hooks: "read"
+
+        # Permission level for single file access (read/none; "write" is rejected by the
+        # compiler). GitHub App-only permission.
+        # (optional)
+        single-file: "read"
+
+        # Permission level for team discussions (read/none; "write" is rejected by the
+        # compiler). GitHub App-only permission.
+        # (optional)
+        team-discussions: "read"
+
+        # Permission level for Dependabot vulnerability alerts (read/none; "write" is
+        # rejected by the compiler). Also available as a GITHUB_TOKEN scope. When used
+        # with a GitHub App, forwarded as permission-vulnerability-alerts input.
+        # (optional)
+        vulnerability-alerts: "read"
+
+        # Permission level for GitHub Actions workflow files (read/none; "write" is
+        # rejected by the compiler). GitHub App-only permission.
+        # (optional)
+        workflows: "read"
+
+    # Optional static fallback values for the check run output fields. Used when the
+    # agent does not provide the corresponding field.
+    # (optional)
+    output:
+      # Fallback title for the check run output (max 256 characters). Used when the
+      # agent does not supply a title.
+      # (optional)
+      title: "example-value"
+
+      # Fallback summary for the check run output (max 65535 characters, GitHub API
+      # limit). Used when the agent does not supply a summary.
+      # (optional)
+      summary: "example-value"
+
+  # Format 2: Enable check run creation with default configuration (max: 1)
+  create-check-run: null
 
   # Enable AI agents to add labels to GitHub issues or pull requests based on
   # workflow analysis or classification.
@@ -4835,10 +5938,39 @@ safe-outputs:
     allowed-repos: []
       # Array of strings
 
+    # Conjunctive label constraint: ALL of these labels must be present on the
+    # issue/PR for the operation to proceed.
+    # (optional)
+    required-labels: []
+      # Array of strings
+
+    # Title prefix constraint: the issue/PR title must start with this prefix for the
+    # operation to proceed.
+    # (optional)
+    required-title-prefix: "example-value"
+
     # If true, emit step summary messages instead of making GitHub API calls for this
     # specific output type (preview mode)
     # (optional)
     staged: true
+
+    # Internal hidden feature. Optional list of declarative sample payloads that
+    # exercise this safe-output handler. Used by the hidden `gh aw compile
+    # --use-samples` flag to replace the agentic step with a deterministic replay
+    # through the safe-outputs MCP server. Each entry should conform to the
+    # corresponding MCP tool inputSchema; recognized sidecar keys (currently `patch`
+    # for create-pull-request and push-to-pull-request-branch) are stripped before
+    # schema validation and consumed by the replay driver.
+    # (optional)
+    # Accepted formats:
+
+    # Format 1: array
+    samples: []
+      # Array items: object
+
+    # Format 2: object
+    samples:
+      {}
 
   # Enable AI agents to remove labels from GitHub issues or pull requests.
   # (optional)
@@ -4897,10 +6029,39 @@ safe-outputs:
     allowed-repos: []
       # Array of strings
 
+    # Conjunctive label constraint: ALL of these labels must be present on the
+    # issue/PR for the operation to proceed.
+    # (optional)
+    required-labels: []
+      # Array of strings
+
+    # Title prefix constraint: the issue/PR title must start with this prefix for the
+    # operation to proceed.
+    # (optional)
+    required-title-prefix: "example-value"
+
     # If true, emit step summary messages instead of making GitHub API calls for this
     # specific output type (preview mode)
     # (optional)
     staged: true
+
+    # Internal hidden feature. Optional list of declarative sample payloads that
+    # exercise this safe-output handler. Used by the hidden `gh aw compile
+    # --use-samples` flag to replace the agentic step with a deterministic replay
+    # through the safe-outputs MCP server. Each entry should conform to the
+    # corresponding MCP tool inputSchema; recognized sidecar keys (currently `patch`
+    # for create-pull-request and push-to-pull-request-branch) are stripped before
+    # schema validation and consumed by the replay driver.
+    # (optional)
+    # Accepted formats:
+
+    # Format 1: array
+    samples: []
+      # Array items: object
+
+    # Format 2: object
+    samples:
+      {}
 
   # Enable AI agents to request reviews from users or teams on pull requests based
   # on code changes or expertise matching.
@@ -4913,9 +6074,10 @@ safe-outputs:
   # Format 2: Configuration for adding reviewers to pull requests from agentic
   # workflow output
   add-reviewer:
-    # Optional list of allowed reviewers. If omitted, any reviewers are allowed.
+    # Optional list of allowed reviewer usernames. If omitted, any reviewers are
+    # allowed.
     # (optional)
-    reviewers: []
+    allowed-reviewers: []
       # Array of strings
 
     # Optional allowed team reviewer or list of allowed team reviewers. If omitted,
@@ -4924,10 +6086,10 @@ safe-outputs:
     # Accepted formats:
 
     # Format 1: string
-    team-reviewers: "example-value"
+    allowed-team-reviewers: "example-value"
 
     # Format 2: array
-    team-reviewers: []
+    allowed-team-reviewers: []
       # Array items: string
 
     # Optional maximum number of reviewers to add (default: 3) Supports integer or
@@ -4951,6 +6113,12 @@ safe-outputs:
     # (optional)
     target-repo: "example-value"
 
+    # List of additional repositories in format 'owner/repo' that reviewers can be
+    # added in. The target repository is always implicitly allowed.
+    # (optional)
+    allowed-repos: []
+      # Array of strings
+
     # GitHub token to use for this specific output type. Overrides global github-token
     # if specified.
     # (optional)
@@ -4960,6 +6128,35 @@ safe-outputs:
     # specific output type (preview mode)
     # (optional)
     staged: true
+
+    # Internal hidden feature. Optional list of declarative sample payloads that
+    # exercise this safe-output handler. Used by the hidden `gh aw compile
+    # --use-samples` flag to replace the agentic step with a deterministic replay
+    # through the safe-outputs MCP server. Each entry should conform to the
+    # corresponding MCP tool inputSchema; recognized sidecar keys (currently `patch`
+    # for create-pull-request and push-to-pull-request-branch) are stripped before
+    # schema validation and consumed by the replay driver.
+    # (optional)
+    # Accepted formats:
+
+    # Format 1: array
+    samples: []
+      # Array items: object
+
+    # Format 2: object
+    samples:
+      {}
+
+    # All of these labels must be present on the target item for this operation to
+    # proceed
+    # (optional)
+    required-labels: []
+      # Array of strings
+
+    # The target item's title must start with this prefix for this operation to
+    # proceed
+    # (optional)
+    required-title-prefix: "example-value"
 
   # Enable AI agents to assign GitHub milestones to issues or pull requests based on
   # workflow analysis or project planning.
@@ -4989,10 +6186,21 @@ safe-outputs:
     # Format 2: GitHub Actions expression that resolves to an integer at runtime
     max: "example-value"
 
+    # Target for milestone assignment: 'triggering' (default, current issue/PR), '*'
+    # (any issue/PR), or explicit number.
+    # (optional)
+    target: "example-value"
+
     # Target repository in format 'owner/repo' for cross-repository milestone
     # assignment. Takes precedence over trial target repo settings.
     # (optional)
     target-repo: "example-value"
+
+    # List of additional repositories in format 'owner/repo' that milestone
+    # assignments can target. The target repository is always implicitly allowed.
+    # (optional)
+    allowed-repos: []
+      # Array of strings
 
     # GitHub token to use for this specific output type. Overrides global github-token
     # if specified.
@@ -5003,6 +6211,35 @@ safe-outputs:
     # specific output type (preview mode)
     # (optional)
     staged: true
+
+    # Internal hidden feature. Optional list of declarative sample payloads that
+    # exercise this safe-output handler. Used by the hidden `gh aw compile
+    # --use-samples` flag to replace the agentic step with a deterministic replay
+    # through the safe-outputs MCP server. Each entry should conform to the
+    # corresponding MCP tool inputSchema; recognized sidecar keys (currently `patch`
+    # for create-pull-request and push-to-pull-request-branch) are stripped before
+    # schema validation and consumed by the replay driver.
+    # (optional)
+    # Accepted formats:
+
+    # Format 1: array
+    samples: []
+      # Array items: object
+
+    # Format 2: object
+    samples:
+      {}
+
+    # All of these labels must be present on the target item for this operation to
+    # proceed
+    # (optional)
+    required-labels: []
+      # Array of strings
+
+    # The target item's title must start with this prefix for this operation to
+    # proceed
+    # (optional)
+    required-title-prefix: "example-value"
 
   # Enable AI agents to assign issues or pull requests to GitHub Copilot (@copilot)
   # for automated handling.
@@ -5065,6 +6302,12 @@ safe-outputs:
     # (optional)
     target-repo: "example-value"
 
+    # List of additional repositories in format 'owner/repo' that agents can be
+    # assigned in. The target repository is always implicitly allowed.
+    # (optional)
+    allowed-repos: []
+      # Array of strings
+
     # Target repository where the pull request should be created, in format
     # 'owner/repo'. If omitted, the PR will be created in the same repository as the
     # issue (specified by target-repo or the workflow's repository). This allows
@@ -5102,6 +6345,24 @@ safe-outputs:
     # specific output type (preview mode)
     # (optional)
     staged: true
+
+    # Internal hidden feature. Optional list of declarative sample payloads that
+    # exercise this safe-output handler. Used by the hidden `gh aw compile
+    # --use-samples` flag to replace the agentic step with a deterministic replay
+    # through the safe-outputs MCP server. Each entry should conform to the
+    # corresponding MCP tool inputSchema; recognized sidecar keys (currently `patch`
+    # for create-pull-request and push-to-pull-request-branch) are stripped before
+    # schema validation and consumed by the replay driver.
+    # (optional)
+    # Accepted formats:
+
+    # Format 1: array
+    samples: []
+      # Array items: object
+
+    # Format 2: object
+    samples:
+      {}
 
   # Enable AI agents to assign issues or pull requests to specific GitHub users
   # based on workflow logic or expertise matching.
@@ -5169,6 +6430,35 @@ safe-outputs:
     # (optional)
     staged: true
 
+    # Internal hidden feature. Optional list of declarative sample payloads that
+    # exercise this safe-output handler. Used by the hidden `gh aw compile
+    # --use-samples` flag to replace the agentic step with a deterministic replay
+    # through the safe-outputs MCP server. Each entry should conform to the
+    # corresponding MCP tool inputSchema; recognized sidecar keys (currently `patch`
+    # for create-pull-request and push-to-pull-request-branch) are stripped before
+    # schema validation and consumed by the replay driver.
+    # (optional)
+    # Accepted formats:
+
+    # Format 1: array
+    samples: []
+      # Array items: object
+
+    # Format 2: object
+    samples:
+      {}
+
+    # All of these labels must be present on the target item for this operation to
+    # proceed
+    # (optional)
+    required-labels: []
+      # Array of strings
+
+    # The target item's title must start with this prefix for this operation to
+    # proceed
+    # (optional)
+    required-title-prefix: "example-value"
+
   # Enable AI agents to unassign users from issues or pull requests. Useful for
   # reassigning work or removing users from issues.
   # (optional)
@@ -5230,6 +6520,35 @@ safe-outputs:
     # (optional)
     staged: true
 
+    # Internal hidden feature. Optional list of declarative sample payloads that
+    # exercise this safe-output handler. Used by the hidden `gh aw compile
+    # --use-samples` flag to replace the agentic step with a deterministic replay
+    # through the safe-outputs MCP server. Each entry should conform to the
+    # corresponding MCP tool inputSchema; recognized sidecar keys (currently `patch`
+    # for create-pull-request and push-to-pull-request-branch) are stripped before
+    # schema validation and consumed by the replay driver.
+    # (optional)
+    # Accepted formats:
+
+    # Format 1: array
+    samples: []
+      # Array items: object
+
+    # Format 2: object
+    samples:
+      {}
+
+    # All of these labels must be present on the target item for this operation to
+    # proceed
+    # (optional)
+    required-labels: []
+      # Array of strings
+
+    # The target item's title must start with this prefix for this operation to
+    # proceed
+    # (optional)
+    required-title-prefix: "example-value"
+
   # Enable AI agents to create hierarchical relationships between issues using
   # GitHub's sub-issue (tasklist) feature.
   # (optional)
@@ -5251,6 +6570,11 @@ safe-outputs:
 
     # Format 2: GitHub Actions expression that resolves to an integer at runtime
     max: "example-value"
+
+    # Target for sub-issue linking: 'triggering' (default, current issue), '*' (any
+    # issue), or explicit issue number.
+    # (optional)
+    target: "example-value"
 
     # Optional list of labels that parent issues must have to be eligible for linking
     # (optional)
@@ -5275,6 +6599,12 @@ safe-outputs:
     # (optional)
     target-repo: "example-value"
 
+    # List of additional repositories in format 'owner/repo' that sub-issue linking
+    # can target. The target repository is always implicitly allowed.
+    # (optional)
+    allowed-repos: []
+      # Array of strings
+
     # GitHub token to use for this specific output type. Overrides global github-token
     # if specified.
     # (optional)
@@ -5284,6 +6614,24 @@ safe-outputs:
     # specific output type (preview mode)
     # (optional)
     staged: true
+
+    # Internal hidden feature. Optional list of declarative sample payloads that
+    # exercise this safe-output handler. Used by the hidden `gh aw compile
+    # --use-samples` flag to replace the agentic step with a deterministic replay
+    # through the safe-outputs MCP server. Each entry should conform to the
+    # corresponding MCP tool inputSchema; recognized sidecar keys (currently `patch`
+    # for create-pull-request and push-to-pull-request-branch) are stripped before
+    # schema validation and consumed by the replay driver.
+    # (optional)
+    # Accepted formats:
+
+    # Format 1: array
+    samples: []
+      # Array items: object
+
+    # Format 2: object
+    samples:
+      {}
 
   # Enable AI agents to edit and update existing GitHub issue content, titles,
   # labels, assignees, and metadata.
@@ -5356,6 +6704,35 @@ safe-outputs:
     # (optional)
     staged: true
 
+    # Internal hidden feature. Optional list of declarative sample payloads that
+    # exercise this safe-output handler. Used by the hidden `gh aw compile
+    # --use-samples` flag to replace the agentic step with a deterministic replay
+    # through the safe-outputs MCP server. Each entry should conform to the
+    # corresponding MCP tool inputSchema; recognized sidecar keys (currently `patch`
+    # for create-pull-request and push-to-pull-request-branch) are stripped before
+    # schema validation and consumed by the replay driver.
+    # (optional)
+    # Accepted formats:
+
+    # Format 1: array
+    samples: []
+      # Array items: object
+
+    # Format 2: object
+    samples:
+      {}
+
+    # All of these labels must be present on the target item for this operation to
+    # proceed
+    # (optional)
+    required-labels: []
+      # Array of strings
+
+    # The target item's title must start with this prefix for this operation to
+    # proceed
+    # (optional)
+    required-title-prefix: "example-value"
+
   # Format 2: Enable issue updating with default configuration
   update-issue: null
 
@@ -5412,6 +6789,12 @@ safe-outputs:
     # (optional)
     target-repo: "example-value"
 
+    # List of additional repositories in format 'owner/repo' that pull requests can be
+    # updated in. The target repository is always implicitly allowed.
+    # (optional)
+    allowed-repos: []
+      # Array of strings
+
     # GitHub token to use for this specific output type. Overrides global github-token
     # if specified.
     # (optional)
@@ -5421,6 +6804,35 @@ safe-outputs:
     # specific output type (preview mode)
     # (optional)
     staged: true
+
+    # Internal hidden feature. Optional list of declarative sample payloads that
+    # exercise this safe-output handler. Used by the hidden `gh aw compile
+    # --use-samples` flag to replace the agentic step with a deterministic replay
+    # through the safe-outputs MCP server. Each entry should conform to the
+    # corresponding MCP tool inputSchema; recognized sidecar keys (currently `patch`
+    # for create-pull-request and push-to-pull-request-branch) are stripped before
+    # schema validation and consumed by the replay driver.
+    # (optional)
+    # Accepted formats:
+
+    # Format 1: array
+    samples: []
+      # Array items: object
+
+    # Format 2: object
+    samples:
+      {}
+
+    # All of these labels must be present on the target item for this operation to
+    # proceed
+    # (optional)
+    required-labels: []
+      # Array of strings
+
+    # The target item's title must start with this prefix for this operation to
+    # proceed
+    # (optional)
+    required-title-prefix: "example-value"
 
   # Format 2: Enable pull request updating with default configuration (title and
   # body updates enabled)
@@ -5447,21 +6859,32 @@ safe-outputs:
     # Format 2: GitHub Actions expression that resolves to an integer at runtime
     max: "example-value"
 
-    # List of labels that must all be present on the pull request before merge is
+    # List of labels that must ALL be present on the pull request before merge is
     # allowed.
     # (optional)
     required-labels: []
       # Array of strings
 
-    # Exact pull request label names. At least one existing PR label must exactly
-    # match one of these values when configured.
-    # (optional)
-    allowed-labels: []
-      # Array of strings
-
-    # Glob patterns for allowed source branch names (pull request head ref).
+    # Glob patterns for allowed source branch names (pull request head ref). The PR's
+    # branch must match at least one pattern.
     # (optional)
     allowed-branches: []
+      # Array of strings
+
+    # Target for merging: 'triggering' (default, current PR), or '*' (any PR with
+    # pull_request_number field)
+    # (optional)
+    target: "example-value"
+
+    # Target repository in format 'owner/repo' for cross-repository operations. Takes
+    # precedence over trial target repo settings.
+    # (optional)
+    target-repo: "example-value"
+
+    # List of additional repositories in format 'owner/repo' that pull requests can be
+    # merged in. The target repository is always implicitly allowed.
+    # (optional)
+    allowed-repos: []
       # Array of strings
 
     # GitHub token to use for this specific output type. Overrides global github-token
@@ -5473,6 +6896,29 @@ safe-outputs:
     # merge API call.
     # (optional)
     staged: true
+
+    # Internal hidden feature. Optional list of declarative sample payloads that
+    # exercise this safe-output handler. Used by the hidden `gh aw compile
+    # --use-samples` flag to replace the agentic step with a deterministic replay
+    # through the safe-outputs MCP server. Each entry should conform to the
+    # corresponding MCP tool inputSchema; recognized sidecar keys (currently `patch`
+    # for create-pull-request and push-to-pull-request-branch) are stripped before
+    # schema validation and consumed by the replay driver.
+    # (optional)
+    # Accepted formats:
+
+    # Format 1: array
+    samples: []
+      # Array items: object
+
+    # Format 2: object
+    samples:
+      {}
+
+    # The target item's title must start with this prefix for this operation to
+    # proceed
+    # (optional)
+    required-title-prefix: "example-value"
 
   # Enable AI agents to push commits directly to pull request branches for automated
   # fixes or improvements.
@@ -5510,7 +6956,7 @@ safe-outputs:
     # Required prefix for pull request title. Only pull requests with this prefix will
     # be accepted.
     # (optional)
-    title-prefix: "example-value"
+    required-title-prefix: "example-value"
 
     # Required labels for pull request validation. Only pull requests with all these
     # labels will be accepted. Accepts an array of label names or a GitHub Actions
@@ -5520,12 +6966,12 @@ safe-outputs:
     # Accepted formats:
 
     # Format 1: Array of label names
-    labels: []
+    required-labels: []
       # Array items: string
 
     # Format 2: GitHub Actions expression resolving to a comma-separated list of label
     # names (e.g. '${{ inputs[\'required-labels\'] }}')
-    labels: "example-value"
+    required-labels: "example-value"
 
     # Behavior when no changes to push: 'warn' (default - log warning but succeed),
     # 'error' (fail the action), or 'ignore' (silent success)
@@ -5543,6 +6989,12 @@ safe-outputs:
     # (optional)
     commit-title-suffix: "example-value"
 
+    # Maximum allowed size for git patches in kilobytes (KB) for
+    # push-to-pull-request-branch only. Overrides safe-outputs max-patch-size for this
+    # output type. Defaults to 4096 KB (4 MB) when unset.
+    # (optional)
+    max-patch-size: 1
+
     # GitHub token to use for this specific output type. Overrides global github-token
     # if specified.
     # (optional)
@@ -5552,6 +7004,24 @@ safe-outputs:
     # specific output type (preview mode)
     # (optional)
     staged: true
+
+    # Internal hidden feature. Optional list of declarative sample payloads that
+    # exercise this safe-output handler. Used by the hidden `gh aw compile
+    # --use-samples` flag to replace the agentic step with a deterministic replay
+    # through the safe-outputs MCP server. Each entry should conform to the
+    # corresponding MCP tool inputSchema; recognized sidecar keys (currently `patch`
+    # for create-pull-request and push-to-pull-request-branch) are stripped before
+    # schema validation and consumed by the replay driver.
+    # (optional)
+    # Accepted formats:
+
+    # Format 1: array
+    samples: []
+      # Array items: object
+
+    # Format 2: object
+    samples:
+      {}
 
     # Token used to push an empty commit after pushing changes to trigger CI events.
     # Works around the GITHUB_TOKEN limitation where pushes don't trigger workflow
@@ -5568,8 +7038,17 @@ safe-outputs:
     # (optional)
     fallback-as-pull-request: true
 
+    # When true (default), signed commits are required and pushes use GitHub's
+    # createCommitOnBranch GraphQL mutation so GitHub signs them. Set to false to use
+    # git push directly for repositories that do not require signed commits; this also
+    # allows pushing merge commits that GraphQL cannot represent.
+    # (optional)
+    signed-commits: true
+
     # Target repository in format 'owner/repo' for cross-repository push to pull
-    # request branch. Takes precedence over trial target repo settings.
+    # request branch, or '*' to let the agent choose the target repository at runtime
+    # (requires checkout: configs with path: for each possible target). Takes
+    # precedence over trial target repo settings.
     # (optional)
     target-repo: "example-value"
 
@@ -5655,16 +7134,16 @@ safe-outputs:
     excluded-files: []
       # Array of strings
 
-    # Transport format for packaging changes. "bundle" (default) uses git bundle.
-    # "am" uses git format-patch/git am. Accepts a GitHub Actions expression for reusable
+    # Transport format for packaging changes. "bundle" (default) uses git bundle. "am"
+    # uses git format-patch/git am. Accepts a GitHub Actions expression for reusable
     # workflows.
     # (optional)
     # Accepted formats:
 
     # Format 1: Transport format for packaging changes. "bundle" (default) uses git
-    # bundle. "am" uses git format-patch/git am, while "bundle" preserves merge commit
-    # topology, per-commit authorship, and merge-resolution-only content.
-    patch-format: "bundle"
+    # bundle, which preserves merge commit topology, per-commit authorship, and
+    # merge-resolution-only content. "am" uses git format-patch/git am.
+    patch-format: "am"
 
     # Format 2: GitHub Actions expression that resolves to 'am' or 'bundle' at
     # runtime. Use in reusable workflow_call workflows to parameterise the transport
@@ -5707,10 +7186,21 @@ safe-outputs:
     # Format 2: GitHub Actions expression that resolves to an integer at runtime
     max: "example-value"
 
+    # Target for comment hiding: 'triggering' (default, current issue/PR), '*' (any
+    # item), or explicit number.
+    # (optional)
+    target: "example-value"
+
     # Target repository in format 'owner/repo' for cross-repository comment hiding.
     # Takes precedence over trial target repo settings.
     # (optional)
     target-repo: "example-value"
+
+    # List of additional repositories in format 'owner/repo' that comment hiding can
+    # target. The target repository is always implicitly allowed.
+    # (optional)
+    allowed-repos: []
+      # Array of strings
 
     # List of allowed reasons for hiding comments. Default: all reasons allowed (spam,
     # abuse, off_topic, outdated, resolved, low_quality).
@@ -5729,6 +7219,35 @@ safe-outputs:
     # specific output type (preview mode)
     # (optional)
     staged: true
+
+    # Internal hidden feature. Optional list of declarative sample payloads that
+    # exercise this safe-output handler. Used by the hidden `gh aw compile
+    # --use-samples` flag to replace the agentic step with a deterministic replay
+    # through the safe-outputs MCP server. Each entry should conform to the
+    # corresponding MCP tool inputSchema; recognized sidecar keys (currently `patch`
+    # for create-pull-request and push-to-pull-request-branch) are stripped before
+    # schema validation and consumed by the replay driver.
+    # (optional)
+    # Accepted formats:
+
+    # Format 1: array
+    samples: []
+      # Array items: object
+
+    # Format 2: object
+    samples:
+      {}
+
+    # All of these labels must be present on the target item for this operation to
+    # proceed
+    # (optional)
+    required-labels: []
+      # Array of strings
+
+    # The target item's title must start with this prefix for this operation to
+    # proceed
+    # (optional)
+    required-title-prefix: "example-value"
 
   # Enable AI agents to set or clear the type of GitHub issues. Use an empty string
   # to clear the current type.
@@ -5786,6 +7305,119 @@ safe-outputs:
     # (optional)
     staged: true
 
+    # Internal hidden feature. Optional list of declarative sample payloads that
+    # exercise this safe-output handler. Used by the hidden `gh aw compile
+    # --use-samples` flag to replace the agentic step with a deterministic replay
+    # through the safe-outputs MCP server. Each entry should conform to the
+    # corresponding MCP tool inputSchema; recognized sidecar keys (currently `patch`
+    # for create-pull-request and push-to-pull-request-branch) are stripped before
+    # schema validation and consumed by the replay driver.
+    # (optional)
+    # Accepted formats:
+
+    # Format 1: array
+    samples: []
+      # Array items: object
+
+    # Format 2: object
+    samples:
+      {}
+
+    # All of these labels must be present on the target item for this operation to
+    # proceed
+    # (optional)
+    required-labels: []
+      # Array of strings
+
+    # The target item's title must start with this prefix for this operation to
+    # proceed
+    # (optional)
+    required-title-prefix: "example-value"
+
+  # Enable AI agents to set one issue field value by field name and value.
+  # (optional)
+  # Accepted formats:
+
+  # Format 1: Null configuration enables set-issue-field with defaults.
+  set-issue-field: null
+
+  # Format 2: Configuration for setting one issue field value by field name and
+  # value.
+  set-issue-field:
+    # Optional maximum number of set-issue-field operations (default: 5). Supports
+    # integer or GitHub Actions expression (e.g. '${{ inputs.max }}').
+    # (optional)
+    # Accepted formats:
+
+    # Format 1: integer
+    max: 1
+
+    # Format 2: GitHub Actions expression that resolves to an integer at runtime
+    max: "example-value"
+
+    # Target for issue field updates: 'triggering' (default), '*' (any issue), or
+    # explicit issue number
+    # (optional)
+    target: "example-value"
+
+    # Optional list of issue field names that can be modified by set-issue-field. If
+    # omitted or empty, any issue field may be set. Use ['*'] to explicitly allow all.
+    # (optional)
+    allowed-fields: []
+      # Array of strings
+
+    # Target repository in format 'owner/repo' for cross-repository issue field
+    # updates. Takes precedence over trial target repo settings.
+    # (optional)
+    target-repo: "example-value"
+
+    # List of additional repositories in format 'owner/repo' where issue fields can be
+    # updated. When specified, the agent can use a 'repo' field in the output to
+    # specify which repository to target. The target repository (current or
+    # target-repo) is always implicitly allowed.
+    # (optional)
+    allowed-repos: []
+      # Array of strings
+
+    # GitHub token to use for this specific output type. Overrides global github-token
+    # if specified.
+    # (optional)
+    github-token: "${{ secrets.GITHUB_TOKEN }}"
+
+    # If true, emit step summary messages instead of making GitHub API calls for this
+    # specific output type (preview mode)
+    # (optional)
+    staged: true
+
+    # Internal hidden feature. Optional list of declarative sample payloads that
+    # exercise this safe-output handler. Used by the hidden `gh aw compile
+    # --use-samples` flag to replace the agentic step with a deterministic replay
+    # through the safe-outputs MCP server. Each entry should conform to the
+    # corresponding MCP tool inputSchema; recognized sidecar keys (currently `patch`
+    # for create-pull-request and push-to-pull-request-branch) are stripped before
+    # schema validation and consumed by the replay driver.
+    # (optional)
+    # Accepted formats:
+
+    # Format 1: array
+    samples: []
+      # Array items: object
+
+    # Format 2: object
+    samples:
+      {}
+
+    # All of these labels must be present on the target item for this operation to
+    # proceed
+    # (optional)
+    required-labels: []
+      # Array of strings
+
+    # The target item's title must start with this prefix for this operation to
+    # proceed
+    # (optional)
+    required-title-prefix: "example-value"
+
   # Dispatch workflow_dispatch events to other workflows. Used by orchestrators to
   # delegate work to worker workflows with controlled maximum dispatch count.
   # (optional)
@@ -5821,6 +7453,20 @@ safe-outputs:
     # (optional)
     target-repo: "example-value"
 
+    # List of repositories in format 'owner/repo' that cross-repository workflow
+    # dispatch may target. Supports arrays and GitHub Actions expressions resolving to
+    # a comma-separated list (e.g. '${{ inputs['allowed-repos'] }}').
+    # (optional)
+    # Accepted formats:
+
+    # Format 1: array
+    allowed-repos: []
+      # Array items: string
+
+    # Format 2: GitHub Actions expression resolving to a comma-separated list of
+    # repository slugs (e.g. '${{ inputs['allowed-repos'] }}')
+    allowed-repos: "example-value"
+
     # Git ref (branch, tag, or SHA) to use when dispatching the workflow. For
     # workflow_call relay scenarios this is auto-injected by the compiler from
     # needs.activation.outputs.target_ref. Overrides the caller's GITHUB_REF.
@@ -5831,6 +7477,24 @@ safe-outputs:
     # specific output type (preview mode)
     # (optional)
     staged: true
+
+    # Internal hidden feature. Optional list of declarative sample payloads that
+    # exercise this safe-output handler. Used by the hidden `gh aw compile
+    # --use-samples` flag to replace the agentic step with a deterministic replay
+    # through the safe-outputs MCP server. Each entry should conform to the
+    # corresponding MCP tool inputSchema; recognized sidecar keys (currently `patch`
+    # for create-pull-request and push-to-pull-request-branch) are stripped before
+    # schema validation and consumed by the replay driver.
+    # (optional)
+    # Accepted formats:
+
+    # Format 1: array
+    samples: []
+      # Array items: object
+
+    # Format 2: object
+    samples:
+      {}
 
   # Format 2: Shorthand array format: list of workflow names (without .md extension)
   # to allow dispatching
@@ -5879,6 +7543,24 @@ safe-outputs:
     # specific output type (preview mode)
     # (optional)
     staged: true
+
+    # Internal hidden feature. Optional list of declarative sample payloads that
+    # exercise this safe-output handler. Used by the hidden `gh aw compile
+    # --use-samples` flag to replace the agentic step with a deterministic replay
+    # through the safe-outputs MCP server. Each entry should conform to the
+    # corresponding MCP tool inputSchema; recognized sidecar keys (currently `patch`
+    # for create-pull-request and push-to-pull-request-branch) are stripped before
+    # schema validation and consumed by the replay driver.
+    # (optional)
+    # Accepted formats:
+
+    # Format 1: array
+    samples: []
+      # Array items: object
+
+    # Format 2: object
+    samples:
+      {}
 
   # Format 2: Shorthand array format: list of workflow names (without .md extension)
   # to allow calling
@@ -5934,6 +7616,24 @@ safe-outputs:
     # specific output type (preview mode)
     # (optional)
     staged: true
+
+    # Internal hidden feature. Optional list of declarative sample payloads that
+    # exercise this safe-output handler. Used by the hidden `gh aw compile
+    # --use-samples` flag to replace the agentic step with a deterministic replay
+    # through the safe-outputs MCP server. Each entry should conform to the
+    # corresponding MCP tool inputSchema; recognized sidecar keys (currently `patch`
+    # for create-pull-request and push-to-pull-request-branch) are stripped before
+    # schema validation and consumed by the replay driver.
+    # (optional)
+    # Accepted formats:
+
+    # Format 1: array
+    samples: []
+      # Array items: object
+
+    # Format 2: object
+    samples:
+      {}
 
   # Format 2: Enable missing tool reporting with default configuration
   missing-tool: null
@@ -5994,6 +7694,24 @@ safe-outputs:
     # (optional)
     staged: true
 
+    # Internal hidden feature. Optional list of declarative sample payloads that
+    # exercise this safe-output handler. Used by the hidden `gh aw compile
+    # --use-samples` flag to replace the agentic step with a deterministic replay
+    # through the safe-outputs MCP server. Each entry should conform to the
+    # corresponding MCP tool inputSchema; recognized sidecar keys (currently `patch`
+    # for create-pull-request and push-to-pull-request-branch) are stripped before
+    # schema validation and consumed by the replay driver.
+    # (optional)
+    # Accepted formats:
+
+    # Format 1: array
+    samples: []
+      # Array items: object
+
+    # Format 2: object
+    samples:
+      {}
+
   # Format 2: Enable missing data reporting with default configuration
   missing-data: null
 
@@ -6034,6 +7752,24 @@ safe-outputs:
     # specific output type (preview mode)
     # (optional)
     staged: true
+
+    # Internal hidden feature. Optional list of declarative sample payloads that
+    # exercise this safe-output handler. Used by the hidden `gh aw compile
+    # --use-samples` flag to replace the agentic step with a deterministic replay
+    # through the safe-outputs MCP server. Each entry should conform to the
+    # corresponding MCP tool inputSchema; recognized sidecar keys (currently `patch`
+    # for create-pull-request and push-to-pull-request-branch) are stripped before
+    # schema validation and consumed by the replay driver.
+    # (optional)
+    # Accepted formats:
+
+    # Format 1: array
+    samples: []
+      # Array items: object
+
+    # Format 2: object
+    samples:
+      {}
 
   # Format 2: Enable noop output with default configuration (max: 1)
   noop: null
@@ -6082,6 +7818,24 @@ safe-outputs:
     # specific output type (preview mode)
     # (optional)
     staged: true
+
+    # Internal hidden feature. Optional list of declarative sample payloads that
+    # exercise this safe-output handler. Used by the hidden `gh aw compile
+    # --use-samples` flag to replace the agentic step with a deterministic replay
+    # through the safe-outputs MCP server. Each entry should conform to the
+    # corresponding MCP tool inputSchema; recognized sidecar keys (currently `patch`
+    # for create-pull-request and push-to-pull-request-branch) are stripped before
+    # schema validation and consumed by the replay driver.
+    # (optional)
+    # Accepted formats:
+
+    # Format 1: array
+    samples: []
+      # Array items: object
+
+    # Format 2: object
+    samples:
+      {}
 
   # Format 2: Enable asset publishing with default configuration
   upload-asset: null
@@ -6199,6 +7953,24 @@ safe-outputs:
     # (optional)
     staged: true
 
+    # Internal hidden feature. Optional list of declarative sample payloads that
+    # exercise this safe-output handler. Used by the hidden `gh aw compile
+    # --use-samples` flag to replace the agentic step with a deterministic replay
+    # through the safe-outputs MCP server. Each entry should conform to the
+    # corresponding MCP tool inputSchema; recognized sidecar keys (currently `patch`
+    # for create-pull-request and push-to-pull-request-branch) are stripped before
+    # schema validation and consumed by the replay driver.
+    # (optional)
+    # Accepted formats:
+
+    # Format 1: array
+    samples: []
+      # Array items: object
+
+    # Format 2: object
+    samples:
+      {}
+
   # Format 2: Enable release updates with default configuration
   update-release: null
 
@@ -6236,6 +8008,11 @@ safe-outputs:
     # mint a GitHub App token.
     # (optional)
     private-key: "example-value"
+
+    # If true, skip token minting when client-id/private-key resolve to empty strings
+    # at runtime. Defaults to false.
+    # (optional)
+    ignore-if-missing: true
 
     # Optional owner of the GitHub App installation (defaults to current repository
     # owner if not specified)
@@ -6406,7 +8183,7 @@ safe-outputs:
       # (optional)
       workflows: "read"
 
-  # Maximum allowed size for git patches in kilobytes (KB). Defaults to 1024 KB (1
+  # Maximum allowed size for git patches in kilobytes (KB). Defaults to 4096 KB (4
   # MB). If patch exceeds this size, the job will fail.
   # (optional)
   max-patch-size: 1
@@ -6468,10 +8245,51 @@ safe-outputs:
     # (optional)
     post-steps: []
 
-    # Runner specification for the detection job. Overrides agent.runs-on for the
-    # detection job only. Defaults to agent.runs-on.
+    # Per-run AI Credits budget for threat-detection engine execution. Accepts numeric
+    # values only (expressions are not supported). When unset, gh-aw emits a runtime
+    # default expression `${{ vars.GH_AW_DEFAULT_DETECTION_MAX_AI_CREDITS || '400'
+    # }}`.
     # (optional)
+    # Accepted formats:
+
+    # Format 1: Configuration object
+
+    # Format 2: integer
+    max-ai-credits: 1
+
+    # Format 3: string
+    max-ai-credits: "example-value"
+
+    # Runner specification for the detection job. Overrides agent.runs-on for the
+    # detection job only. Supports string, array, or runner-group object forms.
+    # Defaults to agent.runs-on.
+    # (optional)
+    # Accepted formats:
+
+    # Format 1: Simple runner label string. Use for standard GitHub-hosted runners
+    # (e.g., 'ubuntu-latest', 'windows-latest', 'macos-latest') or self-hosted runner
+    # labels. Most common form for agentic workflows.
     runs-on: "example-value"
+
+    # Format 2: Array of runner labels for selection with fallbacks. GitHub Actions
+    # will use the first available runner that matches any label in the array. Useful
+    # for high-availability setups or when multiple runner types are acceptable.
+    runs-on: []
+      # Array items: string
+
+    # Format 3: Runner group configuration for GitHub-hosted runners. Use this form to
+    # target specific runner groups (e.g., larger runners with more CPU/memory) or
+    # self-hosted runner pools with specific label requirements. Agentic workflows may
+    # benefit from larger runners for complex AI processing tasks.
+    runs-on:
+      # Runner group name for self-hosted runners or GitHub-hosted runner groups
+      # (optional)
+      group: "example-value"
+
+      # List of runner labels for self-hosted runners or GitHub-hosted runner selection
+      # (optional)
+      labels: []
+        # Array of strings
 
     # When true (default), detection failures produce warnings and allow safe outputs
     # to proceed with a caution notice and 'needs-review' label. When false, detection
@@ -6507,13 +8325,15 @@ safe-outputs:
   # Custom message templates for safe-output footer and notification messages.
   # Available placeholders: {workflow_name} (workflow name), {run_url} (GitHub
   # Actions run URL), {triggering_number} (issue/PR/discussion number),
-  # {workflow_source} (owner/repo/path@ref), {workflow_source_url} (GitHub URL to
+  # {triggering_type} (issue, PR, or discussion), {workflow_source}
+  # (owner/repo/path@ref), {workflow_source_url} (GitHub URL to
   # source), {operation} (safe-output operation name for staged mode).
   # (optional)
   messages:
     # Custom footer message template for AI-generated content. Available placeholders:
-    # {workflow_name}, {run_url}, {triggering_number}, {workflow_source},
-    # {workflow_source_url}. Example: '> Generated by [{workflow_name}]({run_url})'
+    # {workflow_name}, {run_url}, {triggering_number}, {triggering_type},
+    # {workflow_source}, {workflow_source_url}. Example: '> Generated by
+    # [{workflow_name}]({run_url})'
     # (optional)
     footer: "example-value"
 
@@ -6641,6 +8461,18 @@ safe-outputs:
     allowed: []
       # Array of strings
 
+    # List of team slugs whose members are always allowed to be mentioned. Accepts
+    # "team-slug" (resolved against the current org) or "org/team-slug" format.
+    # Members of these teams are fetched from the GitHub API at runtime and added to
+    # the allowed mentions list. Bots are excluded.
+    # IMPORTANT: Requires read:org scope — not available with the default GITHUB_TOKEN.
+    # Use a classic PAT with read:org, a fine-grained PAT with Members:Read, or a
+    # GitHub App with the Members:Read permission. Without the required scope, team
+    # lookups fail silently (warning logged) and those team members are skipped.
+    # (optional)
+    allowed-teams: []
+      # Array of strings, e.g. ["myorg/eng", "reviewers"]
+
     # Maximum number of mentions allowed per message. Default: 50 Supports integer or
     # GitHub Actions expression (e.g. '${{ inputs.max }}').
     # (optional)
@@ -6673,11 +8505,24 @@ safe-outputs:
   # (optional)
   group-reports: true
 
-  # When false, disables creating failure tracking issues when workflows fail.
-  # Useful for workflows where failures are expected or handled elsewhere. Defaults
-  # to true.
   # (optional)
+  # Accepted formats:
+
+  # Format 1: When false, disables creating failure tracking issues when workflows
+  # fail. When true, all failures trigger issues. Defaults to true.
   report-failure-as-issue: true
+
+  # Format 2: List of failure categories that should trigger issue creation.
+  # Categories can be prefixed with '!' to exclude them (e.g.,
+  # '!inference_access_error'). If only non-prefixed categories are specified, only
+  # those categories trigger issues. If only prefixed (excluded) categories are
+  # specified, all categories except those trigger issues. If both are specified,
+  # categories must match included AND not match excluded. Common categories:
+  # agent_failure, timed_out, missing_safe_outputs, report_incomplete, missing_tool,
+  # missing_data, inference_access_error, mcp_policy_error,
+  # ai_credits_rate_limit_error, max_ai_credits_exceeded.
+  report-failure-as-issue: []
+    # Array items: string
 
   # Repository to create failure tracking issues in, in the format 'owner/repo'.
   # Useful when the current repository has issues disabled. Defaults to the current
@@ -6714,6 +8559,12 @@ safe-outputs:
   # (optional)
   concurrency-group: "example-value"
 
+  # Timeout for the safe_outputs job in minutes. Defaults to 45 minutes. Increase
+  # for workflows with many sequential safe output operations (e.g.
+  # push_to_pull_request_branch against large repositories).
+  # (optional)
+  timeout-minutes: 1
+
   # Explicit additional custom workflow jobs that the consolidated safe_outputs job
   # should depend on.
   # (optional)
@@ -6740,11 +8591,36 @@ safe-outputs:
     url: "example-value"
 
   # Runner specification for all safe-outputs jobs (activation, create-issue,
-  # add-comment, etc.). Single runner label (e.g., 'ubuntu-slim', 'ubuntu-latest',
-  # 'windows-latest', 'self-hosted'). Defaults to 'ubuntu-slim'. See
+  # add-comment, etc.). Supports string, array, or runner-group object forms.
+  # Defaults to 'ubuntu-slim'. See
   # https://github.blog/changelog/2025-10-28-1-vcpu-linux-runner-now-available-in-github-actions-in-public-preview/
   # (optional)
+  # Accepted formats:
+
+  # Format 1: Simple runner label string. Use for standard GitHub-hosted runners
+  # (e.g., 'ubuntu-latest', 'windows-latest', 'macos-latest') or self-hosted runner
+  # labels. Most common form for agentic workflows.
   runs-on: "example-value"
+
+  # Format 2: Array of runner labels for selection with fallbacks. GitHub Actions
+  # will use the first available runner that matches any label in the array. Useful
+  # for high-availability setups or when multiple runner types are acceptable.
+  runs-on: []
+    # Array items: string
+
+  # Format 3: Runner group configuration for GitHub-hosted runners. Use this form to
+  # target specific runner groups (e.g., larger runners with more CPU/memory) or
+  # self-hosted runner pools with specific label requirements. Agentic workflows may
+  # benefit from larger runners for complex AI processing tasks.
+  runs-on:
+    # Runner group name for self-hosted runners or GitHub-hosted runner groups
+    # (optional)
+    group: "example-value"
+
+    # List of runner labels for self-hosted runners or GitHub-hosted runner selection
+    # (optional)
+    labels: []
+      # Array of strings
 
   # Custom steps to inject into all safe-output jobs. These steps run after checking
   # out the repository and setting up the action, and before any safe-output code
@@ -6811,6 +8687,24 @@ safe-outputs:
     # specific output type (preview mode)
     # (optional)
     staged: true
+
+    # Internal hidden feature. Optional list of declarative sample payloads that
+    # exercise this safe-output handler. Used by the hidden `gh aw compile
+    # --use-samples` flag to replace the agentic step with a deterministic replay
+    # through the safe-outputs MCP server. Each entry should conform to the
+    # corresponding MCP tool inputSchema; recognized sidecar keys (currently `patch`
+    # for create-pull-request and push-to-pull-request-branch) are stripped before
+    # schema validation and consumed by the replay driver.
+    # (optional)
+    # Accepted formats:
+
+    # Format 1: array
+    samples: []
+      # Array items: object
+
+    # Format 2: object
+    samples:
+      {}
 
   # Format 2: Enable report_incomplete with default configuration
   report-incomplete: null
@@ -6891,6 +8785,46 @@ observability:
     # variable.
     headers: "example-value"
 
+    # How to handle missing OTLP endpoint/header values at runtime (for example from
+    # unset secrets). 'error' fails workflow startup (default), 'warn' logs a warning
+    # and skips MCP gateway OTLP configuration, and 'ignore' skips MCP gateway OTLP
+    # configuration without warning. This affects MCP gateway setup only;
+    # workflow-level OTEL_* environment variables are still injected.
+    # (optional)
+    if-missing: "error"
+
+    # Additional OTEL_RESOURCE_ATTRIBUTES entries to append to the standard
+    # gh-aw/GitHub resource attributes. Values may be static strings or GitHub Actions
+    # expressions such as '${{ github.repository }}'. Do not use secrets.* or vars.*
+    # expressions here: resource attributes are exported to external tracing backends
+    # and are not treated as secret values.
+    # (optional)
+    resource-attributes:
+      {}
+
+    # Optional runtime authentication for OTLP export. Supports GitHub App credentials
+    # (client-id/app-id + private-key) for token minting, or implicit GitHub OIDC mode
+    # when the github-app object is present without credentials.
+    # (optional)
+    github-app:
+      # Deprecated alias for client-id. GitHub App ID/client ID (e.g., '${{ vars.APP_ID
+      # }}').
+      # (optional)
+      app-id: "example-value"
+
+      # GitHub App client ID (e.g., '${{ vars.APP_ID }}').
+      # (optional)
+      client-id: "example-value"
+
+      # GitHub App private key (e.g., '${{ secrets.APP_PRIVATE_KEY }}').
+      # (optional)
+      private-key: "example-value"
+
+      # If true, skip token minting when client-id/private-key resolve to empty strings
+      # at runtime. Defaults to false.
+      # (optional)
+      ignore-if-missing: true
+
 # Rate limiting configuration to restrict how frequently users can trigger the
 # workflow. Helps prevent abuse and resource exhaustion from programmatically
 # triggered events.
@@ -6956,17 +8890,6 @@ private: true
 # https://github.github.com/gh-aw/reference/frontmatter/#check-for-updates
 # (optional)
 check-for-updates: true
-
-# Allow npm pre/post install scripts to execute during package installation. By
-# default, --ignore-scripts is added to all generated npm install commands to
-# prevent supply chain attacks via malicious install hooks. Setting
-# run-install-scripts: true disables this protection globally (all runtimes). A
-# supply chain security warning is emitted at compile time; in strict mode this is
-# an error. Per-runtime control is also available via
-# runtimes.<runtime>.run-install-scripts. See:
-# https://github.github.com/gh-aw/reference/frontmatter/#run-install-scripts
-# (optional)
-run-install-scripts: true
 
 # MCP Scripts configuration for defining custom lightweight MCP tools as
 # JavaScript, shell scripts, or Python scripts. Tools are mounted in an MCP server
@@ -7061,6 +8984,11 @@ checkout:
     # mint a GitHub App token.
     # (optional)
     private-key: "example-value"
+
+    # If true, skip token minting when client-id/private-key resolve to empty strings
+    # at runtime. Defaults to false.
+    # (optional)
+    ignore-if-missing: true
 
     # Optional owner of the GitHub App installation (defaults to current repository
     # owner if not specified)
@@ -7258,6 +9186,12 @@ checkout:
   # (optional)
   wiki: true
 
+  # When true, persist credentials during checkout, then immediately run a
+  # post-checkout cleanup step that removes credentials from root and submodule git
+  # configs. Useful for submodule-safe cleanup behavior.
+  # (optional)
+  force-clean-git-credentials: true
+
 # Format 2: Multiple checkout configurations
 checkout: []
   # Array items: undefined
@@ -7265,228 +9199,6 @@ checkout: []
 # Format 3: Set to false to disable the default checkout step. The agent job will
 # not check out any repository (dev-mode checkouts are unaffected).
 checkout: false
-
-# APM package references to install. Supports array format (list of package slugs)
-# or object format with packages and isolated fields.
-# (optional)
-# Accepted formats:
-
-# Format 1: Simple array of APM package references.
-dependencies: []
-  # Array items: APM package reference in the format 'org/repo' or
-  # 'org/repo/path/to/skill'
-
-# Format 2: Object format with packages and optional isolated flag.
-dependencies:
-  # List of APM package references to install.
-  packages: []
-    # Array of APM package reference in the format 'org/repo' or
-    # 'org/repo/path/to/skill'
-
-  # If true, agent restore step clears primitive dirs before unpacking.
-  # (optional)
-  isolated: true
-
-  # GitHub App credentials for minting installation access tokens used by APM to
-  # access cross-org private repositories.
-  # (optional)
-  github-app:
-    # Deprecated alias for client-id. GitHub App ID/client ID (e.g., '${{ vars.APP_ID
-    # }}').
-    # (optional)
-    app-id: "example-value"
-
-    # GitHub App client ID (e.g., '${{ vars.APP_ID }}'). Required to mint a GitHub App
-    # token.
-    # (optional)
-    client-id: "example-value"
-
-    # GitHub App private key (e.g., '${{ secrets.APP_PRIVATE_KEY }}'). Required to
-    # mint a GitHub App token.
-    # (optional)
-    private-key: "example-value"
-
-    # Optional owner of the GitHub App installation (defaults to current repository
-    # owner if not specified)
-    # (optional)
-    owner: "example-value"
-
-    # Optional list of repositories to grant access to (defaults to current repository
-    # if not specified)
-    # (optional)
-    repositories: []
-      # Array of strings
-
-    # Optional extra GitHub App-only permissions to merge into the minted token. Takes
-    # effect for tools.github.github-app and safe-outputs.github-app; ignored in
-    # on.github-app and the top-level github-app fallback. Use to add GitHub App-only
-    # scopes (e.g. members, organization-administration) not expressible via standard
-    # handler declarations.
-    # (optional)
-    permissions:
-      # Permission level for repository administration (read/none; "write" is rejected
-      # by the compiler). GitHub App-only permission for repository administration.
-      # (optional)
-      administration: "read"
-
-      # Permission level for Codespaces (read/none; "write" is rejected by the
-      # compiler). GitHub App-only permission.
-      # (optional)
-      codespaces: "read"
-
-      # Permission level for Codespaces lifecycle administration (read/none; "write" is
-      # rejected by the compiler). GitHub App-only permission.
-      # (optional)
-      codespaces-lifecycle-admin: "read"
-
-      # Permission level for Codespaces metadata (read/none; "write" is rejected by the
-      # compiler). GitHub App-only permission.
-      # (optional)
-      codespaces-metadata: "read"
-
-      # Permission level for user email addresses (read/none; "write" is rejected by the
-      # compiler). GitHub App-only permission.
-      # (optional)
-      email-addresses: "read"
-
-      # Permission level for repository environments (read/none; "write" is rejected by
-      # the compiler). GitHub App-only permission.
-      # (optional)
-      environments: "read"
-
-      # Permission level for git signing (read/none; "write" is rejected by the
-      # compiler). GitHub App-only permission.
-      # (optional)
-      git-signing: "read"
-
-      # Permission level for organization members (read/none; "write" is rejected by the
-      # compiler). Required for org team membership API calls.
-      # (optional)
-      members: "read"
-
-      # Permission level for organization administration (read/none; "write" is rejected
-      # by the compiler). GitHub App-only permission.
-      # (optional)
-      organization-administration: "read"
-
-      # Permission level for organization announcement banners (read/none; "write" is
-      # rejected by the compiler). GitHub App-only permission.
-      # (optional)
-      organization-announcement-banners: "read"
-
-      # Permission level for organization Codespaces (read/none; "write" is rejected by
-      # the compiler). GitHub App-only permission.
-      # (optional)
-      organization-codespaces: "read"
-
-      # Permission level for organization Copilot (read/none; "write" is rejected by the
-      # compiler). GitHub App-only permission.
-      # (optional)
-      organization-copilot: "read"
-
-      # Permission level for organization custom org roles (read/none; "write" is
-      # rejected by the compiler). GitHub App-only permission.
-      # (optional)
-      organization-custom-org-roles: "read"
-
-      # Permission level for organization custom properties (read/none; "write" is
-      # rejected by the compiler). GitHub App-only permission.
-      # (optional)
-      organization-custom-properties: "read"
-
-      # Permission level for organization custom repository roles (read/none; "write" is
-      # rejected by the compiler). GitHub App-only permission.
-      # (optional)
-      organization-custom-repository-roles: "read"
-
-      # Permission level for organization events (read/none; "write" is rejected by the
-      # compiler). GitHub App-only permission.
-      # (optional)
-      organization-events: "read"
-
-      # Permission level for organization webhooks (read/none; "write" is rejected by
-      # the compiler). GitHub App-only permission.
-      # (optional)
-      organization-hooks: "read"
-
-      # Permission level for organization members management (read/none; "write" is
-      # rejected by the compiler). GitHub App-only permission.
-      # (optional)
-      organization-members: "read"
-
-      # Permission level for organization packages (read/none; "write" is rejected by
-      # the compiler). GitHub App-only permission.
-      # (optional)
-      organization-packages: "read"
-
-      # Permission level for organization personal access token requests (read/none;
-      # "write" is rejected by the compiler). GitHub App-only permission.
-      # (optional)
-      organization-personal-access-token-requests: "read"
-
-      # Permission level for organization personal access tokens (read/none; "write" is
-      # rejected by the compiler). GitHub App-only permission.
-      # (optional)
-      organization-personal-access-tokens: "read"
-
-      # Permission level for organization plan (read/none; "write" is rejected by the
-      # compiler). GitHub App-only permission.
-      # (optional)
-      organization-plan: "read"
-
-      # Permission level for organization self-hosted runners (read/none; "write" is
-      # rejected by the compiler). GitHub App-only permission.
-      # (optional)
-      organization-self-hosted-runners: "read"
-
-      # Permission level for organization user blocking (read/none; "write" is rejected
-      # by the compiler). GitHub App-only permission.
-      # (optional)
-      organization-user-blocking: "read"
-
-      # Permission level for repository custom properties (read/none; "write" is
-      # rejected by the compiler). GitHub App-only permission.
-      # (optional)
-      repository-custom-properties: "read"
-
-      # Permission level for repository webhooks (read/none; "write" is rejected by the
-      # compiler). GitHub App-only permission.
-      # (optional)
-      repository-hooks: "read"
-
-      # Permission level for single file access (read/none; "write" is rejected by the
-      # compiler). GitHub App-only permission.
-      # (optional)
-      single-file: "read"
-
-      # Permission level for team discussions (read/none; "write" is rejected by the
-      # compiler). GitHub App-only permission.
-      # (optional)
-      team-discussions: "read"
-
-      # Permission level for Dependabot vulnerability alerts (read/none; "write" is
-      # rejected by the compiler). Also available as a GITHUB_TOKEN scope. When used
-      # with a GitHub App, forwarded as permission-vulnerability-alerts input.
-      # (optional)
-      vulnerability-alerts: "read"
-
-      # Permission level for GitHub Actions workflow files (read/none; "write" is
-      # rejected by the compiler). GitHub App-only permission.
-      # (optional)
-      workflows: "read"
-
-  # Environment variables to set on the APM pack step (e.g., tokens or registry
-  # URLs).
-  # (optional)
-  env:
-    {}
-
-  # GitHub token expression to authenticate APM with private package repositories.
-  # Uses cascading fallback (GH_AW_PLUGINS_TOKEN → GH_AW_GITHUB_TOKEN →
-  # GITHUB_TOKEN) when not specified. Takes effect unless github-app is also
-  # configured (which takes precedence).
-  # (optional)
-  github-token: "${{ secrets.GITHUB_TOKEN }}"
 
 # Top-level GitHub App configuration used as a fallback for all nested github-app
 # token minting operations (on, safe-outputs, checkout, tools.github,
@@ -7508,6 +9220,11 @@ github-app:
   # mint a GitHub App token.
   # (optional)
   private-key: "example-value"
+
+  # If true, skip token minting when client-id/private-key resolve to empty strings
+  # at runtime. Defaults to false.
+  # (optional)
+  ignore-if-missing: true
 
   # Optional owner of the GitHub App installation (defaults to current repository
   # owner if not specified)

@@ -1,5 +1,6 @@
 // @ts-check
 /// <reference types="@actions/github-script" />
+// @safe-outputs-exempt SEC-004 — body sanitized transitively via sanitizeContent in update_handler_factory.cjs / update_pr_description_helpers.cjs
 
 /**
  * @typedef {import('./types/handler-factory').HandlerFactoryFunction} HandlerFactoryFunction
@@ -9,14 +10,50 @@
 const HANDLER_TYPE = "update_pull_request";
 
 const { updateBody } = require("./update_pr_description_helpers.cjs");
-const { resolveTarget } = require("./safe_output_helpers.cjs");
+const { resolveTarget, checkRequiredFilter } = require("./safe_output_helpers.cjs");
 const { createUpdateHandlerFactory, createStandardResolveNumber, createStandardFormatResult } = require("./update_handler_factory.cjs");
-const { sanitizeTitle } = require("./sanitize_title.cjs");
-const { parseBoolTemplatable } = require("./templatable.cjs");
+const { buildCommonEntityUpdateData } = require("./update_entity_helpers.cjs");
 const { buildWorkflowRunUrl } = require("./workflow_metadata_helpers.cjs");
 const { generateHistoryUrl } = require("./generate_history_link.cjs");
 const { getErrorMessage } = require("./error_helpers.cjs");
+const { fetchPullRequestState, mergePullRequestState } = require("./safe_output_execution_metadata.cjs");
 const { withRetry, isTransientError } = require("./error_recovery.cjs");
+
+/**
+ * @param {unknown} error
+ * @returns {boolean}
+ */
+function isNonFatalUpdateBranchError(error) {
+  /** @type {number | undefined} */
+  let status;
+  if (typeof error === "object" && error !== null && "status" in error) {
+    const candidateStatus = error.status;
+    if (typeof candidateStatus === "number") {
+      status = candidateStatus;
+    }
+  }
+  const message = getErrorMessage(error).toLowerCase();
+  const hasWorkflowsPermissionPhrase = /without\s+`?workflows`?\s+permission/i.test(message);
+  const hasWorkflowMutationRefusal = message.includes("refusing to allow a github app to create or update workflow");
+  // Require both permission wording and update-branch context to avoid treating unrelated
+  // "workflows permission" errors as non-fatal for pull request branch updates.
+  const hasWorkflowsPermissionError = hasWorkflowsPermissionPhrase && (hasWorkflowMutationRefusal || message.includes("update pull request"));
+
+  if (status !== undefined) {
+    if (status === 403 && hasWorkflowsPermissionError) {
+      return true;
+    }
+    if (status !== 422) {
+      return false;
+    }
+  }
+
+  // GitHub update-branch API can return these 422 messages for benign conditions:
+  // - already up to date ("There are no new commits on the base branch")
+  // - cannot auto-update due to conflict ("merge conflict between base and head")
+  // These should not fail safe output processing.
+  return message.includes("there are no new commits on the base branch") || message.includes("merge conflict between base and head") || hasWorkflowsPermissionError;
+}
 
 /**
  * Execute the pull request update API call
@@ -55,8 +92,13 @@ async function executePRUpdate(github, context, prNumber, updateData) {
         `update pull request #${prNumber} branch from base`
       );
     } catch (error) {
-      core.warning(`Failed to update pull request #${prNumber} branch from base: ${getErrorMessage(error)}`);
-      throw error;
+      const errorMessage = getErrorMessage(error);
+      if (isNonFatalUpdateBranchError(error)) {
+        core.warning(`Failed to update pull request #${prNumber} branch from base (non-fatal): ${errorMessage}`);
+      } else {
+        core.warning(`Failed to update pull request #${prNumber} branch from base: ${errorMessage}`);
+        throw error;
+      }
     }
   }
 
@@ -105,10 +147,15 @@ async function executePRUpdate(github, context, prNumber, updateData) {
   }
 
   if (Object.keys(apiData).length === 0) {
-    return {
-      number: prNumber,
-      html_url: `${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/pull/${prNumber}`,
-    };
+    // update_branch-only operations need the authoritative post-update PR state so the
+    // manifest can persist after_state fields such as head_sha/base/draft for later
+    // retained-update evaluation. A synthetic {number, html_url} result is not enough.
+    const { data: pullRequest } = await github.rest.pulls.get({
+      owner: context.repo.owner,
+      repo: context.repo.repo,
+      pull_number: prNumber,
+    });
+    return pullRequest;
   }
 
   const { data: pr } = await github.rest.pulls.update({
@@ -140,26 +187,13 @@ const resolvePRNumber = createStandardResolveNumber({
  */
 function buildPRUpdateData(item, config) {
   const canUpdateTitle = config.allow_title !== false; // Default true
-  const canUpdateBody = config.allow_body !== false; // Default true
-
-  const updateData = {};
-  let hasUpdates = false;
-
-  if (canUpdateTitle && item.title !== undefined) {
-    // Sanitize title for Unicode security (no prefix handling needed for updates)
-    updateData.title = sanitizeTitle(item.title);
-    hasUpdates = true;
-  }
-
-  if (canUpdateBody && item.body !== undefined) {
-    // Store operation information
-    // Use operation from item, or fall back to config default, or use "replace" as final default
-    const operation = item.operation || config.default_operation || "replace";
-    updateData._operation = operation;
-    updateData._rawBody = item.body;
-    updateData.body = item.body;
-    hasUpdates = true;
-  }
+  const { updateData, hasCommonUpdates } = buildCommonEntityUpdateData(item, config, {
+    allowTitle: canUpdateTitle,
+    defaultOperation: "replace",
+    configDefaultOperation: config.default_operation,
+    includeBodyInApiData: true,
+  });
+  let hasUpdates = hasCommonUpdates;
 
   // Other fields (always allowed)
   if (item.state !== undefined) {
@@ -189,9 +223,6 @@ function buildPRUpdateData(item, config) {
     };
   }
 
-  // Pass footer config to executeUpdate (default to true)
-  updateData._includeFooter = parseBoolTemplatable(config.footer, true);
-
   return { success: true, data: updateData };
 }
 
@@ -218,10 +249,19 @@ const main = createUpdateHandlerFactory({
   buildUpdateData: buildPRUpdateData,
   executeUpdate: executePRUpdate,
   formatSuccessResult: formatPRSuccessResult,
+  captureExecutionMetadata: {
+    captureBefore: async (githubClient, effectiveContext, prNumber) => fetchPullRequestState(githubClient, effectiveContext.repo, prNumber),
+    captureAfter: async (updatedPullRequest, beforeState) => mergePullRequestState(beforeState, updatedPullRequest),
+  },
   additionalConfig: {
     allow_title: true,
     allow_body: true,
     update_branch: false,
+  },
+  itemFilter: async (githubClient, repoParts, prNumber, config) => {
+    const requiredLabels = Array.isArray(config.required_labels) ? config.required_labels : [];
+    const requiredTitlePrefix = config.required_title_prefix || "";
+    return checkRequiredFilter(githubClient, repoParts, prNumber, requiredLabels, requiredTitlePrefix, "update_pull_request");
   },
 });
 

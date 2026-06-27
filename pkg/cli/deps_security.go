@@ -7,11 +7,11 @@ import (
 	"io"
 	"net/http"
 	"os"
-	"sort"
+	"slices"
 	"strings"
-	"time"
 
 	"github.com/github/gh-aw/pkg/console"
+	"github.com/github/gh-aw/pkg/constants"
 	"github.com/github/gh-aw/pkg/logger"
 )
 
@@ -100,8 +100,16 @@ func DisplaySecurityAdvisories(advisories []SecurityAdvisory) {
 	fmt.Fprintln(os.Stderr, "")
 
 	// Sort by severity (critical first)
-	sort.Slice(advisories, func(i, j int) bool {
-		return severityWeight(advisories[i].Severity) > severityWeight(advisories[j].Severity)
+	slices.SortFunc(advisories, func(a, b SecurityAdvisory) int {
+		aw := severityWeight(a.Severity)
+		bw := severityWeight(b.Severity)
+		if aw > bw {
+			return -1
+		}
+		if aw < bw {
+			return 1
+		}
+		return 0
 	})
 
 	// Display each advisory
@@ -136,7 +144,7 @@ func querySecurityAdvisories(ctx context.Context, depVersions map[string]string,
 	url := "https://api.github.com/advisories?ecosystem=go&per_page=100"
 
 	depsSecurityLog.Printf("Querying GitHub Security Advisory API: url=%s, dep_count=%d", url, len(depVersions))
-	client := &http.Client{Timeout: 30 * time.Second}
+	client := &http.Client{Timeout: constants.DefaultHTTPClientTimeout}
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
 		return nil, err

@@ -3,6 +3,7 @@ package workflow
 import (
 	"fmt"
 	"maps"
+	"slices"
 	"sort"
 	"strings"
 
@@ -13,8 +14,15 @@ var permissionsOpsLog = logger.New("workflow:permissions_operations")
 
 // SortPermissionScopes sorts a slice of PermissionScope in place using Go's standard library sort
 func SortPermissionScopes(s []PermissionScope) {
-	sort.Slice(s, func(i, j int) bool {
-		return string(s[i]) < string(s[j])
+	slices.SortFunc(s, func(a, b PermissionScope) int {
+		switch {
+		case string(a) < string(b):
+			return -1
+		case string(a) > string(b):
+			return 1
+		default:
+			return 0
+		}
 	})
 }
 
@@ -25,6 +33,7 @@ func (p *Permissions) HasContentsReadAccess() bool {
 	if p == nil {
 		return false
 	}
+
 	if p.shorthand != "" {
 		switch p.shorthand {
 		case "read-all", "write-all":
@@ -45,6 +54,24 @@ func (p *Permissions) HasContentsReadAccess() bool {
 		return contentsLevel == PermissionRead || contentsLevel == PermissionWrite
 	}
 	return false
+}
+
+// hasCopilotRequestsWritePermission returns true when workflow permissions include
+// copilot-requests: write. This controls whether engines should use ${{ github.token }}
+// for Copilot authentication instead of requiring COPILOT_GITHUB_TOKEN.
+func hasCopilotRequestsWritePermission(workflowData *WorkflowData) bool {
+	if workflowData == nil {
+		return false
+	}
+	perms := workflowData.CachedPermissions
+	if perms == nil {
+		perms = NewPermissionsParser(workflowData.Permissions).ToPermissions()
+	}
+	if perms == nil {
+		return false
+	}
+	level, ok := perms.Get(PermissionCopilotRequests)
+	return ok && level == PermissionWrite
 }
 
 // filterJobLevelPermissions takes a raw permissions YAML string (as stored in WorkflowData.Permissions)
@@ -416,4 +443,49 @@ func (p *Permissions) RenderToYAML() string {
 	}
 
 	return strings.Join(lines, "\n")
+}
+
+// mergeInferredIntoPermissionsYAML merges a map of inferred permissions into an existing
+// permissions YAML string and returns the updated YAML string (2-space indented, suitable
+// for filterJobLevelPermissions / indentYAMLLines callers).
+//
+// Rules:
+//   - GitHub App-only scopes are skipped (they are not valid job-level permissions).
+//   - An inferred scope is added only when not already declared by the user.
+//   - An inferred scope at PermissionNone is always ignored.
+//
+// If permissionsYAML is empty the function returns an empty string unchanged, because
+// adding a new explicit block to a job that currently inherits workflow-level permissions
+// would unintentionally restrict those permissions.
+func mergeInferredIntoPermissionsYAML(permissionsYAML string, inferred map[PermissionScope]PermissionLevel) string {
+	if permissionsYAML == "" {
+		// No existing permissions block: adding one would unintentionally narrow the
+		// workflow-level permissions that the job currently inherits.
+		return permissionsYAML
+	}
+	if len(inferred) == 0 {
+		return permissionsYAML
+	}
+
+	parsedPerms := NewPermissionsParser(permissionsYAML).ToPermissions()
+
+	changed := false
+	for scope, level := range inferred {
+		if IsGitHubAppOnlyScope(scope) {
+			continue
+		}
+		if level == PermissionNone {
+			continue
+		}
+		if _, exists := parsedPerms.Get(scope); !exists {
+			parsedPerms.Set(scope, level)
+			changed = true
+		}
+	}
+
+	if !changed {
+		return permissionsYAML
+	}
+
+	return filterJobLevelPermissions(parsedPerms.RenderToYAML())
 }

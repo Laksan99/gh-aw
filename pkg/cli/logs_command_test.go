@@ -3,6 +3,9 @@
 package cli
 
 import (
+	"os"
+	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -14,9 +17,9 @@ func TestNewLogsCommand(t *testing.T) {
 
 	require.NotNil(t, cmd, "NewLogsCommand should not return nil")
 	assert.Equal(t, "logs [workflow]", cmd.Use, "Command use should be 'logs [workflow]'")
-	assert.Equal(t, "Download and analyze agentic workflow logs with aggregated metrics", cmd.Short, "Command short description should match")
+	assert.Equal(t, "Download and analyze agentic workflow logs and artifacts", cmd.Short, "Command short description should match")
 	assert.Contains(t, cmd.Long, "Download and analyze agentic workflow logs", "Command long description should contain expected text")
-	assert.Contains(t, cmd.Long, "Evict local cache older than 1 week before downloading runs", "Cache maintenance examples should describe eviction plus download behavior")
+	assert.Contains(t, cmd.Example, "logs --cache-before -1w", "Cache maintenance examples should use the cache-before flag name")
 
 	// Verify flags are registered
 	flags := cmd.Flags()
@@ -37,6 +40,7 @@ func TestNewLogsCommand(t *testing.T) {
 	// Check engine flag
 	engineFlag := flags.Lookup("engine")
 	assert.NotNil(t, engineFlag, "Should have 'engine' flag")
+	assert.Empty(t, engineFlag.Shorthand, "Engine filter flag should not have shorthand")
 
 	// Check firewall flags
 	firewallFlag := flags.Lookup("firewall")
@@ -75,11 +79,16 @@ func TestNewLogsCommand(t *testing.T) {
 	repoFlag := flags.Lookup("repo")
 	assert.NotNil(t, repoFlag, "Should have 'repo' flag")
 
-	// Check after flag (cache maintenance)
-	afterFlag := flags.Lookup("after")
-	assert.NotNil(t, afterFlag, "Should have 'after' flag")
-	assert.Contains(t, afterFlag.Usage, "-1d", "after flag should document day deltas")
-	assert.Contains(t, afterFlag.Usage, "-30d", "after flag should document explicit day-count deltas")
+	// Check cache-before flag (cache maintenance)
+	cacheBeforeFlag := flags.Lookup("cache-before")
+	assert.NotNil(t, cacheBeforeFlag, "Should have 'cache-before' flag")
+	assert.Contains(t, cacheBeforeFlag.Usage, "-1d", "cache-before flag should document day deltas")
+	assert.Contains(t, cacheBeforeFlag.Usage, "-30d", "cache-before flag should document explicit day-count deltas")
+
+	// Backward-compatible alias should remain registered but hidden from help output
+	afterAliasFlag := flags.Lookup("after")
+	assert.NotNil(t, afterAliasFlag, "Should retain hidden 'after' alias")
+	assert.True(t, afterAliasFlag.Hidden, "'after' alias should be hidden from help output")
 }
 
 func TestLogsCommandFlagDefaults(t *testing.T) {
@@ -98,6 +107,7 @@ func TestLogsCommandFlagDefaults(t *testing.T) {
 		{"after-run-id", "0"},
 		{"before-run-id", "0"},
 		{"repo", ""},
+		{"artifacts", "[usage]"},
 	}
 
 	for _, tt := range tests {
@@ -253,17 +263,27 @@ func TestLogsCommandHelpText(t *testing.T) {
 	cmd := NewLogsCommand()
 
 	// Verify long description contains expected sections
-	expectedSections := []string{
+	expectedLongSections := []string{
 		"Download and analyze agentic workflow logs",
-		"Downloaded artifacts include:",
-		"Examples:",
+		"Downloaded artifacts include (when using --artifacts all):",
+		"--artifacts all",
+		strings.Join(ValidArtifactSetNames(), ", "),
+	}
+
+	for _, section := range expectedLongSections {
+		assert.Contains(t, cmd.Long, section, "Long description should contain: %s", section)
+	}
+
+	// Verify example field contains example commands
+	expectedExampleSections := []string{
 		"gh aw logs",
 		"--safe-output noop",
 		"--safe-output report-incomplete",
+		"--artifacts all",
 	}
 
-	for _, section := range expectedSections {
-		assert.Contains(t, cmd.Long, section, "Long description should contain: %s", section)
+	for _, section := range expectedExampleSections {
+		assert.Contains(t, cmd.Example, section, "Example field should contain: %s", section)
 	}
 
 	safeOutputFlag := cmd.Flags().Lookup("safe-output")
@@ -292,4 +312,96 @@ func TestLogsCommandStdinRejectsPositionalArgs(t *testing.T) {
 	err := cmd.Execute()
 	require.Error(t, err, "logs --stdin with a positional arg should return an error")
 	assert.Contains(t, err.Error(), "positional arguments are not allowed with --stdin", "error message should explain the conflict")
+}
+
+// TestLogsCommand_RepoBypassesLocalWorkflowResolution verifies that specifying
+// --repo prevents a "workflow not found" error from local file lookup when a
+// positional workflow name argument is supplied and no local lock file exists.
+// In that case the command normalizes the name and passes it directly to the
+// download orchestrator. Because there is no running GitHub API in unit tests
+// the orchestrator itself will fail; the test asserts only that the error is
+// NOT the local-resolution "workflow not found" message.
+func TestLogsCommand_RepoBypassesLocalWorkflowResolution(t *testing.T) {
+	tmpDir := t.TempDir()
+	origDir, err := os.Getwd()
+	require.NoError(t, err)
+	require.NoError(t, os.Chdir(tmpDir))
+	defer func() { _ = os.Chdir(origDir) }()
+
+	cmd := NewLogsCommand()
+	// Use a workflow name that definitely does not exist locally.
+	cmd.SetArgs([]string{"nonexistent-remote-workflow", "--repo", "owner/repo"})
+	cmd.SetOut(nil)
+	cmd.SetErr(nil)
+
+	execErr := cmd.Execute()
+
+	// The command must fail: there are no local workflows and the --repo target
+	// does not exist / no gh auth in tests, so downstream API calls will error.
+	require.Error(t, execErr, "--repo with a non-existent local workflow must not succeed in unit tests")
+
+	// The "workflow 'X' not found" error from local FindWorkflowName must NOT appear.
+	// (Any other error from downstream API calls is acceptable in unit tests.)
+	assert.NotContains(t, execErr.Error(), "workflow 'nonexistent-remote-workflow' not found",
+		"--repo should bypass local workflow name resolution and not produce a local-not-found error")
+}
+
+// TestLogsCommand_RepoUsesLocalResolutionWhenLockFileExists verifies that when
+// --repo is set to the current repository (the common MCP server case where
+// GITHUB_REPOSITORY is the current repo), FindWorkflowName is still called to
+// resolve the workflow ID to its GitHub Actions display name. Without this, the
+// raw workflow ID (e.g. "audit-workflows") would be passed to `gh run list
+// --workflow` instead of the display name (e.g. "Agentic Workflow Audit Agent"),
+// causing GitHub's API to report "could not find any workflows named X".
+func TestLogsCommand_RepoUsesLocalResolutionWhenLockFileExists(t *testing.T) {
+	tmpDir := t.TempDir()
+	workflowsDir := filepath.Join(tmpDir, ".github", "workflows")
+	require.NoError(t, os.MkdirAll(workflowsDir, 0755))
+
+	// Create the markdown file (required by ResolveWorkflowName).
+	// The frontmatter name field is the GitHub Actions display name; the workflow
+	// ID is derived from the filename ("my-test-workflow").
+	require.NoError(t, os.WriteFile(filepath.Join(workflowsDir, "my-test-workflow.md"), []byte("---\nname: My Test Workflow Display Name\n---\n"), 0644))
+
+	// Create a lock file whose display name differs from the workflow ID.
+	// This simulates the real scenario where audit-workflows.lock.yml has
+	// name: "Agentic Workflow Audit Agent" while the ID is "audit-workflows".
+	lockContent := "name: \"My Test Workflow Display Name\"\non: push\n"
+	require.NoError(t, os.WriteFile(filepath.Join(workflowsDir, "my-test-workflow.lock.yml"), []byte(lockContent), 0644))
+
+	// Isolate file-system writes: chdir into tmpDir so that ensureLogsGitignore
+	// and the default output directory (.github/aw/logs) land in tmpDir, not in
+	// the repository root.
+	origDir, err := os.Getwd()
+	require.NoError(t, err)
+	require.NoError(t, os.Chdir(tmpDir))
+	defer func() { _ = os.Chdir(origDir) }()
+
+	// GITHUB_REPOSITORY signals to repoIsLocal that owner/repo IS the current
+	// repo, so local lock files are authoritative for display-name resolution.
+	t.Setenv("GITHUB_REPOSITORY", "owner/repo")
+	t.Setenv("GH_AW_WORKFLOWS_DIR", workflowsDir)
+
+	cmd := NewLogsCommand()
+	cmd.SetArgs([]string{"my-test-workflow", "--repo", "owner/repo", "--output", filepath.Join(tmpDir, "logs-out")})
+	cmd.SetOut(nil)
+	cmd.SetErr(nil)
+
+	execErr := cmd.Execute()
+
+	// The command must fail in unit tests (no real GitHub API access).
+	require.Error(t, execErr)
+
+	// Local "workflow not found" must NOT appear: the lock file exists and
+	// GITHUB_REPOSITORY matches --repo, so FindWorkflowName should succeed.
+	assert.NotContains(t, execErr.Error(), "workflow 'my-test-workflow' not found",
+		"when GITHUB_REPOSITORY matches --repo and a local lock file exists, FindWorkflowName should succeed")
+
+	// The raw workflow ID must NOT appear as the failing name in a gh run list
+	// "could not find" error, because the resolved display name should be used.
+	// In unit tests the API call fails with an HTTP 403 before GitHub can report
+	// a workflow-not-found message, so we verify the negative: the workflow ID
+	// ("my-test-workflow") is not echoed back as the unrecognised workflow name.
+	assert.NotContains(t, execErr.Error(), "could not find any workflows named my-test-workflow",
+		"when a local lock file exists, the display name (not the workflow ID) should be passed to gh run list")
 }

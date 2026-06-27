@@ -40,6 +40,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"strings"
 )
 
 // validatePermissions validates all permission-related configuration: dangerous
@@ -58,20 +59,32 @@ func (c *Compiler) validatePermissions(workflowData *WorkflowData, markdownPath 
 		workflowPermissions = NewPermissionsParser(workflowData.Permissions).ToPermissions()
 	}
 
+	// Validate permission scope names for typos (e.g. "contnts" → "contents")
+	workflowLog.Printf("Validating permission scope names")
+	var scopeValidationErr error
+	if workflowData.CachedPermissionScopeNamesSet {
+		scopeValidationErr = workflowData.CachedPermissionScopeNamesErr
+	} else {
+		scopeValidationErr = ValidatePermissionScopeNames(workflowData.Permissions)
+	}
+	if scopeValidationErr != nil {
+		return nil, formatCompilerError(markdownPath, "error", scopeValidationErr.Error(), scopeValidationErr)
+	}
+
 	// Validate dangerous permissions
-	log.Printf("Validating dangerous permissions")
+	workflowLog.Printf("Validating dangerous permissions")
 	if err := validateDangerousPermissions(workflowData, workflowPermissions); err != nil {
 		return nil, formatCompilerError(markdownPath, "error", err.Error(), err)
 	}
 
 	// Validate GitHub App-only permissions require a GitHub App to be configured
-	log.Printf("Validating GitHub App-only permissions")
+	workflowLog.Printf("Validating GitHub App-only permissions")
 	if err := validateGitHubAppOnlyPermissions(workflowData, workflowPermissions); err != nil {
 		return nil, formatCompilerError(markdownPath, "error", err.Error(), err)
 	}
 
 	// Validate tools.github.github-app.permissions does not use "write"
-	log.Printf("Validating GitHub MCP app permissions (no write)")
+	workflowLog.Printf("Validating GitHub MCP app permissions (no write)")
 	if err := validateGitHubMCPAppPermissionsNoWrite(workflowData); err != nil {
 		return nil, formatCompilerError(markdownPath, "error", err.Error(), err)
 	}
@@ -80,31 +93,31 @@ func (c *Compiler) validatePermissions(workflowData *WorkflowData, markdownPath 
 	warnGitHubAppPermissionsUnsupportedContexts(workflowData)
 
 	// Validate workflow_run triggers have branch restrictions
-	log.Printf("Validating workflow_run triggers for branch restrictions")
+	workflowLog.Printf("Validating workflow_run triggers for branch restrictions")
 	if err := c.validateWorkflowRunBranches(workflowData, markdownPath); err != nil {
 		return nil, err
 	}
 
 	// Validate pull_request_target trigger security
-	log.Printf("Validating pull_request_target trigger security")
+	workflowLog.Printf("Validating pull_request_target trigger security")
 	if err := c.validatePullRequestTargetTrigger(workflowData, markdownPath); err != nil {
 		return nil, err
 	}
 
 	// Validate permissions against GitHub MCP toolsets
-	log.Printf("Validating permissions for GitHub MCP toolsets")
+	workflowLog.Printf("Validating permissions for GitHub MCP toolsets")
 	if workflowData.ParsedTools != nil && workflowData.ParsedTools.GitHub != nil {
 		// Check if GitHub tool was explicitly configured in frontmatter
 		// If permissions exist but tools.github was NOT explicitly configured,
 		// skip validation and let the GitHub MCP server handle permission issues
 		hasPermissions := workflowData.Permissions != ""
 
-		log.Printf("Permission validation check: hasExplicitGitHubTool=%v, hasPermissions=%v",
+		workflowLog.Printf("Permission validation check: hasExplicitGitHubTool=%v, hasPermissions=%v",
 			workflowData.HasExplicitGitHubTool, hasPermissions)
 
 		// Skip validation if permissions exist but GitHub tool was auto-added (not explicit)
 		if hasPermissions && !workflowData.HasExplicitGitHubTool {
-			log.Printf("Skipping permission validation: permissions exist but tools.github not explicitly configured")
+			workflowLog.Printf("Skipping permission validation: permissions exist but tools.github not explicitly configured")
 		} else {
 			// Validate permissions using the typed GitHub tool configuration.
 			// Pass the cached parsed toolsets from applyDefaults to avoid a redundant
@@ -135,13 +148,13 @@ func (c *Compiler) validatePermissions(workflowData *WorkflowData, markdownPath 
 		}
 	}
 
-	// Enforce required id-token: write permission for engine.auth.type=github-oidc.
-	if err := validateEngineAuthPermissions(workflowData, workflowPermissions); err != nil {
+	// Enforce required id-token: write permission for OIDC auth users.
+	if err := validateOIDCPermissions(workflowData, workflowPermissions); err != nil {
 		return nil, formatCompilerError(markdownPath, "error", err.Error(), err)
 	}
 
 	// Emit warning if id-token: write permission is detected
-	log.Printf("Checking for id-token: write permission")
+	workflowLog.Printf("Checking for id-token: write permission")
 	if level, exists := workflowPermissions.Get(PermissionIdToken); exists && level == PermissionWrite {
 		warningMsg := `This workflow grants id-token: write permission
 OIDC tokens can authenticate to cloud providers (AWS, Azure, GCP).
@@ -149,25 +162,94 @@ Ensure proper audience validation and trust policies are configured.`
 		fmt.Fprintln(os.Stderr, formatCompilerMessage(markdownPath, "warning", warningMsg))
 		c.IncrementWarningCount()
 	}
+	if shouldEmitCopilotRequestsEnableTip(workflowData, workflowPermissions) && !c.repositoryOwnerIsIndividualUser() {
+		if !c.copilotRequestsTipShown[markdownPath] {
+			tipMsg := `Tip: set permissions.copilot-requests: write to use GitHub Actions token-based inference with the Copilot engine instead of a personal access token (COPILOT_GITHUB_TOKEN). This option requires that your organization has centralized Copilot billing enabled and may not be available in all organizations — see https://github.github.com/gh-aw/reference/billing/ for details.`
+			fmt.Fprintln(os.Stderr, formatCompilerMessage(markdownPath, "info", tipMsg))
+			c.copilotRequestsTipShown[markdownPath] = true
+		}
+	}
 
 	return workflowPermissions, nil
 }
 
-func validateEngineAuthPermissions(workflowData *WorkflowData, workflowPermissions *Permissions) error {
-	if workflowData == nil || workflowData.EngineConfig == nil || workflowData.EngineConfig.Auth == nil {
+// repositoryOwnerIsIndividualUser reports whether the repository owner is confirmed
+// to be an individual user account (as opposed to an organization).
+//
+// It returns true only when the GitHub API confirms the owner type is "User". It
+// returns false when the owner is an organization, when no repository slug is set, or
+// when the API call fails (e.g. no authentication, network error). This fail-safe
+// default ensures the copilot-requests tip continues to be shown whenever the owner
+// type cannot be determined, preserving prior behavior.
+func (c *Compiler) repositoryOwnerIsIndividualUser() bool {
+	slug := c.repositorySlug
+	owner, repo, ok := strings.Cut(slug, "/")
+	if !ok || owner == "" || repo == "" {
+		workflowLog.Printf("Skipping owner-type check: slug %q is not in owner/repo format", slug)
+		return false
+	}
+
+	ownerType, cached := c.ownerTypeCache[owner]
+	if !cached {
+		workflowLog.Printf("Checking owner type for: %s", owner)
+		output, err := RunGH("Checking repository owner type...", "api", "/users/"+owner, "--jq", ".type")
+		if err != nil {
+			workflowLog.Printf("Could not determine owner type for %q: %v", owner, err)
+			// Cache the empty string so subsequent calls for the same owner also return false
+			// without retrying. This is intentional: fail-safe means "show the tip when uncertain"
+			// and avoids N retry round-trips per run.
+			c.ownerTypeCache[owner] = ""
+			return false
+		}
+		ownerType = strings.TrimSpace(string(output))
+		c.ownerTypeCache[owner] = ownerType
+		workflowLog.Printf("Owner type for %q: %s", owner, ownerType)
+	}
+	return ownerType == "User"
+}
+
+func shouldEmitCopilotRequestsEnableTip(workflowData *WorkflowData, workflowPermissions *Permissions) bool {
+	if workflowData == nil || workflowPermissions == nil {
+		return false
+	}
+	if workflowData.EngineConfig == nil || workflowData.EngineConfig.ID != "copilot" {
+		return false
+	}
+	if level, exists := workflowPermissions.GetExplicit(PermissionCopilotRequests); exists && level == PermissionNone {
+		return false
+	}
+	level, exists := workflowPermissions.Get(PermissionCopilotRequests)
+	return !exists || level != PermissionWrite
+}
+
+func validateOIDCPermissions(workflowData *WorkflowData, workflowPermissions *Permissions) error {
+	if workflowData == nil {
 		return nil
 	}
 
-	if workflowData.EngineConfig.Auth.Type != "github-oidc" {
+	requiresIDTokenWrite := false
+	errorPrefix := ""
+
+	if workflowData.EngineConfig != nil && workflowData.EngineConfig.Auth != nil && workflowData.EngineConfig.Auth.Type == "github-oidc" {
+		requiresIDTokenWrite = true
+		errorPrefix = "engine.auth.type: github-oidc"
+	}
+
+	if !requiresIDTokenWrite && hasOTLPGitHubOIDCAuth(workflowData.ParsedFrontmatter, workflowData.RawFrontmatter) {
+		requiresIDTokenWrite = true
+		errorPrefix = "observability.otlp.github-app"
+	}
+
+	if !requiresIDTokenWrite {
 		return nil
 	}
 
 	if workflowPermissions == nil {
-		return errors.New("engine.auth.type: github-oidc requires permissions.id-token: write")
+		return errors.New(errorPrefix + " requires permissions.id-token: write")
 	}
 
 	if level, exists := workflowPermissions.Get(PermissionIdToken); !exists || level != PermissionWrite {
-		return errors.New("engine.auth.type: github-oidc requires permissions.id-token: write")
+		return errors.New(errorPrefix + " requires permissions.id-token: write")
 	}
 
 	return nil

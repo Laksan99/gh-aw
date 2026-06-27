@@ -11,6 +11,7 @@ const { logStagedPreviewInfo } = require("./staged_preview.cjs");
 const { createAuthenticatedGitHubClient } = require("./handler_auth.cjs");
 const { resolveTargetRepoConfig, resolveAndValidateRepo } = require("./repo_helpers.cjs");
 const { sanitizeContent } = require("./sanitize_content.cjs");
+const { attachExecutionState } = require("./safe_output_execution_metadata.cjs");
 const { withRetry, isTransientError } = require("./error_recovery.cjs");
 const { loadTemporaryIdMapFromResolved, resolveRepoIssueTarget } = require("./temporary_id.cjs");
 
@@ -24,6 +25,8 @@ const { loadTemporaryIdMapFromResolved, resolveRepoIssueTarget } = require("./te
  * @property {Function} executeUpdate - Function to execute the update API call
  * @property {Function} formatSuccessResult - Function to format success result
  * @property {Object} [additionalConfig] - Additional configuration options specific to the handler
+ * @property {Function} [itemFilter] - Optional async filter function called before update; returns null to proceed or a result object to skip
+ * @property {{captureBefore?: Function, captureAfter?: Function}} [captureExecutionMetadata] - Optional execution metadata hooks
  */
 
 /**
@@ -69,7 +72,7 @@ function createStandardResolveNumber(config) {
     });
 
     if (!targetResult.success) {
-      return { success: false, error: targetResult.error };
+      return { success: false, shouldFail: targetResult.shouldFail, error: targetResult.error };
     }
 
     return { success: true, number: targetResult.number };
@@ -113,7 +116,7 @@ function createStandardFormatResult(fieldMapping) {
  * @returns {HandlerFactoryFunction} Handler factory function
  */
 function createUpdateHandlerFactory(handlerConfig) {
-  const { itemType, itemTypeName, supportsPR, resolveItemNumber, buildUpdateData, executeUpdate, formatSuccessResult, additionalConfig = {} } = handlerConfig;
+  const { itemType, itemTypeName, supportsPR, resolveItemNumber, buildUpdateData, executeUpdate, formatSuccessResult, additionalConfig = {}, itemFilter = null, captureExecutionMetadata = null } = handlerConfig;
 
   /**
    * Main handler factory
@@ -135,15 +138,13 @@ function createUpdateHandlerFactory(handlerConfig) {
     // Check if we're in staged mode
     const isStaged = isStagedMode(config);
 
-    // Build configuration log message
-    const configParts = [`max=${maxCount}`, `target=${updateTarget}`];
-
-    // Add additional config items to log
-    Object.entries(additionalConfig).forEach(([key, value]) => {
-      if (config[key] !== undefined) {
-        configParts.push(`${key}=${config[key]}`);
-      }
-    });
+    const configParts = [
+      `max=${maxCount}`,
+      `target=${updateTarget}`,
+      ...Object.entries(additionalConfig)
+        .filter(([key]) => config[key] !== undefined)
+        .map(([key]) => `${key}=${config[key]}`),
+    ];
 
     core.info(`Update ${itemTypeName} configuration: ${configParts.join(", ")}`);
 
@@ -194,6 +195,17 @@ function createUpdateHandlerFactory(handlerConfig) {
       const itemNumberResult = resolveItemNumber(item, updateTarget, effectiveContext, resolvedTemporaryIds);
 
       if (!itemNumberResult.success) {
+        // shouldFail:false means the target cannot be resolved in this context but it is not
+        // an error (e.g. target:triggering on a schedule run has no triggering issue).
+        // Treat it as a soft skip so it does not count toward fatal failures.
+        if (itemNumberResult.shouldFail === false) {
+          core.info(itemNumberResult.error);
+          return {
+            success: false,
+            skipped: true,
+            error: itemNumberResult.error,
+          };
+        }
         core.warning(itemNumberResult.error);
         return {
           success: false,
@@ -204,6 +216,14 @@ function createUpdateHandlerFactory(handlerConfig) {
 
       const itemNumber = itemNumberResult.number;
       core.info(`Resolved target ${itemTypeName} #${itemNumber} (target config: ${updateTarget})`);
+
+      // Apply required-labels/required-title-prefix filter if configured
+      if (itemFilter) {
+        const filterResult = await itemFilter(githubClient, repoResult.repoParts, itemNumber, config);
+        if (filterResult) {
+          return filterResult;
+        }
+      }
 
       // Build update data (handler-specific logic)
       const updateDataResult = buildUpdateData(item, config);
@@ -276,11 +296,17 @@ function createUpdateHandlerFactory(handlerConfig) {
       // effectiveContext.repo contains the target repo owner/name for cross-repo routing.
       // Retry on transient errors (e.g. GitHub API returning HTML instead of JSON on 500 crashes).
       try {
+        const beforeState = captureExecutionMetadata?.captureBefore ? await captureExecutionMetadata.captureBefore(githubClient, effectiveContext, itemNumber, updateData) : null;
         const updatedItem = await withRetry(() => executeUpdate(githubClient, effectiveContext, itemNumber, updateData), { maxRetries: 1, initialDelayMs: 2000, shouldRetry: isTransientError }, `update ${itemTypeName} #${itemNumber}`);
         core.info(`Successfully updated ${itemTypeName} #${itemNumber}: ${updatedItem.html_url || updatedItem.url}`);
 
         // Format and return success result
-        return formatSuccessResult(itemNumber, updatedItem);
+        const result = {
+          ...formatSuccessResult(itemNumber, updatedItem),
+          repo: `${effectiveContext.repo.owner}/${effectiveContext.repo.repo}`,
+        };
+        const afterState = captureExecutionMetadata?.captureAfter ? await captureExecutionMetadata.captureAfter(updatedItem, beforeState, updateData) : null;
+        return attachExecutionState(result, beforeState, afterState);
       } catch (error) {
         const errorMessage = getErrorMessage(error);
         core.error(`Failed to update ${itemTypeName} #${itemNumber}: ${errorMessage}`);

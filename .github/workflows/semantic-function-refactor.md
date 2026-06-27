@@ -1,4 +1,5 @@
 ---
+emoji: "🔧"
 name: Semantic Function Refactoring
 description: Analyzes Go codebase daily to identify opportunities for semantic function extraction and refactoring
 on:
@@ -15,7 +16,7 @@ engine: claude
 imports:
   - shared/go-source-analysis.md
 
-  - shared/observability-otlp.md
+  - shared/otlp.md
 safe-outputs:
   close-issue:
     required-title-prefix: "[refactor] "

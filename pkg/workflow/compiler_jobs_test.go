@@ -346,17 +346,17 @@ func TestGetCustomJobsDependingOnPreActivationExcludesActivationDependents(t *te
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			result := compiler.getCustomJobsDependingOnPreActivation(tt.customJobs)
-			resultSet := make(map[string]bool, len(result))
+			resultSet := make(map[string]struct{}, len(result))
 			for _, j := range result {
-				resultSet[j] = true
+				resultSet[j] = struct{}{}
 			}
 			for _, expected := range tt.expectedJobs {
-				if !resultSet[expected] {
+				if _, ok := resultSet[expected]; !ok {
 					t.Errorf("Expected job %q in result, got: %v", expected, result)
 				}
 			}
 			for _, excluded := range tt.excludedJobs {
-				if resultSet[excluded] {
+				if _, ok := resultSet[excluded]; ok {
 					t.Errorf("Job %q should be excluded from result, got: %v", excluded, result)
 				}
 			}
@@ -969,6 +969,71 @@ jobs:
 		"- name: Checkout repo",
 		"- name: Main work",
 	)
+	assert.Contains(t, customJobSection, "persist-credentials: false", "custom job checkout should disable credential persistence by default")
+}
+
+func TestCustomJobCheckoutPreservesExplicitPersistCredentialsTrue(t *testing.T) {
+	tmpDir := testutil.TempDir(t, "custom-job-checkout-persist-true")
+
+	frontmatter := `---
+on: push
+permissions:
+  contents: read
+engine: copilot
+strict: false
+jobs:
+  custom_job:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v6
+        with:
+          persist-credentials: true
+---
+
+# Test Workflow
+`
+
+	testFile := filepath.Join(tmpDir, "test.md")
+	if err := os.WriteFile(testFile, []byte(frontmatter), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	compiler := NewCompiler()
+	if err := compiler.CompileWorkflow(testFile); err != nil {
+		t.Fatalf("CompileWorkflow() error: %v", err)
+	}
+
+	lockFile := filepath.Join(tmpDir, "test.lock.yml")
+	content, err := os.ReadFile(lockFile)
+	if err != nil {
+		t.Fatalf("Failed to read lock file: %v", err)
+	}
+
+	yamlStr := string(content)
+	customJobSection := extractJobSection(yamlStr, "custom_job")
+	if customJobSection == "" {
+		t.Fatal("Expected custom_job section in lock file")
+	}
+
+	assert.Contains(t, customJobSection, "persist-credentials: true", "explicit persist-credentials: true should be preserved")
+	assert.NotContains(t, customJobSection, "persist-credentials: false", "compiler should not override explicit persist-credentials: true")
+}
+
+func TestCustomJobCheckoutHardensNullPersistCredentials(t *testing.T) {
+	// A nil value for persist-credentials (YAML null) must be treated as absent
+	// and hardened to false. The compiler rejects YAML null in with-fields before
+	// reaching this function, but direct unit coverage guards against future
+	// code paths that could pass a nil value through.
+	stepMap := map[string]any{
+		"uses": "actions/checkout@v6",
+		"with": map[string]any{
+			"persist-credentials": nil,
+		},
+	}
+	ensureCheckoutPersistCredentials(stepMap)
+	withMap, _ := stepMap["with"].(map[string]any)
+	assert.Equal(t, false, withMap["persist-credentials"], "null persist-credentials should be hardened to false")
 }
 
 func TestPreStepsInsertAfterSetupBoundary(t *testing.T) {
@@ -1138,6 +1203,77 @@ func TestInsertPreStepsAfterSetupBeforeCheckout(t *testing.T) {
 			},
 		},
 		{
+			name: "insert before token mint when no setup or checkout exists",
+			steps: []string{
+				"      - name: Generate GitHub App token",
+				"        uses: actions/create-github-app-token@v3",
+				"      - name: Main work",
+				"        run: echo \"work\"",
+			},
+			preSteps: []string{
+				"      - name: Pre setup",
+				"        run: echo \"pre\"",
+			},
+			want: []string{
+				"      - name: Pre setup",
+				"        run: echo \"pre\"",
+				"      - name: Generate GitHub App token",
+				"        uses: actions/create-github-app-token@v3",
+				"      - name: Main work",
+				"        run: echo \"work\"",
+			},
+		},
+		{
+			name: "insert before token mint shorthand step without name",
+			steps: []string{
+				"      - uses: actions/create-github-app-token@v3",
+				"      - name: Main work",
+				"        run: echo \"work\"",
+			},
+			preSteps: []string{
+				"      - name: Pre setup",
+				"        run: echo \"pre\"",
+			},
+			want: []string{
+				"      - name: Pre setup",
+				"        run: echo \"pre\"",
+				"      - uses: actions/create-github-app-token@v3",
+				"      - name: Main work",
+				"        run: echo \"work\"",
+			},
+		},
+		{
+			name: "insert after setup scaffold when token mint and checkout also present",
+			steps: []string{
+				"      - name: Setup Scripts",
+				"        uses: actions/github-script@v7",
+				"        id: setup",
+				"      - name: Generate GitHub App token",
+				"        uses: actions/create-github-app-token@v3",
+				"      - name: Checkout repository",
+				"        uses: actions/checkout@v6",
+				"      - name: Main work",
+				"        run: echo \"work\"",
+			},
+			preSteps: []string{
+				"      - name: Pre setup",
+				"        run: echo \"pre\"",
+			},
+			want: []string{
+				"      - name: Setup Scripts",
+				"        uses: actions/github-script@v7",
+				"        id: setup",
+				"      - name: Pre setup",
+				"        run: echo \"pre\"",
+				"      - name: Generate GitHub App token",
+				"        uses: actions/create-github-app-token@v3",
+				"      - name: Checkout repository",
+				"        uses: actions/checkout@v6",
+				"      - name: Main work",
+				"        run: echo \"work\"",
+			},
+		},
+		{
 			name: "insert before checkout shorthand step without name",
 			steps: []string{
 				"      - uses: actions/checkout@v6",
@@ -1184,11 +1320,43 @@ func TestInsertPreStepsAfterSetupBeforeCheckout(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got := insertPreStepsAfterSetupBeforeCheckout(tt.steps, tt.preSteps)
+			got := insertPreStepsAtEarliestBoundary(tt.steps, tt.preSteps)
 			if !slices.Equal(got, tt.want) {
-				t.Fatalf("insertPreStepsAfterSetupBeforeCheckout() mismatch\nwant:\n%q\ngot:\n%q", tt.want, got)
+				t.Fatalf("insertPreStepsAtEarliestBoundary() mismatch\nwant:\n%q\ngot:\n%q", tt.want, got)
 			}
 		})
+	}
+}
+
+func TestInsertSetupStepsAtStart(t *testing.T) {
+	steps := []string{
+		"      - name: Setup Scripts",
+		"        uses: actions/github-script@v7",
+		"        id: setup",
+		"      - name: Set runtime paths",
+		"        run: echo runtime",
+		"      - name: Main work",
+		"        run: echo work",
+	}
+	setupSteps := []string{
+		"      - name: Setup extension",
+		"        run: echo setup",
+	}
+
+	got := insertSetupStepsAtStart(steps, setupSteps)
+	want := []string{
+		"      - name: Setup extension",
+		"        run: echo setup",
+		"      - name: Setup Scripts",
+		"        uses: actions/github-script@v7",
+		"        id: setup",
+		"      - name: Set runtime paths",
+		"        run: echo runtime",
+		"      - name: Main work",
+		"        run: echo work",
+	}
+	if !slices.Equal(got, want) {
+		t.Fatalf("insertSetupStepsAtStart() mismatch\nwant:\n%q\ngot:\n%q", want, got)
 	}
 }
 
@@ -1227,6 +1395,97 @@ jobs:
 	if !strings.Contains(err.Error(), "pre-steps") {
 		t.Fatalf("Expected error to mention pre-steps, got: %v", err)
 	}
+}
+
+func TestCustomJobSetupStepsSchemaValidation(t *testing.T) {
+	tmpDir := testutil.TempDir(t, "custom-job-setup-steps-schema")
+
+	frontmatter := `---
+on: push
+permissions:
+  contents: read
+engine: copilot
+strict: false
+jobs:
+  custom_job:
+    runs-on: ubuntu-latest
+    setup-steps:
+      name: Invalid setup-steps
+      run: echo "invalid"
+    steps:
+      - run: echo "work"
+---
+
+# Test Workflow
+`
+
+	testFile := filepath.Join(tmpDir, "test.md")
+	if err := os.WriteFile(testFile, []byte(frontmatter), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	compiler := NewCompiler()
+	err := compiler.CompileWorkflow(testFile)
+	if err == nil {
+		t.Fatal("Expected schema validation error for non-array jobs.<job-id>.setup-steps, got nil")
+	}
+	if !strings.Contains(err.Error(), "setup-steps") {
+		t.Fatalf("Expected error to mention setup-steps, got: %v", err)
+	}
+}
+
+func TestCustomJobSetupAndPreStepsOrdering(t *testing.T) {
+	tmpDir := testutil.TempDir(t, "custom-job-setup-and-pre-steps")
+
+	frontmatter := `---
+on: push
+permissions:
+  contents: read
+engine: copilot
+strict: false
+jobs:
+  custom_job:
+    runs-on: ubuntu-latest
+    setup-steps:
+      - name: Setup step
+        run: echo "setup"
+    pre-steps:
+      - name: Pre step
+        run: echo "pre"
+    steps:
+      - name: Main step
+        run: echo "work"
+---
+
+# Test Workflow
+`
+
+	testFile := filepath.Join(tmpDir, "test.md")
+	if err := os.WriteFile(testFile, []byte(frontmatter), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	compiler := NewCompiler()
+	if err := compiler.CompileWorkflow(testFile); err != nil {
+		t.Fatalf("CompileWorkflow() returned error: %v", err)
+	}
+
+	lockFile := filepath.Join(tmpDir, "test.lock.yml")
+	lockContent, err := os.ReadFile(lockFile)
+	if err != nil {
+		t.Fatalf("Failed to read lock file: %v", err)
+	}
+
+	customJobSection := extractJobSection(string(lockContent), "custom_job")
+	if customJobSection == "" {
+		t.Fatal("Expected custom_job section")
+	}
+	assertStepOrderInSection(t, customJobSection,
+		"- name: Setup step",
+		"- name: Configure GH_HOST for enterprise compatibility",
+		"- name: Pre step",
+		"- name: Main step",
+	)
 }
 
 func assertStepOrderInSection(t *testing.T, section string, orderedSteps ...string) {
@@ -1333,9 +1592,9 @@ Test content`
 		t.Error("Expected add_labels in handler config")
 	}
 
-	// Check that the consolidated job has correct timeout (15 minutes for consolidated job)
-	if !strings.Contains(yamlStr, "timeout-minutes: 15") {
-		t.Error("Expected timeout-minutes: 15 for consolidated safe_outputs job")
+	// Check that the consolidated job has correct timeout (45 minutes for consolidated job)
+	if !strings.Contains(yamlStr, "timeout-minutes: 45") {
+		t.Error("Expected timeout-minutes: 45 for consolidated safe_outputs job")
 	}
 }
 
@@ -1499,6 +1758,43 @@ Test content`
 	}
 	if strings.Contains(yamlStr, "secrets:\n      ") {
 		t.Error("Should not emit secrets map when using inherit")
+	}
+}
+
+func TestBuildJobsWithReusableWorkflowTimeoutMinutesFails(t *testing.T) {
+	tmpDir := testutil.TempDir(t, "reusable-workflow-timeout-test")
+
+	frontmatter := `---
+on: push
+permissions:
+  contents: read
+engine: copilot
+strict: false
+jobs:
+  call-other:
+    uses: owner/repo/.github/workflows/reusable.yml@main
+    timeout-minutes: 10
+---
+
+# Test Workflow
+
+Test content`
+
+	testFile := filepath.Join(tmpDir, "test.md")
+	if err := os.WriteFile(testFile, []byte(frontmatter), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	compiler := NewCompiler()
+	err := compiler.CompileWorkflow(testFile)
+	if err == nil {
+		t.Fatal("CompileWorkflow() expected error, got nil")
+	}
+	if !strings.Contains(err.Error(), "call-other") {
+		t.Fatalf("CompileWorkflow() error = %v, want error mentioning job name", err)
+	}
+	if !strings.Contains(err.Error(), "cannot set timeout-minutes") {
+		t.Fatalf("CompileWorkflow() error = %v, want error mentioning timeout-minutes restriction", err)
 	}
 }
 
@@ -3310,6 +3606,82 @@ func TestBuildCustomJobsAllNewFieldsViaWorkflowData(t *testing.T) {
 	}
 }
 
+func TestBuildCustomJobsTimeoutMinutesExpressionViaWorkflowData(t *testing.T) {
+	t.Parallel()
+
+	compiler := NewCompiler()
+	compiler.jobManager = NewJobManager()
+
+	data := &WorkflowData{
+		Name:   "Test Workflow",
+		AI:     "copilot",
+		RunsOn: "runs-on: ubuntu-latest",
+		Jobs: map[string]any{
+			"templated_timeout_job": map[string]any{
+				"runs-on":         "ubuntu-latest",
+				"timeout-minutes": "${{ inputs.timeout }}",
+				"steps": []any{
+					map[string]any{"run": "echo 'test'"},
+				},
+			},
+		},
+	}
+
+	err := compiler.buildCustomJobs(data, false)
+	if err != nil {
+		t.Fatalf("buildCustomJobs() returned error: %v", err)
+	}
+
+	job, exists := compiler.jobManager.GetJob("templated_timeout_job")
+	if !exists {
+		t.Fatal("Expected templated_timeout_job to be added")
+	}
+
+	if job.TimeoutMinutesExpression != "${{ inputs.timeout }}" {
+		t.Errorf("TimeoutMinutesExpression = %q, want %q", job.TimeoutMinutesExpression, "${{ inputs.timeout }}")
+	}
+	if job.TimeoutMinutes != 0 {
+		t.Errorf("TimeoutMinutes = %d, want 0 when expression is used", job.TimeoutMinutes)
+	}
+
+	var renderedBuf strings.Builder
+	compiler.jobManager.WriteJobsYAML(&renderedBuf)
+	rendered := renderedBuf.String()
+	if !strings.Contains(rendered, "timeout-minutes: ${{ inputs.timeout }}") {
+		t.Errorf("Expected templated timeout-minutes in rendered YAML, got:\n%s", rendered)
+	}
+}
+
+func TestBuildCustomJobsTimeoutMinutesInvalidStringViaWorkflowData(t *testing.T) {
+	t.Parallel()
+
+	compiler := NewCompiler()
+	compiler.jobManager = NewJobManager()
+
+	data := &WorkflowData{
+		Name:   "Test Workflow",
+		AI:     "copilot",
+		RunsOn: "runs-on: ubuntu-latest",
+		Jobs: map[string]any{
+			"invalid_timeout_job": map[string]any{
+				"runs-on":         "ubuntu-latest",
+				"timeout-minutes": "not-an-expression",
+				"steps": []any{
+					map[string]any{"run": "echo 'test'"},
+				},
+			},
+		},
+	}
+
+	err := compiler.buildCustomJobs(data, false)
+	if err == nil {
+		t.Fatal("expected error for non-expression timeout-minutes string")
+	}
+	if !strings.Contains(err.Error(), "timeout-minutes must be an integer or a GitHub Actions expression") {
+		t.Fatalf("expected timeout-minutes validation error, got: %v", err)
+	}
+}
+
 // TestPushRepoMemoryJobConditionalDetection verifies that push_repo_memory already uses
 // always() and buildDetectionPassedCondition() (accepting 'success' or 'skipped') when
 // detection is expression-controlled, so the job still runs when detection is skipped at runtime.
@@ -3363,9 +3735,9 @@ func TestPushRepoMemoryJobConditionalDetection(t *testing.T) {
 	}
 }
 
-// TestUpdateCacheMemoryJobConditionalDetection verifies that update_cache_memory already uses
-// always() and buildDetectionPassedCondition() (accepting 'success' or 'skipped') when
-// detection is expression-controlled, so the job still runs when detection is skipped at runtime.
+// TestUpdateCacheMemoryJobConditionalDetection verifies that update_cache_memory keeps always()
+// but requires detection success (not skipped) when detection is expression-controlled.
+// Detection always runs when the agent ran (even for noop), so 'success' is sufficient.
 func TestUpdateCacheMemoryJobConditionalDetection(t *testing.T) {
 	compiler := NewCompiler()
 	compiler.jobManager = NewJobManager()
@@ -3402,13 +3774,16 @@ func TestUpdateCacheMemoryJobConditionalDetection(t *testing.T) {
 		t.Fatal("expected non-nil update_cache_memory job")
 	}
 
-	// Job condition must use always() so it runs even when detection is skipped at runtime
+	// Job condition must include always() so explicit condition checks are evaluated.
 	if !strings.Contains(job.If, "always()") {
 		t.Errorf("update_cache_memory if: %q should contain 'always()'", job.If)
 	}
-	// Job condition must accept detection being skipped
-	if !strings.Contains(job.If, "'skipped'") {
-		t.Errorf("update_cache_memory if: %q should accept 'skipped' detection result", job.If)
+	// Job condition must require detection success and must not accept skipped.
+	if !strings.Contains(job.If, "needs.detection.result == 'success'") {
+		t.Errorf("update_cache_memory if: %q should require detection success", job.If)
+	}
+	if strings.Contains(job.If, "'skipped'") {
+		t.Errorf("update_cache_memory if: %q must not accept skipped detection result", job.If)
 	}
 	// Detection must be in Needs
 	if !slices.Contains(job.Needs, string(constants.DetectionJobName)) {

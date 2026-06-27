@@ -6,6 +6,7 @@ import (
 
 	"github.com/github/gh-aw/pkg/constants"
 	"github.com/github/gh-aw/pkg/logger"
+	"github.com/github/gh-aw/pkg/workflow/compilerenv"
 )
 
 var crushLog = logger.New("workflow:crush_engine")
@@ -28,7 +29,7 @@ func NewCrushEngine() *CrushEngine {
 				experimental: true, // Start as experimental until smoke tests pass consistently
 				capabilities: EngineCapabilities{
 					ToolsAllowlist: false, // Crush manages its own tool permissions via .crush.json
-					MaxTurns:       false, // No --max-turns flag in crush run
+					MaxTurns:       true,  // AWF max-turns is supported for Crush runs
 					WebSearch:      false, // Has built-in websearch but not exposed via gh-aw neutral tools yet
 				},
 			},
@@ -44,11 +45,23 @@ func (e *CrushEngine) GetModelEnvVarName() string {
 
 // GetRequiredSecretNames returns the list of secrets required by the Crush engine.
 // By default, Crush routes through the Copilot API using COPILOT_GITHUB_TOKEN
-// (or ${{ github.token }} when copilot-requests feature is enabled).
+// (or ${{ github.token }} when permissions.copilot-requests is set to write).
 // Additional provider API keys can be added via engine.env overrides.
 func (e *CrushEngine) GetRequiredSecretNames(workflowData *WorkflowData) []string {
 	crushLog.Print("Collecting required secrets for Crush engine")
 	return e.GetUniversalRequiredSecretNames(workflowData)
+}
+
+// GetSupportedEnvVarKeys returns the engine.env variable names that the Crush engine
+// supports as defined in the AWF specification. Crush is a multi-provider engine so all
+// provider API keys are valid engine.env overrides.
+func (e *CrushEngine) GetSupportedEnvVarKeys() []string {
+	return []string{
+		constants.CopilotGitHubToken,
+		constants.AnthropicAPIKey,
+		constants.CodexAPIKey,
+		constants.OpenAIAPIKey,
+	}
 }
 
 // GetInstallationSteps returns the GitHub Actions steps needed to install Crush CLI
@@ -76,6 +89,7 @@ func (e *CrushEngine) GetInstallationSteps(workflowData *WorkflowData) []GitHubA
 		"crush",
 		true, // Include Node.js setup
 		true, // Crush requires post-install scripts for native binaries
+		resolveRuntimeCooldown(workflowData, "node"),
 	)
 
 	// Run crush --version to verify the installation and force any deferred binary downloads
@@ -93,7 +107,7 @@ func (e *CrushEngine) GetInstallationSteps(workflowData *WorkflowData) []GitHubA
 }
 
 // GetSecretValidationStep returns the secret validation step for the Crush engine.
-// Returns an empty step if copilot-requests feature is enabled (uses GitHub Actions token).
+// Returns an empty step if permissions.copilot-requests is write (uses GitHub Actions token).
 func (e *CrushEngine) GetSecretValidationStep(workflowData *WorkflowData) GitHubActionStep {
 	return e.GetUniversalSecretValidationStep(
 		workflowData,
@@ -153,6 +167,7 @@ func (e *CrushEngine) GetExecutionSteps(workflowData *WorkflowData, logFile stri
 		commandName = workflowData.EngineConfig.Command
 	}
 	crushCommand := fmt.Sprintf("%s run %s %s", commandName, shellJoinArgs(crushArgs), promptArg)
+	crushCommand = getWorkspaceCommandPrefixFor(workflowData.EngineConfig) + crushCommand
 
 	// AWF wrapping
 	firewallEnabled := isFirewallEnabled(workflowData)
@@ -201,10 +216,12 @@ func (e *CrushEngine) GetExecutionSteps(workflowData *WorkflowData, logFile stri
 	}
 
 	env := map[string]string{
-		"GH_AW_PROMPT":     "/tmp/gh-aw/aw-prompts/prompt.txt",
+		"GH_AW_PROMPT":     constants.AwPromptsFile,
 		"GITHUB_WORKSPACE": "${{ github.workspace }}",
+		"RUNNER_TEMP":      "${{ runner.temp }}",
 		"NO_PROXY":         "localhost,127.0.0.1",
 	}
+	injectWorkflowCallNetworkAllowedEnv(env, workflowData)
 	e.ApplyUniversalProviderEnv(env, workflowData, firewallEnabled)
 
 	// MCP config path
@@ -215,6 +232,15 @@ func (e *CrushEngine) GetExecutionSteps(workflowData *WorkflowData, logFile stri
 	// Safe outputs env
 	applySafeOutputEnvToMap(env, workflowData)
 
+	// Propagate W3C trace context so engine spans nest under the gh-aw.agent.setup span.
+	applyTraceContextEnvToMap(env)
+
+	if workflowData.EngineConfig != nil && workflowData.EngineConfig.MaxTurns != "" {
+		env["GH_AW_MAX_TURNS"] = workflowData.EngineConfig.MaxTurns
+	} else {
+		env["GH_AW_MAX_TURNS"] = compilerenv.BuildDefaultMaxTurnsExpression()
+	}
+
 	// Model env var (only when explicitly configured)
 	if modelConfigured {
 		crushLog.Printf("Setting %s env var for model: %s",
@@ -223,6 +249,7 @@ func (e *CrushEngine) GetExecutionSteps(workflowData *WorkflowData, logFile stri
 	}
 
 	// Custom env from engine config (allows provider override)
+	applyEngineCwdEnv(env, workflowData)
 	if workflowData.EngineConfig != nil && len(workflowData.EngineConfig.Env) > 0 {
 		maps.Copy(env, workflowData.EngineConfig.Env)
 	}

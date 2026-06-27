@@ -23,9 +23,42 @@ const { generateFooterWithMessages, getDetectionCautionAlert } = require("./mess
 const { getErrorMessage } = require("./error_helpers.cjs");
 const { isStagedMode } = require("./safe_output_helpers.cjs");
 const { generateWorkflowCallIdMarker, matchesWorkflowId } = require("./generate_footer.cjs");
+const { attachExecutionState, fetchPullRequestReviewState } = require("./safe_output_execution_metadata.cjs");
+const { withRetry, RATE_LIMIT_RETRY_CONFIG, isTransientError, sleep } = require("./error_recovery.cjs");
+const { ERR_API } = require("./error_codes.cjs");
 
 const SUPERSEDE_REVIEW_MESSAGE = "Superseded by updated review from same workflow.";
 const MAX_SUPERSEDE_REVIEW_PAGES = 10;
+const MAX_REVIEW_BODY_LENGTH = 65000;
+const DEFAULT_FALLBACK_EXCERPT_LENGTH = 500;
+const FALLBACK_SECTION_HEADER = "### Comments that could not be inline-anchored";
+const FALLBACK_EMPTY_COMMENT_BODY = "_(empty comment body)_";
+const FALLBACK_TRUNCATION_SUFFIX = "\n\n_(Fallback review body truncated to fit GitHub length limits.)_";
+const FALLBACK_OMISSION_NOTE = "_(Unanchored comment details omitted to fit GitHub length limits.)_";
+const ELLIPSIS = "…";
+// GitHub API message fragment returned when a PR is locked and review submission is rejected.
+// Must be lowercase — compared against errorMessage.toLowerCase() for case-insensitive matching.
+const LOCKED_PR_REVIEW_MESSAGE = "lock prevents review";
+
+/** Returns true if the error message indicates a locked-PR 422 rejection. */
+const isLockedPrError = errorMessage => errorMessage.toLowerCase().includes(LOCKED_PR_REVIEW_MESSAGE);
+// Number of retries before treating a locked-PR 422 as a permanent soft skip.
+// A small number is used so the run does not stall when the PR is permanently locked.
+const LOCKED_PR_RETRY_COUNT = 3;
+// Delay between lock-retry attempts. Short enough to keep the run responsive
+// while still giving a transient lock a few seconds to clear.
+const LOCKED_PR_RETRY_DELAY_MS = 5000;
+// Keep review retries bounded so safe-outputs can recover from short installation-token
+// quota stalls without spending most of the workflow timeout waiting for a reset.
+const REVIEW_RATE_LIMIT_RETRY_CONFIG = {
+  ...RATE_LIMIT_RETRY_CONFIG,
+  maxRetries: 1,
+  // Use short backoff + small jitter for review submission so retries remain bounded
+  // while still avoiding synchronized thundering-herd retries.
+  initialDelayMs: 1000,
+  jitterMs: 200,
+  maxDelayMs: 60000,
+};
 
 /**
  * @typedef {Object} BufferedComment
@@ -78,6 +111,28 @@ function createReviewBuffer() {
 
   /** @type {boolean} When true, dismiss older same-workflow REQUEST_CHANGES reviews after posting a replacement review. */
   let supersedeOlderReviews = false;
+
+  /**
+   * Best-effort execution-state capture.
+   * When the installation token is out of quota, metadata collection should not
+   * prevent the actual review submission from proceeding.
+   *
+   * @param {{owner: string, repo: string}} repoParts
+   * @param {number} pullRequestNumber
+   * @param {"before" | "after"} phase
+   * @returns {Promise<Object | null>}
+   */
+  async function fetchReviewStateBestEffort(repoParts, pullRequestNumber, phase) {
+    try {
+      return await fetchPullRequestReviewState(github, repoParts, pullRequestNumber);
+    } catch (error) {
+      if (!isTransientError(error)) {
+        throw new Error(`${ERR_API}: Failed to capture ${phase} PR review state for #${pullRequestNumber}: ${getErrorMessage(error)} (non-transient)`, { cause: error });
+      }
+      core.warning(`Failed to capture ${phase} PR review state for #${pullRequestNumber}: ${getErrorMessage(error)}. Continuing without execution-state metadata.`);
+      return null;
+    }
+  }
   /**
    * Add a validated comment to the buffer.
    * Rejects comments targeting a different repo/PR than the first comment.
@@ -228,8 +283,12 @@ function createReviewBuffer() {
     }
 
     if (!reviewContext) {
-      core.warning("No review context set - cannot submit review");
-      return { success: false, error: "No review context available" };
+      core.info("No review context set - skipping PR review submission");
+      return {
+        success: true,
+        skipped: true,
+        reason: "No review context available",
+      };
     }
 
     const { repo, repoParts, pullRequestNumber, pullRequest } = reviewContext;
@@ -284,7 +343,7 @@ function createReviewBuffer() {
     }
 
     // Build comments array for the API
-    const comments = bufferedComments.map(comment => {
+    let comments = bufferedComments.map(comment => {
       /** @type {any} */
       const apiComment = {
         path: comment.path,
@@ -309,6 +368,65 @@ function createReviewBuffer() {
 
       return apiComment;
     });
+
+    // Sub-pattern B: Validate comment paths against the PR diff before POSTing.
+    // Comments targeting paths not in the diff cause GitHub to return 422 "Path could not be resolved".
+    if (comments.length > 0) {
+      try {
+        const changedPaths = new Set();
+        let listPage = 1;
+        // Cap at 10 pages (1,000 files). PRs with more than 1,000 changed files are
+        // extremely rare and path validation is best-effort; we proceed without filtering
+        // if any individual listFiles call throws (see catch block below).
+        const MAX_LIST_FILES_PAGES = 10;
+        while (listPage <= MAX_LIST_FILES_PAGES) {
+          const { data: files } = await github.rest.pulls.listFiles({
+            owner: repoParts.owner,
+            repo: repoParts.repo,
+            pull_number: pullRequestNumber,
+            per_page: 100,
+            page: listPage,
+          });
+          if (!Array.isArray(files) || files.length === 0) break;
+          for (const f of files) {
+            changedPaths.add(f.filename);
+            // For renamed files, the old path (previous_filename) is also valid for review comments.
+            if (f.previous_filename) changedPaths.add(f.previous_filename);
+          }
+          if (files.length < 100) break;
+          listPage++;
+        }
+        // `listPage > MAX_LIST_FILES_PAGES` is only true when the loop exited via the
+        // while-condition (not via a break), which only happens after a full page of 100
+        // files caused listPage to be incremented past the cap. A partial page always
+        // triggers the `files.length < 100` break first, so hitPageCap implies the last
+        // page was full and there may be more files beyond the 1,000-file limit.
+        // Fail-open in that case: the collected set is non-authoritative and filtering
+        // would risk dropping valid comments on the un-fetched files.
+        const hitPageCap = listPage > MAX_LIST_FILES_PAGES;
+        // Only filter when we received a non-empty file list and did not hit the cap;
+        // an empty list likely indicates an API quirk or a PR with no diff.
+        if (changedPaths.size > 0 && !hitPageCap) {
+          const invalidComments = comments.filter(c => !changedPaths.has(c.path));
+          if (invalidComments.length > 0) {
+            for (const c of invalidComments) {
+              core.warning(`Skipping review comment at '${c.path}:${c.line}' — path not found in PR #${pullRequestNumber} diff`);
+            }
+            comments = comments.filter(c => changedPaths.has(c.path));
+          }
+        }
+      } catch (pathValidationError) {
+        core.warning(`Failed to validate comment paths against PR diff: ${getErrorMessage(pathValidationError)}. Proceeding without path validation.`);
+      }
+    }
+
+    // Sub-pattern A: Guard against empty review submission (no body and no inline comments).
+    // GitHub returns 422 "Unprocessable Entity" when both are absent.
+    if (comments.length === 0 && !body) {
+      const errorMsg = "Empty review: review body is empty and no inline comments are present" + (bufferedComments.length > 0 ? " (all comment paths were outside the PR diff)" : "") + ". Skipping POST to avoid 422.";
+      core.warning(errorMsg);
+      return { success: false, error: errorMsg };
+    }
 
     core.info(`Submitting PR review on ${repo}#${pullRequestNumber}: event=${event}, comments=${comments.length}, bodyLength=${body.length}`);
 
@@ -339,6 +457,8 @@ function createReviewBuffer() {
       core.info("📝 PR review preview written to step summary (staged mode)");
       return { success: true, staged: true };
     }
+
+    const beforeState = await fetchReviewStateBestEffort(repoParts, pullRequestNumber, "before");
 
     /** @type {any} */
     const requestParams = {
@@ -432,21 +552,57 @@ function createReviewBuffer() {
       }
     }
 
+    async function createReviewWithRetry(params) {
+      return withRetry(() => github.rest.pulls.createReview(params), REVIEW_RATE_LIMIT_RETRY_CONFIG, `pulls.createReview ${repo}#${pullRequestNumber}`);
+    }
+
+    async function fetchAfterStateIfAvailable() {
+      // Only fetch after-state when before-state capture succeeded; otherwise we are
+      // already in degraded mode and avoid spending another API call on metadata.
+      return beforeState ? fetchReviewStateBestEffort(repoParts, pullRequestNumber, "after") : null;
+    }
+
+    /**
+     * Build the success result payload for a submitted PR review, wrapping it with
+     * execution-state metadata. Extracted to avoid duplicating the shape across the
+     * initial submit, own-PR-COMMENT retry, locked-PR retry, and body-only fallback paths.
+     *
+     * @param {{ id: number, html_url: string, state?: string }} review - Created review object
+     * @param {string} resolvedEvent - The review event actually used (may differ from the requested event)
+     * @param {number} commentCount - Number of inline comments included
+     * @param {import("./safe_output_execution_metadata.cjs").ReviewState|null} afterState - Post-submit review state
+     */
+    function buildReviewSuccessResult(review, resolvedEvent, commentCount, afterState) {
+      return attachExecutionState(
+        {
+          success: true,
+          url: review.html_url,
+          number: pullRequestNumber,
+          review_id: review.id,
+          review_url: review.html_url,
+          pull_request_number: pullRequestNumber,
+          repo: repo,
+          event: resolvedEvent,
+          comment_count: commentCount,
+          metadata: {
+            review_id: review.id,
+            review_event: resolvedEvent,
+            ...(review.state ? { review_state: review.state } : {}),
+          },
+        },
+        beforeState,
+        afterState
+      );
+    }
+
     try {
-      const { data: review } = await github.rest.pulls.createReview(requestParams);
+      const { data: review } = await createReviewWithRetry(requestParams);
       await maybeSupersedeOlderReviews(review.id);
+      const afterState = await fetchAfterStateIfAvailable();
 
       core.info(`Created PR review #${review.id}: ${review.html_url}`);
 
-      return {
-        success: true,
-        review_id: review.id,
-        review_url: review.html_url,
-        pull_request_number: pullRequestNumber,
-        repo: repo,
-        event: event,
-        comment_count: comments.length,
-      };
+      return buildReviewSuccessResult(review, event, comments.length, afterState);
     } catch (error) {
       const errorMessage = getErrorMessage(error);
 
@@ -458,18 +614,11 @@ function createReviewBuffer() {
         core.warning(`Cannot submit ${event} review on own PR. Retrying with event=COMMENT.`);
         try {
           requestParams.event = "COMMENT";
-          const { data: review } = await github.rest.pulls.createReview(requestParams);
+          const { data: review } = await createReviewWithRetry(requestParams);
           await maybeSupersedeOlderReviews(review.id);
+          const afterState = await fetchAfterStateIfAvailable();
           core.info(`Created PR review #${review.id}: ${review.html_url}`);
-          return {
-            success: true,
-            review_id: review.id,
-            review_url: review.html_url,
-            pull_request_number: pullRequestNumber,
-            repo: repo,
-            event: "COMMENT",
-            comment_count: comments.length,
-          };
+          return buildReviewSuccessResult(review, "COMMENT", comments.length, afterState);
         } catch (retryError) {
           core.error(`Failed to submit PR review on retry: ${getErrorMessage(retryError)}`);
           return {
@@ -479,25 +628,52 @@ function createReviewBuffer() {
         }
       }
 
-      // When the API cannot resolve a line reference in an inline comment, retry as a body-only
-      // review so that the overall review (and its footer body) is still submitted successfully.
-      if (errorMessage.includes("Line could not be resolved") && comments.length > 0) {
+      // When the PR is locked, retry a few times to detect if the lock is temporary,
+      // then treat as a soft skip (success:true, skipped:true) so the run is not failed.
+      // GitHub returns 422 with message "lock prevents review" for locked PRs.
+      // We check the error message (which withRetry/enhanceError preserves in "Original error:")
+      // rather than the status code, which may not survive error wrapping.
+      if (isLockedPrError(errorMessage)) {
+        core.warning(`PR #${pullRequestNumber} is locked (422 "${LOCKED_PR_REVIEW_MESSAGE}"). Retrying ${LOCKED_PR_RETRY_COUNT} time(s) to check if the lock is temporary...`);
+        for (let attempt = 1; attempt <= LOCKED_PR_RETRY_COUNT; attempt++) {
+          await sleep(LOCKED_PR_RETRY_DELAY_MS);
+          try {
+            const { data: review } = await createReviewWithRetry(requestParams);
+            await maybeSupersedeOlderReviews(review.id);
+            const afterState = await fetchAfterStateIfAvailable();
+            core.info(`Created PR review #${review.id} after lock retry (attempt ${attempt}/${LOCKED_PR_RETRY_COUNT}): ${review.html_url}`);
+            return buildReviewSuccessResult(review, event, comments.length, afterState);
+          } catch (retryError) {
+            const retryErrorMessage = getErrorMessage(retryError);
+            if (isLockedPrError(retryErrorMessage)) {
+              core.warning(`PR #${pullRequestNumber} is still locked (attempt ${attempt}/${LOCKED_PR_RETRY_COUNT})`);
+            } else {
+              // Different error on retry — surface as a regular failure
+              core.error(`Failed to submit PR review on lock retry attempt ${attempt}: ${retryErrorMessage}`);
+              return { success: false, error: retryErrorMessage };
+            }
+          }
+        }
+        // All retries exhausted — treat as a soft skip so the run stays green
+        const skipMsg = `Review skipped — PR #${pullRequestNumber} is locked`;
+        core.warning(skipMsg);
+        return { success: true, skipped: true, reason: skipMsg, pr_locked: true };
+      }
+
+      // When the API cannot resolve a line or path reference in an inline comment, retry as a
+      // body-only review so that the overall review (and its footer body) is still submitted
+      // successfully. Matches both "Line could not be resolved" and "Path could not be resolved".
+      if ((errorMessage.includes("Line could not be resolved") || errorMessage.includes("Path could not be resolved")) && comments.length > 0) {
         core.warning(`PR review submission failed due to unresolvable comment line(s): ${errorMessage}. Retrying as body-only review.`);
         try {
           const bodyOnlyParams = { ...requestParams };
           delete bodyOnlyParams.comments;
-          const { data: review } = await github.rest.pulls.createReview(bodyOnlyParams);
+          bodyOnlyParams.body = appendUnanchoredCommentsSection(typeof requestParams.body === "string" ? requestParams.body : "", comments);
+          const { data: review } = await createReviewWithRetry(bodyOnlyParams);
           await maybeSupersedeOlderReviews(review.id);
+          const afterState = await fetchAfterStateIfAvailable();
           core.info(`Created PR review #${review.id} (body-only fallback): ${review.html_url}`);
-          return {
-            success: true,
-            review_id: review.id,
-            review_url: review.html_url,
-            pull_request_number: pullRequestNumber,
-            repo: repo,
-            event: event,
-            comment_count: 0,
-          };
+          return buildReviewSuccessResult(review, event, 0, afterState);
         } catch (retryError) {
           core.error(`Failed to submit body-only PR review: ${getErrorMessage(retryError)}`);
           return {
@@ -546,3 +722,91 @@ function createReviewBuffer() {
 }
 
 module.exports = { createReviewBuffer };
+/**
+ * Append a fallback section that preserves inline comment content when comments cannot be anchored.
+ * @param {string} reviewBody
+ * @param {BufferedComment[]} comments
+ * @returns {string}
+ */
+function appendUnanchoredCommentsSection(reviewBody, comments) {
+  const baseBody = reviewBody || "";
+  const sectionPrefix = baseBody ? `\n\n${FALLBACK_SECTION_HEADER}\n\n` : `${FALLBACK_SECTION_HEADER}\n\n`;
+  const overheadLength = comments.reduce((sum, comment, index) => {
+    const separatorLength = index > 0 ? 2 : 0; // \n\n separator used by join("\n\n")
+    return sum + separatorLength + renderUnanchoredCommentBlock(comment, "").length;
+  }, 0);
+  const availableExcerptChars = MAX_REVIEW_BODY_LENGTH - (baseBody.length + sectionPrefix.length + overheadLength);
+
+  let perCommentExcerptLimit = DEFAULT_FALLBACK_EXCERPT_LENGTH;
+  if (comments.length > 0) {
+    if (availableExcerptChars <= 0) {
+      perCommentExcerptLimit = 0;
+    } else {
+      perCommentExcerptLimit = Math.min(DEFAULT_FALLBACK_EXCERPT_LENGTH, Math.floor(availableExcerptChars / comments.length));
+    }
+  }
+
+  const detailsBlocks = comments.map(comment => {
+    const rawBody = (comment.body || "").trim();
+    if (perCommentExcerptLimit <= 0) {
+      return renderUnanchoredCommentBlock(comment, FALLBACK_EMPTY_COMMENT_BODY);
+    }
+
+    const shouldTruncate = perCommentExcerptLimit > 0 && rawBody.length > perCommentExcerptLimit;
+    const truncateLength = perCommentExcerptLimit >= ELLIPSIS.length ? perCommentExcerptLimit - ELLIPSIS.length : 0;
+    const truncatedBody = shouldTruncate ? rawBody.substring(0, truncateLength) : rawBody;
+    const excerpt = shouldTruncate ? `${truncatedBody}${ELLIPSIS}` : rawBody;
+    const safeExcerpt = excerpt || FALLBACK_EMPTY_COMMENT_BODY;
+    return renderUnanchoredCommentBlock(comment, safeExcerpt);
+  });
+
+  const mergedBody = `${baseBody}${sectionPrefix}${detailsBlocks.join("\n\n")}`;
+  if (mergedBody.length <= MAX_REVIEW_BODY_LENGTH) {
+    return mergedBody;
+  }
+
+  const maxBodyLength = Math.max(0, MAX_REVIEW_BODY_LENGTH - FALLBACK_TRUNCATION_SUFFIX.length);
+  if (baseBody.length > maxBodyLength) {
+    return `${baseBody.substring(0, maxBodyLength)}${FALLBACK_TRUNCATION_SUFFIX}`;
+  }
+
+  const omissionBody = `${baseBody}${sectionPrefix}${FALLBACK_OMISSION_NOTE}`;
+  if (omissionBody.length <= MAX_REVIEW_BODY_LENGTH) {
+    return omissionBody;
+  }
+
+  return `${baseBody.substring(0, maxBodyLength)}${FALLBACK_TRUNCATION_SUFFIX}`;
+}
+
+/**
+ * @param {BufferedComment} comment
+ * @param {string} bodyText
+ * @returns {string}
+ */
+function renderUnanchoredCommentBlock(comment, bodyText) {
+  const summaryText = `${comment.path}:${comment.line}`;
+  return `<details><summary>${escapeHtml(summaryText)}</summary>\n\n${escapeHtml(bodyText)}\n\n</details>`;
+}
+
+/**
+ * @param {string} value
+ * @returns {string}
+ */
+function escapeHtml(value) {
+  return value.replace(/[&<>"']/g, character => {
+    switch (character) {
+      case "&":
+        return "&amp;";
+      case "<":
+        return "&lt;";
+      case ">":
+        return "&gt;";
+      case '"':
+        return "&quot;";
+      case "'":
+        return "&#39;";
+      default:
+        return character;
+    }
+  });
+}

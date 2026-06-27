@@ -8,9 +8,19 @@
 //   - import_topological.go: Topological ordering
 package parser
 
-import "github.com/github/gh-aw/pkg/logger"
+import (
+	"github.com/github/gh-aw/pkg/logger"
+	"github.com/github/gh-aw/pkg/types"
+)
 
 var importLog = logger.New("parser:import_processor")
+
+// PromptImportEntry describes one import contribution to prompt assembly, preserving
+// import declaration order across runtime-import and compile-time inlined markdown.
+type PromptImportEntry struct {
+	ImportPath string // Non-empty when this import should be emitted as {{#runtime-import ...}}
+	Markdown   string // Non-empty when this import should be inlined into the prompt at compile time
+}
 
 // ImportsResult holds the result of processing imports from frontmatter
 type ImportsResult struct {
@@ -21,12 +31,13 @@ type ImportsResult struct {
 	MergedMCPScripts              []string              // Merged mcp-scripts configurations from all imports
 	MergedMarkdown                string                // Only contains imports WITH inputs (for compile-time substitution)
 	ImportPaths                   []string              // List of import file paths for runtime-import macro generation (replaces MergedMarkdown)
+	PromptImports                 []PromptImportEntry   // Ordered import prompt contributions (runtime-import and inlined markdown interleaved)
 	MergedSteps                   string                // Merged steps configuration from all imports (excluding copilot-setup-steps)
 	CopilotSetupSteps             string                // Steps from copilot-setup-steps.yml (inserted at start)
 	MergedPreSteps                string                // Merged pre-steps configuration from all imports (prepended in order)
 	MergedPreAgentSteps           string                // Merged pre-agent-steps configuration from all imports (prepended in order)
 	MergedRuntimes                string                // Merged runtimes configuration from all imports
-	MergedRunInstallScripts       bool                  // true if any imported workflow sets run-install-scripts: true (global or node-level)
+	MergedRunInstallScripts       bool                  // true if any imported workflow sets runtimes.node.run-install-scripts: true
 	MergedServices                string                // Merged services configuration from all imports
 	MergedNetwork                 string                // Merged network configuration from all imports
 	MergedPermissions             string                // Merged permissions configuration from all imports
@@ -48,12 +59,17 @@ type ImportsResult struct {
 	MergedEnvSources              map[string]string     // env var name → source import path (for conflict detection and lock file header listing)
 	MergedFeatures                []map[string]any      // Merged features configuration from all imports (parsed YAML structures)
 	MergedModels                  []map[string][]string // Merged model alias definitions from all imports (first import to define a key wins among imports)
+	MergedModelCosts              []map[string]any      // Merged model pricing overlays (models.json provider structure) from all imports
 	MergedObservability           string                // Merged observability config (JSON) from all imports as an endpoint array (deduped by URL)
 	MergedEngineMCPToolTimeout    string                // First engine.mcp.tool-timeout found across all imports (Go duration string, e.g. "10m")
 	MergedEngineMCPSessionTimeout string                // First engine.mcp.session-timeout found across all imports (Go duration string, e.g. "4h")
 	MergedEngineModel             string                // First engine.model found in imports that have no engine.id (model preference without engine selection)
+	MergedMaxTurns                string                // First max-turns value found across all imports (JSON-encoded, first-wins)
+	MergedMaxToolDenials          string                // First max-tool-denials value found across all imports (JSON-encoded, first-wins)
 	MergedMaxRuns                 string                // First max-runs value found across all imports (JSON-encoded, first-wins)
-	MergedMaxEffectiveTokens      string                // First max-effective-tokens value found across all imports (JSON-encoded, first-wins)
+	MergedMaxTurnCacheMisses      string                // First max-turn-cache-misses value found across all imports (JSON-encoded, first-wins)
+	MergedMaxAICredits            string                // First max-ai-credits value found across all imports (JSON-encoded, first-wins)
+	MergedMaxDailyAICredits       string                // First max-daily-ai-credits value found across all imports (JSON-encoded, first-wins)
 	ImportedFiles                 []string              // List of imported file paths (for manifest)
 	AgentFile                     string                // Path to custom agent file (if imported)
 	AgentImportSpec               string                // Original import specification for agent file (e.g., "owner/repo/path@ref")
@@ -71,15 +87,9 @@ type ImportsResult struct {
 
 // ImportInputDefinition defines an input parameter for a shared workflow import.
 // Uses the same schema as workflow_dispatch inputs.
-// NOTE: This type matches workflow.InputDefinition which is the canonical type for input parameters.
-// The parser package uses map[string]any for actual parsing to avoid circular dependencies.
-type ImportInputDefinition struct {
-	Description string   `yaml:"description,omitempty" json:"description,omitempty"`
-	Required    bool     `yaml:"required,omitempty" json:"required,omitempty"`
-	Default     any      `yaml:"default,omitempty" json:"default,omitempty"` // Can be string, number, or boolean (dynamic type from YAML)
-	Type        string   `yaml:"type,omitempty" json:"type,omitempty"`       // "string", "choice", "boolean", "number"
-	Options     []string `yaml:"options,omitempty" json:"options,omitempty"` // Options for choice type
-}
+// NOTE: The parser package still uses map[string]any for actual parsing to avoid prematurely
+// constraining dynamic YAML/JSON payloads during frontmatter extraction.
+type ImportInputDefinition = types.InputDefinition
 
 // ImportSpec represents a single import specification (either a string path or an object with path and inputs)
 type ImportSpec struct {

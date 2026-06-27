@@ -1,4 +1,5 @@
 ---
+emoji: "🔒"
 description: Tests network firewall functionality and validates security rules for workflow network access
 on:
   workflow_dispatch:
@@ -8,7 +9,9 @@ permissions:
   issues: read
   pull-requests: read
 
-engine: copilot
+engine:
+  id: copilot
+  copilot-sdk: true
 
 network:
   allowed:
@@ -16,9 +19,11 @@ network:
     - node
   
 sandbox:
-  agent: awf  # Firewall enabled (migrated from network.firewall)
+  agent:
+    id: awf
+    sudo: false
 imports:
-  - shared/observability-otlp.md
+  - shared/otlp.md
 tools:
   cli-proxy: true
   web-fetch:

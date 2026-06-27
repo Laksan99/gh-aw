@@ -65,6 +65,9 @@ Create an issue.
 	if !strings.Contains(yaml, "detection_reason:") {
 		t.Error("Detection job missing detection_reason output")
 	}
+	if !strings.Contains(yaml, "aic:") {
+		t.Error("Detection job missing aic output")
+	}
 
 	// Check that the detection conclusion step has GH_AW_DETECTION_CONTINUE_ON_ERROR env var
 	if !strings.Contains(detectionSection, "GH_AW_DETECTION_CONTINUE_ON_ERROR:") {
@@ -82,6 +85,15 @@ Create an issue.
 	// Check that the script uses require to load the parse_threat_detection_results.cjs file
 	if !strings.Contains(detectionSection, "require('${{ runner.temp }}/gh-aw/actions/parse_threat_detection_results.cjs')") {
 		t.Error("Detection conclusion step doesn't use require to load parse_threat_detection_results.cjs")
+	}
+	if !strings.Contains(detectionSection, "id: parse_detection_token_usage") {
+		t.Error("Detection job missing parse_detection_token_usage step")
+	}
+	if !strings.Contains(detectionSection, "GH_AW_TOKEN_USAGE_SUMMARY_TITLE: Threat Detection Token Usage") {
+		t.Error("Detection token usage step missing threat detection summary title")
+	}
+	if !strings.Contains(detectionSection, "require('${{ runner.temp }}/gh-aw/actions/parse_token_usage.cjs')") {
+		t.Error("Detection token usage step doesn't use require to load parse_token_usage.cjs")
 	}
 
 	// Check that setupGlobals is called
@@ -146,6 +158,12 @@ Create outputs.
 	// (detection job fails with exit 1 when threats are found, so downstream jobs check job result)
 	if !strings.Contains(yaml, "needs.detection.result == 'success'") {
 		t.Error("Safe output jobs don't check detection result via detection job result")
+	}
+	if !strings.Contains(yaml, "GH_AW_AGENT_AIC: ${{ needs.agent.outputs.aic }}") {
+		t.Error("Safe output jobs should receive agent AI Credits separately")
+	}
+	if !strings.Contains(yaml, "GH_AW_THREAT_DETECTION_AIC: ${{ needs.detection.outputs.aic }}") {
+		t.Error("Safe output jobs should receive threat-detection AI Credits separately")
 	}
 }
 
@@ -213,6 +231,145 @@ Create an issue.
 	// Verify the step uses handle_detection_runs.cjs
 	if !strings.Contains(conclusionSection, "handle_detection_runs.cjs") {
 		t.Error("Detection runs step should use handle_detection_runs.cjs")
+	}
+}
+
+func TestNoopStepGetsThreatDetectionAICEnvVar(t *testing.T) {
+	tmpDir := testutil.TempDir(t, "test-*")
+	workflowPath := filepath.Join(tmpDir, "test-workflow.md")
+
+	frontmatter := `---
+on: workflow_dispatch
+permissions:
+  contents: read
+engine: claude
+safe-outputs:
+  noop: {}
+---
+
+# Test
+
+Emit noop output.
+`
+
+	if err := os.WriteFile(workflowPath, []byte(frontmatter), 0644); err != nil {
+		t.Fatalf("Failed to write workflow file: %v", err)
+	}
+
+	compiler := NewCompiler()
+	if err := compiler.CompileWorkflow(workflowPath); err != nil {
+		t.Fatalf("Failed to compile: %v", err)
+	}
+
+	lockPath := stringutil.MarkdownToLockFile(workflowPath)
+	yamlBytes, err := os.ReadFile(lockPath)
+	if err != nil {
+		t.Fatalf("Failed to read compiled YAML: %v", err)
+	}
+	yaml := string(yamlBytes)
+
+	conclusionSection := extractJobSection(yaml, "conclusion")
+	if conclusionSection == "" {
+		t.Fatal("Conclusion job not found in compiled YAML")
+	}
+	if !strings.Contains(conclusionSection, "Process no-op messages") {
+		t.Fatal("Conclusion job should contain 'Process no-op messages' step")
+	}
+	if !strings.Contains(conclusionSection, "GH_AW_THREAT_DETECTION_AIC: ${{ needs.detection.outputs.aic }}") {
+		t.Error("No-op step should receive threat-detection AI Credits env var")
+	}
+}
+
+func TestAgentFailureStepGetsThreatDetectionAICEnvVar(t *testing.T) {
+	tmpDir := testutil.TempDir(t, "test-*")
+	workflowPath := filepath.Join(tmpDir, "test-workflow.md")
+
+	frontmatter := `---
+on: workflow_dispatch
+permissions:
+  contents: read
+engine: claude
+safe-outputs:
+  create-issue:
+---
+
+# Test
+
+Create an issue.
+`
+
+	if err := os.WriteFile(workflowPath, []byte(frontmatter), 0644); err != nil {
+		t.Fatalf("Failed to write workflow file: %v", err)
+	}
+
+	compiler := NewCompiler()
+	if err := compiler.CompileWorkflow(workflowPath); err != nil {
+		t.Fatalf("Failed to compile: %v", err)
+	}
+
+	lockPath := stringutil.MarkdownToLockFile(workflowPath)
+	yamlBytes, err := os.ReadFile(lockPath)
+	if err != nil {
+		t.Fatalf("Failed to read compiled YAML: %v", err)
+	}
+	yaml := string(yamlBytes)
+
+	conclusionSection := extractJobSection(yaml, "conclusion")
+	if conclusionSection == "" {
+		t.Fatal("Conclusion job not found in compiled YAML")
+	}
+	if !strings.Contains(conclusionSection, "handle_agent_failure") {
+		t.Fatal("Conclusion job should contain handle_agent_failure step")
+	}
+	if !strings.Contains(conclusionSection, "GH_AW_THREAT_DETECTION_AIC: ${{ needs.detection.outputs.aic }}") {
+		t.Error("Agent failure step should receive threat-detection AI Credits env var")
+	}
+}
+
+func TestAgentFailureStepOmitsThreatDetectionAICEnvVarWhenDetectionDisabled(t *testing.T) {
+	tmpDir := testutil.TempDir(t, "test-*")
+	workflowPath := filepath.Join(tmpDir, "test-workflow.md")
+
+	frontmatter := `---
+on: workflow_dispatch
+permissions:
+  contents: read
+engine: claude
+safe-outputs:
+  create-issue:
+  threat-detection: false
+---
+
+# Test
+
+Create an issue.
+`
+
+	if err := os.WriteFile(workflowPath, []byte(frontmatter), 0644); err != nil {
+		t.Fatalf("Failed to write workflow file: %v", err)
+	}
+
+	compiler := NewCompiler()
+	if err := compiler.CompileWorkflow(workflowPath); err != nil {
+		t.Fatalf("Failed to compile: %v", err)
+	}
+
+	lockPath := stringutil.MarkdownToLockFile(workflowPath)
+	yamlBytes, err := os.ReadFile(lockPath)
+	if err != nil {
+		t.Fatalf("Failed to read compiled YAML: %v", err)
+	}
+	yaml := string(yamlBytes)
+
+	conclusionSection := extractJobSection(yaml, "conclusion")
+	if conclusionSection == "" {
+		t.Fatal("Conclusion job not found in compiled YAML")
+	}
+	if !strings.Contains(conclusionSection, "handle_agent_failure") {
+		t.Fatal("Conclusion job should contain handle_agent_failure step")
+	}
+	if strings.Contains(conclusionSection, "GH_AW_THREAT_DETECTION_AIC: ${{ needs.detection.outputs.aic }}") {
+		t.Error("Agent failure step should not receive threat-detection AI Credits env var when detection is disabled")
 	}
 }
 

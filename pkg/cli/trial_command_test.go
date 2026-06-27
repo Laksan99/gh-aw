@@ -27,6 +27,24 @@ func TestNewTrialCommandCloneRepoFlagDescription(t *testing.T) {
 	}
 }
 
+func TestNewTrialCommandNoArgsErrorIncludesExample(t *testing.T) {
+	cmd := NewTrialCommand(func(string) error { return nil })
+	cmd.SetArgs(nil)
+
+	err := cmd.Execute()
+	if err == nil {
+		t.Fatal("expected an error when no workflow specification is provided")
+	}
+
+	if !strings.Contains(err.Error(), "missing workflow specification") {
+		t.Fatalf("expected missing workflow specification error, got: %s", err)
+	}
+
+	if !strings.Contains(err.Error(), "Example:") {
+		t.Fatalf("expected trial usage error to include an Example section, got: %s", err)
+	}
+}
+
 // Test the host repo slug processing logic with dot notation
 func TestHostRepoSlugProcessing(t *testing.T) {
 	testCases := []struct {
@@ -74,9 +92,18 @@ func TestHostRepoSlugProcessing(t *testing.T) {
 // TestCloneRepoWithVersion tests that parseRepoSpec correctly handles version specifications
 // and that the version is properly passed to cloneRepoContentsIntoHost
 func TestCloneRepoWithVersion(t *testing.T) {
+	setHostEnv := func(t *testing.T, ghHost string) {
+		t.Helper()
+		t.Setenv("GITHUB_SERVER_URL", "")
+		t.Setenv("GITHUB_ENTERPRISE_HOST", "")
+		t.Setenv("GITHUB_HOST", "")
+		t.Setenv("GH_HOST", ghHost)
+	}
+
 	tests := []struct {
 		name            string
 		cloneRepoSpec   string
+		ghHost          string
 		expectedSlug    string
 		expectedVersion string
 		shouldError     bool
@@ -117,15 +144,27 @@ func TestCloneRepoWithVersion(t *testing.T) {
 		{
 			name:            "GitHub URL with tag",
 			cloneRepoSpec:   "https://github.com/owner/repo@v2.1.0",
+			ghHost:          "",
 			expectedSlug:    "owner/repo",
 			expectedVersion: "v2.1.0",
 			shouldError:     false,
 			description:     "Should parse GitHub URL with tag",
 		},
+		{
+			name:            "GHES URL with tag",
+			cloneRepoSpec:   "https://example.ghe.com/owner/repo@v2.1.0",
+			ghHost:          "example.ghe.com",
+			expectedSlug:    "owner/repo",
+			expectedVersion: "v2.1.0",
+			shouldError:     false,
+			description:     "Should parse GHES URL with tag when GH_HOST is configured",
+		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
+			setHostEnv(t, tt.ghHost)
+
 			repoSpec, err := parseRepoSpec(tt.cloneRepoSpec)
 
 			if tt.shouldError {

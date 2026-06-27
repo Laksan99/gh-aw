@@ -1,5 +1,5 @@
 ---
-title: Feature Synchronization
+title: 'Example: Feature Synchronization'
 description: Synchronize features from a main repository to sub-repositories or downstream services with automated pull requests.
 sidebar:
   badge: { text: 'Multi-Repo', variant: 'note' }
@@ -12,6 +12,16 @@ Feature synchronization workflows propagate changes from a main repository to re
 Use feature sync when maintaining related projects in separate repositories (monorepo alternative), propagating library updates to dependent projects, updating platform-specific repos after core changes, or keeping downstream forks synchronized with upstream.
 
 ## How It Works
+
+```mermaid
+flowchart LR
+    subgraph upstream["Upstream repo"]
+        push([Push to main]) --> agent[Sync agent]
+    end
+    agent -->|create-pull-request| ds1[downstream-service]
+    agent -->|create-pull-request| ds2[api-service]
+    agent -->|create-pull-request| ds3[mobile-backend]
+```
 
 The workflow monitors specific paths in the main repository and creates pull requests in target repositories when changes occur, adapting the changes for each target's structure while maintaining full audit trails.
 
@@ -26,15 +36,18 @@ on:
     branches: [main]
     paths:
       - 'shared/**'
+
 permissions:
   contents: read
   actions: read
+
 tools:
   github:
     toolsets: [repos]
   edit:
   bash:
     - "git:*"
+
 safe-outputs:
   github-token: ${{ secrets.GH_AW_CROSS_REPO_PAT }}
   create-pull-request:
@@ -50,6 +63,8 @@ safe-outputs:
 When shared components change, synchronize them to `myorg/downstream-service`. Review the git diff, read current versions from the target repo, adapt paths if needed, and create a PR with descriptive commit messages linking to original commits. Include structural adaptations and migration notes for breaking changes.
 ```
 
+To sync only specific file types, narrow the `paths` filter — for example `types/**/*.ts` and `interfaces/**/*.ts` to propagate just TypeScript definitions to a client SDK while preserving client-specific extensions.
+
 ## Multi-Target Sync
 
 Synchronize to multiple repositories simultaneously:
@@ -61,15 +76,18 @@ on:
     branches: [main]
     paths:
       - 'core/**'
+
 permissions:
   contents: read
   actions: read
+
 tools:
   github:
     toolsets: [repos]
   edit:
   bash:
     - "git:*"
+
 safe-outputs:
   github-token: ${{ secrets.GH_AW_CROSS_REPO_PAT }}
   create-pull-request:
@@ -93,15 +111,18 @@ Synchronize when new releases are published:
 on:
   release:
     types: [published]
+
 permissions:
   contents: read
   actions: read
+
 tools:
   github:
     toolsets: [repos]
   edit:
   bash:
     - "git:*"
+
 safe-outputs:
   github-token: ${{ secrets.GH_AW_CROSS_REPO_PAT }}
   create-pull-request:
@@ -117,41 +138,6 @@ safe-outputs:
 When a new release is published (version ${{ github.event.release.tag_name }}), create an upgrade PR that updates version references, applies API changes from release notes, updates configuration for breaking changes, and includes a migration guide with testing recommendations.
 ```
 
-## Selective File Sync
-
-Synchronize only specific file types or patterns:
-
-```aw wrap
----
-on:
-  push:
-    branches: [main]
-    paths:
-      - 'types/**/*.ts'
-      - 'interfaces/**/*.ts'
-permissions:
-  contents: read
-  actions: read
-tools:
-  github:
-    toolsets: [repos]
-  edit:
-  bash:
-    - "git:*"
-safe-outputs:
-  github-token: ${{ secrets.GH_AW_CROSS_REPO_PAT }}
-  create-pull-request:
-    target-repo: "myorg/client-sdk"
-    title-prefix: "[types] "
-    labels: [type-definitions]
-    draft: true
----
-
-# Sync TypeScript Type Definitions
-
-Synchronize TypeScript type definitions to client SDK. Identify changed `.ts` files in `types/` and `interfaces/`, update them in `myorg/client-sdk` while preserving client-specific extensions, validate no breaking changes, and document any compatibility concerns.
-```
-
 ## Bidirectional Sync with Conflict Detection
 
 Handle bidirectional synchronization with conflict awareness:
@@ -163,15 +149,18 @@ on:
     branches: [main]
     paths:
       - 'shared-config/**'
+
 permissions:
   contents: read
   actions: read
+
 tools:
   github:
     toolsets: [repos, pull_requests]
   edit:
   bash:
     - "git:*"
+
 safe-outputs:
   github-token: ${{ secrets.GH_AW_CROSS_REPO_PAT }}
   create-pull-request:
@@ -186,70 +175,12 @@ safe-outputs:
 Synchronize shared configuration between this project and `myorg/sister-project`, which may be modified independently. Compare timestamps and change history; if conflicts are detected, create a PR marked for manual review with conflict notes. If no conflict, apply changes automatically and record sync timestamp.
 ```
 
-## Feature Branch Sync
+## Other Trigger Variations
 
-Synchronize feature branches between repositories:
+The same `create-pull-request` setup works with any trigger. Two common variations:
 
-```aw wrap
----
-on:
-  pull_request:
-    types: [opened, synchronize]
-    branches:
-      - 'feature/**'
-permissions:
-  contents: read
-  pull-requests: read
-  actions: read
-tools:
-  github:
-    toolsets: [repos, pull_requests]
-  edit:
-  bash:
-    - "git:*"
-safe-outputs:
-  github-token: ${{ secrets.GH_AW_CROSS_REPO_PAT }}
-  create-pull-request:
-    target-repo: "myorg/integration-tests"
-    title-prefix: "[feature-test] "
-    labels: [feature-branch, auto-sync]
-    draft: true
----
-
-# Sync Feature Branch for Integration Testing
-
-When feature branch ${{ github.event.pull_request.head.ref }} (PR #${{ github.event.pull_request.number }}) is updated, create a matching branch in the integration test repo, sync relevant changes, update test configurations, and create a PR linking to the source with test scenarios and integration points.
-```
-
-## Scheduled Sync Check
-
-Regularly check for sync drift and create catch-up PRs:
-
-```aw wrap
----
-on: weekly on monday
-permissions:
-  contents: read
-  actions: read
-tools:
-  github:
-    toolsets: [repos, pull_requests]
-  edit:
-  bash:
-    - "git:*"
-safe-outputs:
-  github-token: ${{ secrets.GH_AW_CROSS_REPO_PAT }}
-  create-pull-request:
-    target-repo: "myorg/downstream-fork"
-    title-prefix: "[weekly-sync] "
-    labels: [scheduled-sync]
-    draft: true
----
-
-# Weekly Sync Check
-
-Check for accumulated changes needing synchronization to downstream fork. Find the last sync PR, identify all commits since then, categorize changes (features, fixes, docs), and create a comprehensive PR grouping commits by category with breaking changes highlighted and migration guidance.
-```
+- **Feature-branch sync** — trigger on `pull_request` for `feature/**` branches (add the `pull_requests` toolset and `pull-requests: read` permission). When a feature branch is updated, create a matching branch in an integration-test repo, sync the relevant changes, update test configurations, and open a PR linking back to the source PR with test scenarios.
+- **Scheduled drift check** — trigger on a schedule (`on: weekly on monday`) to catch accumulated changes. Find the last sync PR, identify all commits since then, categorize them (features, fixes, docs), and open a single catch-up PR grouping commits by category with breaking changes highlighted.
 
 ## Authentication Setup
 

@@ -14,7 +14,7 @@ import (
 // validateNoTemplateInjection is a test helper that parses YAML and validates
 // it for template injection vulnerabilities using validateNoTemplateInjectionFromParsed.
 func validateNoTemplateInjection(yamlContent string) error {
-	if !unsafeContextRegex.MatchString(yamlContent) {
+	if !UnsafeContextPattern.MatchString(yamlContent) {
 		return nil
 	}
 	var workflow map[string]any
@@ -813,6 +813,47 @@ GH_AW_MCP_CONFIG_EOF`,
 	}
 }
 
+func TestStripShellLineComments(t *testing.T) {
+	tests := []struct {
+		name     string
+		input    string
+		expected string
+	}{
+		{
+			name: "full line comment stripped",
+			input: strings.Join([]string{
+				`# docs: ${{ secrets.* }}`,
+				`echo "ok"`,
+			}, "\n"),
+			expected: strings.Join([]string{
+				``,
+				`echo "ok"`,
+			}, "\n"),
+		},
+		{
+			name:     "trailing comment stripped",
+			input:    `echo "ok" # docs: ${{ github.token }}`,
+			expected: `echo "ok" `,
+		},
+		{
+			name:     "hash in double quotes is preserved",
+			input:    `echo "# docs: ${{ github.token }}"`,
+			expected: `echo "# docs: ${{ github.token }}"`,
+		},
+		{
+			name:     "escaped hash is preserved",
+			input:    `echo \# ${{ github.token }}`,
+			expected: `echo \# ${{ github.token }}`,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.expected, stripShellLineComments(tt.input))
+		})
+	}
+}
+
 // TestTemplateInjectionYAMLKeyOrdering tests that validation correctly handles
 // different YAML key orderings, particularly when env: appears after run:
 func TestTemplateInjectionYAMLKeyOrdering(t *testing.T) {
@@ -1299,151 +1340,68 @@ func TestTemplateInjectionYAMLParsingEdgeCases(t *testing.T) {
 	}
 }
 
-// TestHasUnsafeExpressionInRunContent tests the fast text-based pre-flight check
-// that gates full YAML parsing in generateAndValidateYAML.
-func TestHasUnsafeExpressionInRunContent(t *testing.T) {
+func TestScanRunContentExpressions(t *testing.T) {
 	tests := []struct {
-		name     string
-		yaml     string
-		expected bool
-		desc     string
+		name              string
+		yaml              string
+		wantHasUnsafe     bool
+		wantHasDisallowed bool
 	}{
 		{
-			name:     "empty yaml",
-			yaml:     "",
-			expected: false,
-			desc:     "empty input has no violations",
-		},
-		{
-			name: "no unsafe expressions",
+			name: "no expressions",
 			yaml: `jobs:
   test:
     steps:
-      - run: echo "hello"`,
-			expected: false,
-			desc:     "no unsafe expressions anywhere",
+      - run: echo hello`,
+			wantHasUnsafe:     false,
+			wantHasDisallowed: false,
 		},
 		{
-			name: "unsafe expression only in env block - common compiler pattern",
+			name: "allowed run expression only",
 			yaml: `jobs:
   test:
     steps:
-      - name: Step
-        env:
-          VALUE: ${{ github.event.issue.title }}
-        run: |
-          echo "$VALUE"`,
-			expected: false,
-			desc:     "compiler puts expressions in env: blocks, not run: – no violation",
+      - run: node ${{ runner.temp }}/actions/foo.cjs`,
+			wantHasUnsafe:     false,
+			wantHasDisallowed: false,
 		},
 		{
-			name: "unsafe expression in concurrency group - not in run block",
-			yaml: `concurrency:
-  group: "ci-${{ github.event.pull_request.number }}"
-jobs:
-  test:
-    steps:
-      - name: Step
-        env:
-          PR: ${{ github.event.pull_request.number }}
-        run: |
-          echo "$PR"`,
-			expected: false,
-			desc:     "expressions in concurrency.group are not in run: blocks",
-		},
-		{
-			name: "unsafe expression directly in inline run value",
+			name: "unsafe run expression",
 			yaml: `jobs:
   test:
     steps:
       - run: echo "${{ github.event.issue.title }}"`,
-			expected: true,
-			desc:     "direct expression use in inline run: is unsafe",
+			wantHasUnsafe:     true,
+			wantHasDisallowed: true,
 		},
 		{
-			name: "unsafe expression in block scalar run content",
-			yaml: `jobs:
-  test:
-    steps:
-      - run: |
-          echo "${{ github.event.issue.title }}"`,
-			expected: true,
-			desc:     "direct expression use in run: block scalar is unsafe",
-		},
-		{
-			name: "unsafe expression in folded block run content",
-			yaml: `jobs:
-  test:
-    steps:
-      - run: >
-          echo "${{ github.event.issue.title }}"`,
-			expected: true,
-			desc:     "direct expression use in run: folded block is unsafe",
-		},
-		{
-			name: "unsafe expression in steps outputs context",
-			yaml: `jobs:
-  test:
-    steps:
-      - run: |
-          echo "${{ steps.prior.outputs.data }}"`,
-			expected: true,
-			desc:     "steps.outputs expression in run: is unsafe",
-		},
-		{
-			name: "unsafe expression in inputs context",
-			yaml: `jobs:
-  test:
-    steps:
-      - run: |
-          echo "${{ inputs.user_data }}"`,
-			expected: true,
-			desc:     "inputs expression in run: is unsafe",
-		},
-		{
-			name: "expression in env block above run block - not in run content",
-			yaml: `jobs:
-  test:
-    steps:
-      - name: Multi-step with env
-        env:
-          A: ${{ github.event.issue.title }}
-          B: ${{ steps.prior.outputs.val }}
-        run: |
-          echo "$A $B"
-      - run: echo "done"`,
-			expected: false,
-			desc:     "expressions in env: before run: are not inside run: content",
-		},
-		{
-			name: "multiple steps - only one has unsafe run content",
+			name: "safe env expression outside run block",
 			yaml: `jobs:
   test:
     steps:
       - env:
-          V: ${{ github.event.issue.title }}
-        run: echo "$V"
-      - run: |
-          echo "${{ github.event.issue.title }}"`,
-			expected: true,
-			desc:     "second step has unsafe expression directly in run: block",
+          TITLE: ${{ github.event.issue.title }}
+        run: echo "$TITLE"`,
+			wantHasUnsafe:     false,
+			wantHasDisallowed: false,
 		},
 		{
-			name: "chomping indicator |- still detected",
+			name: "disallowed expression in flow-style run block",
 			yaml: `jobs:
   test:
     steps:
-      - run: |-
-          echo "${{ github.event.issue.title }}"`,
-			expected: true,
-			desc:     "chomping indicators don't prevent detection",
+      - { run: "echo ${{ github.actor }}" }`,
+			wantHasUnsafe:     false,
+			wantHasDisallowed: true,
 		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got := hasUnsafeExpressionInRunContent(tt.yaml)
-			assert.Equal(t, tt.expected, got, tt.desc)
+			got := scanRunContentExpressions(tt.yaml)
+
+			assert.Equal(t, tt.wantHasUnsafe, got.hasUnsafe)
+			assert.Equal(t, tt.wantHasDisallowed, got.hasDisallowed)
 		})
 	}
 }

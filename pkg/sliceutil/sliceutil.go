@@ -2,8 +2,14 @@
 package sliceutil
 
 import (
+	"cmp"
+	"maps"
 	"slices"
+
+	"github.com/github/gh-aw/pkg/logger"
 )
+
+var sliceutilLog = logger.New("sliceutil:sliceutil")
 
 // Filter returns a new slice containing only elements that match the predicate.
 // This is a pure function that does not modify the input slice.
@@ -51,6 +57,13 @@ func FilterMapKeys[K comparable, V any](m map[K]V, predicate func(K, V) bool) []
 	return result
 }
 
+// SortedKeys returns the keys of a map in sorted order.
+// K must satisfy cmp.Ordered (e.g. string, int).
+// This is a pure function that does not modify the input map.
+func SortedKeys[K cmp.Ordered, V any](m map[K]V) []K {
+	return slices.Sorted(maps.Keys(m))
+}
+
 // Any returns true if at least one element in the slice satisfies the predicate.
 // Returns false for nil or empty slices.
 // This is a pure function that does not modify the input slice.
@@ -70,14 +83,22 @@ func Deduplicate[T comparable](slice []T) []T {
 			result = append(result, item)
 		}
 	}
+	if sliceutilLog.Enabled() && len(result) < len(slice) {
+		sliceutilLog.Printf("Deduplicate: removed %d duplicate(s) from %d items", len(slice)-len(result), len(slice))
+	}
 	return result
 }
 
 // MergeUnique returns a deduplicated slice that starts with base and appends any
 // items from extra that are not already present in base. Order is preserved.
 func MergeUnique[T comparable](base []T, extra ...T) []T {
-	seen := make(map[T]struct{}, len(base)+len(extra))
-	result := make([]T, 0, len(base)+len(extra))
+	capacity := len(base)
+	if len(extra) <= int(^uint(0)>>1)-capacity {
+		capacity += len(extra)
+	}
+
+	seen := make(map[T]struct{}, capacity)
+	result := make([]T, 0, capacity)
 	for _, item := range base {
 		if _, exists := seen[item]; !exists {
 			seen[item] = struct{}{}
@@ -89,6 +110,9 @@ func MergeUnique[T comparable](base []T, extra ...T) []T {
 			seen[item] = struct{}{}
 			result = append(result, item)
 		}
+	}
+	if sliceutilLog.Enabled() {
+		sliceutilLog.Printf("MergeUnique: base=%d extra=%d result=%d", len(base), len(extra), len(result))
 	}
 	return result
 }

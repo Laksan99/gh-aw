@@ -14,6 +14,7 @@ import (
 	"github.com/github/gh-aw/pkg/console"
 	"github.com/github/gh-aw/pkg/gitutil"
 	"github.com/github/gh-aw/pkg/logger"
+	"github.com/github/gh-aw/pkg/setutil"
 )
 
 var zizmorLog = logger.New("cli:zizmor")
@@ -208,11 +209,13 @@ func parseAndDisplayZizmorOutput(stdout, stderr string, verbose bool) (int, erro
 		// Organize findings by file
 		for _, finding := range findings {
 			// Track which files this finding affects (avoid duplicates)
-			affectedFiles := make(map[string]bool)
+			affectedFiles := make(map[string]struct {
+			})
 			for _, location := range finding.Locations {
 				filePath := location.Symbolic.Key.Local.GivenPath
-				if filePath != "" && !affectedFiles[filePath] {
-					affectedFiles[filePath] = true
+				if filePath != "" && !setutil.Contains(affectedFiles, filePath) {
+					affectedFiles[filePath] = struct {
+					}{}
 					fileFindings[filePath] = append(fileFindings[filePath], finding)
 					totalWarnings++
 				}

@@ -134,6 +134,47 @@ Flags:
 
 **When to use**: Validating workflow compilation against a feature branch in `github/gh-aw-actions` before a release.
 
+#### Compile against a specific gh-aw branch, tag, or SHA
+
+When developing changes to `github/gh-aw` itself, you can E2E-test the compiled workflows produced by an external repo against a specific revision of `gh-aw` using the `--gh-aw-ref` convenience flag.
+
+> [!IMPORTANT]
+> The `gh-aw` binary you invoke should come from a **parallel checkout of `github/gh-aw` at the same ref** you pass to `--gh-aw-ref`. The flag only controls the refs emitted into the compiled `.lock.yml` files — it does *not* fetch a different compiler. Compiling with one version of `gh-aw` while emitting refs to a different version will silently mix incompatible compiler output and action scripts.
+
+Typical end-to-end loop:
+
+```bash
+# 1. Check out github/gh-aw at the target ref in a sibling directory and build
+git clone -b <REF> https://github.com/github/gh-aw.git ~/gh-aw && make -C ~/gh-aw build
+
+# 2. From your downstream repo, compile workflows using that binary + ref
+cd ~/my-repo
+~/gh-aw/gh-aw compile --gh-aw-ref <REF> .github/workflows/*.md
+
+# 3. Commit the regenerated .lock.yml files and push so GitHub Actions runs them
+git commit -am "Pin workflows to gh-aw@<REF> for latest fix"
+git push
+```
+
+Examples of valid `<REF>` values:
+
+```bash
+# Main branch
+~/gh-aw/gh-aw compile --gh-aw-ref main .github/workflows/my-workflow.md
+
+# Feature branch
+~/gh-aw/gh-aw compile --gh-aw-ref my-feature-branch .github/workflows/my-workflow.md
+
+# Specific commit SHA
+~/gh-aw/gh-aw compile --gh-aw-ref abc123def456 .github/workflows/my-workflow.md
+```
+
+When a branch or tag name is supplied, the compiler resolves it to its commit SHA at compile time using the GitHub API, so the baked-in ref is immutable. Passing a full 40-character SHA skips the resolution call.
+
+This emits action references of the form `github/gh-aw/actions/setup@<SHA>` in the compiled `.lock.yml` files. It is exactly equivalent to passing `--action-mode release --action-tag <sha>` and exists as a single, mnemonic flag for the `gh-aw`-developer workflow.
+
+**When to use**: Running a downstream workflow against an unreleased branch of `gh-aw` to validate changes before merging. This flag is for developers of `gh-aw` itself; end users should rely on released versions instead.
+
 #### Watch and auto-compile workflows on changes
 ```bash
 make watch  # Or: ./gh-aw compile --watch
@@ -906,6 +947,12 @@ This documentation provides:
 2. **Run tests frequently**: Ensure changes don't break existing functionality
 3. **Check formatting**: Run `make fmt` before committing
 4. **Validate thoroughly**: Use `go run test_validation.go` before pull requests
+5. **Follow PR lifecycle discipline**:
+   - Open PRs as **draft**
+   - Move to **Ready for review** and approve required CI workflows
+   - Run the `pr-finisher` skill (automates final review/check/mergeability hardening) to get to green
+   - For features that deeply impact the engine, add the `smoke` label and approve workflows
+   - If no smoke run is queued after setting `smoke`, or additional changes require another smoke run, toggle the `smoke` label (remove and re-add), then approve workflows again
 
 ## Release Process
 
@@ -927,7 +974,7 @@ The codebase uses a consistent pattern for GitHub API operations:
 ```go
 // In create_issue.go
 type CreateIssuesConfig struct { ... }
-func (c *Compiler) parseIssuesConfig(...) *CreateIssuesConfig
+func (c *Compiler) parseCreateIssuesConfig(...) *CreateIssuesConfig
 func (c *Compiler) generateCreateIssuesJob(...) map[string]any
 ```
 
@@ -1190,4 +1237,3 @@ git commit -m "docs: update installation instructions"
 - **Current version** comes from git tags (`git describe --tags`)
 - **No manual version files** need to be updated
 - **Build metadata** includes commit hash and build date
-

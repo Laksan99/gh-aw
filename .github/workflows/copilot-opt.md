@@ -1,16 +1,21 @@
 ---
+private: true
+emoji: "⚡"
 name: Copilot Opt
 description: Analyze Copilot sessions from the last 14 days and create three optimization issues with evidence-backed recommendations
 on:
   schedule:
     - cron: "weekly on monday"
   workflow_dispatch:
+max-daily-ai-credits: 10000
 permissions:
   contents: read
   actions: read
   issues: read
   pull-requests: read
-engine: copilot
+engine:
+  id: copilot
+  copilot-sdk: true
 strict: true
 network:
   allowed:
@@ -42,9 +47,13 @@ imports:
   - shared/copilot-session-data-fetch.md
   - shared/copilot-pr-data-fetch.md
   - shared/reporting.md
-  - shared/observability-otlp.md
+  - shared/otlp.md
 timeout-minutes: 30
-
+features:
+  gh-aw-detection: true
+sandbox:
+  agent:
+    sudo: false
 ---
 {{#runtime-import? .github/shared-instructions.md}}
 
@@ -60,13 +69,13 @@ Analyze Copilot session logs from the **last 14 days** to detect inefficiencies,
 
 Pre-fetched data is available from shared imports:
 
-- `/tmp/gh-aw/session-data/sessions-list.json`
-- `/tmp/gh-aw/session-data/logs/` (conversation logs and/or fallback logs)
-- `/tmp/gh-aw/pr-data/copilot-prs.json` (cross-analysis source — always present)
+- `/tmp/gh-aw/agent/session-data/sessions-list.json`
+- `/tmp/gh-aw/agent/session-data/logs/` (conversation logs and/or fallback logs)
+- `/tmp/gh-aw/agent/pr-data/copilot-prs.json` (cross-analysis source — always present)
 
 These paths are populated by imported setup components:
-- `shared/copilot-session-data-fetch.md` writes the session files under `/tmp/gh-aw/session-data/`
-- `shared/copilot-pr-data-fetch.md` writes PR data under `/tmp/gh-aw/pr-data/`
+- `shared/copilot-session-data-fetch.md` writes the session files under `/tmp/gh-aw/agent/session-data/`
+- `shared/copilot-pr-data-fetch.md` writes PR data under `/tmp/gh-aw/agent/pr-data/`
 
 ## Hard Requirements
 
@@ -80,7 +89,7 @@ These paths are populated by imported setup components:
    - large initial instruction/context payload
    - inefficient orchestration/model-loading patterns
    - prompt drift / instruction adherence degradation
-4. **Always** correlate findings with Copilot PR patterns from `/tmp/gh-aw/pr-data/copilot-prs.json`.
+4. **Always** correlate findings with Copilot PR patterns from `/tmp/gh-aw/agent/pr-data/copilot-prs.json`.
 5. **Always** perform duplicate PR pattern detection (see Phase 3) and surface retry-blocked topics.
 6. Generate **exactly three** recommendations:
    - each recommendation must target a distinct root cause
@@ -93,7 +102,7 @@ If data is incomplete, proceed with available evidence and clearly state data qu
 ## Phase 0 — Setup
 
 1. Confirm required files exist.
-2. Enumerate session logs under `/tmp/gh-aw/session-data/logs`.
+2. Enumerate session logs under `/tmp/gh-aw/agent/session-data/logs`.
 3. Restrict analysis scope to sessions with `created_at` in the last 14 days.
 
 Use UTC for all time filtering.
@@ -133,7 +142,7 @@ Aggregate across all sessions to identify recurring systemic patterns.
 
 ## Phase 3 — PR Cross-Analysis and Duplicate Pattern Detection
 
-This phase is **mandatory**. `/tmp/gh-aw/pr-data/copilot-prs.json` is always present from the imported `shared/copilot-pr-data-fetch.md` step.
+This phase is **mandatory**. `/tmp/gh-aw/agent/pr-data/copilot-prs.json` is always present from the imported `shared/copilot-pr-data-fetch.md` step.
 
 ### 3a — General PR Failure Signals
 
@@ -153,7 +162,7 @@ jq '[.[] | select(.state == "CLOSED" and .mergedAt == null)]
     | group_by(.title)
     | map({title: .[0].title, count: length, prs: [.[] | {number, url, closedAt}]})
     | map(select(.count >= 2))
-    | sort_by(-.count)' /tmp/gh-aw/pr-data/copilot-prs.json
+    | sort_by(-.count)' /tmp/gh-aw/agent/pr-data/copilot-prs.json
 ```
 
 For each topic with **two or more** closed-without-merge PRs (retry-blocked topics):

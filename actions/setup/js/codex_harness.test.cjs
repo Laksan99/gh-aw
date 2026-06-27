@@ -1,11 +1,39 @@
 import { describe, it, expect } from "vitest";
+import { spawnSync } from "child_process";
 import { createRequire } from "module";
 import fs from "fs";
 import os from "os";
 import path from "path";
 
 const require = createRequire(import.meta.url);
-const { resolveCodexPromptFileArgs, isRateLimitError, isServerError, countPermissionDeniedIssues, hasNumerousPermissionDeniedIssues, buildMissingToolPermissionIssuePayload } = require("./codex_harness.cjs");
+const {
+  resolveCodexPromptFileArgs,
+  injectJsonFlag,
+  isRateLimitError,
+  isAuthenticationFailedError,
+  isMissingApiKeyError,
+  isServerError,
+  isInvalidModelError,
+  isReconnectExhaustedError,
+  countPermissionDeniedIssues,
+  hasNumerousPermissionDeniedIssues,
+  extractDeniedCommands,
+  buildMissingToolPermissionIssuePayload,
+  buildCodexChildEnv,
+  extractPortFromURL,
+  extractOpenAIProxyBaseURLFromToml,
+  getConfiguredOpenAIPortFromReflect,
+  validateCodexOpenAIBaseURLFromReflect,
+  hasNoopInSafeOutputs,
+} = require("./codex_harness.cjs");
+const { detectNonRetryableHarnessGuard } = require("./harness_retry_guard.cjs");
+
+const agentTempDir = "/tmp/gh-aw/agent";
+
+function makeHarnessTempDir(name) {
+  fs.mkdirSync(agentTempDir, { recursive: true });
+  return fs.mkdtempSync(path.join(agentTempDir, name));
+}
 
 describe("codex_harness.cjs", () => {
   describe("resolveCodexPromptFileArgs", () => {
@@ -70,6 +98,10 @@ describe("codex_harness.cjs", () => {
       expect(isRateLimitError("RateLimitError: You exceeded your current quota")).toBe(true);
     });
 
+    it("returns true for 'Rate limit reached for' human-readable message", () => {
+      expect(isRateLimitError("Rate limit reached for gpt-4o-mini in organization org-xxx on tokens per min (TPM): " + "Limit 200000, Used 166655, Requested 35398. Please try again in 615ms.")).toBe(true);
+    });
+
     it("returns false for unrelated errors", () => {
       expect(isRateLimitError("Error: ENOENT: no such file")).toBe(false);
       expect(isRateLimitError("Fatal: out of memory")).toBe(false);
@@ -81,9 +113,196 @@ describe("codex_harness.cjs", () => {
     });
   });
 
+  describe("isAuthenticationFailedError", () => {
+    it("returns true for authentication failed with request id", () => {
+      expect(isAuthenticationFailedError("Authentication failed (Request ID: C818:3ED713:19D401B:1C446B7:69D653CA)")).toBe(true);
+    });
+
+    it("returns false for non-authentication-failed output", () => {
+      expect(isAuthenticationFailedError("No authentication information found")).toBe(false);
+      expect(isAuthenticationFailedError("rate_limit_exceeded")).toBe(false);
+    });
+  });
+
+  describe("isMissingApiKeyError", () => {
+    it("returns true for missing OPENAI_API_KEY with backtick delimiters", () => {
+      expect(isMissingApiKeyError("ERROR: Missing environment variable: `OPENAI_API_KEY`")).toBe(true);
+    });
+
+    it("returns true for missing CODEX_API_KEY with backtick delimiters", () => {
+      expect(isMissingApiKeyError("ERROR: Missing environment variable: `CODEX_API_KEY`")).toBe(true);
+    });
+
+    it("returns true for missing OPENAI_API_KEY without backtick delimiters", () => {
+      expect(isMissingApiKeyError("Missing environment variable: OPENAI_API_KEY")).toBe(true);
+    });
+
+    it("returns true when the error appears within a larger output block", () => {
+      const output = "Starting codex...\nERROR: Missing environment variable: `OPENAI_API_KEY`\nExiting.";
+      expect(isMissingApiKeyError(output)).toBe(true);
+    });
+
+    it("returns false for unrelated errors", () => {
+      expect(isMissingApiKeyError("Authentication failed")).toBe(false);
+      expect(isMissingApiKeyError("rate_limit_exceeded")).toBe(false);
+      expect(isMissingApiKeyError("Missing environment variable: HOME")).toBe(false);
+      expect(isMissingApiKeyError("")).toBe(false);
+    });
+  });
+
+  describe("injectJsonFlag", () => {
+    it("injects --json after exec when not already present", () => {
+      expect(injectJsonFlag(["exec", "--dangerously-bypass-approvals-and-sandbox", "do the thing"])).toEqual(["exec", "--json", "--dangerously-bypass-approvals-and-sandbox", "do the thing"]);
+    });
+
+    it("does not inject --json when already present", () => {
+      expect(injectJsonFlag(["exec", "--json", "--skip-git-repo-check", "do the thing"])).toEqual(["exec", "--json", "--skip-git-repo-check", "do the thing"]);
+    });
+
+    it("does not inject --json for non-exec subcommands", () => {
+      expect(injectJsonFlag(["resume", "--last", "fix it"])).toEqual(["resume", "--last", "fix it"]);
+    });
+
+    it("returns empty array unchanged", () => {
+      expect(injectJsonFlag([])).toEqual([]);
+    });
+  });
+
+  describe("buildCodexChildEnv", () => {
+    it("preserves captured keys even when base environment is missing them", () => {
+      const result = buildCodexChildEnv({ PATH: "/usr/bin" }, "codex-key", "openai-key");
+      expect(result.CODEX_API_KEY).toBe("codex-key");
+      expect(result.OPENAI_API_KEY).toBe("openai-key");
+      expect(result.PATH).toBe("/usr/bin");
+    });
+
+    it("does not add unset keys", () => {
+      const result = buildCodexChildEnv({ PATH: "/usr/bin" }, undefined, undefined);
+      expect(result.CODEX_API_KEY).toBeUndefined();
+      expect(result.OPENAI_API_KEY).toBeUndefined();
+    });
+  });
+
+  describe("OpenAI base URL validation", () => {
+    it("extracts port from URL", () => {
+      expect(extractPortFromURL("http://172.30.0.30:10000")).toBe(10000);
+      expect(extractPortFromURL("https://example.com")).toBeNull();
+      expect(extractPortFromURL("not-a-url")).toBeNull();
+    });
+
+    it("extracts openai-proxy base_url from TOML", () => {
+      const toml = `
+[history]
+persistence = "none"
+[model_providers.openai-proxy]
+name = "OpenAI AWF proxy"
+base_url = "http://172.30.0.30:10000"
+env_key = "OPENAI_API_KEY"
+`;
+      expect(extractOpenAIProxyBaseURLFromToml(toml)).toBe("http://172.30.0.30:10000");
+    });
+
+    it("extracts configured OpenAI port from reflect payload", () => {
+      const reflect = {
+        endpoints: [
+          { provider: "anthropic", port: 10001, configured: true },
+          { provider: "openai", port: 10000, configured: true },
+        ],
+      };
+      expect(getConfiguredOpenAIPortFromReflect(reflect)).toBe(10000);
+    });
+
+    it("returns null for malformed reflect endpoint ports", () => {
+      const reflect = {
+        endpoints: [{ provider: "openai", port: "not-a-number", configured: true }],
+      };
+      expect(getConfiguredOpenAIPortFromReflect(reflect)).toBeNull();
+    });
+
+    it("fails validation when config and reflect OpenAI ports mismatch", () => {
+      const toml = `[model_providers.openai-proxy]\nbase_url = "http://172.30.0.30:10001"\n`;
+      const reflect = JSON.stringify({
+        endpoints: [
+          { provider: "openai", port: 10000, configured: true },
+          { provider: "anthropic", port: 10001, configured: true },
+        ],
+      });
+      const files = {
+        "/tmp/codex-config.toml": toml,
+        "/tmp/awf-reflect.json": reflect,
+      };
+      const readFileSync = filePath => files[filePath];
+      const result = validateCodexOpenAIBaseURLFromReflect({
+        codexConfigPath: "/tmp/codex-config.toml",
+        reflectPath: "/tmp/awf-reflect.json",
+        readFileSync,
+      });
+      expect(result.ok).toBe(false);
+      expect(result.reason).toContain("mismatch");
+    });
+
+    it("passes validation when ports match", () => {
+      const toml = `[model_providers.openai-proxy]\nbase_url = "http://172.30.0.30:10000"\n`;
+      const reflect = JSON.stringify({
+        endpoints: [{ provider: "openai", port: 10000, configured: true }],
+      });
+      const files = {
+        "/tmp/codex-config.toml": toml,
+        "/tmp/awf-reflect.json": reflect,
+      };
+      const readFileSync = filePath => files[filePath];
+      const result = validateCodexOpenAIBaseURLFromReflect({
+        codexConfigPath: "/tmp/codex-config.toml",
+        reflectPath: "/tmp/awf-reflect.json",
+        readFileSync,
+      });
+      expect(result.ok).toBe(true);
+    });
+
+    it("passes through when TOML lacks openai-proxy section", () => {
+      const files = {
+        "/tmp/codex-config.toml": `[history]\npersistence = "none"\n`,
+        "/tmp/awf-reflect.json": JSON.stringify({ endpoints: [{ provider: "openai", port: 10000, configured: true }] }),
+      };
+      const readFileSync = filePath => files[filePath];
+      const result = validateCodexOpenAIBaseURLFromReflect({
+        codexConfigPath: "/tmp/codex-config.toml",
+        reflectPath: "/tmp/awf-reflect.json",
+        readFileSync,
+      });
+      expect(result.ok).toBe(true);
+    });
+  });
+
   describe("isServerError", () => {
     it("returns true for InternalServerError", () => {
       expect(isServerError("InternalServerError: The server had an error processing your request")).toBe(true);
+    });
+
+    describe("isInvalidModelError", () => {
+      it("returns true for model-not-supported errors", () => {
+        expect(isInvalidModelError("Execution failed: CAPIError: 400 The requested model is not supported.")).toBe(true);
+      });
+
+      it("returns true for invalid model name errors", () => {
+        expect(isInvalidModelError("invalid model name 'claude-sonnet-999'")).toBe(true);
+        expect(isInvalidModelError("model 'gpt-foo' not found")).toBe(true);
+        expect(isInvalidModelError("model gpt-unknown is not available")).toBe(true);
+        expect(isInvalidModelError("model 'claude-3-5-sonnet@20241022' not found")).toBe(true);
+      });
+
+      it("returns true for AIC api-proxy 404 standalone Model not found shape", () => {
+        expect(isInvalidModelError("404 Not Found: Model not found")).toBe(true);
+        expect(isInvalidModelError("ResponseError: 404 Not Found: Model not found")).toBe(true);
+        expect(isInvalidModelError("Error: 404 Model not found")).toBe(true);
+      });
+
+      it("returns false for unrelated errors", () => {
+        expect(isInvalidModelError("rate_limit_exceeded")).toBe(false);
+        expect(isInvalidModelError("unknown model behavior detected")).toBe(false);
+        expect(isInvalidModelError("ServiceUnavailableError")).toBe(false);
+        expect(isInvalidModelError("")).toBe(false);
+      });
     });
 
     it("returns true for ServiceUnavailableError", () => {
@@ -128,6 +347,65 @@ describe("codex_harness.cjs", () => {
       const payload = JSON.parse(buildMissingToolPermissionIssuePayload());
       expect(payload.type).toBe("missing_tool");
       expect(payload.reason).toContain("missing tool/permission issue");
+      expect(payload.denied_commands).toEqual([]);
+    });
+
+    it("builds missing_tool payload with denied commands", () => {
+      const payload = JSON.parse(buildMissingToolPermissionIssuePayload(["go version", "ls /usr/local/go"]));
+      expect(payload.type).toBe("missing_tool");
+      expect(payload.denied_commands).toEqual(["go version", "ls /usr/local/go"]);
+    });
+  });
+
+  describe("extractDeniedCommands", () => {
+    it("returns empty array for empty output", () => {
+      expect(extractDeniedCommands("")).toEqual([]);
+      expect(extractDeniedCommands(null)).toEqual([]);
+    });
+
+    it("extracts command from line with box-drawing pipe marker (│) before permission denied", () => {
+      const output = ["\u2713 Some successful step", "\u2717 Check if go command works (shell)", "  \u2502 go version 2>&1", "  \u2514 Permission denied and could not request permission from user"].join("\n");
+      expect(extractDeniedCommands(output)).toEqual(["go version 2>&1"]);
+    });
+
+    it("extracts command with plain pipe (|) before permission denied", () => {
+      const output = ["| ls -la", "Permission denied"].join("\n");
+      expect(extractDeniedCommands(output)).toEqual(["ls -la"]);
+    });
+
+    it("deduplicates repeated denied commands", () => {
+      const output = ["  \u2502 go version", "  Permission denied", "  \u2502 go version", "  Permission denied", "  \u2502 go version", "  Permission denied"].join("\n");
+      const result = extractDeniedCommands(output);
+      expect(result).toEqual(["go version"]);
+    });
+
+    it("extracts multiple distinct denied commands", () => {
+      const output = ["  \u2502 go version 2>&1", "  Permission denied", "  \u2502 ls /usr/local/go/bin/go", "  Permission denied", "  \u2502 which go", "  Permission denied"].join("\n");
+      const result = extractDeniedCommands(output);
+      expect(result).toContain("go version 2>&1");
+      expect(result).toContain("ls /usr/local/go/bin/go");
+      expect(result).toContain("which go");
+    });
+
+    it("returns empty array when no pipe markers are present before permission denied", () => {
+      const output = "Some output\nPermission denied\nMore output";
+      expect(extractDeniedCommands(output)).toEqual([]);
+    });
+
+    it("looks back up to 3 lines for command context", () => {
+      const output = ["  \u2502 make test", "Running...", "Still running...", "  Permission denied"].join("\n");
+      expect(extractDeniedCommands(output)).toEqual(["make test"]);
+    });
+
+    it("does not look back more than 3 lines", () => {
+      const output = ["  \u2502 make test", "line2", "line3", "line4", "  Permission denied"].join("\n");
+      expect(extractDeniedCommands(output)).toEqual([]);
+    });
+
+    it("does not capture suffix of a command containing an internal pipe", () => {
+      // "find . -name '*.go' | sort" should not match by splitting on the internal |
+      const output = ["  find . -name '*.go' | sort", "  Permission denied"].join("\n");
+      expect(extractDeniedCommands(output)).toEqual([]);
     });
   });
 
@@ -141,10 +419,14 @@ describe("codex_harness.cjs", () => {
      */
     function shouldRetry(result, attempt) {
       if (result.exitCode === 0) return false;
-      const RATE_LIMIT_ERROR_PATTERN = /rate_limit_exceeded|429 Too Many Requests|RateLimitError/i;
-      const SERVER_ERROR_PATTERN = /InternalServerError|ServiceUnavailableError|500 Internal Server Error|503 Service Unavailable/i;
+      if (attempt === 0 && isAuthenticationFailedError(result.output)) return false;
+      if (isMissingApiKeyError(result.output)) return false;
       if (hasNumerousPermissionDeniedIssues(result.output)) return false;
-      const isTransient = RATE_LIMIT_ERROR_PATTERN.test(result.output) || SERVER_ERROR_PATTERN.test(result.output);
+      const nonRetryableGuard = detectNonRetryableHarnessGuard(result.output);
+      if (nonRetryableGuard.aiCreditsExceeded || nonRetryableGuard.awfAPIProxyBlockingRequests || nonRetryableGuard.goalAlreadyActive || nonRetryableGuard.maxRunsExceeded) return false;
+      const isRateLimit = isRateLimitError(result.output);
+      if (isRateLimit && isReconnectExhaustedError(result.output)) return false;
+      const isTransient = isRateLimit || isServerError(result.output);
       return attempt < MAX_RETRIES && (result.hasOutput || isTransient);
     }
 
@@ -161,6 +443,17 @@ describe("codex_harness.cjs", () => {
     it("retries on any other non-zero exit when session produced output", () => {
       const result = { exitCode: 1, hasOutput: true, output: "Error: connection reset" };
       expect(shouldRetry(result, 0)).toBe(true);
+    });
+
+    it("does not retry when first attempt fails authentication", () => {
+      const result = { exitCode: 1, hasOutput: true, output: "Authentication failed (Request ID: ABC123)" };
+      expect(shouldRetry(result, 0)).toBe(false);
+    });
+
+    it("does not retry when missing API key is detected (any attempt)", () => {
+      const result = { exitCode: 1, hasOutput: false, output: "ERROR: Missing environment variable: `OPENAI_API_KEY`" };
+      expect(shouldRetry(result, 0)).toBe(false);
+      expect(shouldRetry(result, 1)).toBe(false);
     });
 
     it("does not retry when no output was produced and no transient error", () => {
@@ -181,6 +474,152 @@ describe("codex_harness.cjs", () => {
     it("does not retry when numerous permission-denied issues are present", () => {
       const result = { exitCode: 1, hasOutput: true, output: "permission denied\npermission denied\npermission denied" };
       expect(shouldRetry(result, 0)).toBe(false);
+    });
+
+    it("does not retry when codex reports an existing active goal", () => {
+      const result = {
+        exitCode: 1,
+        hasOutput: true,
+        output: "cannot create a new goal because this thread already has a goal; use update_goal only when the existing goal is complete",
+      };
+      expect(shouldRetry(result, 0)).toBe(false);
+    });
+
+    it("does not retry when maximum LLM invocations are exceeded", () => {
+      const result = {
+        exitCode: 1,
+        hasOutput: true,
+        output: '{"error":{"type":"max_runs_exceeded","message":"Maximum LLM invocations exceeded (20 / 20).","invocation_count":20,"max_runs":20}}',
+      };
+      expect(shouldRetry(result, 0)).toBe(false);
+    });
+
+    it("retries on rate limit with format 'Rate limit reached for' without exhausted reconnects", () => {
+      const result = {
+        exitCode: 1,
+        hasOutput: false,
+        output: '{"type":"error","message":"Rate limit reached for gpt-4o-mini in organization org-xxx on tokens per min (TPM): Limit 200000, Used 50000, Requested 35000. Please try again in 615ms."}',
+      };
+      expect(shouldRetry(result, 0)).toBe(true);
+    });
+
+    it("does not retry when rate-limit reconnects are exhausted (N/N pattern)", () => {
+      // Simulates the real log format: multiple Reconnecting... lines appear in
+      // the output as codex retries the stream. The final "5/5" line is what
+      // triggers the exhausted-reconnect detection; intermediate lines (1/5, 2/5)
+      // confirm that the function ignores non-final attempts.
+      const output =
+        '{"type":"error","message":"Reconnecting... 1/5 (stream disconnected before completion: Rate limit reached for gpt-4o-mini on tokens per min (TPM): Limit 200000, Used 166655, Requested 35398. Please try again in 615ms.)"}\n' +
+        '{"type":"error","message":"Reconnecting... 2/5 (stream disconnected before completion: Rate limit reached for gpt-4o-mini on tokens per min (TPM): Limit 200000, Used 166655, Requested 35398. Please try again in 615ms.)"}\n' +
+        '{"type":"error","message":"Reconnecting... 5/5 (stream disconnected before completion: Rate limit reached for gpt-4o-mini on tokens per min (TPM): Limit 200000, Used 166655, Requested 35398. Please try again in 615ms.)"}';
+      const result = { exitCode: 1, hasOutput: true, output };
+      expect(shouldRetry(result, 0)).toBe(false);
+    });
+
+    it("retries when reconnects are exhausted but no rate-limit error is present", () => {
+      const output =
+        '{"type":"error","message":"Reconnecting... 1/5 (stream disconnected before completion: Connection timed out)"}\n' + '{"type":"error","message":"Reconnecting... 5/5 (stream disconnected before completion: Connection timed out)"}';
+      const result = { exitCode: 1, hasOutput: true, output };
+      expect(shouldRetry(result, 0)).toBe(true);
+    });
+  });
+
+  describe("isReconnectExhaustedError", () => {
+    it("returns true when output contains Reconnecting N/N pattern (same numbers)", () => {
+      expect(isReconnectExhaustedError("Reconnecting... 5/5 (some error)")).toBe(true);
+    });
+
+    it("returns true for last reconnect embedded in JSON output", () => {
+      const output = '{"type":"error","message":"Reconnecting... 5/5 (stream disconnected before completion: Rate limit reached for gpt-4o-mini...)"}';
+      expect(isReconnectExhaustedError(output)).toBe(true);
+    });
+
+    it("returns false when reconnect attempt is not the last (different numbers)", () => {
+      expect(isReconnectExhaustedError("Reconnecting... 1/5 (some error)")).toBe(false);
+      expect(isReconnectExhaustedError("Reconnecting... 3/5 (some error)")).toBe(false);
+    });
+
+    it("returns false when output has no reconnect messages", () => {
+      expect(isReconnectExhaustedError("rate_limit_exceeded")).toBe(false);
+      expect(isReconnectExhaustedError("")).toBe(false);
+    });
+
+    it("returns true for multi-digit N/N", () => {
+      expect(isReconnectExhaustedError("Reconnecting... 10/10 (error)")).toBe(true);
+    });
+
+    it("returns false for N/M where N !== M", () => {
+      expect(isReconnectExhaustedError("Reconnecting... 10/15 (error)")).toBe(false);
+    });
+  });
+
+  describe("noop pre-flight and retry guard", () => {
+    it("skips the agent when a noop is already in safe-outputs before the run", () => {
+      const tempDir = makeHarnessTempDir("codex-noop-preflight-");
+      const safeOutputsPath = path.join(tempDir, "safe-outputs.jsonl");
+      fs.writeFileSync(safeOutputsPath, '{"type":"noop","message":"nothing to do"}\n', "utf8");
+      const stubPath = path.join(tempDir, "stub.cjs");
+      const promptPath = path.join(tempDir, "prompt.txt");
+      const callsPath = path.join(tempDir, "calls.jsonl");
+      fs.writeFileSync(
+        stubPath,
+        `const fs = require("fs");
+const callsPath = process.env.CODEX_HARNESS_STUB_CALLS;
+fs.appendFileSync(callsPath, JSON.stringify({args: process.argv.slice(2)}) + "\\n");
+process.exit(0);`,
+        "utf8"
+      );
+      fs.writeFileSync(promptPath, "fix the bug", "utf8");
+
+      const result = spawnSync(process.execPath, ["codex_harness.cjs", process.execPath, stubPath, "exec", "--prompt-file", promptPath], {
+        cwd: path.dirname(require.resolve("./codex_harness.cjs")),
+        env: { ...process.env, CODEX_HARNESS_STUB_CALLS: callsPath, GH_AW_SAFE_OUTPUTS: safeOutputsPath },
+        encoding: "utf8",
+        timeout: 10000,
+      });
+      // Agent stub should never have been invoked
+      const stubCallCount = fs.existsSync(callsPath) ? fs.readFileSync(callsPath, "utf8").trim().split("\n").filter(Boolean).length : 0;
+      expect(stubCallCount).toBe(0);
+      expect(result.status).toBe(0);
+      expect(result.stderr).toContain("pre-flight: noop message found in safe-outputs");
+    });
+
+    it("does not retry after a failed run when a noop was written to safe-outputs", () => {
+      const tempDir = makeHarnessTempDir("codex-noop-retry-");
+      const safeOutputsPath = path.join(tempDir, "safe-outputs.jsonl");
+      const stubPath = path.join(tempDir, "stub.cjs");
+      const promptPath = path.join(tempDir, "prompt.txt");
+      const callsPath = path.join(tempDir, "calls.jsonl");
+      // Stub writes a noop on the first call then fails; harness must not retry.
+      fs.writeFileSync(
+        stubPath,
+        `const fs = require("fs");
+const callsPath = process.env.CODEX_HARNESS_STUB_CALLS;
+const safeOutputsPath = process.env.GH_AW_SAFE_OUTPUTS;
+fs.appendFileSync(callsPath, JSON.stringify({args: process.argv.slice(2)}) + "\\n");
+fs.appendFileSync(safeOutputsPath, JSON.stringify({type:"noop",message:"nothing to do"}) + "\\n");
+process.exit(1);`,
+        "utf8"
+      );
+      fs.writeFileSync(promptPath, "fix the bug", "utf8");
+
+      const result = spawnSync(process.execPath, ["codex_harness.cjs", process.execPath, stubPath, "exec", "--prompt-file", promptPath], {
+        cwd: path.dirname(require.resolve("./codex_harness.cjs")),
+        env: {
+          ...process.env,
+          CODEX_HARNESS_STUB_CALLS: callsPath,
+          GH_AW_SAFE_OUTPUTS: safeOutputsPath,
+          CODEX_API_KEY: "fake-key-for-test",
+        },
+        encoding: "utf8",
+        timeout: 10000,
+      });
+      const callCount = fs.readFileSync(callsPath, "utf8").trim().split("\n").filter(Boolean).length;
+      // Only one attempt — no retries after noop detected
+      expect(callCount).toBe(1);
+      // Harness exits 0 because noop means the work is done
+      expect(result.status).toBe(0);
+      expect(result.stderr).toContain("noop message found in safe-outputs — not retrying");
     });
   });
 });

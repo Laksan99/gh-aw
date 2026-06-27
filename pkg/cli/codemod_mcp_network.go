@@ -2,6 +2,7 @@ package cli
 
 import (
 	"fmt"
+	"slices"
 	"strings"
 
 	"github.com/github/gh-aw/pkg/logger"
@@ -31,7 +32,8 @@ func getMCPNetworkMigrationCodemod() Codemod {
 
 			// Collect all network.allowed domains from MCP servers
 			var allAllowedDomains []string
-			serversWithNetwork := make(map[string]bool)
+			serversWithNetwork := make(map[string]struct {
+			})
 
 			for serverName, serverValue := range mcpServersMap {
 				serverConfig, ok := serverValue.(map[string]any)
@@ -66,13 +68,15 @@ func getMCPNetworkMigrationCodemod() Codemod {
 					}
 					// Only mark server as having network if it has domains
 					if len(allowed) > 0 {
-						serversWithNetwork[serverName] = true
+						serversWithNetwork[serverName] = struct {
+						}{}
 					}
 				case []string:
 					allAllowedDomains = append(allAllowedDomains, allowed...)
 					// Only mark server as having network if it has domains
 					if len(allowed) > 0 {
-						serversWithNetwork[serverName] = true
+						serversWithNetwork[serverName] = struct {
+						}{}
 					}
 				}
 			}
@@ -203,7 +207,7 @@ func removeFieldFromMCPServer(lines []string, serverName string, fieldName strin
 		// Skip nested properties under the field
 		if inFieldBlock {
 			// Empty lines within the field block should be removed
-			if len(trimmedLine) == 0 {
+			if trimmedLine == "" {
 				continue
 			}
 
@@ -251,7 +255,7 @@ func addTopLevelNetwork(lines []string, domains []string) []string {
 				for j := i + 1; j < len(lines); j++ {
 					nextLine := lines[j]
 					nextTrimmed := strings.TrimSpace(nextLine)
-					if len(nextTrimmed) == 0 {
+					if nextTrimmed == "" {
 						continue
 					}
 					if hasExitedBlock(nextLine, onIndent) {
@@ -327,7 +331,7 @@ func updateNetworkAllowed(lines []string, domains []string) []string {
 			currentIndent := getIndentation(line)
 
 			// Empty lines - skip
-			if len(trimmedLine) == 0 {
+			if trimmedLine == "" {
 				continue
 			}
 
@@ -397,7 +401,7 @@ func addAllowedToNetwork(lines []string, domains []string) []string {
 	} else {
 		// Append at the end of network block
 		networkIndentStr := ""
-		for i := len(result) - 1; i >= 0; i-- {
+		for i := range slices.Backward(result) {
 			trimmed := strings.TrimSpace(result[i])
 			if strings.HasPrefix(trimmed, "network:") {
 				networkIndentStr = getIndentation(result[i])

@@ -1,4 +1,6 @@
 ---
+private: true
+emoji: "📊"
 description: Daily analysis of repository changes to extract insights about team evolution and working patterns
 on:
   schedule: daily
@@ -24,13 +26,14 @@ tools:
     mode: local
     toolsets: [repos, issues, pull_requests, discussions]
 timeout-minutes: 90
+max-ai-credits: 1500
 imports:
   - uses: shared/daily-audit-base.md
     with:
       title-prefix: "[daily-team-evolution] "
       expires: 1d
 
-  - shared/observability-otlp.md
+  - shared/otlp.md
 ---
 # Daily Team Evolution Insights
 

@@ -19,6 +19,24 @@ import (
 
 var trialRepoLog = logger.New("cli:trial_repository")
 
+// trialRepoInitDelay gives GitHub time to finish initializing a newly created repository.
+const trialRepoInitDelay = 2 * time.Second
+
+// checkoutActionPattern matches actions/checkout step lines with leading indentation
+var checkoutActionPattern = regexp.MustCompile(`^(\s*)(uses: actions/checkout@[^\s]*)(.*)$`)
+
+func trialRepositoryURL(repoSlug string) string {
+	return fmt.Sprintf("%s/%s", getGitHubHost(), repoSlug)
+}
+
+func trialRepositoryGitURL(repoSlug string) string {
+	return trialRepositoryURL(repoSlug) + ".git"
+}
+
+func trialRepositoryActionsSettingsURL(repoSlug string) string {
+	return trialRepositoryURL(repoSlug) + "/settings/actions"
+}
+
 // ensureTrialRepository creates a host repository if it doesn't exist, or reuses existing one
 // For clone-repo mode, reusing an existing host repository is not allowed
 // If forceDeleteHostRepo is true, deletes the repository if it exists before creating it
@@ -78,7 +96,7 @@ func ensureTrialRepository(repoSlug string, cloneRepoSlug string, forceDeleteHos
 			if dryRun {
 				prefix = "[DRY RUN] "
 			}
-			fmt.Fprintln(os.Stderr, console.FormatSuccessMessage(fmt.Sprintf("%sUsing existing host repository: https://github.com/%s", prefix, repoSlug)))
+			fmt.Fprintln(os.Stderr, console.FormatSuccessMessage(fmt.Sprintf("%sUsing existing host repository: %s", prefix, trialRepositoryURL(repoSlug))))
 			return nil
 		}
 	}
@@ -94,9 +112,9 @@ func ensureTrialRepository(repoSlug string, cloneRepoSlug string, forceDeleteHos
 
 	if dryRun {
 		fmt.Fprintln(os.Stderr, console.FormatInfoMessage("[DRY RUN] Would create repository with description: 'GitHub Agentic Workflows host repository'"))
-		fmt.Fprintln(os.Stderr, console.FormatInfoMessage(fmt.Sprintf("[DRY RUN] Would enable GitHub Actions permissions at: https://github.com/%s/settings/actions", repoSlug)))
+		fmt.Fprintln(os.Stderr, console.FormatInfoMessage("[DRY RUN] Would enable GitHub Actions permissions at: "+trialRepositoryActionsSettingsURL(repoSlug)))
 		fmt.Fprintln(os.Stderr, console.FormatInfoMessage("[DRY RUN] Would enable discussions"))
-		fmt.Fprintln(os.Stderr, console.FormatSuccessMessage("[DRY RUN] Would create host repository: https://github.com/"+repoSlug))
+		fmt.Fprintln(os.Stderr, console.FormatSuccessMessage("[DRY RUN] Would create host repository: "+trialRepositoryURL(repoSlug)))
 		return nil
 	}
 
@@ -111,19 +129,19 @@ func ensureTrialRepository(repoSlug string, cloneRepoSlug string, forceDeleteHos
 			if verbose {
 				fmt.Fprintln(os.Stderr, console.FormatInfoMessage("Repository already exists (detected via create error): "+repoSlug))
 			}
-			fmt.Fprintln(os.Stderr, console.FormatSuccessMessage("Using existing host repository: https://github.com/"+repoSlug))
+			fmt.Fprintln(os.Stderr, console.FormatSuccessMessage("Using existing host repository: "+trialRepositoryURL(repoSlug)))
 			return nil
 		}
 		return fmt.Errorf("failed to create host repository: %w (output: %s)", err, string(output))
 	}
 
 	// Show host repository creation message with URL
-	fmt.Fprintln(os.Stderr, console.FormatSuccessMessage("Created host repository: https://github.com/"+repoSlug))
+	fmt.Fprintln(os.Stderr, console.FormatSuccessMessage("Created host repository: "+trialRepositoryURL(repoSlug)))
 
 	// Prompt user to enable GitHub Actions permissions
 	fmt.Fprintln(os.Stderr, console.FormatInfoMessage(""))
 	fmt.Fprintln(os.Stderr, console.FormatInfoMessage("IMPORTANT: You must enable GitHub Actions permissions for the repository."))
-	fmt.Fprintln(os.Stderr, console.FormatInfoMessage(fmt.Sprintf("1. Go to: https://github.com/%s/settings/actions", repoSlug)))
+	fmt.Fprintln(os.Stderr, console.FormatInfoMessage("1. Go to: "+trialRepositoryActionsSettingsURL(repoSlug)))
 	fmt.Fprintln(os.Stderr, console.FormatInfoMessage("2. Under 'Workflow permissions', select 'Allow GitHub Actions to create and approve pull requests'"))
 	fmt.Fprintln(os.Stderr, console.FormatInfoMessage("3. Click 'Save'"))
 	fmt.Fprintln(os.Stderr, console.FormatInfoMessage(""))
@@ -147,7 +165,7 @@ func ensureTrialRepository(repoSlug string, cloneRepoSlug string, forceDeleteHos
 	}
 
 	// Give GitHub a moment to fully initialize the repository
-	time.Sleep(2 * time.Second)
+	time.Sleep(trialRepoInitDelay)
 
 	return nil
 }
@@ -186,7 +204,7 @@ func cloneTrialHostRepository(repoSlug string, verbose bool) (string, error) {
 	}
 
 	// Clone the repository using the full slug
-	repoURL := fmt.Sprintf("https://github.com/%s.git", repoSlug)
+	repoURL := trialRepositoryGitURL(repoSlug)
 	trialRepoLog.Printf("Cloning repository from URL to tempDir: %s", tempDir)
 
 	output, err := workflow.RunGitCombined(fmt.Sprintf("Cloning %s...", repoSlug), "clone", repoURL, tempDir)
@@ -306,7 +324,7 @@ func installWorkflowInTrialMode(ctx context.Context, tempDir string, parsedSpec 
 
 	// Compile the workflow with trial modifications
 	config := CompileConfig{
-		MarkdownFiles:        []string{".github/workflows/" + parsedSpec.WorkflowName + ".md"},
+		MarkdownFiles:        []string{constants.WorkflowsDirSlash + parsedSpec.WorkflowName + ".md"},
 		Verbose:              opts.Verbose,
 		EngineOverride:       opts.EngineOverride,
 		Validate:             true,
@@ -433,11 +451,10 @@ func modifyWorkflowForTrialMode(tempDir, workflowName, logicalRepoSlug string, v
 		// Also replace any hardcoded checkout actions to use the simulated host repo
 		// Split content into lines to preserve indentation
 		lines := strings.Split(modifiedContent, "\n")
-		checkoutPattern := regexp.MustCompile(`^(\s*)(uses: actions/checkout@[^\s]*)(.*)$`)
 
 		var newLines []string
 		for _, line := range lines {
-			if matches := checkoutPattern.FindStringSubmatch(line); len(matches) >= 3 {
+			if matches := checkoutActionPattern.FindStringSubmatch(line); len(matches) >= 3 {
 				indentation := matches[1]
 				usesLine := matches[2]
 				remainder := matches[3]
@@ -489,7 +506,7 @@ func commitAndPushWorkflow(tempDir, workflowName string, verbose bool) error {
 	}
 
 	// If no changes, skip commit and push
-	if len(strings.TrimSpace(string(statusOutput))) == 0 {
+	if strings.TrimSpace(string(statusOutput)) == "" {
 		if verbose {
 			fmt.Fprintln(os.Stderr, console.FormatInfoMessage("No changes detected, skipping commit"))
 		}
@@ -544,7 +561,7 @@ func cloneRepoContentsIntoHost(cloneRepoSlug string, cloneRepoVersion string, ho
 	defer os.RemoveAll(tempCloneDir)
 
 	// Clone the source repository
-	cloneURL := fmt.Sprintf("https://github.com/%s.git", cloneRepoSlug)
+	cloneURL := trialRepositoryGitURL(cloneRepoSlug)
 
 	output, err := workflow.RunGitCombined(fmt.Sprintf("Cloning %s...", cloneRepoSlug), "clone", cloneURL, tempCloneDir)
 	if err != nil {
@@ -565,7 +582,7 @@ func cloneRepoContentsIntoHost(cloneRepoSlug string, cloneRepoVersion string, ho
 	}
 
 	// Add the host repository as a new remote
-	hostURL := fmt.Sprintf("https://github.com/%s.git", hostRepoSlug)
+	hostURL := trialRepositoryGitURL(hostRepoSlug)
 	remoteCmd := exec.Command("git", "remote", "add", "host", hostURL)
 	if output, err := remoteCmd.CombinedOutput(); err != nil {
 		return fmt.Errorf("failed to add host remote: %w (output: %s)", err, string(output))

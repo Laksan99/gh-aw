@@ -8,6 +8,7 @@ import (
 
 	"github.com/github/gh-aw/pkg/agentdrain"
 	"github.com/github/gh-aw/pkg/console"
+	"github.com/github/gh-aw/pkg/constants"
 	"github.com/github/gh-aw/pkg/logger"
 )
 
@@ -38,11 +39,10 @@ func TrainDrain3Weights(processedRuns []ProcessedRun, outputDir string, verbose 
 	totalEvents := 0
 	for _, pr := range processedRuns {
 		events := buildAgentEventsFromProcessedRun(pr, MetricsData{
-			Turns:         pr.Run.Turns,
-			TokenUsage:    pr.Run.TokenUsage,
-			EstimatedCost: pr.Run.EstimatedCost,
-			ErrorCount:    pr.Run.ErrorCount,
-			WarningCount:  pr.Run.WarningCount,
+			Turns:        pr.Run.Turns,
+			TokenUsage:   pr.Run.TokenUsage,
+			ErrorCount:   pr.Run.ErrorCount,
+			WarningCount: pr.Run.WarningCount,
 		}, nil)
 		totalEvents += len(events)
 		for _, evt := range events {
@@ -80,7 +80,7 @@ func TrainDrain3Weights(processedRuns []ProcessedRun, outputDir string, verbose 
 	}
 
 	outputPath := filepath.Join(outputDir, drain3WeightsFilename)
-	if err := os.WriteFile(outputPath, weightsData, 0o644); err != nil {
+	if err := os.WriteFile(outputPath, weightsData, constants.FilePermPublic); err != nil {
 		return fmt.Errorf("log pattern training: write weights file: %w", err)
 	}
 

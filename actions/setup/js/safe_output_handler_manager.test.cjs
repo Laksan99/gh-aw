@@ -2,7 +2,21 @@
 
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import fs from "fs";
-import { loadConfig, loadHandlers, processMessages, buildCommentMemoryMessagesFromFiles } from "./safe_output_handler_manager.cjs";
+import { createRequire } from "module";
+import {
+  loadConfig,
+  loadHandlers,
+  processMessages,
+  buildCommentMemoryMessagesFromFiles,
+  rollbackReviewResults,
+  skipReviewResults,
+  logCreatedItemFromResult,
+  isFailedProcessingResult,
+  isReportOnlyFailureResult,
+  partitionFailureResults,
+} from "./safe_output_handler_manager.cjs";
+
+const require = createRequire(import.meta.url);
 
 describe("Safe Output Handler Manager", () => {
   beforeEach(() => {
@@ -23,6 +37,7 @@ describe("Safe Output Handler Manager", () => {
     delete process.env.GH_AW_TRACKER_LABEL;
     delete process.env.GH_AW_SAFE_OUTPUT_JOBS;
     delete process.env.GH_AW_SAFE_OUTPUT_SCRIPTS;
+    delete process.env.GH_AW_DETECTION_CONCLUSION;
     fs.rmSync("/tmp/gh-aw/comment-memory", { recursive: true, force: true });
   });
 
@@ -43,6 +58,33 @@ describe("Safe Output Handler Manager", () => {
       expect(result.add_comment).toEqual({ max: 1 });
     });
 
+    describe("logCreatedItemFromResult", () => {
+      it("should log finalized review results and skip buffered review metadata", () => {
+        const onItemCreated = vi.fn();
+
+        logCreatedItemFromResult(onItemCreated, "submit_pull_request_review", { success: true, event: "COMMENT", body_length: 12 });
+        expect(onItemCreated).not.toHaveBeenCalled();
+
+        logCreatedItemFromResult(onItemCreated, "submit_pull_request_review", {
+          success: true,
+          review_url: "https://github.com/owner/repo/pull/1#pullrequestreview-2",
+          pull_request_number: 1,
+          repo: "owner/repo",
+          before_state: { reviews: [] },
+          after_state: { reviews: [{ id: 2, state: "COMMENTED" }] },
+        });
+
+        expect(onItemCreated).toHaveBeenCalledWith({
+          type: "submit_pull_request_review",
+          url: "https://github.com/owner/repo/pull/1#pullrequestreview-2",
+          number: 1,
+          repo: "owner/repo",
+          before_state: { reviews: [] },
+          after_state: { reviews: [{ id: 2, state: "COMMENTED" }] },
+        });
+      });
+    });
+
     it("should throw error if environment variable is not set", () => {
       expect(() => loadConfig()).toThrow("GH_AW_SAFE_OUTPUTS_HANDLER_CONFIG environment variable is required but not set");
     });
@@ -50,6 +92,97 @@ describe("Safe Output Handler Manager", () => {
     it("should throw error if environment variable contains invalid JSON", () => {
       process.env.GH_AW_SAFE_OUTPUTS_HANDLER_CONFIG = "not json";
       expect(() => loadConfig()).toThrow("Failed to parse GH_AW_SAFE_OUTPUTS_HANDLER_CONFIG");
+    });
+  });
+
+  describe("report-only assignment failures", () => {
+    it("recognizes only active failures as failed processing results", () => {
+      expect(isFailedProcessingResult({ success: false })).toBe(true);
+      expect(isFailedProcessingResult({ success: false, deferred: true })).toBe(false);
+      expect(isFailedProcessingResult({ success: false, skipped: true })).toBe(false);
+      expect(isFailedProcessingResult({ success: false, cancelled: true })).toBe(false);
+    });
+
+    it("treats failed assign_to_agent results as report-only", () => {
+      expect(
+        isReportOnlyFailureResult({
+          type: "assign_to_agent",
+          success: false,
+        })
+      ).toBe(true);
+    });
+
+    it("treats failed upload_artifact results as report-only", () => {
+      expect(
+        isReportOnlyFailureResult({
+          type: "upload_artifact",
+          success: false,
+        })
+      ).toBe(true);
+    });
+
+    it("does not treat skipped or cancelled assign_to_agent results as report-only", () => {
+      expect(
+        isReportOnlyFailureResult({
+          type: "assign_to_agent",
+          success: false,
+          skipped: true,
+        })
+      ).toBe(false);
+      expect(
+        isReportOnlyFailureResult({
+          type: "assign_to_agent",
+          success: false,
+          cancelled: true,
+        })
+      ).toBe(false);
+      expect(
+        isReportOnlyFailureResult({
+          type: "assign_to_agent",
+          success: false,
+          deferred: true,
+        })
+      ).toBe(false);
+    });
+
+    it("does not treat skipped or cancelled upload_artifact results as report-only", () => {
+      expect(
+        isReportOnlyFailureResult({
+          type: "upload_artifact",
+          success: false,
+          skipped: true,
+        })
+      ).toBe(false);
+      expect(
+        isReportOnlyFailureResult({
+          type: "upload_artifact",
+          success: false,
+          cancelled: true,
+        })
+      ).toBe(false);
+    });
+
+    it("partitions fatal failures away from assign_to_agent report-only failures", () => {
+      const { fatalFailures, reportOnlyFailures } = partitionFailureResults([
+        { type: "assign_to_agent", success: false, error: "Insufficient permissions" },
+        { type: "create_issue", success: false, error: "Validation failed" },
+        { type: "assign_to_agent", success: false, skipped: true, error: "Handled elsewhere" },
+        { type: "create_discussion", success: true },
+      ]);
+
+      expect(reportOnlyFailures).toEqual([{ type: "assign_to_agent", success: false, error: "Insufficient permissions" }]);
+      expect(fatalFailures).toEqual([{ type: "create_issue", success: false, error: "Validation failed" }]);
+    });
+
+    it("partitions upload_artifact failures as report-only, not fatal", () => {
+      const { fatalFailures, reportOnlyFailures } = partitionFailureResults([
+        { type: "upload_artifact", success: false, error: "artifact twirp CreateArtifact failed (400)" },
+        { type: "create_discussion", success: true },
+        { type: "create_issue", success: false, error: "Validation failed" },
+      ]);
+
+      expect(reportOnlyFailures).toEqual([{ type: "upload_artifact", success: false, error: "artifact twirp CreateArtifact failed (400)" }]);
+      expect(fatalFailures).toEqual([{ type: "create_issue", success: false, error: "Validation failed" }]);
     });
   });
 
@@ -113,6 +246,48 @@ describe("Safe Output Handler Manager", () => {
       // Note: Actual integration testing requires real handler modules
       // This test documents the expected behavior for validation
       expect(true).toBe(true);
+    });
+
+    it("should pass top-level mentions config into handler config", async () => {
+      const addCommentModule = require("./add_comment.cjs");
+      const addCommentMainSpy = vi.spyOn(addCommentModule, "main").mockImplementation(async () => async () => ({ success: true }));
+      const createIssueModule = require("./create_issue.cjs");
+      const createIssueMainSpy = vi.spyOn(createIssueModule, "main").mockImplementation(async () => async () => ({ success: true }));
+
+      try {
+        const mentionsConfig = { enabled: true, allowed: ["@copilot"] };
+        const handlers = await loadHandlers(
+          {
+            add_comment: { max: 1 },
+            create_issue: { max: 1 },
+            mentions: mentionsConfig,
+          },
+          undefined,
+          ["copilot", "octocat"]
+        );
+
+        expect(handlers.has("add_comment")).toBe(true);
+        expect(handlers.has("create_issue")).toBe(true);
+        expect(addCommentMainSpy).toHaveBeenCalledTimes(1);
+        expect(createIssueMainSpy).toHaveBeenCalledTimes(1);
+        expect(addCommentMainSpy).toHaveBeenCalledWith(
+          expect.objectContaining({
+            max: 1,
+            mentions: mentionsConfig,
+            allowedMentionAliases: ["copilot", "octocat"],
+          })
+        );
+        expect(createIssueMainSpy).toHaveBeenCalledWith(
+          expect.objectContaining({
+            max: 1,
+            mentions: mentionsConfig,
+            allowedMentionAliases: ["copilot", "octocat"],
+          })
+        );
+      } finally {
+        addCommentMainSpy.mockRestore();
+        createIssueMainSpy.mockRestore();
+      }
     });
   });
 
@@ -239,6 +414,61 @@ describe("Safe Output Handler Manager", () => {
       expect(result.results[0].messageIndex).toBe(0);
       expect(result.results[1].type).toBe("create_issue");
       expect(result.results[1].messageIndex).toBe(1);
+    });
+
+    it("should abort non-reviewable outputs in detection warning mode", async () => {
+      process.env.GH_AW_DETECTION_CONCLUSION = "warning";
+      const messages = [{ type: "merge_pull_request" }, { type: "create_issue", title: "Review this", body: "Body" }];
+      const mergeHandler = vi.fn().mockResolvedValue({ success: true });
+      const createIssueHandler = vi.fn().mockResolvedValue({ success: true });
+      const handlers = new Map([
+        ["merge_pull_request", mergeHandler],
+        ["create_issue", createIssueHandler],
+      ]);
+
+      const result = await processMessages(handlers, messages);
+
+      expect(mergeHandler).not.toHaveBeenCalled();
+      expect(createIssueHandler).toHaveBeenCalledTimes(1);
+      expect(result.results[0]).toMatchObject({
+        type: "merge_pull_request",
+        success: false,
+        cancelled: true,
+        threatDetected: true,
+        errorCode: "threat_detected_abort_policy",
+      });
+      expect(result.results[1].success).toBe(true);
+    });
+
+    it.each(["set_issue_type", "set_issue_field", "dispatch_repository", "call_workflow", "upload_artifact"])("should abort %s in detection warning mode", async messageType => {
+      process.env.GH_AW_DETECTION_CONCLUSION = "warning";
+      const handler = vi.fn().mockResolvedValue({ success: true });
+      const handlers = new Map([[messageType, handler]]);
+      const messages = [{ type: messageType }];
+
+      const result = await processMessages(handlers, messages);
+
+      expect(handler).not.toHaveBeenCalled();
+      expect(result.results[0]).toMatchObject({
+        type: messageType,
+        success: false,
+        cancelled: true,
+        threatDetected: true,
+        errorCode: "threat_detected_abort_policy",
+      });
+    });
+
+    it("should log conversion requirement for push_to_pull_request_branch in detection warning mode", async () => {
+      process.env.GH_AW_DETECTION_CONCLUSION = "warning";
+      const pushHandler = vi.fn().mockResolvedValue({ success: true });
+      const handlers = new Map([["push_to_pull_request_branch", pushHandler]]);
+      const messages = [{ type: "push_to_pull_request_branch", branch: "topic" }];
+
+      const result = await processMessages(handlers, messages);
+
+      expect(pushHandler).toHaveBeenCalledTimes(1);
+      expect(result.results[0]).toMatchObject({ type: "push_to_pull_request_branch", success: true });
+      expect(core.info).toHaveBeenCalledWith(expect.stringContaining('Threat-detection warn policy conversion required for "push_to_pull_request_branch" -> "create_pull_request"'));
     });
 
     it("should pass the shared temporary ID map to handlers", async () => {
@@ -946,6 +1176,98 @@ describe("Safe Output Handler Manager", () => {
       expect(parentTracked.type).toBe("create_issue");
     });
 
+    it("should register temporary ID from create_pull_request result", async () => {
+      const messages = [{ type: "create_pull_request", temporary_id: "aw_pr1", title: "My PR", body: "PR body" }];
+
+      const prHandler = vi.fn().mockResolvedValue({
+        success: true,
+        number: 42,
+        url: "https://github.com/owner/repo/pull/42",
+        temporaryId: "aw_pr1",
+        repo: "owner/repo",
+      });
+
+      const handlers = new Map([["create_pull_request", prHandler]]);
+
+      const result = await processMessages(handlers, messages);
+
+      expect(result.success).toBe(true);
+      expect(result.temporaryIdMap["aw_pr1"]).toBeDefined();
+      expect(result.temporaryIdMap["aw_pr1"].number).toBe(42);
+      expect(result.temporaryIdMap["aw_pr1"].repo).toBe("owner/repo");
+    });
+
+    it("should resolve #aw_prN in later messages after create_pull_request registers its temp ID", async () => {
+      const messages = [
+        { type: "create_pull_request", temporary_id: "aw_pr1", title: "My PR", body: "PR body" },
+        { type: "create_issue", title: "Summary", body: "See #aw_pr1 for the changes" },
+      ];
+
+      const prHandler = vi.fn().mockResolvedValue({
+        success: true,
+        number: 42,
+        url: "https://github.com/owner/repo/pull/42",
+        temporaryId: "aw_pr1",
+        repo: "owner/repo",
+      });
+
+      let capturedResolvedIds;
+      const issueHandler = vi.fn().mockImplementation((message, resolvedTemporaryIds) => {
+        capturedResolvedIds = resolvedTemporaryIds;
+        return Promise.resolve({ success: true, number: 100, repo: "owner/repo", temporaryId: undefined });
+      });
+
+      const handlers = new Map([
+        ["create_pull_request", prHandler],
+        ["create_issue", issueHandler],
+      ]);
+
+      const result = await processMessages(handlers, messages);
+
+      expect(result.success).toBe(true);
+      // aw_pr1 should be in the resolvedTemporaryIds snapshot passed to the second handler
+      expect(capturedResolvedIds).toBeDefined();
+      expect(capturedResolvedIds["aw_pr1"]).toBeDefined();
+      expect(capturedResolvedIds["aw_pr1"].number).toBe(42);
+    });
+
+    it("should track create_pull_request with forward temp ID refs for synthetic update", async () => {
+      const messages = [
+        { type: "create_pull_request", temporary_id: "aw_pr1", title: "My PR", body: "Closes #aw_issue1" },
+        { type: "create_issue", temporary_id: "aw_issue1", title: "Issue", body: "Issue body" },
+      ];
+
+      const prHandler = vi.fn().mockResolvedValue({
+        success: true,
+        number: 10,
+        url: "https://github.com/owner/repo/pull/10",
+        managedBody: "Managed: Closes #aw_issue1\n\n<!-- footer -->",
+        temporaryId: "aw_pr1",
+        repo: "owner/repo",
+      });
+
+      const issueHandler = vi.fn().mockResolvedValue({
+        success: true,
+        number: 99,
+        repo: "owner/repo",
+        temporaryId: "aw_issue1",
+      });
+
+      const handlers = new Map([
+        ["create_pull_request", prHandler],
+        ["create_issue", issueHandler],
+      ]);
+
+      const result = await processMessages(handlers, messages);
+
+      expect(result.success).toBe(true);
+      // PR was created with an unresolved forward ref (#aw_issue1 not yet registered)
+      expect(result.outputsWithUnresolvedIds.length).toBeGreaterThan(0);
+      const trackedPR = result.outputsWithUnresolvedIds.find(o => o.type === "create_pull_request");
+      expect(trackedPR).toBeDefined();
+      expect(trackedPR.result.number).toBe(10);
+    });
+
     it("should collect missing_tool and missing_data messages and include in result", async () => {
       const messages = [
         {
@@ -1129,8 +1451,8 @@ describe("Safe Output Handler Manager", () => {
     });
   });
 
-  describe("code-push fail-fast behaviour", () => {
-    it("should cancel subsequent non-add_comment messages when push_to_pull_request_branch fails", async () => {
+  describe("code-push failure behaviour", () => {
+    it("should continue processing non-code-push messages when push_to_pull_request_branch fails", async () => {
       const messages = [{ type: "push_to_pull_request_branch" }, { type: "add_comment", body: "Success!" }, { type: "create_issue", title: "Issue" }];
 
       const codePushHandler = vi.fn().mockResolvedValue({ success: false, error: "Branch not found" });
@@ -1159,11 +1481,10 @@ describe("Safe Output Handler Manager", () => {
       const calledMessage = commentHandler.mock.calls[0][0];
       expect(calledMessage.body).toContain("push_to_pull_request_branch");
       expect(calledMessage.body).toContain("Branch not found");
-      // create_issue IS still cancelled (non-add_comment non-code-push type)
-      expect(result.results[2].success).toBe(false);
-      expect(result.results[2].cancelled).toBe(true);
-      // create_issue handler was NOT called
-      expect(issueHandler).not.toHaveBeenCalled();
+      // non-code-push message should continue to execute
+      expect(result.results[2].success).toBe(true);
+      expect(result.results[2].cancelled).toBeUndefined();
+      expect(issueHandler).toHaveBeenCalledTimes(1);
     });
 
     it("should allow add_comment through when create_pull_request fails via exception", async () => {
@@ -1397,8 +1718,8 @@ describe("Safe Output Handler Manager", () => {
 
       const prHandler = vi.fn().mockResolvedValue({
         success: true,
-        pull_request_number: 5,
-        pull_request_url: "https://github.com/owner/repo/pull/5",
+        number: 5,
+        url: "https://github.com/owner/repo/pull/5",
         repo: "owner/repo",
       });
       const commentHandler = vi.fn().mockResolvedValue([{ _tracking: null }]);
@@ -1538,6 +1859,116 @@ describe("Safe Output Handler Manager", () => {
       expect(result.results).toHaveLength(1);
       expect(result.results[0].success).toBe(false);
       expect(result.results[0].error).toContain("No handler loaded for type 'call_workflow'");
+    });
+  });
+
+  describe("rollbackReviewResults", () => {
+    it("flips success:true to success:false for submit_pull_request_review results", () => {
+      const results = [{ type: "submit_pull_request_review", success: true }];
+      rollbackReviewResults(results, "422 Unprocessable Entity");
+      expect(results[0].success).toBe(false);
+      expect(results[0].error).toBe("Review finalization failed: 422 Unprocessable Entity");
+    });
+
+    it("flips success:true to success:false for create_pull_request_review_comment results", () => {
+      const results = [
+        { type: "create_pull_request_review_comment", success: true },
+        { type: "create_pull_request_review_comment", success: true },
+      ];
+      rollbackReviewResults(results, "Path could not be resolved");
+      expect(results[0].success).toBe(false);
+      expect(results[0].error).toBe("Review finalization failed: Path could not be resolved");
+      expect(results[1].success).toBe(false);
+    });
+
+    it("does not modify results with success:false", () => {
+      const results = [{ type: "submit_pull_request_review", success: false, error: "already failed" }];
+      rollbackReviewResults(results, "new error");
+      expect(results[0].error).toBe("already failed");
+    });
+
+    it("does not modify unrelated result types", () => {
+      const results = [
+        { type: "add_comment", success: true },
+        { type: "create_issue", success: true },
+      ];
+      rollbackReviewResults(results, "some error");
+      expect(results[0].success).toBe(true);
+      expect(results[1].success).toBe(true);
+    });
+
+    it("handles mixed result types correctly", () => {
+      const results = [
+        { type: "add_comment", success: true },
+        { type: "create_pull_request_review_comment", success: true },
+        { type: "submit_pull_request_review", success: true },
+        { type: "create_issue", success: true },
+      ];
+      rollbackReviewResults(results, "finalization failed");
+      expect(results[0].success).toBe(true);
+      expect(results[1].success).toBe(false);
+      expect(results[2].success).toBe(false);
+      expect(results[3].success).toBe(true);
+    });
+
+    it("handles empty results array without throwing", () => {
+      expect(() => rollbackReviewResults([], "error")).not.toThrow();
+    });
+  });
+
+  describe("skipReviewResults", () => {
+    it("marks submit_pull_request_review results as skipped", () => {
+      const results = [{ type: "submit_pull_request_review", success: true }];
+      skipReviewResults(results, "Review skipped — PR is locked");
+      expect(results[0].skipped).toBe(true);
+      expect(results[0].skipReason).toBe("Review skipped — PR is locked");
+      expect(results[0].success).toBe(true);
+    });
+
+    it("marks create_pull_request_review_comment results as skipped", () => {
+      const results = [
+        { type: "create_pull_request_review_comment", success: true },
+        { type: "create_pull_request_review_comment", success: true },
+      ];
+      skipReviewResults(results, "Review skipped — PR is locked");
+      expect(results[0].skipped).toBe(true);
+      expect(results[0].skipReason).toBe("Review skipped — PR is locked");
+      expect(results[1].skipped).toBe(true);
+    });
+
+    it("does not modify results with success:false", () => {
+      const results = [{ type: "submit_pull_request_review", success: false, error: "already failed" }];
+      skipReviewResults(results, "PR is locked");
+      expect(results[0].skipped).toBeUndefined();
+      expect(results[0].error).toBe("already failed");
+    });
+
+    it("does not modify unrelated result types", () => {
+      const results = [
+        { type: "add_comment", success: true },
+        { type: "create_issue", success: true },
+      ];
+      skipReviewResults(results, "PR is locked");
+      expect(results[0].skipped).toBeUndefined();
+      expect(results[1].skipped).toBeUndefined();
+    });
+
+    it("handles mixed result types correctly", () => {
+      const results = [
+        { type: "add_comment", success: true },
+        { type: "create_pull_request_review_comment", success: true },
+        { type: "submit_pull_request_review", success: true },
+        { type: "create_issue", success: true },
+      ];
+      skipReviewResults(results, "Review skipped — PR is locked");
+      expect(results[0].skipped).toBeUndefined();
+      expect(results[1].skipped).toBe(true);
+      expect(results[2].skipped).toBe(true);
+      expect(results[3].skipped).toBeUndefined();
+    });
+
+    it("handles empty results array without throwing", () => {
+      expect(() => skipReviewResults([], "PR is locked")).not.toThrow();
     });
   });
 

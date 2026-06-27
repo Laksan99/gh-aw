@@ -40,57 +40,39 @@ Some key toolsets are:
 - `labels` (labels management)
 
 :::note
-`toolsets: [all]` does **not** include the `dependabot` toolset. The `dependabot` toolset must be opted into explicitly:
+`toolsets: [all]` does **not** include the `dependabot` toolset. The `dependabot` toolset must be opted into explicitly. See [Using the `dependabot` toolset](#using-the-dependabot-toolset) for authentication requirements.
+:::
+
+Some toolsets require [additional authentication](#additional-authentication-for-github-tools).
+
+## Restricting Tools (`tools.github.allowed`)
+
+Use `tools.github.allowed` to restrict which GitHub MCP tools the agent can call. Each entry is either a string tool name or an object with a per-tool call limit:
 
 ```yaml wrap
 tools:
   github:
-    toolsets: [all, dependabot]
+    allowed:
+      - name: issue_read
+        max-calls: 1
+      - list_labels
+      - pull_request_read
 ```
 
-See [Using the `dependabot` toolset](#using-the-dependabot-toolset) for authentication requirements.
-:::
+- **String entries** (`list_labels`) — allow unlimited calls to that tool within the run.
+- **Object entries** (`{ name: <tool>, max-calls: <n> }`) — cap how many times the tool can be invoked. `max-calls` must be a positive integer; the MCP gateway enforces the cap at runtime.
 
-Some toolsets require [additional authentication](#additional-authentication-for-github-tools).
+The shorthand form `"issue_read:1"` is **not** interpreted as a call limit — it is treated as a literal (and therefore unknown) tool name.
+
+This complements toolset selection: `toolsets` decides which API groups are loaded, while `allowed` further narrows which individual tools the agent may invoke and how many times.
 
 ## GitHub Integrity Filtering (`tools.github.min-integrity`)
 
 Sets the minimum integrity level required for content the agent can access. For public repositories, `min-integrity: approved` is applied automatically. See [Integrity Filtering](/gh-aw/reference/integrity/) for levels, examples, user blocking, and approval labels.
 
-## GitHub Repository Access Restrictions (`tools.github.allowed-repos`)
+## GitHub Cross-Repository Reading
 
-You can configure the GitHub Tools to be restricted in which repositories can be accessed via the GitHub tools during AI engine execution.
-
-The setting `tools.github.allowed-repos` specifies which repositories the agent can access through GitHub tools:
-
-- `"all"` — All repositories accessible by the configured token
-- `"public"` — Public repositories only
-- Array of patterns — Specific repositories and wildcards:
-  - `"owner/repo"` — Exact repository match
-  - `"owner/*"` — All repositories under an owner
-  - `"owner/prefix*"` — Repositories with a name prefix under an owner
-
-This defaults to `"all"` when omitted. Patterns must be lowercase. Wildcards are only permitted at the end of the repository name component.
-
-For example:
-
-```yaml wrap
-tools:
-  github:
-    mode: remote
-    toolsets: [default]
-    allowed-repos:
-      - "myorg/*"
-      - "partner/shared-repo"
-      - "myorg/api-*"
-    min-integrity: approved
-```
-
-:::note
-The `repos` field was renamed to `allowed-repos` to better reflect its purpose. If you have existing workflows using `repos`, run `gh aw fix` to automatically migrate them to `allowed-repos`.
-:::
-
-### GitHub Cross-Repository Reading
+By default, the GitHub Tools can read from the current repository and all public repositories (if permitted by the network firewall). To read from other private repositories, you must configure additional authentication. You can also configure the GitHub Tools to be restricted in which repositories can be accessed via the GitHub tools during AI engine execution by using the `tools.github.allowed-repos` setting. See [Cross-Repository Operations](/gh-aw/reference/cross-repository/) for details and examples.
 
 By default, the GitHub Tools can read from the current repository and all public repositories (if permitted by the network firewall). To read from other private repositories, you must configure additional authentication. See [Cross-Repository Operations](/gh-aw/reference/cross-repository/) for details and examples.
 

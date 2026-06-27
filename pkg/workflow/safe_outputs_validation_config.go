@@ -2,6 +2,10 @@ package workflow
 
 import (
 	"encoding/json"
+	"fmt"
+	"slices"
+	"strings"
+	"sync"
 
 	"github.com/github/gh-aw/pkg/logger"
 )
@@ -12,8 +16,10 @@ var safeOutputValidationLog = logger.New("workflow:safe_outputs_validation_confi
 type FieldValidation struct {
 	Required                 bool     `json:"required,omitempty"`
 	Type                     string   `json:"type,omitempty"`
+	TypeHint                 string   `json:"typeHint,omitempty"` // Overrides the type description in error messages (e.g. "GraphQL node ID string")
 	Sanitize                 bool     `json:"sanitize,omitempty"`
 	MaxLength                int      `json:"maxLength,omitempty"`
+	MinLength                int      `json:"minLength,omitempty"`
 	PositiveInteger          bool     `json:"positiveInteger,omitempty"`
 	OptionalPositiveInteger  bool     `json:"optionalPositiveInteger,omitempty"`
 	IssueOrPRNumber          bool     `json:"issueOrPRNumber,omitempty"`
@@ -39,6 +45,9 @@ const (
 	MaxBodyLength           = 65000
 	MaxGitHubUsernameLength = 39
 	MaxGitHubTeamSlugLength = 100
+	MinIssueBodyLength      = 20 // Minimum body length for create_issue to prevent placeholder-only submissions
+	MinDiscussionBodyLength = 64 // Minimum body length for create_discussion to prevent placeholder-only submissions
+	MinReleaseBodyLength    = 20 // Minimum body length for update_release to prevent placeholder-only submissions
 )
 
 // ValidationConfig contains all safe output type validation rules
@@ -48,7 +57,7 @@ var ValidationConfig = map[string]TypeValidationConfig{
 		DefaultMax: 1,
 		Fields: map[string]FieldValidation{
 			"title":        {Required: true, Type: "string", Sanitize: true, MaxLength: 128},
-			"body":         {Required: true, Type: "string", Sanitize: true, MaxLength: MaxBodyLength},
+			"body":         {Required: true, Type: "string", Sanitize: true, MaxLength: MaxBodyLength, MinLength: MinIssueBodyLength},
 			"labels":       {Type: "array", ItemType: "string", ItemSanitize: true, ItemMaxLength: 128},
 			"fields":       {Type: "array"},
 			"parent":       {IssueOrPRNumber: true},
@@ -96,7 +105,7 @@ var ValidationConfig = map[string]TypeValidationConfig{
 	"add_labels": {
 		DefaultMax: 5,
 		Fields: map[string]FieldValidation{
-			"labels":      {Required: true, Type: "array", ItemType: "string", ItemSanitize: true, ItemMaxLength: 128},
+			"labels":      {Required: true, Type: "array"}, // Item-level validation/sanitization handled by JS issue-intent label normalization.
 			"item_number": {IssueNumberOrTemporaryID: true},
 			"repo":        {Type: "string", MaxLength: 256}, // Optional: target repository in format "owner/repo"
 		},
@@ -112,10 +121,12 @@ var ValidationConfig = map[string]TypeValidationConfig{
 		},
 	},
 	"assign_milestone": {
-		DefaultMax: 1,
+		DefaultMax:       1,
+		CustomValidation: "requiresOneOf:milestone_number,milestone_title",
 		Fields: map[string]FieldValidation{
 			"issue_number":     {IssueNumberOrTemporaryID: true},
-			"milestone_number": {Required: true, PositiveInteger: true},
+			"milestone_number": {OptionalPositiveInteger: true},
+			"milestone_title":  {Type: "string", Sanitize: true, MaxLength: 128},
 			"repo":             {Type: "string", MaxLength: 256}, // Optional: target repository in format "owner/repo"
 		},
 	},
@@ -124,7 +135,10 @@ var ValidationConfig = map[string]TypeValidationConfig{
 		Fields: map[string]FieldValidation{
 			"issue_number": {IssueOrPRNumber: true},
 			"issue_type":   {Required: true, Type: "string", Sanitize: true, MaxLength: 128}, // Empty string clears the type
-			"repo":         {Type: "string", MaxLength: 256},                                 // Optional: target repository in format "owner/repo"
+			"rationale":    {Type: "string", Sanitize: true, MaxLength: 1024},
+			"confidence":   {Type: "string", Enum: []string{"LOW", "MEDIUM", "HIGH"}},
+			"suggest":      {Type: "boolean"},
+			"repo":         {Type: "string", MaxLength: 256}, // Optional: target repository in format "owner/repo"
 		},
 	},
 	"set_issue_field": {
@@ -135,6 +149,9 @@ var ValidationConfig = map[string]TypeValidationConfig{
 			"field_name":    {Type: "string", Sanitize: true, MaxLength: 128},
 			"field_node_id": {Type: "string", MaxLength: 256},
 			"value":         {Required: true, Type: "string", Sanitize: true, MaxLength: 256},
+			"rationale":     {Type: "string", Sanitize: true, MaxLength: 1024},
+			"confidence":    {Type: "string", Enum: []string{"LOW", "MEDIUM", "HIGH"}},
+			"suggest":       {Type: "boolean"},
 			"repo":          {Type: "string", MaxLength: 256}, // Optional: target repository in format "owner/repo"
 		},
 	},
@@ -160,13 +177,13 @@ var ValidationConfig = map[string]TypeValidationConfig{
 	},
 	"update_issue": {
 		DefaultMax:       1,
-		CustomValidation: "requiresOneOf:status,title,body",
+		CustomValidation: "requiresOneOf:status,title,body,labels,assignees,milestone",
 		Fields: map[string]FieldValidation{
 			"status":       {Type: "string", Enum: []string{"open", "closed"}},
 			"title":        {Type: "string", Sanitize: true, MaxLength: 128},
 			"body":         {Type: "string", Sanitize: true, MaxLength: MaxBodyLength},
 			"operation":    {Type: "string", Enum: []string{"replace", "append", "prepend", "replace-island"}},
-			"labels":       {Type: "array", ItemType: "string", ItemSanitize: true, ItemMaxLength: 128},
+			"labels":       {Type: "array"},
 			"assignees":    {Type: "array", ItemType: "string", ItemSanitize: true, ItemMaxLength: MaxGitHubUsernameLength},
 			"milestone":    {OptionalPositiveInteger: true},
 			"issue_number": {IssueOrPRNumber: true},
@@ -199,9 +216,9 @@ var ValidationConfig = map[string]TypeValidationConfig{
 	"push_to_pull_request_branch": {
 		DefaultMax: 1,
 		Fields: map[string]FieldValidation{
-			"branch":              {Required: true, Type: "string", Sanitize: true, MaxLength: 256},
 			"message":             {Required: true, Type: "string", Sanitize: true, MaxLength: MaxBodyLength},
 			"pull_request_number": {IssueOrPRNumber: true},
+			"branch":              {Type: "string", Sanitize: true, MaxLength: 256}, // Optional: stripped before MCP call; validated for type/length when present.
 		},
 	},
 	"create_pull_request_review_comment": {
@@ -220,8 +237,10 @@ var ValidationConfig = map[string]TypeValidationConfig{
 	"submit_pull_request_review": {
 		DefaultMax: 1,
 		Fields: map[string]FieldValidation{
-			"body":  {Type: "string", Sanitize: true, MaxLength: MaxBodyLength},
-			"event": {Type: "string", Enum: []string{"APPROVE", "REQUEST_CHANGES", "COMMENT"}},
+			"body":                {Type: "string", Sanitize: true, MaxLength: MaxBodyLength},
+			"event":               {Type: "string", Enum: []string{"APPROVE", "REQUEST_CHANGES", "COMMENT"}},
+			"pull_request_number": {IssueOrPRNumber: true},
+			"repo":                {Type: "string", MaxLength: 256}, // Optional: target repository in format "owner/repo"
 		},
 	},
 	"reply_to_pull_request_review_comment": {
@@ -243,7 +262,7 @@ var ValidationConfig = map[string]TypeValidationConfig{
 		DefaultMax: 1,
 		Fields: map[string]FieldValidation{
 			"title":    {Required: true, Type: "string", Sanitize: true, MaxLength: 128},
-			"body":     {Required: true, Type: "string", Sanitize: true, MaxLength: MaxBodyLength},
+			"body":     {Required: true, Type: "string", Sanitize: true, MaxLength: MaxBodyLength, MinLength: MinDiscussionBodyLength},
 			"category": {Type: "string", Sanitize: true, MaxLength: 128},
 			"repo":     {Type: "string", MaxLength: 256}, // Optional: target repository in format "owner/repo"
 		},
@@ -251,7 +270,7 @@ var ValidationConfig = map[string]TypeValidationConfig{
 	"close_discussion": {
 		DefaultMax: 1,
 		Fields: map[string]FieldValidation{
-			"body":              {Required: true, Type: "string", Sanitize: true, MaxLength: MaxBodyLength},
+			"body":              {Type: "string", Sanitize: true, MaxLength: MaxBodyLength},
 			"reason":            {Type: "string", Enum: []string{"RESOLVED", "DUPLICATE", "OUTDATED", "ANSWERED"}},
 			"discussion_number": {OptionalPositiveInteger: true},
 			"repo":              {Type: "string", MaxLength: 256}, // Optional: target repository in format "owner/repo"
@@ -260,7 +279,7 @@ var ValidationConfig = map[string]TypeValidationConfig{
 	"close_issue": {
 		DefaultMax: 1,
 		Fields: map[string]FieldValidation{
-			"body":         {Required: true, Type: "string", Sanitize: true, MaxLength: MaxBodyLength},
+			"body":         {Type: "string", Sanitize: true, MaxLength: MaxBodyLength},
 			"issue_number": {OptionalPositiveInteger: true},
 			"repo":         {Type: "string", MaxLength: 256}, // Optional: target repository in format "owner/repo"
 		},
@@ -271,6 +290,13 @@ var ValidationConfig = map[string]TypeValidationConfig{
 			"body":                {Required: true, Type: "string", Sanitize: true, MaxLength: MaxBodyLength},
 			"pull_request_number": {OptionalPositiveInteger: true},
 			"repo":                {Type: "string", MaxLength: 256}, // Optional: target repository in format "owner/repo"
+		},
+	},
+	"dispatch_workflow": {
+		DefaultMax: 1,
+		Fields: map[string]FieldValidation{
+			"workflow_name": {Required: true, Type: "string", Sanitize: true, MinLength: 1, MaxLength: 256, Pattern: ".*\\S.*", PatternError: "must not be empty"},
+			"inputs":        {Type: "object"},
 		},
 	},
 	"missing_tool": {
@@ -286,7 +312,7 @@ var ValidationConfig = map[string]TypeValidationConfig{
 		Fields: map[string]FieldValidation{
 			"tag":       {Type: "string", Sanitize: true, MaxLength: 256},
 			"operation": {Required: true, Type: "string", Enum: []string{"replace", "append", "prepend"}},
-			"body":      {Required: true, Type: "string", Sanitize: true, MaxLength: MaxBodyLength},
+			"body":      {Required: true, Type: "string", Sanitize: true, MaxLength: MaxBodyLength, MinLength: MinReleaseBodyLength},
 		},
 	},
 	"upload_asset": {
@@ -367,9 +393,18 @@ var ValidationConfig = map[string]TypeValidationConfig{
 	"remove_labels": {
 		DefaultMax: 5,
 		Fields: map[string]FieldValidation{
-			"labels":      {Required: true, Type: "array", ItemType: "string", ItemSanitize: true, ItemMaxLength: 128},
+			"labels":      {Required: true, Type: "array"}, // Item-level validation/sanitization handled by JS issue-intent label normalization.
 			"item_number": {IssueNumberOrTemporaryID: true},
 			"repo":        {Type: "string", MaxLength: 256}, // Optional: target repository in format "owner/repo"
+		},
+	},
+	"replace_label": {
+		DefaultMax: 5,
+		Fields: map[string]FieldValidation{
+			"label_to_remove": {Required: true, Type: "string", Sanitize: true, MaxLength: 128},
+			"label_to_add":    {Required: true, Type: "string", Sanitize: true, MaxLength: 128},
+			"item_number":     {IssueNumberOrTemporaryID: true},
+			"repo":            {Type: "string", MaxLength: 256}, // Optional: target repository in format "owner/repo"
 		},
 	},
 	"unassign_from_user": {
@@ -384,7 +419,7 @@ var ValidationConfig = map[string]TypeValidationConfig{
 	"hide_comment": {
 		DefaultMax: 5,
 		Fields: map[string]FieldValidation{
-			"comment_id": {Required: true, Type: "string", MaxLength: 256},
+			"comment_id": {Required: true, Type: "string", MaxLength: 256, TypeHint: "GraphQL node ID string (e.g. 'IC_kwDOABCD123456'); numeric REST comment IDs are accepted but may not resolve for all comment types (e.g. PR review comments)"},
 			"reason":     {Type: "string", Enum: []string{"SPAM", "ABUSE", "OFF_TOPIC", "OUTDATED", "RESOLVED", "LOW_QUALITY"}},
 			"repo":       {Type: "string", MaxLength: 256}, // Optional: target repository in format "owner/repo"
 		},
@@ -423,11 +458,35 @@ var ValidationConfig = map[string]TypeValidationConfig{
 	},
 }
 
-// GetValidationConfigJSON returns the validation configuration as indented JSON
-// If enabledTypes is empty or nil, returns all validation configs
-// If enabledTypes is provided, returns only configs for the specified types
-func GetValidationConfigJSON(enabledTypes []string) (string, error) {
-	safeOutputValidationLog.Printf("Getting validation config JSON for %d types", len(enabledTypes))
+// validationConfigJSONCache caches GetValidationConfigJSON results keyed by the sorted,
+// comma-joined enabledTypes string. ValidationConfig is a package-level constant so
+// the output is deterministic for a given set of types; caching avoids repeated
+// json.MarshalIndent calls on every workflow compilation.
+var validationConfigJSONCache sync.Map // key: string → value: string
+
+// GetValidationConfigJSON returns the validation configuration as indented JSON.
+// If enabledTypes is empty or nil, returns all validation configs.
+// If enabledTypes is provided, returns only configs for the specified types.
+// If mentions is non-empty, a top-level "mentions" key is included in the JSON
+// so that collect_ndjson_output.cjs honours the configured @mention allowlist
+// during the initial sanitization pass (mirroring what the publish-side handlers
+// receive via GH_AW_SAFE_OUTPUTS_HANDLER_CONFIG).
+func GetValidationConfigJSON(enabledTypes []string, mentions map[string]any) (string, error) {
+	safeOutputValidationLog.Printf("Getting validation config JSON for %d types (mentions=%t)", len(enabledTypes), len(mentions) > 0)
+
+	// Cache only the schema-only path; mentions are workflow-specific and cheap to remarshal.
+	if len(mentions) == 0 {
+		cacheKey := buildValidationConfigCacheKey(enabledTypes)
+		if cached, ok := validationConfigJSONCache.Load(cacheKey); ok {
+			safeOutputValidationLog.Print("Returning cached validation config JSON")
+			result, ok := cached.(string)
+			if !ok {
+				// The cache exclusively stores string values; a non-string indicates a programmer error.
+				return "", fmt.Errorf("validationConfigJSONCache: unexpected type %T for key %s", cached, cacheKey)
+			}
+			return result, nil
+		}
+	}
 
 	configToMarshal := ValidationConfig
 	if len(enabledTypes) > 0 {
@@ -442,11 +501,37 @@ func GetValidationConfigJSON(enabledTypes []string) (string, error) {
 		safeOutputValidationLog.Print("Returning all validation configs")
 	}
 
-	data, err := json.MarshalIndent(configToMarshal, "", "  ")
+	var data []byte
+	var err error
+	if len(mentions) > 0 {
+		composite := make(map[string]any, len(configToMarshal)+1)
+		for k, v := range configToMarshal {
+			composite[k] = v
+		}
+		composite["mentions"] = mentions
+		data, err = json.MarshalIndent(composite, "", "  ")
+	} else {
+		data, err = json.MarshalIndent(configToMarshal, "", "  ")
+	}
 	if err != nil {
 		safeOutputValidationLog.Printf("Failed to marshal validation config: %v", err)
 		return "", err
 	}
-	safeOutputValidationLog.Printf("Generated validation config JSON with %d bytes", len(data))
-	return string(data), nil
+	result := string(data)
+	safeOutputValidationLog.Printf("Generated validation config JSON with %d bytes", len(result))
+	if len(mentions) == 0 {
+		validationConfigJSONCache.Store(buildValidationConfigCacheKey(enabledTypes), result)
+	}
+	return result, nil
+}
+
+// buildValidationConfigCacheKey returns a stable cache key for GetValidationConfigJSON.
+// For nil/empty enabledTypes the key is "" (full config). Otherwise the sorted type
+// names are joined with commas so the order the caller provides does not affect caching.
+func buildValidationConfigCacheKey(enabledTypes []string) string {
+	if len(enabledTypes) == 0 {
+		return ""
+	}
+	sorted := slices.Sorted(slices.Values(enabledTypes))
+	return strings.Join(sorted, ",")
 }

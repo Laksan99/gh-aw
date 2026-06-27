@@ -1,6 +1,12 @@
 ---
+private: true
+emoji: "🧪"
 description: Smoke test workflow that validates Crush engine functionality
 on:
+  slash_command:
+    name: smoke-crush
+    strategy: centralized
+    events: [issues, issue_comment, pull_request, pull_request_comment]
   workflow_dispatch:
   pull_request:
     types: [labeled]
@@ -19,7 +25,7 @@ strict: true
 imports:
   - shared/gh.md
   - shared/reporting.md
-  - shared/observability-otlp.md
+  - shared/otlp.md
 network:
   allowed:
     - defaults
@@ -48,7 +54,8 @@ safe-outputs:
       run-success: "🎯 [{workflow_name}]({run_url}) **MISSION COMPLETE!** Crush has delivered. ⚡"
       run-failure: "⚠️ [{workflow_name}]({run_url}) {status}. Crush encountered unexpected challenges..."
 timeout-minutes: 15
-
+features:
+  gh-aw-detection: false
 ---
 
 # Smoke Test: Crush Engine Validation
@@ -64,7 +71,7 @@ timeout-minutes: 15
 2. **Web Fetch Testing**: Use the web-fetch MCP tool to fetch https://github.com and verify the response contains "GitHub" (do NOT use bash or playwright for this test - use the web-fetch MCP tool directly)
 3. **File Writing Testing**: Create a test file `/tmp/gh-aw/agent/smoke-test-crush-${{ github.run_id }}.txt` with content "Smoke test passed for Crush at $(date)" (create the directory if it doesn't exist)
 4. **Bash Tool Testing**: Execute bash commands to verify file creation was successful (use `cat` to read the file back)
-5. **Build gh-aw**: Run `GOCACHE=/tmp/go-cache GOMODCACHE=/tmp/go-mod make build` to verify the agent can successfully build the gh-aw project. If the command fails, mark this test as ❌ and report the failure.
+5. **Build gh-aw**: Run `GOCACHE=/tmp/gh-aw/agent/go-cache GOMODCACHE=/tmp/gh-aw/agent/go-mod make build` to verify the agent can successfully build the gh-aw project. If the command fails, mark this test as ❌ and report the failure.
 
 ## Output
 

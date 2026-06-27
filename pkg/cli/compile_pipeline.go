@@ -22,6 +22,7 @@
 package cli
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"os"
@@ -37,8 +38,11 @@ import (
 
 var compileOrchestrationLog = logger.New("cli:compile_pipeline")
 
+const fallbackCompilationErrorMessage = "compilation failed (no detailed error message available)"
+
 // compileSpecificFiles compiles a specific list of workflow files
 func compileSpecificFiles(
+	ctx context.Context,
 	compiler *workflow.Compiler,
 	config CompileConfig,
 	stats *CompilationStats,
@@ -62,6 +66,14 @@ func compileSpecificFiles(
 
 	// Compile each specified file
 	for _, markdownFile := range config.MarkdownFiles {
+		// Respect context cancellation between files (e.g. Ctrl+C)
+		select {
+		case <-ctx.Done():
+			fmt.Fprintln(os.Stderr, console.FormatWarningMessage("Operation cancelled"))
+			return workflowDataList, ctx.Err()
+		default:
+		}
+
 		stats.Total++
 
 		// Initialize validation result
@@ -96,23 +108,33 @@ func compileSpecificFiles(
 
 		// Compile regular workflow file (disable per-file security tools)
 		fileResult := compileWorkflowFile(
-			compiler, resolvedFile, config.Verbose, config.JSONOutput,
-			config.NoEmit, false, false, false, // Disable per-file security tools
-			config.Strict, shouldValidate,
+			ctx, compiler, resolvedFile, compileWorkflowFileOptions{
+				verbose:    config.Verbose,
+				jsonOutput: config.JSONOutput,
+				noEmit:     config.NoEmit,
+				strict:     config.Strict,
+				validate:   shouldValidate,
+				// zizmor, poutine, actionlint disabled per-file (batched instead)
+			},
 		)
 
 		if !fileResult.success {
-			errorCount++
-			stats.Errors++
 			// Collect error messages from validation result for display in summary
 			var errMsgs []string
 			for _, verr := range fileResult.validationResult.Errors {
 				errMsgs = append(errMsgs, verr.Message)
 			}
-			trackWorkflowFailure(stats, resolvedFile, 1, errMsgs)
+			if len(errMsgs) == 0 {
+				errMsgs = []string{fallbackCompilationErrorMessage}
+			}
+			errorCount++
+			stats.Errors += len(errMsgs)
+			trackWorkflowFailure(stats, resolvedFile, len(errMsgs), errMsgs)
 		} else {
 			compiledCount++
-			workflowDataList = append(workflowDataList, fileResult.workflowData)
+			if fileResult.workflowData != nil {
+				workflowDataList = append(workflowDataList, fileResult.workflowData)
+			}
 
 			// Collect lock files for batch security tools
 			if !config.NoEmit && fileResult.lockFile != "" {
@@ -135,7 +157,10 @@ func compileSpecificFiles(
 
 	// Run batch actionlint on all collected lock files
 	if config.Actionlint && !config.NoEmit && len(lockFilesForActionlint) > 0 {
-		if err := RunActionlintOnFiles(lockFilesForActionlint, config.Verbose && !config.JSONOutput, config.Strict); err != nil {
+		if err := ctx.Err(); err != nil {
+			return workflowDataList, err
+		}
+		if err := RunActionlintOnFiles(ctx, lockFilesForActionlint, config.Verbose && !config.JSONOutput, config.Strict); err != nil {
 			if config.Strict {
 				return workflowDataList, err
 			}
@@ -144,6 +169,9 @@ func compileSpecificFiles(
 
 	// Run batch zizmor on all collected lock files
 	if config.Zizmor && !config.NoEmit && len(lockFilesForZizmor) > 0 {
+		if err := ctx.Err(); err != nil {
+			return workflowDataList, err
+		}
 		if err := RunZizmorOnFiles(lockFilesForZizmor, config.Verbose && !config.JSONOutput, config.Strict); err != nil {
 			if config.Strict {
 				return workflowDataList, err
@@ -154,6 +182,9 @@ func compileSpecificFiles(
 	// Run batch poutine once on the workflow directory
 	// Get the directory from the first lock file (all should be in same directory)
 	if config.Poutine && !config.NoEmit && len(lockFilesForDirTools) > 0 {
+		if err := ctx.Err(); err != nil {
+			return workflowDataList, err
+		}
 		workflowDir := filepath.Dir(lockFilesForDirTools[0])
 		if err := runBatchDirectoryTool("poutine", workflowDir, config.Verbose && !config.JSONOutput, config.Strict, RunPoutineOnDirectory); err != nil {
 			if config.Strict {
@@ -165,6 +196,9 @@ func compileSpecificFiles(
 	// Run batch runner-guard once on the workflow directory
 	// Get the directory from the first lock file (all should be in same directory)
 	if config.RunnerGuard && !config.NoEmit && len(lockFilesForDirTools) > 0 {
+		if err := ctx.Err(); err != nil {
+			return workflowDataList, err
+		}
 		workflowDir := filepath.Dir(lockFilesForDirTools[0])
 		if err := runBatchDirectoryTool("runner-guard", workflowDir, config.Verbose && !config.JSONOutput, config.Strict, RunRunnerGuardOnDirectory); err != nil {
 			if config.Strict {
@@ -204,6 +238,7 @@ func compileSpecificFiles(
 
 // compileAllFilesInDirectory compiles all workflow files in a directory
 func compileAllFilesInDirectory(
+	ctx context.Context,
 	compiler *workflow.Compiler,
 	config CompileConfig,
 	workflowDir string,
@@ -269,27 +304,45 @@ func compileAllFilesInDirectory(
 	var lockFilesForDirTools []string // lock files for directory-based tools (poutine, runner-guard)
 
 	for _, file := range mdFiles {
+		// Respect context cancellation between files (e.g. Ctrl+C)
+		select {
+		case <-ctx.Done():
+			fmt.Fprintln(os.Stderr, console.FormatWarningMessage("Operation cancelled"))
+			return workflowDataList, ctx.Err()
+		default:
+		}
+
 		stats.Total++
 
 		// Compile regular workflow file (disable per-file security tools)
 		fileResult := compileWorkflowFile(
-			compiler, file, config.Verbose, config.JSONOutput,
-			config.NoEmit, false, false, false, // Disable per-file security tools
-			config.Strict, shouldValidate,
+			ctx, compiler, file, compileWorkflowFileOptions{
+				verbose:    config.Verbose,
+				jsonOutput: config.JSONOutput,
+				noEmit:     config.NoEmit,
+				strict:     config.Strict,
+				validate:   shouldValidate,
+				// zizmor, poutine, actionlint disabled per-file (batched instead)
+			},
 		)
 
 		if !fileResult.success {
-			errorCount++
-			stats.Errors++
 			// Collect error messages from validation result
 			var errMsgs []string
 			for _, verr := range fileResult.validationResult.Errors {
 				errMsgs = append(errMsgs, verr.Message)
 			}
-			trackWorkflowFailure(stats, file, 1, errMsgs)
+			if len(errMsgs) == 0 {
+				errMsgs = []string{fallbackCompilationErrorMessage}
+			}
+			errorCount++
+			stats.Errors += len(errMsgs)
+			trackWorkflowFailure(stats, file, len(errMsgs), errMsgs)
 		} else {
 			successCount++
-			workflowDataList = append(workflowDataList, fileResult.workflowData)
+			if fileResult.workflowData != nil {
+				workflowDataList = append(workflowDataList, fileResult.workflowData)
+			}
 
 			// Collect lock files for batch security tools
 			if !config.NoEmit && fileResult.lockFile != "" {
@@ -312,7 +365,10 @@ func compileAllFilesInDirectory(
 
 	// Run batch actionlint
 	if config.Actionlint && !config.NoEmit && len(lockFilesForActionlint) > 0 {
-		if err := RunActionlintOnFiles(lockFilesForActionlint, config.Verbose && !config.JSONOutput, config.Strict); err != nil {
+		if err := ctx.Err(); err != nil {
+			return workflowDataList, err
+		}
+		if err := RunActionlintOnFiles(ctx, lockFilesForActionlint, config.Verbose && !config.JSONOutput, config.Strict); err != nil {
 			if config.Strict {
 				return workflowDataList, err
 			}
@@ -321,6 +377,9 @@ func compileAllFilesInDirectory(
 
 	// Run batch zizmor
 	if config.Zizmor && !config.NoEmit && len(lockFilesForZizmor) > 0 {
+		if err := ctx.Err(); err != nil {
+			return workflowDataList, err
+		}
 		if err := RunZizmorOnFiles(lockFilesForZizmor, config.Verbose && !config.JSONOutput, config.Strict); err != nil {
 			if config.Strict {
 				return workflowDataList, err
@@ -330,6 +389,9 @@ func compileAllFilesInDirectory(
 
 	// Run batch poutine once on the workflow directory
 	if config.Poutine && !config.NoEmit && len(lockFilesForDirTools) > 0 {
+		if err := ctx.Err(); err != nil {
+			return workflowDataList, err
+		}
 		if err := runBatchDirectoryTool("poutine", workflowsDir, config.Verbose && !config.JSONOutput, config.Strict, RunPoutineOnDirectory); err != nil {
 			if config.Strict {
 				return workflowDataList, err
@@ -339,6 +401,9 @@ func compileAllFilesInDirectory(
 
 	// Run batch runner-guard once on the workflow directory
 	if config.RunnerGuard && !config.NoEmit && len(lockFilesForDirTools) > 0 {
+		if err := ctx.Err(); err != nil {
+			return workflowDataList, err
+		}
 		if err := runBatchDirectoryTool("runner-guard", workflowsDir, config.Verbose && !config.JSONOutput, config.Strict, RunRunnerGuardOnDirectory); err != nil {
 			if config.Strict {
 				return workflowDataList, err
@@ -368,7 +433,7 @@ func compileAllFilesInDirectory(
 	}
 
 	// Post-processing
-	if err := runPostProcessingForDirectory(compiler, workflowDataList, config, workflowsDir, gitRoot, successCount); err != nil {
+	if err := runPostProcessingForDirectory(ctx, compiler, workflowDataList, config, workflowsDir, gitRoot, successCount, errorCount); err != nil {
 		return workflowDataList, err
 	}
 
@@ -443,22 +508,15 @@ func runPostProcessing(
 	// Update .gitattributes (errors are non-fatal)
 	_ = updateGitAttributes(successCount, actionCache, config.Verbose)
 
-	// Generate Dependabot manifests if requested
+	// Generate Dependabot manifests and reconcile compiler-managed ignore entries if requested.
 	if config.Dependabot && !config.NoEmit {
-		gitRoot, err := gitutil.FindGitRoot()
-		if err == nil {
+		if gitRoot, err := gitutil.FindGitRoot(); err == nil {
 			absWorkflowDir := filepath.Join(gitRoot, config.WorkflowDir)
 			if err := generateDependabotManifestsWrapper(compiler, workflowDataList, absWorkflowDir, config.ForceOverwrite, config.Strict); err != nil {
 				if config.Strict {
 					return err
 				}
 			}
-		}
-	}
-
-	// Reconcile compiler-managed Dependabot ignore entries for compiler-emitted action refs.
-	if !config.NoEmit {
-		if gitRoot, err := gitutil.FindGitRoot(); err == nil {
 			if err := compiler.ReconcileManagedDependabotIgnoresInRepo(gitRoot); err != nil {
 				if config.Strict {
 					return err
@@ -486,12 +544,14 @@ func runPostProcessing(
 
 // runPostProcessingForDirectory runs post-processing for directory compilation
 func runPostProcessingForDirectory(
+	ctx context.Context,
 	compiler *workflow.Compiler,
 	workflowDataList []*workflow.WorkflowData,
 	config CompileConfig,
 	workflowsDir string,
 	gitRoot string,
 	successCount int,
+	errorCount int,
 ) error {
 	// Get action cache
 	actionCache := compiler.GetSharedActionCache()
@@ -510,7 +570,7 @@ func runPostProcessingForDirectory(
 	}
 
 	// Reconcile compiler-managed Dependabot ignore entries for compiler-emitted action refs.
-	if !config.NoEmit {
+	if config.Dependabot && !config.NoEmit {
 		if err := compiler.ReconcileManagedDependabotIgnoresInRepo(gitRoot); err != nil {
 			if config.Strict {
 				return err
@@ -519,16 +579,17 @@ func runPostProcessingForDirectory(
 		}
 	}
 
-	// Generate maintenance workflow if needed
-	// Skip maintenance workflow generation when using custom --dir option
+	// Generate maintenance workflow if needed.
+	// Skip maintenance workflow generation when using custom --dir option.
+	// Keep invoking generators for empty workflowDataList so stale generated files are cleaned up.
 	if !config.NoEmit && config.WorkflowDir == "" {
 		absWorkflowDir := getAbsoluteWorkflowDir(workflowsDir, gitRoot)
-		if err := generateMaintenanceWorkflowWrapper(compiler, workflowDataList, absWorkflowDir, gitRoot, config.Verbose, config.Strict); err != nil {
+		if err := generateMaintenanceWorkflowWrapper(ctx, compiler, workflowDataList, absWorkflowDir, gitRoot, config.Verbose, config.Strict); err != nil {
 			if config.Strict {
 				return err
 			}
 		}
-		if err := generateCentralSlashCommandWorkflowWrapper(workflowDataList, absWorkflowDir, config.Strict); err != nil {
+		if err := generateCentralSlashCommandWorkflowWrapper(ctx, workflowDataList, absWorkflowDir, gitRoot, config.Strict); err != nil {
 			if config.Strict {
 				return err
 			}
@@ -537,6 +598,11 @@ func runPostProcessingForDirectory(
 
 	// Prune stale gh-aw-actions entries before saving
 	pruneStaleActionCacheEntries(compiler, actionCache)
+
+	// Prune orphaned entries — entries for action versions no longer referenced
+	// by any workflow in the directory (e.g. old pins left after a version bump).
+	// Safe to call only after a full-directory compilation with zero compile errors.
+	pruneOrphanedActionCacheEntries(compiler, actionCache, errorCount)
 
 	// Save action cache (errors are logged but non-fatal)
 	_ = saveActionCache(actionCache, config.Verbose)
@@ -566,10 +632,10 @@ func outputResults(
 		if err != nil {
 			return err
 		}
-		fmt.Println(jsonStr)
+		fmt.Fprintln(os.Stdout, jsonStr)
 	} else if !config.Stats {
 		// Print summary for text output (skip if stats mode)
-		printCompilationSummary(stats)
+		printCompilationSummary(stats, config.ShowAllErrors)
 	}
 
 	// Display actionlint summary if enabled

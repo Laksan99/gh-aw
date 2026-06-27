@@ -1,4 +1,6 @@
 ---
+private: true
+emoji: "🧪"
 name: Smoke Workflow Call
 description: Reusable workflow to validate checkout from fork works correctly in workflow_call context
 on:
@@ -28,7 +30,7 @@ network:
   allowed:
     - defaults
 imports:
-  - shared/observability-otlp.md
+  - shared/otlp.md
 tools:
   bash:
     - "git status"
@@ -43,11 +45,13 @@ safe-outputs:
     max: 1
   messages:
     append-only-comments: true
-    footer: "> 🔁 *workflow_call smoke test by [{workflow_name}]({run_url})*{effective_tokens_suffix}{history_link}"
+    footer: "> 🔁 *workflow_call smoke test by [{workflow_name}]({run_url})*{ai_credits_suffix}{history_link}"
     run-started: "🔁 [{workflow_name}]({run_url}) is validating workflow_call checkout..."
     run-success: "✅ [{workflow_name}]({run_url}) successfully validated workflow_call checkout."
     run-failure: "❌ [{workflow_name}]({run_url}) failed to validate workflow_call checkout. Check the logs."
 timeout-minutes: 10
+features:
+  gh-aw-detection: false
 ---
 
 # Smoke Test: Workflow Call Checkout Validation

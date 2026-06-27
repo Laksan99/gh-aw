@@ -13,6 +13,8 @@ import (
 
 	"github.com/github/gh-aw/pkg/jsonutil"
 	"github.com/github/gh-aw/pkg/logger"
+	"github.com/github/gh-aw/pkg/setutil"
+	"github.com/github/gh-aw/pkg/sliceutil"
 	"github.com/github/gh-aw/pkg/typeutil"
 )
 
@@ -46,73 +48,69 @@ func marshalJSONWithoutHTMLEscape(v any) (string, error) {
 func marshalSorted(data any) string {
 	switch v := data.(type) {
 	case map[string]any:
-		if len(v) == 0 {
-			return "{}"
-		}
-
-		// Sort keys
-		keys := make([]string, 0, len(v))
-		for key := range v {
-			keys = append(keys, key)
-		}
-		sort.Strings(keys)
-
-		// Build JSON string with sorted keys
-		var result strings.Builder
-		result.WriteString("{")
-		for i, key := range keys {
-			if i > 0 {
-				result.WriteString(",")
-			}
-			// Marshal the key without HTML escaping
-			keyJSON, err := marshalJSONWithoutHTMLEscape(key)
-			if err != nil {
-				frontmatterHashLog.Printf("Warning: failed to marshal key %s: %v", key, err)
-				continue
-			}
-			result.WriteString(keyJSON)
-			result.WriteString(":")
-			// Marshal the value recursively
-			result.WriteString(marshalSorted(v[key]))
-		}
-		result.WriteString("}")
-		return result.String()
+		return marshalSortedMap(v)
 
 	case []any:
-		if len(v) == 0 {
-			return "[]"
-		}
-
-		var result strings.Builder
-		result.WriteString("[")
-		for i, elem := range v {
-			if i > 0 {
-				result.WriteString(",")
-			}
-			result.WriteString(marshalSorted(elem))
-		}
-		result.WriteString("]")
-		return result.String()
+		return marshalSortedSlice(v)
 
 	case string, int, int64, float64, bool, nil:
-		// Use JSON marshaling without HTML escaping to match JavaScript behavior
-		jsonStr, err := marshalJSONWithoutHTMLEscape(v)
-		if err != nil {
-			// This should rarely happen for primitives, but log it for debugging
-			frontmatterHashLog.Printf("Warning: failed to marshal primitive value: %v", err)
-			return "null"
-		}
-		return jsonStr
+		return marshalSortedValue(v, "primitive value")
 
 	default:
-		// Fallback to JSON marshaling without HTML escaping
-		jsonStr, err := marshalJSONWithoutHTMLEscape(v)
-		if err != nil {
-			frontmatterHashLog.Printf("Warning: failed to marshal value of type %T: %v", v, err)
-			return "null"
-		}
-		return jsonStr
+		return marshalSortedValue(v, fmt.Sprintf("value of type %T", v))
 	}
+}
+
+func marshalSortedMap(v map[string]any) string {
+	if len(v) == 0 {
+		return "{}"
+	}
+
+	keys := sliceutil.SortedKeys(v)
+
+	var result strings.Builder
+	result.WriteString("{")
+	for i, key := range keys {
+		if i > 0 {
+			result.WriteString(",")
+		}
+		keyJSON, err := marshalJSONWithoutHTMLEscape(key)
+		if err != nil {
+			frontmatterHashLog.Printf("Warning: failed to marshal key %s: %v", key, err)
+			continue
+		}
+		result.WriteString(keyJSON)
+		result.WriteString(":")
+		result.WriteString(marshalSorted(v[key]))
+	}
+	result.WriteString("}")
+	return result.String()
+}
+
+func marshalSortedSlice(v []any) string {
+	if len(v) == 0 {
+		return "[]"
+	}
+
+	var result strings.Builder
+	result.WriteString("[")
+	for i, elem := range v {
+		if i > 0 {
+			result.WriteString(",")
+		}
+		result.WriteString(marshalSorted(elem))
+	}
+	result.WriteString("]")
+	return result.String()
+}
+
+func marshalSortedValue(v any, valueDescription string) string {
+	jsonStr, err := marshalJSONWithoutHTMLEscape(v)
+	if err != nil {
+		frontmatterHashLog.Printf("Warning: failed to marshal %s: %v", valueDescription, err)
+		return "null"
+	}
+	return jsonStr
 }
 
 // ComputeFrontmatterHashFromParsedContent computes the frontmatter hash from already-parsed
@@ -218,7 +216,8 @@ func computeFrontmatterHashFromContent(content string, parsedFrontmatter map[str
 func extractRelevantTemplateExpressions(markdown string) []string {
 	frontmatterHashLog.Printf("Extracting relevant template expressions from markdown: size=%d bytes", len(markdown))
 	var expressions []string
-	seen := make(map[string]bool)
+	seen := make(map[string]struct {
+	})
 
 	// Regex to match ${{ ... }} expressions
 	matches := templateExpressionRegex.FindAllStringSubmatch(markdown, -1)
@@ -235,9 +234,10 @@ func extractRelevantTemplateExpressions(markdown string) []string {
 			// Store the full expression including ${{ }}
 			expr := match[0]
 			// Deduplicate expressions
-			if !seen[expr] {
+			if !setutil.Contains(seen, expr) {
 				expressions = append(expressions, expr)
-				seen[expr] = true
+				seen[expr] = struct {
+				}{}
 			}
 		}
 	}
@@ -318,82 +318,101 @@ func extractImportsFromText(frontmatterText string) []string {
 	var imports []string
 	lines := strings.Split(frontmatterText, "\n")
 
-	inImports := false
-	baseIndent := 0
-	inAwSubfield := false // true when inside the "aw:" subfield of the object form
-	awIndent := 0
-	isObjectForm := false // true when imports is in object form (map)
+	state := importExtractionState{}
 
 	for i := range lines {
 		line := lines[i]
 		trimmed := strings.TrimSpace(line)
 
-		// Skip empty lines and comments
 		if trimmed == "" || strings.HasPrefix(trimmed, "#") {
 			continue
 		}
 
-		// Check if this is the imports: key
-		if strings.HasPrefix(trimmed, "imports:") {
-			inImports = true
-			inAwSubfield = false
-			isObjectForm = false
-			// Find the base indentation (position of first non-whitespace character)
-			baseIndent = len(line) - len(strings.TrimLeft(line, " \t"))
+		if state.beginImportsBlock(line, trimmed) {
 			continue
 		}
 
-		if inImports {
-			// Calculate current line's indentation
-			lineIndent := len(line) - len(strings.TrimLeft(line, " \t"))
+		if !state.inImports {
+			continue
+		}
 
-			// If indentation decreased or same level, we're out of the imports block
-			if lineIndent <= baseIndent && trimmed != "" && !strings.HasPrefix(trimmed, "#") {
-				break
-			}
+		lineIndent := indentationOf(line)
+		if state.exitsImportsBlock(trimmed, lineIndent) {
+			break
+		}
+		if state.handleSubfield(trimmed, lineIndent) {
+			continue
+		}
 
-			// Detect the 'aw:' subfield (object form)
-			if lineIndent == baseIndent+2 && strings.HasPrefix(trimmed, "aw:") {
-				isObjectForm = true
-				inAwSubfield = true
-				awIndent = lineIndent
-				continue
-			}
-
-			// Detect other object-form subfields (e.g. 'apm-packages:') — skip their contents
-			if isObjectForm && lineIndent == baseIndent+2 && strings.Contains(trimmed, ":") && !strings.HasPrefix(trimmed, "-") {
-				inAwSubfield = false
-				continue
-			}
-
-			// In array form: collect top-level array items directly under imports:
-			// In object form: collect array items only under the 'aw:' subfield
-			if strings.HasPrefix(trimmed, "-") {
-				if !isObjectForm {
-					// Array form — all items belong to imports
-					item := strings.TrimSpace(trimmed[1:])
-					item = strings.Trim(item, `"'`)
-					if item != "" {
-						imports = append(imports, item)
-					}
-				} else if inAwSubfield && lineIndent > awIndent {
-					// Object form — only items under 'aw:' are import paths
-					item := strings.TrimSpace(trimmed[1:])
-					item = strings.Trim(item, `"'`)
-					if item != "" {
-						imports = append(imports, item)
-					}
-				}
-			}
+		if item, ok := state.extractImportItem(trimmed, lineIndent); ok {
+			imports = append(imports, item)
 		}
 	}
 
 	return imports
 }
 
+type importExtractionState struct {
+	inImports    bool
+	baseIndent   int
+	inAwSubfield bool
+	awIndent     int
+	isObjectForm bool
+}
+
+func (s *importExtractionState) beginImportsBlock(line, trimmed string) bool {
+	if !strings.HasPrefix(trimmed, "imports:") {
+		return false
+	}
+	s.inImports = true
+	s.inAwSubfield = false
+	s.isObjectForm = false
+	s.baseIndent = indentationOf(line)
+	return true
+}
+
+func (s *importExtractionState) exitsImportsBlock(trimmed string, lineIndent int) bool {
+	return lineIndent <= s.baseIndent && trimmed != "" && !strings.HasPrefix(trimmed, "#")
+}
+
+func (s *importExtractionState) handleSubfield(trimmed string, lineIndent int) bool {
+	if lineIndent == s.baseIndent+2 && strings.HasPrefix(trimmed, "aw:") {
+		s.isObjectForm = true
+		s.inAwSubfield = true
+		s.awIndent = lineIndent
+		return true
+	}
+	if s.isObjectForm && lineIndent == s.baseIndent+2 && strings.Contains(trimmed, ":") && !strings.HasPrefix(trimmed, "-") {
+		s.inAwSubfield = false
+		return true
+	}
+	return false
+}
+
+func (s *importExtractionState) extractImportItem(trimmed string, lineIndent int) (string, bool) {
+	if !strings.HasPrefix(trimmed, "-") {
+		return "", false
+	}
+	if s.isObjectForm && (!s.inAwSubfield || lineIndent <= s.awIndent) {
+		return "", false
+	}
+
+	item := strings.TrimSpace(trimmed[1:])
+	item = strings.Trim(item, `"'`)
+	if item == "" {
+		return "", false
+	}
+	return item, true
+}
+
+func indentationOf(line string) int {
+	return len(line) - len(strings.TrimLeft(line, " \t"))
+}
+
 // processImportsTextBased processes imports from frontmatter using text-based parsing
 // Returns: importedFiles (list of import paths), importedFrontmatterTexts (list of frontmatter texts)
-func processImportsTextBased(frontmatterText, baseDir string, visited map[string]bool, fileReader FileReader) ([]string, []string, error) {
+func processImportsTextBased(frontmatterText, baseDir string, visited map[string]struct {
+}, fileReader FileReader) ([]string, []string, error) {
 	var importedFiles []string
 	var importedFrontmatterTexts []string
 
@@ -414,11 +433,12 @@ func processImportsTextBased(frontmatterText, baseDir string, visited map[string
 		fullPath := filepath.Join(baseDir, importPath)
 
 		// Skip if already visited (cycle detection)
-		if visited[fullPath] {
+		if setutil.Contains(visited, fullPath) {
 			frontmatterHashLog.Printf("Skipping already-visited import (cycle detection): %s", fullPath)
 			continue
 		}
-		visited[fullPath] = true
+		visited[fullPath] = struct {
+		}{}
 
 		// Read imported file using the provided file reader
 		content, err := fileReader(fullPath)
@@ -455,6 +475,104 @@ func processImportsTextBased(frontmatterText, baseDir string, visited map[string
 	return importedFiles, importedFrontmatterTexts, nil
 }
 
+// collectImportedBodies processes imports from frontmatter and returns the body texts of all
+// transitively imported files. Used to include imported file bodies in the body hash.
+func collectImportedBodies(frontmatterText, baseDir string, visited map[string]struct {
+}, fileReader FileReader) ([]string, error) {
+	var importedBodyTexts []string
+
+	imports := extractImportsFromText(frontmatterText)
+	if len(imports) == 0 {
+		return importedBodyTexts, nil
+	}
+
+	sort.Strings(imports)
+
+	for _, importPath := range imports {
+		fullPath := filepath.Join(baseDir, importPath)
+
+		if setutil.Contains(visited, fullPath) {
+			continue
+		}
+		visited[fullPath] = struct {
+		}{}
+
+		content, err := fileReader(fullPath)
+		if err != nil {
+			continue
+		}
+
+		importFrontmatterText, importBody, err := extractFrontmatterAndBodyText(string(content))
+		if err != nil {
+			continue
+		}
+
+		importedBodyTexts = append(importedBodyTexts, importBody)
+
+		importBaseDir := filepath.Dir(fullPath)
+		nestedBodies, err := collectImportedBodies(importFrontmatterText, importBaseDir, visited, fileReader)
+		if err != nil {
+			continue
+		}
+		importedBodyTexts = append(importedBodyTexts, nestedBodies...)
+	}
+
+	return importedBodyTexts, nil
+}
+
+// ComputeBodyHashFromParsedContent computes a SHA-256 hash of the markdown body (after frontmatter)
+// including the bodies of all transitively imported files. This hash covers changes to the prompt
+// body that are not captured by the frontmatter hash.
+// markdownBody is the raw markdown body (after the frontmatter --- delimiter).
+// frontmatterText is the raw frontmatter text, used to resolve imports.
+func ComputeBodyHashFromParsedContent(markdownBody, frontmatterText, baseDir string, fileReader FileReader) (string, error) {
+	frontmatterHashLog.Printf("Computing body hash from parsed content (baseDir=%s)", baseDir)
+
+	normalizedBody := normalizeFrontmatterText(markdownBody)
+
+	visited := make(map[string]struct {
+	})
+	importedBodies, err := collectImportedBodies(frontmatterText, baseDir, visited, fileReader)
+	if err != nil {
+		return "", fmt.Errorf("failed to process imports for body hash: %w", err)
+	}
+
+	allParts := []string{normalizedBody}
+
+	if len(importedBodies) > 0 {
+		normalizedBodies := make([]string, len(importedBodies))
+		for i, b := range importedBodies {
+			normalizedBodies[i] = normalizeFrontmatterText(b)
+		}
+		sort.Strings(normalizedBodies)
+		allParts = append(allParts, normalizedBodies...)
+	}
+
+	combined := strings.Join(allParts, "\n---\n")
+	frontmatterHashLog.Printf("Body hash combined length: %d bytes", len(combined))
+
+	hash := sha256.Sum256([]byte(combined))
+	hashHex := hex.EncodeToString(hash[:])
+	frontmatterHashLog.Printf("Computed body hash: %s", hashHex)
+	return hashHex, nil
+}
+
+// ComputeBodyHashFromFile computes the body hash for a workflow file from disk.
+func ComputeBodyHashFromFile(filePath string) (string, error) {
+	content, err := DefaultFileReader(filePath)
+	if err != nil {
+		return "", fmt.Errorf("failed to read file: %w", err)
+	}
+
+	frontmatterText, markdownBody, err := extractFrontmatterAndBodyText(string(content))
+	if err != nil {
+		return "", fmt.Errorf("failed to extract frontmatter: %w", err)
+	}
+
+	baseDir := filepath.Dir(filePath)
+	return ComputeBodyHashFromParsedContent(markdownBody, frontmatterText, baseDir, DefaultFileReader)
+}
+
 // computeFrontmatterHashTextBasedWithReader computes the hash using text-based approach with custom file reader.
 // When markdown is non-empty, it is included as the full body text in the canonical data (used for
 // inlined-imports mode where the entire body is compiled into the lock file).
@@ -462,7 +580,8 @@ func computeFrontmatterHashTextBasedWithReader(frontmatterText, markdown, baseDi
 	frontmatterHashLog.Print("Computing frontmatter hash using text-based approach")
 
 	// Process imports using text-based parsing with custom file reader
-	visited := make(map[string]bool)
+	visited := make(map[string]struct {
+	})
 	importedFiles, importedFrontmatterTexts, err := processImportsTextBased(frontmatterText, baseDir, visited, fileReader)
 	if err != nil {
 		return "", fmt.Errorf("failed to process imports: %w", err)

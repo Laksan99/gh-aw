@@ -5,7 +5,12 @@ import (
 	"regexp"
 	"sort"
 	"strings"
+
+	"github.com/github/gh-aw/pkg/logger"
+	"github.com/github/gh-aw/pkg/setutil"
 )
+
+var schemaErrorsLog = logger.New("parser:schema_errors")
 
 // atPathPattern matches "- at '/path': " or "at '/path': " prefixes in error messages
 var atPathPattern = regexp.MustCompile(`^-?\s*at '([^']*)': (.+)$`)
@@ -23,11 +28,11 @@ var maxConstraintPattern = regexp.MustCompile(`^maximum: got (-?\d+(?:\.\d+)?), 
 //   - "maximum: got 120, want 60" → "must be at most 60 (got 120)"
 func translateSchemaConstraintMessage(message string) string {
 	if m := minConstraintPattern.FindStringSubmatch(message); len(m) == 3 {
-		log.Printf("Translating minimum constraint message: got=%s want=%s", m[1], m[2])
+		schemaErrorsLog.Printf("Translating minimum constraint message: got=%s want=%s", m[1], m[2])
 		return fmt.Sprintf("must be at least %s (got %s)", m[2], m[1])
 	}
 	if m := maxConstraintPattern.FindStringSubmatch(message); len(m) == 3 {
-		log.Printf("Translating maximum constraint message: got=%s want=%s", m[1], m[2])
+		schemaErrorsLog.Printf("Translating maximum constraint message: got=%s want=%s", m[1], m[2])
 		return fmt.Sprintf("must be at most %s (got %s)", m[2], m[1])
 	}
 	return message
@@ -35,7 +40,7 @@ func translateSchemaConstraintMessage(message string) string {
 
 // cleanJSONSchemaErrorMessage removes unhelpful prefixes from jsonschema validation errors
 func cleanJSONSchemaErrorMessage(errorMsg string) string {
-	log.Printf("Cleaning JSON schema error message (%d chars)", len(errorMsg))
+	schemaErrorsLog.Printf("Cleaning JSON schema error message (%d chars)", len(errorMsg))
 	// Split the error message into lines
 	lines := strings.Split(errorMsg, "\n")
 
@@ -86,7 +91,7 @@ func cleanOneOfMessage(message string) string {
 		return message
 	}
 
-	log.Printf("Simplifying oneOf error message (%d lines)", len(strings.Split(message, "\n")))
+	schemaErrorsLog.Printf("Simplifying oneOf error message (%d lines)", len(strings.Split(message, "\n")))
 	lines := strings.Split(message, "\n")
 	var meaningful []string
 
@@ -133,7 +138,7 @@ var typeConflictGotWantPattern = regexp.MustCompile(`(?:^|: )got (\w+), want (\w
 // The engine list mirrors the built-in engines in NewEngineCatalog.
 // Update this list when built-in engines change.
 var knownOneOfFieldHints = map[string]string{
-	"/engine":                "Valid engine names: claude, codex, copilot, gemini.\n\nExample:\nengine: copilot\n# or with options:\nengine:\n  id: copilot\n  max-turns: 15",
+	"/engine":                "Valid engine names: antigravity, claude, codex, copilot, crush, gemini, opencode, pi.\n\nExample:\nengine: copilot\n# or with options:\nengine:\n  id: copilot\nmax-turns: 15  # top-level field, not nested under engine",
 	"/tools/github/toolsets": "Valid toolsets: all, default, action-friendly, context, repos, issues, pull_requests, actions, code_security, dependabot, discussions, experiments, gists, labels, notifications, orgs, projects, search, secret_protection, security_advisories, stargazers, users.\n\nExample:\ntools:\n  github:\n    toolsets: default\n    # or as an array:\n    toolsets: [default, repos]",
 }
 
@@ -171,11 +176,13 @@ func synthesizeOneOfTypeConflictMessage(lines []string) string {
 	}
 
 	// Deduplicate expected types (e.g., multiple "object" branches in oneOf)
-	seen := make(map[string]bool)
+	seen := make(map[string]struct {
+	})
 	var uniqueWantTypes []string
 	for _, t := range wantTypes {
-		if !seen[t] {
-			seen[t] = true
+		if !setutil.Contains(seen, t) {
+			seen[t] = struct {
+			}{}
 			uniqueWantTypes = append(uniqueWantTypes, t)
 		}
 	}
@@ -250,7 +257,7 @@ func stripAtPathPrefix(line string) string {
 // findFrontmatterBounds finds the start and end indices of frontmatter in file lines
 // Returns: startIdx (-1 if not found), endIdx (-1 if not found), frontmatterContent
 func findFrontmatterBounds(lines []string) (startIdx int, endIdx int, frontmatterContent string) {
-	log.Printf("Finding frontmatter bounds in %d lines", len(lines))
+	schemaErrorsLog.Printf("Finding frontmatter bounds in %d lines", len(lines))
 	startIdx = -1
 	endIdx = -1
 
@@ -269,7 +276,7 @@ func findFrontmatterBounds(lines []string) (startIdx int, endIdx int, frontmatte
 	}
 
 	if startIdx == -1 {
-		log.Print("No frontmatter opening delimiter found")
+		schemaErrorsLog.Print("No frontmatter opening delimiter found")
 		return -1, -1, ""
 	}
 
@@ -284,10 +291,10 @@ func findFrontmatterBounds(lines []string) (startIdx int, endIdx int, frontmatte
 
 	if endIdx == -1 {
 		// No closing "---" found
-		log.Print("No frontmatter closing delimiter found")
+		schemaErrorsLog.Print("No frontmatter closing delimiter found")
 		return -1, -1, ""
 	}
-	log.Printf("Found frontmatter bounds: start=%d end=%d", startIdx, endIdx)
+	schemaErrorsLog.Printf("Found frontmatter bounds: start=%d end=%d", startIdx, endIdx)
 
 	// Extract frontmatter content between the markers
 	frontmatterLines := lines[startIdx+1 : endIdx]
@@ -300,22 +307,29 @@ func findFrontmatterBounds(lines []string) (startIdx int, endIdx int, frontmatte
 // of the valid values / children for that field. Used to append helpful hints when an
 // additionalProperties error occurs on these fields so users quickly know what is allowed.
 //
-// The permissions scope list mirrors the properties defined in main_workflow_schema.json
-// under permissions.oneOf[1].properties. Update this list when the schema changes.
+// Both /permissions and /on/permissions mirror #/$defs/github_actions_permissions in
+// main_workflow_schema.json. Update this list when the schema changes.
 var knownFieldValidValues = map[string]string{
-	// This list mirrors permissions.oneOf[1].properties in main_workflow_schema.json.
+	// Both entries mirror $defs/github_actions_permissions in main_workflow_schema.json.
 	// Update both when the schema changes.
-	"/permissions": "Valid permission scopes: actions, all, attestations, checks, contents, deployments, discussions, id-token, issues, metadata, models, organization-projects, packages, pages, pull-requests, repository-projects, security-events, statuses, vulnerability-alerts",
+	"/permissions":    "Valid permission scopes: actions, all, attestations, checks, copilot-requests, contents, deployments, discussions, id-token, issues, metadata, models, organization-projects, packages, pages, pull-requests, repository-projects, security-events, statuses, vulnerability-alerts",
+	"/on/permissions": "Valid permission scopes: actions, all, attestations, checks, copilot-requests, contents, deployments, discussions, id-token, issues, metadata, models, organization-projects, packages, pages, pull-requests, repository-projects, security-events, statuses, vulnerability-alerts",
 }
 
 // knownFieldScopes maps well-known JSON schema paths to a slice of valid scope names.
 // This enables spell-check ("Did you mean?") suggestions for unknown-property errors.
 //
-// The permissions scope list mirrors permissions.oneOf[1].properties in main_workflow_schema.json.
-// Update both when the schema changes.
+// Both /permissions and /on/permissions mirror #/$defs/github_actions_permissions in
+// main_workflow_schema.json. Update this list when the schema changes.
 var knownFieldScopes = map[string][]string{
 	"/permissions": {
-		"actions", "all", "attestations", "checks", "contents", "deployments",
+		"actions", "all", "attestations", "checks", "copilot-requests", "contents", "deployments",
+		"discussions", "id-token", "issues", "metadata", "models",
+		"organization-projects", "packages", "pages", "pull-requests",
+		"repository-projects", "security-events", "statuses", "vulnerability-alerts",
+	},
+	"/on/permissions": {
+		"actions", "all", "attestations", "checks", "copilot-requests", "contents", "deployments",
 		"discussions", "id-token", "issues", "metadata", "models",
 		"organization-projects", "packages", "pages", "pull-requests",
 		"repository-projects", "security-events", "statuses", "vulnerability-alerts",
@@ -324,7 +338,8 @@ var knownFieldScopes = map[string][]string{
 
 // knownFieldDocs maps well-known JSON schema paths to documentation URLs.
 var knownFieldDocs = map[string]string{
-	"/permissions": "https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/controlling-permissions-for-github_token",
+	"/permissions":    "https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/controlling-permissions-for-github_token",
+	"/on/permissions": "https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/controlling-permissions-for-github_token",
 }
 
 // unknownPropertyPattern extracts the property name(s) from a rewritten "Unknown property(ies):" message.
@@ -341,78 +356,91 @@ func appendKnownFieldValidValuesHint(message string, jsonPath string) (string, b
 	if !strings.Contains(strings.ToLower(message), "unknown propert") {
 		return message, false
 	}
-	log.Printf("Appending known field hint for path: %s", jsonPath)
+	schemaErrorsLog.Printf("Appending known field hint for path: %s", jsonPath)
 
-	// Find the best matching known path: exact match first, then the longest matching parent.
-	hint, hintOK := knownFieldValidValues[jsonPath]
-	scopes := knownFieldScopes[jsonPath]
-	docsURL := knownFieldDocs[jsonPath]
-	if !hintOK {
-		// Select the longest matching parent path deterministically to avoid
-		// random map iteration order when multiple known paths share a common prefix.
-		bestPath := ""
-		bestLen := 0
-		for path := range knownFieldValidValues {
-			if strings.HasPrefix(jsonPath, path+"/") {
-				if l := len(path); l > bestLen {
-					bestLen = l
-					bestPath = path
-				}
-			}
-		}
-		if bestPath != "" {
-			hint = knownFieldValidValues[bestPath]
-			scopes = knownFieldScopes[bestPath]
-			docsURL = knownFieldDocs[bestPath]
-			hintOK = true
-		}
-	}
+	hint, scopes, docsURL, hintOK := knownFieldHintForPath(jsonPath)
 	if !hintOK {
 		return message, false
 	}
 
 	result := message + " (" + hint + ")"
+	result = appendKnownFieldSuggestions(result, message, scopes)
+	result = appendKnownFieldDocsURL(result, docsURL)
+	return result, true
+}
 
-	// Add "Did you mean?" suggestions when the unknown property name is close to a valid scope.
-	if len(scopes) > 0 {
-		// unknownPropertyPattern has exactly one capture group, so a successful match
-		// returns [fullMatch, captureGroup1], giving len(m) == 2.
-		if m := unknownPropertyPattern.FindStringSubmatch(message); len(m) == 2 {
-			unknownProps := strings.Split(m[1], ", ")
-			var allSuggestions []string
-			for _, prop := range unknownProps {
-				prop = strings.TrimSpace(prop)
-				if prop == "" {
-					continue
-				}
-				// maxClosestMatches is defined in schema_suggestions.go in the same package.
-				closest := FindClosestMatches(prop, scopes, maxClosestMatches)
-				allSuggestions = append(allSuggestions, closest...)
-			}
-			// Deduplicate suggestions
-			seen := make(map[string]bool)
-			var unique []string
-			for _, s := range allSuggestions {
-				if !seen[s] {
-					seen[s] = true
-					unique = append(unique, s)
-				}
-			}
-			if len(unique) == 1 {
-				result = fmt.Sprintf("%s. Did you mean '%s'?", result, unique[0])
-			} else if len(unique) > 1 {
-				result = fmt.Sprintf("%s. Did you mean: %s?", result, strings.Join(unique, ", "))
+func knownFieldHintForPath(jsonPath string) (string, []string, string, bool) {
+	if hint, ok := knownFieldValidValues[jsonPath]; ok {
+		return hint, knownFieldScopes[jsonPath], knownFieldDocs[jsonPath], true
+	}
+	bestPath := findBestKnownFieldParentPath(jsonPath)
+	if bestPath == "" {
+		return "", nil, "", false
+	}
+	return knownFieldValidValues[bestPath], knownFieldScopes[bestPath], knownFieldDocs[bestPath], true
+}
+
+func findBestKnownFieldParentPath(jsonPath string) string {
+	bestPath := ""
+	bestLen := 0
+	for path := range knownFieldValidValues {
+		if strings.HasPrefix(jsonPath, path+"/") {
+			if l := len(path); l > bestLen {
+				bestLen = l
+				bestPath = path
 			}
 		}
 	}
+	return bestPath
+}
 
-	// Append documentation link on the same line to avoid breaking bullet-list formatting
-	// when this message is embedded in "Multiple schema validation failures:" output.
-	if docsURL != "" {
-		result = fmt.Sprintf("%s See: %s", result, docsURL)
+func appendKnownFieldSuggestions(result, message string, scopes []string) string {
+	if len(scopes) == 0 {
+		return result
+	}
+	m := unknownPropertyPattern.FindStringSubmatch(message)
+	if len(m) != 2 {
+		return result
 	}
 
-	return result, true
+	unknownProps := strings.Split(m[1], ", ")
+	unique := uniqueClosestScopeSuggestions(unknownProps, scopes)
+	if len(unique) == 1 {
+		return fmt.Sprintf("%s. Did you mean '%s'?", result, unique[0])
+	}
+	if len(unique) > 1 {
+		return fmt.Sprintf("%s. Did you mean: %s?", result, strings.Join(unique, ", "))
+	}
+	return result
+}
+
+func uniqueClosestScopeSuggestions(unknownProps []string, scopes []string) []string {
+	var allSuggestions []string
+	for _, prop := range unknownProps {
+		prop = strings.TrimSpace(prop)
+		if prop == "" {
+			continue
+		}
+		allSuggestions = append(allSuggestions, FindClosestMatches(prop, scopes, maxClosestMatches)...)
+	}
+	seen := make(map[string]struct {
+	})
+	var unique []string
+	for _, s := range allSuggestions {
+		if !setutil.Contains(seen, s) {
+			seen[s] = struct {
+			}{}
+			unique = append(unique, s)
+		}
+	}
+	return unique
+}
+
+func appendKnownFieldDocsURL(result, docsURL string) string {
+	if docsURL == "" {
+		return result
+	}
+	return fmt.Sprintf("%s See: %s", result, docsURL)
 }
 
 // rewriteAdditionalPropertiesError rewrites "additional properties not allowed" errors to be more user-friendly
@@ -420,12 +448,11 @@ func rewriteAdditionalPropertiesError(message string) string {
 	// Check if this is an "additional properties not allowed" error
 	if strings.Contains(strings.ToLower(message), "additional propert") && strings.Contains(strings.ToLower(message), "not allowed") {
 		// Extract property names from the message using regex
-		re := regexp.MustCompile(`additional propert(?:y|ies) (.+?) not allowed`)
-		match := re.FindStringSubmatch(message)
+		match := additionalPropertiesPattern.FindStringSubmatch(message)
 
 		if len(match) >= 2 {
 			properties := normalizeAdditionalPropertyList(match[1])
-			log.Printf("Rewriting additional properties error: %s", properties)
+			schemaErrorsLog.Printf("Rewriting additional properties error: %s", properties)
 
 			if strings.Contains(properties, ",") {
 				return "Unknown properties: " + properties

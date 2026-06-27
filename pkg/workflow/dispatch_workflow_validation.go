@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"strings"
 
+	"github.com/github/gh-aw/pkg/constants"
 	"github.com/goccy/go-yaml"
 )
 
@@ -58,8 +59,8 @@ func (c *Compiler) validateDispatchWorkflow(data *WorkflowData, workflowPath str
 			currentDir := filepath.Dir(workflowPath)
 			githubDir := filepath.Dir(currentDir)
 			repoRoot := filepath.Dir(githubDir)
-			workflowsDir := filepath.Join(repoRoot, ".github", "workflows")
-			notFoundErr := fmt.Errorf("dispatch-workflow: workflow '%s' not found in %s\n\nChecked for: %s.md, %s.lock.yml, %s.yml\n\nTo fix:\n1. Verify the workflow file exists in .github/workflows/\n2. Ensure the filename matches exactly (case-sensitive)\n3. Use the filename without extension in your configuration", workflowName, workflowsDir, workflowName, workflowName, workflowName)
+			workflowsDir := filepath.Join(repoRoot, constants.GetWorkflowDir())
+			notFoundErr := fmt.Errorf("dispatch-workflow: workflow '%s' not found in %s\n\nChecked for: %s.md, %s.lock.yml, %s.yml\n\nTo fix:\n1. Verify the workflow file exists in %s/\n2. Ensure the filename matches exactly (case-sensitive)\n3. Use the filename without extension in your configuration", workflowName, workflowsDir, workflowName, workflowName, workflowName, workflowsDir)
 			if returnErr := collector.Add(notFoundErr); returnErr != nil {
 				return returnErr
 			}
@@ -190,36 +191,7 @@ func parseRepoSlugLiteral(slug string) (string, string, bool) {
 // Returns a map of input definitions that can be used to generate MCP tool schemas
 func extractWorkflowDispatchInputs(workflowPath string) (map[string]any, error) {
 	dispatchWorkflowValidationLog.Printf("Extracting workflow_dispatch inputs from: %s", workflowPath)
-	workflow, err := readWorkflowYAML(workflowPath)
-	if err != nil {
-		return nil, err
-	}
-
-	onSection, hasOn := workflow["on"]
-	if !hasOn {
-		return make(map[string]any), nil
-	}
-	onMap, ok := onSection.(map[string]any)
-	if !ok {
-		return make(map[string]any), nil
-	}
-	workflowDispatch, hasWorkflowDispatch := onMap["workflow_dispatch"]
-	if !hasWorkflowDispatch {
-		return make(map[string]any), nil
-	}
-	workflowDispatchMap, ok := workflowDispatch.(map[string]any)
-	if !ok {
-		return make(map[string]any), nil
-	}
-	inputs, hasInputs := workflowDispatchMap["inputs"]
-	if !hasInputs {
-		return make(map[string]any), nil
-	}
-	inputsMap, ok := inputs.(map[string]any)
-	if !ok {
-		return make(map[string]any), nil
-	}
-	return inputsMap, nil
+	return extractInputsFromYAML(workflowPath, "workflow_dispatch")
 }
 
 // containsWorkflowDispatch reports whether the given 'on:' section value includes

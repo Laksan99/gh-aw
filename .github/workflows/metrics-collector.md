@@ -1,4 +1,5 @@
 ---
+emoji: "📊"
 description: Collects daily performance metrics for the agent ecosystem and stores them in repo-memory
 on: daily
 permissions:
@@ -7,12 +8,14 @@ permissions:
   pull-requests: read
   discussions: read
   actions: read
-engine: copilot
+engine:
+  id: copilot
+  copilot-sdk: true
 imports:
   - uses: shared/meta-analysis-base.md
     with:
       toolsets: [default]
-  - shared/observability-otlp.md
+  - shared/otlp.md
 tools:
   repo-memory:
     branch-name: memory/meta-orchestrators

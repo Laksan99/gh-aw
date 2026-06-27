@@ -3,6 +3,7 @@
 package workflow
 
 import (
+	"context"
 	"os"
 	"path/filepath"
 	"strings"
@@ -59,7 +60,15 @@ This workflow operates on a separate repository.
 
 	workflowDataList, tmpDir := compileSideRepoWorkflow(t, workflowContent)
 
-	err := GenerateMaintenanceWorkflow(workflowDataList, tmpDir, "v1.0.0", ActionModeDev, "", false, nil, "")
+	err := GenerateMaintenanceWorkflow(context.Background(), GenerateMaintenanceWorkflowOptions{
+		WorkflowDataList: workflowDataList,
+		WorkflowDir:      tmpDir,
+		Version:          "v1.0.0",
+		ActionMode:       ActionModeDev,
+		ActionTag:        "",
+		RepoConfig:       nil,
+		RepoSlug:         "",
+	})
 	require.NoError(t, err, "generate maintenance workflow")
 
 	sideRepoFile := filepath.Join(tmpDir, "agentics-maintenance-my-org-target-repo.yml")
@@ -107,8 +116,8 @@ This workflow operates on a separate repository.
 		"generated workflow should run gh aw logs directly")
 	assert.Contains(t, contentStr, "--start-date -1w",
 		"generated workflow should download 7 days of logs for activity_report")
-	assert.Contains(t, contentStr, "--count 100",
-		"generated workflow should limit activity_report log downloads to at most 100 runs")
+	assert.Contains(t, contentStr, "--count 500",
+		"generated workflow should limit activity_report log downloads to at most 500 runs")
 	assert.Contains(t, contentStr, "--format markdown",
 		"generated workflow should request markdown report output from gh aw logs")
 	assert.Contains(t, contentStr, "./.cache/gh-aw/activity-report-logs/report.md",
@@ -160,7 +169,15 @@ Create issues that expire after 14 days.
 
 	workflowDataList, tmpDir := compileSideRepoWorkflow(t, workflowContent)
 
-	err := GenerateMaintenanceWorkflow(workflowDataList, tmpDir, "v1.0.0", ActionModeDev, "", false, nil, "")
+	err := GenerateMaintenanceWorkflow(context.Background(), GenerateMaintenanceWorkflowOptions{
+		WorkflowDataList: workflowDataList,
+		WorkflowDir:      tmpDir,
+		Version:          "v1.0.0",
+		ActionMode:       ActionModeDev,
+		ActionTag:        "",
+		RepoConfig:       nil,
+		RepoSlug:         "",
+	})
 	require.NoError(t, err, "generate maintenance workflow")
 
 	sideRepoFile := filepath.Join(tmpDir, "agentics-maintenance-corp-infra-tools.yml")
@@ -210,7 +227,15 @@ checkout:
 
 	workflowDataList, tmpDir := compileSideRepoWorkflow(t, workflowContent)
 
-	err := GenerateMaintenanceWorkflow(workflowDataList, tmpDir, "v1.0.0", ActionModeDev, "", false, nil, "")
+	err := GenerateMaintenanceWorkflow(context.Background(), GenerateMaintenanceWorkflowOptions{
+		WorkflowDataList: workflowDataList,
+		WorkflowDir:      tmpDir,
+		Version:          "v1.0.0",
+		ActionMode:       ActionModeDev,
+		ActionTag:        "",
+		RepoConfig:       nil,
+		RepoSlug:         "",
+	})
 	require.NoError(t, err, "generate maintenance workflow")
 
 	sideRepoFile := filepath.Join(tmpDir, "agentics-maintenance-acme-shared-services.yml")
@@ -246,7 +271,15 @@ checkout:
 
 	workflowDataList, tmpDir := compileSideRepoWorkflow(t, workflowContent)
 
-	err := GenerateMaintenanceWorkflow(workflowDataList, tmpDir, "v1.0.0", ActionModeDev, "", false, nil, "")
+	err := GenerateMaintenanceWorkflow(context.Background(), GenerateMaintenanceWorkflowOptions{
+		WorkflowDataList: workflowDataList,
+		WorkflowDir:      tmpDir,
+		Version:          "v1.0.0",
+		ActionMode:       ActionModeDev,
+		ActionTag:        "",
+		RepoConfig:       nil,
+		RepoSlug:         "",
+	})
 	require.NoError(t, err, "generate maintenance workflow")
 
 	// No side-repo file should be created because the repository is an expression.
@@ -305,7 +338,16 @@ safe-outputs:
 	} {
 		t.Run(tc.repo, func(t *testing.T) {
 			wdl, tmpDir := compileSideRepoWorkflow(t, makeContent(tc.repo))
-			require.NoError(t, GenerateMaintenanceWorkflow(wdl, tmpDir, "v1.0.0", ActionModeDev, "", false, nil, ""))
+			err := GenerateMaintenanceWorkflow(context.Background(), GenerateMaintenanceWorkflowOptions{
+				WorkflowDataList: wdl,
+				WorkflowDir:      tmpDir,
+				Version:          "v1.0.0",
+				ActionMode:       ActionModeDev,
+				ActionTag:        "",
+				RepoConfig:       nil,
+				RepoSlug:         "",
+			})
+			require.NoError(t, err)
 
 			slug := stringutil.SanitizeForFilename(tc.repo)
 			sideFile := filepath.Join(tmpDir, "agentics-maintenance-"+slug+".yml")

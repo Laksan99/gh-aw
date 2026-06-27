@@ -16,9 +16,6 @@
 //
 // # Key Functions
 //
-// Base Installation:
-//   - GetBaseInstallationSteps() - Generate base installation steps for an engine
-//
 // Secret Validation:
 //   - GenerateMultiSecretValidationStep() - Validate at least one of multiple secrets
 //   - BuildDefaultSecretValidationStep() - Build secret validation step for an engine
@@ -34,11 +31,15 @@ package workflow
 
 import (
 	"fmt"
+	"maps"
 	"regexp"
-	"sort"
 	"strings"
 
+	"github.com/github/gh-aw/pkg/workflow/compilerenv"
+
 	"github.com/github/gh-aw/pkg/logger"
+	"github.com/github/gh-aw/pkg/setutil"
+	"github.com/github/gh-aw/pkg/sliceutil"
 )
 
 var engineHelpersLog = logger.New("workflow:engine_helpers")
@@ -79,6 +80,18 @@ func getEngineEnvOverrides(workflowData *WorkflowData) map[string]string {
 	return workflowData.EngineConfig.Env
 }
 
+// ResolveEngineID returns the workflow engine ID, preferring engine.id over the legacy AI field.
+// It returns an empty string when no engine ID is available.
+func ResolveEngineID(workflowData *WorkflowData) string {
+	if workflowData == nil {
+		return ""
+	}
+	if workflowData.EngineConfig != nil && workflowData.EngineConfig.ID != "" {
+		return workflowData.EngineConfig.ID
+	}
+	return workflowData.AI
+}
+
 // engineEnvHasKey reports whether the given env var key is present in the engine.env map.
 // Returns false if workflowData or EngineConfig is nil, or if the key is not in the map.
 func engineEnvHasKey(workflowData *WorkflowData, key string) bool {
@@ -89,40 +102,70 @@ func engineEnvHasKey(workflowData *WorkflowData, key string) bool {
 	return ok
 }
 
-// GetBaseInstallationSteps returns the common installation steps for an engine.
-// This includes npm package installation steps shared across all engines.
-// Secret validation is now handled in the activation job via GetSecretValidationStep.
-//
-// Parameters:
-//   - config: Engine-specific configuration for installation
-//   - workflowData: The workflow data containing engine configuration
-//
-// Returns:
-//   - []GitHubActionStep: The base installation steps (npm install)
-func GetBaseInstallationSteps(config EngineInstallConfig, workflowData *WorkflowData) []GitHubActionStep {
-	engineHelpersLog.Printf("Generating base installation steps for %s engine: workflow=%s", config.Name, workflowData.Name)
-
-	var steps []GitHubActionStep
-
-	// Secret validation step is now generated in the activation job (GetSecretValidationStep).
-
-	// Determine step name - use InstallStepName if provided, otherwise default to "Install <Name>"
-	stepName := config.InstallStepName
-	if stepName == "" {
-		stepName = "Install " + config.Name
+// applyEngineCwdEnv sets the GH_AW_ENGINE_CWD environment variable in the given env map
+// when engine.cwd is configured. This variable is consumed by JS harness processes (via
+// process_runner.cjs) and by shell-based engine command prefixes so the engine spawns in
+// the user-specified working directory rather than the default GITHUB_WORKSPACE.
+func applyEngineCwdEnv(env map[string]string, workflowData *WorkflowData) {
+	if workflowData == nil || workflowData.EngineConfig == nil || workflowData.EngineConfig.Cwd == "" {
+		return
 	}
+	env["GH_AW_ENGINE_CWD"] = workflowData.EngineConfig.Cwd
+}
 
-	// Add npm package installation steps
-	npmSteps := BuildStandardNpmEngineInstallSteps(
-		config.NpmPackage,
-		config.Version,
-		stepName,
-		config.CliName,
-		workflowData,
-	)
-	steps = append(steps, npmSteps...)
+// applyOptionalEngineToolTimeouts adds optional tool timeout environment variables.
+func applyOptionalEngineToolTimeouts(env map[string]string, workflowData *WorkflowData) {
+	if workflowData == nil {
+		return
+	}
+	if workflowData.ToolsStartupTimeout != "" {
+		env["GH_AW_STARTUP_TIMEOUT"] = workflowData.ToolsStartupTimeout
+	}
+	if workflowData.ToolsTimeout != "" {
+		env["GH_AW_TOOL_TIMEOUT"] = workflowData.ToolsTimeout
+	}
+}
 
-	return steps
+// applyEngineMaxTurnsEnv sets GH_AW_MAX_TURNS from engine.max-turns or the default expression.
+func applyEngineMaxTurnsEnv(env map[string]string, workflowData *WorkflowData) {
+	if workflowData != nil && workflowData.EngineConfig != nil && workflowData.EngineConfig.MaxTurns != "" {
+		env["GH_AW_MAX_TURNS"] = workflowData.EngineConfig.MaxTurns
+		return
+	}
+	env["GH_AW_MAX_TURNS"] = compilerenv.BuildDefaultMaxTurnsExpression()
+}
+
+// applyEngineAndAgentEnv merges custom environment variables from engine and agent configs.
+func applyEngineAndAgentEnv(env map[string]string, workflowData *WorkflowData, log *logger.Logger) {
+	if workflowData == nil {
+		return
+	}
+	if workflowData.EngineConfig != nil && len(workflowData.EngineConfig.Env) > 0 {
+		maps.Copy(env, workflowData.EngineConfig.Env)
+	}
+	agentConfig := getAgentConfig(workflowData)
+	if agentConfig != nil && len(agentConfig.Env) > 0 {
+		maps.Copy(env, agentConfig.Env)
+		if log != nil {
+			log.Printf("Added %d custom env vars from agent config", len(agentConfig.Env))
+		}
+	}
+}
+
+// applyMCPScriptsSecretEnv appends mcp-scripts secrets unless already present.
+func applyMCPScriptsSecretEnv(env map[string]string, workflowData *WorkflowData) {
+	if workflowData == nil {
+		return
+	}
+	if !IsMCPScriptsEnabled(workflowData.MCPScripts) {
+		return
+	}
+	mcpScriptsSecrets := collectMCPScriptsSecrets(workflowData.MCPScripts)
+	for varName, secretExpr := range mcpScriptsSecrets {
+		if _, exists := env[varName]; !exists {
+			env[varName] = secretExpr
+		}
+	}
 }
 
 // GenerateMultiSecretValidationStep creates a GitHub Actions step that validates at least one
@@ -254,14 +297,7 @@ func FormatStepWithCommandAndEnv(stepLines []string, command string, env map[str
 	// Add environment variables
 	if len(env) > 0 {
 		stepLines = append(stepLines, "        env:")
-		// Sort environment keys for consistent output
-		envKeys := make([]string, 0, len(env))
-		for key := range env {
-			envKeys = append(envKeys, key)
-		}
-		sort.Strings(envKeys)
-
-		for _, key := range envKeys {
+		for _, key := range sliceutil.SortedKeys(env) {
 			value := env[key]
 			stepLines = appendEnvVarLine(stepLines, key, value)
 		}
@@ -300,8 +336,11 @@ func appendEnvVarLine(lines []string, key, value string) []string {
 // that would cause it to be misinterpreted by YAML parsers, it wraps the value
 // in single quotes. Any embedded single quotes are escaped by doubling them (' becomes ”).
 func yamlStringValue(value string) string {
-	if len(value) == 0 {
+	if value == "" {
 		return value
+	}
+	if quoted := quoteYAMLValueContainingColonSpace(value); quoted != value {
+		return quoted
 	}
 	// Values starting with YAML flow indicators need quoting to be treated as strings.
 	// '{' would be parsed as a YAML flow mapping, '[' as a YAML flow sequence.
@@ -333,9 +372,11 @@ func FilterEnvForSecrets(env map[string]string, allowedNamesAndKeys []string) ma
 	engineHelpersLog.Printf("Filtering environment variables: total=%d, allowed=%d", len(env), len(allowedNamesAndKeys))
 
 	// Create a set for fast lookup — entries may be secret names or env var keys.
-	allowedSet := make(map[string]bool)
+	allowedSet := make(map[string]struct {
+	})
 	for _, entry := range allowedNamesAndKeys {
-		allowedSet[entry] = true
+		allowedSet[entry] = struct {
+		}{}
 	}
 
 	filtered := make(map[string]string)
@@ -348,7 +389,7 @@ func FilterEnvForSecrets(env map[string]string, allowedNamesAndKeys []string) ma
 			// Format: ${{ secrets.SECRET_NAME }} or ${{ secrets.SECRET_NAME || ... }}
 			secretName := ExtractSecretName(value)
 			// Allow the secret if the secret name OR the env var key is in the allowed set.
-			if secretName != "" && !allowedSet[secretName] && !allowedSet[key] {
+			if secretName != "" && !setutil.Contains(allowedSet, secretName) && !setutil.Contains(allowedSet, key) {
 				engineHelpersLog.Printf("Removing unauthorized secret from env: %s (secret: %s)", key, secretName)
 				secretsRemoved++
 				continue

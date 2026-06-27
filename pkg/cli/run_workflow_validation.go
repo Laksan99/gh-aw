@@ -15,6 +15,7 @@ import (
 	"github.com/github/gh-aw/pkg/constants"
 	"github.com/github/gh-aw/pkg/logger"
 	"github.com/github/gh-aw/pkg/parser"
+	"github.com/github/gh-aw/pkg/sliceutil"
 	"github.com/github/gh-aw/pkg/workflow"
 	"github.com/goccy/go-yaml"
 )
@@ -45,7 +46,7 @@ func IsRunnable(markdownPath string) (bool, error) {
 
 	// Read the lock file - path is sanitized using filepath.Clean() to prevent path traversal attacks.
 	// The lockPath is derived from markdownPath which comes from trusted sources (CLI arguments, validated workflow paths).
-	contentBytes, err := os.ReadFile(cleanLockPath) // #nosec G304
+	contentBytes, err := os.ReadFile(cleanLockPath) // #nosec G304 -- path is sanitized with filepath.Clean() and derived from trusted CLI argument
 	if err != nil {
 		return false, fmt.Errorf("failed to read lock file: %w", err)
 	}
@@ -98,7 +99,7 @@ func getWorkflowInputs(markdownPath string) (map[string]*workflow.InputDefinitio
 
 	// Read the lock file - path is sanitized using filepath.Clean() to prevent path traversal attacks.
 	// The lockPath is derived from markdownPath which comes from trusted sources (CLI arguments, validated workflow paths).
-	contentBytes, err := os.ReadFile(cleanLockPath) // #nosec G304
+	contentBytes, err := os.ReadFile(cleanLockPath) // #nosec G304 -- path is sanitized with filepath.Clean() and derived from trusted CLI argument
 	if err != nil {
 		return nil, fmt.Errorf("failed to read lock file: %w", err)
 	}
@@ -237,7 +238,7 @@ func validateWorkflowInputs(markdownPath string, providedInputs []string) error 
 		// Add helpful information about valid inputs
 		if len(workflowInputs) > 0 {
 			var inputDescriptions []string
-			sortedNames := slices.Sorted(maps.Keys(workflowInputs))
+			sortedNames := sliceutil.SortedKeys(workflowInputs)
 			for _, name := range sortedNames {
 				def := workflowInputs[name]
 				required := ""
@@ -272,7 +273,12 @@ func validateWorkflowInputs(markdownPath string, providedInputs []string) error 
 			errorParts = append(errorParts, validInputsMsg)
 		}
 
-		return errors.New(strings.Join(errorParts, "\n\n"))
+		return workflow.NewValidationError(
+			"on.workflow_dispatch.inputs",
+			strings.Join(providedInputs, ", "),
+			strings.Join(errorParts, "\n\n"),
+			fmt.Sprintf("Define and provide valid workflow_dispatch inputs.\n\nExample workflow frontmatter:\n\non:\n  workflow_dispatch:\n    inputs:\n      issue_url:\n        description: \"Issue URL\"\n        required: true\n        type: string\n\nExample command:\n  gh aw run %s -F issue_url=https://github.com/org/repo/issues/123", strings.TrimSuffix(filepath.Base(markdownPath), ".md")),
+		)
 	}
 
 	return nil

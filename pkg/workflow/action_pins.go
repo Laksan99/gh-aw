@@ -1,6 +1,7 @@
 package workflow
 
 import (
+	"fmt"
 	"strings"
 
 	actionpins "github.com/github/gh-aw/pkg/actionpins"
@@ -24,6 +25,10 @@ type ActionPinsData = actionpins.ActionPinsData
 
 // ContainerPin is the pinned container image type from pkg/actionpins.
 type ContainerPin = actionpins.ContainerPin
+
+// SHAResolver is the interface for resolving a GitHub Action's commit SHA for a given version tag.
+// It aliases actionpins.SHAResolver so pkg/workflow files can reference it without a separate import.
+type SHAResolver = actionpins.SHAResolver
 
 // --------------------------------------------------------------------------
 // Package-private helpers used throughout pkg/workflow
@@ -81,6 +86,10 @@ func getActionPin(repo string) string {
 //
 // This is the preferred call site for code running inside a Compiler method, since it
 // automatically honours the per-compilation GHES compat flag without any global state.
+//
+// If the compiler has an action cache and resolver, this method will check the cache for
+// any existing entry and mark it as "used" for orphan pruning. This ensures compiler-generated
+// action references (e.g., actions/cache/save in notify steps) are tracked.
 func (c *Compiler) getActionPin(repo string) string {
 	if c.ghesArtifactCompat {
 		if pin, ok := ghesArtifactCompatPins[repo]; ok {
@@ -88,13 +97,29 @@ func (c *Compiler) getActionPin(repo string) string {
 			return actionpins.FormatPinnedActionReference(repo, pin.sha, pin.version)
 		}
 	}
+
+	// Check the cache for any existing entry for this repo (regardless of version).
+	// Compiler-generated actions don't specify versions, so we use any cached entry we have.
+	cache := c.GetSharedActionCache()
+	resolver := c.GetSharedActionResolver()
+	if cache != nil {
+		if cacheKey, entry, found := cache.FindAnyEntryForRepo(repo); found {
+			// Mark this cache key as used so it won't be pruned as orphaned
+			if resolver != nil {
+				resolver.MarkCacheKeyAsUsed(cacheKey)
+			}
+			return actionpins.FormatPinnedActionReference(repo, entry.SHA, entry.Version)
+		}
+	}
+
+	// Fall back to embedded pins if no cache entry exists
 	return getActionPin(repo)
 }
 
 // getCachedActionPinFromResolver returns the pinned action reference for repo,
 // preferring dynamic resolution via resolver over the embedded pins.
 // For use within pkg/workflow when only a resolver is available (no WorkflowData).
-func getCachedActionPinFromResolver(repo string, resolver ActionSHAResolver) string {
+func getCachedActionPinFromResolver(repo string, resolver SHAResolver) string {
 	ctx := &actionpins.PinContext{}
 	if resolver != nil {
 		ctx.Resolver = resolver
@@ -130,6 +155,31 @@ func lookupContainerPin(image string, cache *ActionCache) (ContainerPin, bool) {
 	return ContainerPin{}, false
 }
 
+// resolveContainerImage returns the digest-pinned image reference when a cache or
+// embedded container pin exists for image; otherwise it returns the original image.
+func resolveContainerImage(image string, data *WorkflowData) string {
+	var cache *ActionCache
+	if data != nil {
+		cache = data.ActionCache
+	}
+	if pin, ok := lookupContainerPin(image, cache); ok && pin.PinnedImage != "" {
+		return pin.PinnedImage
+	}
+	return image
+}
+
+// resolveMCPGatewayContainerImage returns an MCP Gateway-compatible container
+// reference. MCP Gateway container fields accept image[:tag] but not digest
+// references, so digest-pinned images are normalized back to their base image.
+func resolveMCPGatewayContainerImage(image string, data *WorkflowData) string {
+	resolved := resolveContainerImage(image, data)
+	base, _, hasDigest := strings.Cut(resolved, "@")
+	if hasDigest {
+		return base
+	}
+	return resolved
+}
+
 // getActionPinWithData returns the pinned action reference for a given action@version,
 // delegating to pkg/actionpins with a PinContext built from WorkflowData.
 func getActionPinWithData(actionRepo, version string, data *WorkflowData) (string, error) {
@@ -149,19 +199,36 @@ func getCachedActionPin(repo string, data *WorkflowData) string {
 // applyActionPinToTypedStep applies SHA pinning to a WorkflowStep if it uses an action.
 // Returns a modified copy of the step with pinned references.
 // If the step doesn't use an action or the action is not pinned, returns the original step.
-func applyActionPinToTypedStep(step *WorkflowStep, data *WorkflowData) *WorkflowStep {
+// Returns an error if the step uses an unversioned action reference with no available pin,
+// because emitting such a reference would produce invalid GitHub Actions workflow syntax.
+// Local action refs (./...) and Docker image refs (docker://...) are always passed through as-is.
+func applyActionPinToTypedStep(step *WorkflowStep, data *WorkflowData) (*WorkflowStep, error) {
 	if step == nil || !step.IsUsesStep() {
-		return step
+		return step, nil
+	}
+
+	// Local action references (./...) and Docker image references (docker://...)
+	// are valid GitHub Actions syntax that cannot and should not be pinned — emit as-is.
+	if strings.HasPrefix(step.Uses, "./") || strings.HasPrefix(step.Uses, "docker://") {
+		return step, nil
 	}
 
 	actionRepo := extractActionRepo(step.Uses)
 	if actionRepo == "" {
-		return step
+		return step, nil
 	}
 
 	version := extractActionVersion(step.Uses)
 	if version == "" {
-		return step
+		pin := getCachedActionPin(actionRepo, data)
+		if pin == "" {
+			return nil, fmt.Errorf("unversioned action %q has no available pin; add a @ref (e.g. @v1) or include it in action-pins.json", actionRepo)
+		}
+
+		actionPinsLog.Printf("Pinned action: %s (no ref) -> %s", actionRepo, pin)
+		result := step.Clone()
+		result.Uses = pin
+		return result, nil
 	}
 
 	// Strip the comment suffix before checking if it's already a SHA.
@@ -171,20 +238,21 @@ func applyActionPinToTypedStep(step *WorkflowStep, data *WorkflowData) *Workflow
 	pinnedRef, err := getActionPinWithData(actionRepo, rawVersion, data)
 	if err != nil || pinnedRef == "" {
 		actionPinsLog.Printf("Skipping pin for %s@%s: no pin available", actionRepo, rawVersion)
-		return step
+		return step, nil
 	}
 
 	actionPinsLog.Printf("Pinned action: %s@%s -> %s", actionRepo, rawVersion, pinnedRef)
 	result := step.Clone()
 	result.Uses = pinnedRef
-	return result
+	return result, nil
 }
 
 // applyActionPinsToTypedSteps applies SHA pinning to a slice of typed WorkflowStep pointers.
-// Returns a new slice with pinned references.
-func applyActionPinsToTypedSteps(steps []*WorkflowStep, data *WorkflowData) []*WorkflowStep {
+// Returns a new slice with pinned references, or an error if any step has an unversioned
+// action reference with no available pin.
+func applyActionPinsToTypedSteps(steps []*WorkflowStep, data *WorkflowData) ([]*WorkflowStep, error) {
 	if steps == nil {
-		return nil
+		return nil, nil
 	}
 
 	result := make([]*WorkflowStep, 0, len(steps))
@@ -193,7 +261,11 @@ func applyActionPinsToTypedSteps(steps []*WorkflowStep, data *WorkflowData) []*W
 			result = append(result, nil)
 			continue
 		}
-		result = append(result, applyActionPinToTypedStep(step, data))
+		pinned, err := applyActionPinToTypedStep(step, data)
+		if err != nil {
+			return nil, err
+		}
+		result = append(result, pinned)
 	}
-	return result
+	return result, nil
 }

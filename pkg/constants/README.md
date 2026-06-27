@@ -1,5 +1,7 @@
 # constants Package
 
+> Shared semantic type aliases and named constants for `gh-aw` — AI engine names, feature flags, job names, version strings, URLs, and runtime configuration values.
+
 The `constants` package provides shared semantic type aliases and named constants used across multiple `gh-aw` packages. Centralizing these values ensures consistency and type safety throughout the codebase.
 
 ## Overview
@@ -24,7 +26,7 @@ The package uses typed aliases to prevent mixing unrelated string or integer val
 
 | Type | Description | Example constant |
 |------|-------------|-----------------|
-| `EngineName` | AI engine identifier | `CopilotEngine`, `ClaudeEngine`, `CodexEngine`, `GeminiEngine`, `OpenCodeEngine`, `CrushEngine`, `PiEngine` |
+| `EngineName` | AI engine identifier | `CopilotEngine`, `ClaudeEngine`, `CodexEngine`, `GeminiEngine`, `AntigravityEngine`, `OpenCodeEngine`, `CrushEngine`, `PiEngine` |
 | `FeatureFlag` | Feature flag identifier | `MCPGatewayFeatureFlag`, `MCPScriptsFeatureFlag` |
 | `JobName` | GitHub Actions job name | `AgentJobName`, `ActivationJobName` |
 | `StepID` | GitHub Actions step identifier | `CheckMembershipStepID`, `CheckRateLimitStepID` |
@@ -45,17 +47,18 @@ All semantic types implement `String() string` and `IsValid() bool` methods.
 import "github.com/github/gh-aw/pkg/constants"
 
 // Engine names
-constants.CopilotEngine   // "copilot"
-constants.ClaudeEngine    // "claude"
-constants.CodexEngine     // "codex"
-constants.GeminiEngine    // "gemini"
-constants.OpenCodeEngine  // "opencode"
-constants.CrushEngine     // "crush"
-constants.PiEngine        // "pi" (experimental)
-constants.DefaultEngine   // "copilot"
+constants.CopilotEngine      // "copilot"
+constants.ClaudeEngine       // "claude"
+constants.CodexEngine        // "codex"
+constants.GeminiEngine       // "gemini"
+constants.AntigravityEngine  // "antigravity"
+constants.OpenCodeEngine     // "opencode"
+constants.CrushEngine        // "crush"
+constants.PiEngine           // "pi" (experimental)
+constants.DefaultEngine      // "copilot"
 
 // All supported engine names
-constants.AgenticEngines // []string{"claude", "codex", "copilot", "gemini", "opencode", "crush", "pi"}
+constants.AgenticEngines // []string{"claude", "codex", "copilot", "gemini", "antigravity", "opencode", "crush", "pi"}
 
 // Get engine metadata
 opt := constants.GetEngineOption("copilot")
@@ -134,7 +137,7 @@ constants.EnvVarGitHubTrustedUsers   // "GH_AW_GITHUB_TRUSTED_USERS"   (tools.gi
 
 ```go
 constants.CopilotBYOKDummyAPIKey // "dummy-byok-key-for-offline-mode" — placeholder key used for AWF runtime BYOK detection
-constants.CopilotBYOKDefaultModel // "claude-sonnet-4.6" — explicit fallback model when GH_AW_MODEL_*_COPILOT is unset
+constants.CopilotBYOKDefaultModel // "claude-sonnet-4.6" — explicit fallback used when GH_AW_MODEL_*_COPILOT is unset
 ```
 
 ### Copilot Stem Commands
@@ -147,7 +150,6 @@ constants.CopilotBYOKDefaultModel // "claude-sonnet-4.6" — explicit fallback m
 constants.MCPScriptsFeatureFlag             // "mcp-scripts"
 constants.MCPGatewayFeatureFlag             // "mcp-gateway"
 constants.DisableXPIAPromptFeatureFlag      // "disable-xpia-prompt"
-constants.CopilotRequestsFeatureFlag        // "copilot-requests"
 constants.DIFCProxyFeatureFlag              // "difc-proxy" (deprecated — use tools.github.integrity-proxy)
 constants.CliProxyFeatureFlag               // "cli-proxy"
 constants.AwfDiagnosticLogsFeatureFlag      // "awf-diagnostic-logs"
@@ -182,6 +184,8 @@ constants.AgentArtifactName           // "agent" (unified agent artifact)
 constants.DetectionArtifactName       // "detection"
 constants.LegacyDetectionArtifactName // "threat-detection.log" (backward compat)
 constants.ActivationArtifactName      // "activation"
+constants.ExperimentArtifactName      // "experiment" — A/B experiment state uploaded by the activation job
+constants.UsageArtifactName           // "usage" — compact run metadata and token-usage files from the conclusion job
 constants.SafeOutputItemsArtifactName // "safe-outputs-items"
 constants.SarifArtifactName           // "code-scanning-sarif"
 
@@ -191,6 +195,7 @@ constants.SafeOutputsFilename         // "safeoutputs.jsonl"
 constants.TokenUsageFilename          // "agent_usage.json"
 constants.GithubRateLimitsFilename    // "github_rate_limits.jsonl"
 constants.OtelJsonlFilename           // "otel.jsonl"
+constants.OtlpExportErrorsFilename    // "otlp-export-errors.jsonl" — OTLP per-endpoint export failure log
 constants.TemporaryIdMapFilename      // "temporary-id-map.json"
 constants.SarifFileName               // "code-scanning-alert.sarif"
 constants.SarifArtifactDownloadPath   // "/tmp/gh-aw/sarif/"
@@ -219,6 +224,7 @@ constants.PreActivationAppTokenStepID    // "pre-activation-app-token"
 
 // Agent job step IDs
 constants.ParseMCPGatewayStepID          // "parse-mcp-gateway"
+constants.DetectAgentErrorsStepID        // "detect-agent-errors" — post-execution error detection step
 ```
 
 ### Step Output Keys
@@ -252,10 +258,12 @@ constants.AgenticWorkflowsMCPServerID  // "agenticworkflows"
 
 ```go
 // AI engine CLIs
-constants.DefaultCopilotVersion         // Copilot CLI version (e.g. "1.0.21")
+constants.DefaultCopilotVersion         // Copilot CLI version (e.g. "1.0.63")
+constants.DefaultCopilotSDKVersion      // @github/copilot-sdk npm package version
 constants.DefaultClaudeCodeVersion      // Claude Code CLI version
 constants.DefaultCodexVersion           // OpenAI Codex CLI version
 constants.DefaultGeminiVersion          // Google Gemini CLI version
+constants.DefaultAntigravityVersion     // Antigravity CLI version
 constants.DefaultCrushVersion           // Crush CLI version
 constants.DefaultOpenCodeVersion        // OpenCode CLI version
 constants.DefaultPiVersion              // Pi CLI version (experimental)
@@ -263,10 +271,12 @@ constants.DefaultPiVersion              // Pi CLI version (experimental)
 // Infrastructure
 constants.DefaultGitHubMCPServerVersion // GitHub MCP server Docker image version
 constants.DefaultFirewallVersion        // AWF firewall version
+constants.DefaultThreatDetectVersion    // gh-aw-threat-detection binary version
 constants.DefaultMCPGatewayVersion      // MCP Gateway (gh-aw-mcpg) Docker image version
 
 // MCP tooling
 constants.DefaultPlaywrightMCPVersion   // @playwright/mcp npm package version
+constants.DefaultPlaywrightCLIVersion   // @playwright/cli npm package version (tools.playwright.mode = "cli")
 constants.DefaultPlaywrightBrowserVersion // Playwright browser Docker image version
 constants.DefaultMCPSDKVersion          // @modelcontextprotocol/sdk npm package version
 constants.DefaultGitHubScriptVersion    // actions/github-script action version
@@ -274,7 +284,7 @@ constants.DefaultGitHubScriptVersion    // actions/github-script action version
 // Runtime setup versions
 constants.DefaultNodeVersion            // Node.js (e.g. "24")
 constants.DefaultPythonVersion          // Python (e.g. "3.12")
-constants.DefaultGoVersion              // Go (e.g. "1.25")
+constants.DefaultGoVersion              // Go (e.g. "1.26")
 constants.DefaultBunVersion             // Bun
 constants.DefaultRubyVersion            // Ruby
 constants.DefaultDotNetVersion          // .NET
@@ -292,6 +302,9 @@ These constants guard feature flag emission: the compiler MUST NOT emit certain 
 constants.AWFExcludeEnvMinVersion       // "v0.25.3"  — minimum AWF for --exclude-env
 constants.AWFCliProxyMinVersion         // "v0.25.17" — minimum AWF for CLI proxy flags
 constants.AWFAllowHostPortsMinVersion   // "v0.25.24" — minimum AWF for --allow-host-ports
+constants.AWFDockerHostPathPrefixMinVersion // "v0.25.43" — minimum AWF for --docker-host-path-prefix
+constants.AWFTokenSteeringMinVersion    // "v0.25.44" — minimum AWF for token steering support
+constants.AWFChrootConfigMinVersion     // "v0.27.1"  — minimum AWF for chroot.binariesSourcePath and identity.*
 constants.CopilotNoAskUserMinVersion    // "1.0.19"   — minimum Copilot CLI for --no-ask-user
 constants.MCPGIntegrityReactionsMinVersion // "v0.2.18" — minimum MCPG for integrity-reactions policy
 ```
@@ -392,6 +405,14 @@ constants.DefaultGitHubLockdown      // false — GitHub MCP server lockdown def
 constants.AWFAPIProxyContainerIP     // "172.30.0.30" — fixed api-proxy sidecar address inside the AWF sandbox network
 ```
 
+### Threat Detection Paths
+
+```go
+constants.ThreatDetectionLogPath    // "/tmp/gh-aw/threat-detection/detection.log" — engine log file
+constants.ThreatDetectionDir        // "/tmp/gh-aw/threat-detection" — working directory
+constants.ThreatDetectionResultPath // "/tmp/gh-aw/threat-detection/detection_result.json" — structured verdict output
+```
+
 ## Validation Field Lists
 
 These variables control YAML key ordering and validation during workflow compilation:
@@ -403,10 +424,10 @@ constants.PriorityJobFields       // []string{"name","runs-on","needs","if","per
 constants.PriorityWorkflowFields  // []string{"on","permissions","if","network","imports",...}
 
 // Fields silently ignored during frontmatter validation
-constants.IgnoredFrontmatterFields // []string{"user-invokable"}
+constants.IgnoredFrontmatterFields // []string{}
 
 // Fields forbidden in shared/imported workflows (only valid in main workflows)
-constants.SharedWorkflowForbiddenFields // []string{"on","command","concurrency",...}
+constants.SharedWorkflowForbiddenFields // []string{"on","concurrency","container",...}
 
 // Events that do not require permission checks
 constants.SafeWorkflowEvents      // []string{"workflow_dispatch","schedule"}
@@ -480,6 +501,14 @@ fmt.Println(constants.GhAwRootDirShell)  // "${RUNNER_TEMP}/gh-aw"
 // Dynamic workflow directory (respects GH_AW_WORKFLOWS_DIR)
 dir := constants.GetWorkflowDir() // ".github/workflows"
 ```
+
+## Dependencies
+
+**Internal**:
+- None
+
+**External**:
+- None beyond the Go standard library (`io/fs`, `os`, `path/filepath`, `time`).
 
 ## Design Notes
 

@@ -1,5 +1,5 @@
 // This file implements compile-time validation of the Model Alias Format (MAF)
-// as specified in docs/src/content/docs/reference/model-alias-specification.md.
+// as specified in docs/src/content/docs/specs/model-alias-specification.md.
 //
 // # Validation Rules Implemented
 //
@@ -24,11 +24,12 @@ import (
 	"fmt"
 	"math"
 	"os"
-	"sort"
 	"strconv"
 	"strings"
 
 	"github.com/github/gh-aw/pkg/console"
+	"github.com/github/gh-aw/pkg/setutil"
+	"github.com/github/gh-aw/pkg/sliceutil"
 )
 
 var modelAliasValidationLog = newValidationLogger("model_alias")
@@ -242,21 +243,26 @@ func detectCircularModelAliases(aliasMap map[string][]string, markdownPath strin
 
 	// visited tracks keys for which all DFS descendants have been fully explored
 	// (no cycle detected from that key).
-	visited := map[string]bool{}
+	visited := map[string]struct {
+	}{}
 
 	// Iterate keys in deterministic order for reproducible error messages.
-	keys := make([]string, 0, len(aliasMap))
-	for k := range aliasMap {
-		keys = append(keys, k)
+	keys := sliceutil.SortedKeys(aliasMap)
+
+	state := &dfsState{
+		aliasMap: aliasMap,
+		visited:  visited,
+		onPath:   make(map[string]bool, 16),
+		path:     make([]string, 0, 16),
 	}
-	sort.Strings(keys)
 
 	for _, key := range keys {
-		if visited[key] {
+		if setutil.Contains(visited, key) {
 			continue
 		}
-		path := []string{} // current DFS path (ordered)
-		if cycle := dfsCycleCheck(key, aliasMap, visited, path); cycle != nil {
+		clear(state.onPath)
+		state.path = state.path[:0]
+		if cycle := state.dfs(key); cycle != nil {
 			// Format cycle chain for a clear error message.
 			chain := strings.Join(append(cycle, cycle[0]), " → ")
 			return formatCompilerError(markdownPath, "error",
@@ -270,44 +276,26 @@ func detectCircularModelAliases(aliasMap map[string][]string, markdownPath strin
 	return nil
 }
 
-// dfsCycleCheck performs a depth-first traversal starting at start.
-// visited tracks fully explored nodes (no cycle reachable from there).
-// Returns the cycle chain (slice of alias names forming the loop) or nil.
-func dfsCycleCheck(
-	start string,
-	aliasMap map[string][]string,
-	visited map[string]bool,
-	path []string,
-) []string {
-	state := &dfsState{
-		aliasMap: aliasMap,
-		visited:  visited,
-		onPath:   map[string]bool{},
-		path:     path,
-	}
-	return state.dfs(start)
-}
-
 // dfsState holds the mutable state for a single DFS traversal.
 type dfsState struct {
 	aliasMap map[string][]string
-	visited  map[string]bool
+	visited  map[string]struct{}
 	onPath   map[string]bool
 	path     []string
 }
 
 func (s *dfsState) dfs(node string) []string {
-	if s.visited[node] {
+	if setutil.Contains(s.visited, node) {
 		return nil
 	}
 	if s.onPath[node] {
 		// Cycle found — return the chain from node back around.
 		for i, n := range s.path {
 			if n == node {
-				return s.path[i:]
+				return append([]string(nil), s.path[i:]...)
 			}
 		}
-		return s.path // fallback: should not happen
+		return append([]string(nil), s.path...) // fallback: should not happen
 	}
 
 	s.onPath[node] = true
@@ -323,8 +311,8 @@ func (s *dfsState) dfs(node string) []string {
 	}
 
 	s.path = s.path[:len(s.path)-1]
-	s.onPath[node] = false
-	s.visited[node] = true
+	delete(s.onPath, node)
+	s.visited[node] = struct{}{}
 	return nil
 }
 

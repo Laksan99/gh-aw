@@ -57,6 +57,7 @@ checkout:
 | `submodules` | string/bool | Submodule handling: `"recursive"`, `"true"`, or `"false"`. |
 | `lfs` | boolean | Download Git LFS objects. |
 | `current` | boolean | Marks this checkout as the primary working repository. The agent uses this as the default target for all GitHub operations. Only one checkout may set `current: true`; the compiler rejects workflows where multiple checkouts enable it. |
+| `force-clean-git-credentials` | boolean | When `true`, the checkout step is generated with `persist-credentials: true` and followed by a dedicated cleanup step that scrubs both repo and submodule git credentials. Use this for submodule-heavy or sparse checkouts where the default `persist-credentials: false` post-step cleanup fails. See [Cleaning Submodule Credentials](#cleaning-submodule-credentials). |
 
 ## Fetching Additional Refs
 
@@ -97,6 +98,17 @@ checkout:
 If a branch you need is not available after checkout and is not covered by a `fetch:` pattern, and you're in a private or internal repo, then the agent cannot access its Git history except inefficiently, file by file, via the GitHub MCP. For private repositories, it will be unable to fetch or explore additional branches. If the branch is required and unavailable, configure the appropriate pattern in `fetch:` (e.g., `fetch: ["*"]` for all branches, or `fetch: ["refs/pulls/open/*"]` for PR branches) and recompile the workflow.
 :::
 
+## Git Credentials After Checkout
+
+The generated checkout step uses `persist-credentials: false`, so the git credentials that `actions/checkout` used are removed once checkout completes. The agent then runs without credentials for the checked-out repository, and any git operation that must authenticate to the remote fails. In private repositories this includes:
+
+- `git fetch`, `git pull`, `git clone`, and direct `git push`
+- Checking out or switching to a remote branch that was not already fetched
+- Deepening a shallow clone (`git fetch --unshallow`)
+- On-demand blob fetches in partial (blobless) clones — operations on files absent from the initial checkout
+
+Fetch everything the workflow needs at checkout time using `fetch-depth` and [`fetch:`](#fetching-additional-refs), and write changes through safe-output tools such as [`push-to-pull-request-branch`](/gh-aw/reference/safe-outputs-pull-requests/) rather than a direct `git push`. The agent is instructed not to configure credential helpers or run `git credential fill`, because authentication cannot succeed; credential errors are reported as a limitation instead of worked around.
+
 ## Disabling Checkout (`checkout: false`)
 
 Set `checkout: false` to suppress the default `actions/checkout` step entirely. Use this for workflows that access repositories through MCP servers or other mechanisms that do not require a local clone:
@@ -127,6 +139,19 @@ checkout:
 > ```
 >
 > Without this instruction, the agent starts in `$GITHUB_WORKSPACE` (the side repository checkout) and must infer the correct directory on its own.
+
+## Cleaning Submodule Credentials
+
+By default, generated checkout steps set `persist-credentials: false`, which causes `actions/checkout` to remove credentials in its post-step. In repositories with submodules or sparse checkouts, that post-step can fail with missing submodule URL or path errors.
+
+Set `force-clean-git-credentials: true` on a checkout target to opt into an explicit cleanup step instead. The compiler emits the checkout with `persist-credentials: true`, then injects a `Clean git credentials after checkout` step immediately after it. The cleanup removes the credential helper and `http.*.extraheader` entries from both `.git/config` and any `.git/modules/*/config`, including nested submodules.
+
+```yaml wrap
+checkout:
+  - repository: org/monorepo-with-submodules
+    submodules: recursive
+    force-clean-git-credentials: true
+```
 
 ## Checkout Merging
 

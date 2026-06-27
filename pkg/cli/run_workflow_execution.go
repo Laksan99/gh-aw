@@ -25,6 +25,9 @@ var executionLog = logger.New("cli:run_workflow_execution")
 // workflowCompletionWaitTimeoutMinutes matches the GitHub Actions maximum job runtime.
 const workflowCompletionWaitTimeoutMinutes = 6 * 60
 
+// betweenWorkflowsDelay paces sequential workflow triggers to avoid overwhelming the GitHub API.
+const betweenWorkflowsDelay = 1 * time.Second
+
 // RunOptions contains all configuration options for running workflows
 type RunOptions struct {
 	Enable            bool     // Enable the workflow if it's disabled
@@ -75,7 +78,7 @@ func RunWorkflowOnGitHub(ctx context.Context, workflowIdOrName string, opts RunO
 		}
 		// Check that key (before '=') is not empty
 		parts := strings.SplitN(input, "=", 2)
-		if len(parts[0]) == 0 {
+		if parts[0] == "" {
 			return fmt.Errorf("invalid input format '%s': key cannot be empty", input)
 		}
 	}
@@ -196,11 +199,11 @@ func RunWorkflowOnGitHub(ctx context.Context, workflowIdOrName string, opts RunO
 
 		_, _, err := readWorkflowFile(normalizedID+".md", workflowsDir)
 		if err != nil {
-			return fmt.Errorf("failed to find workflow in local .github/workflows: %w", err)
+			return fmt.Errorf("failed to find workflow in local %s: %w", workflowsDir, err)
 		}
 
-		// Check if the lock file exists in .github/workflows
-		lockFilePath = filepath.Join(".github/workflows", lockFileName)
+		// Check if the lock file exists in the workflows directory
+		lockFilePath = filepath.Join(constants.GetWorkflowDir(), lockFileName)
 		if _, err := os.Stat(lockFilePath); os.IsNotExist(err) {
 			executionLog.Printf("Lock file not found: %s (workflow must be compiled first)", lockFilePath)
 			suggestions := []string{
@@ -208,7 +211,7 @@ func RunWorkflowOnGitHub(ctx context.Context, workflowIdOrName string, opts RunO
 				fmt.Sprintf("Run '%s compile %s' to compile this specific workflow", string(constants.CLIExtensionPrefix), normalizedID),
 			}
 			errMsg := console.FormatErrorWithSuggestions(
-				fmt.Sprintf("workflow lock file '%s' not found in .github/workflows", lockFileName),
+				fmt.Sprintf("workflow lock file '%s' not found in %s", lockFileName, constants.GetWorkflowDir()),
 				suggestions,
 			)
 			return errors.New(errMsg)
@@ -287,7 +290,7 @@ func RunWorkflowOnGitHub(ctx context.Context, workflowIdOrName string, opts RunO
 		}
 
 		// Commit and push the files (includes branch verification if --ref is specified)
-		if err := pushWorkflowFiles(workflowIdOrName, files, opts.RefOverride, opts.Verbose); err != nil {
+		if err := pushWorkflowFiles(ctx, workflowIdOrName, files, opts.RefOverride, opts.Verbose); err != nil {
 			return fmt.Errorf("failed to push workflow files: %w", err)
 		}
 
@@ -568,7 +571,14 @@ func RunWorkflowsOnGitHub(ctx context.Context, workflowNames []string, opts RunO
 
 			// Add a small delay between workflows to avoid overwhelming GitHub API
 			if i < len(workflowNames)-1 {
-				time.Sleep(1 * time.Second)
+				timer := time.NewTimer(betweenWorkflowsDelay)
+				select {
+				case <-ctx.Done():
+					timer.Stop()
+					fmt.Fprintln(os.Stderr, console.FormatWarningMessage("Operation cancelled"))
+					return ctx.Err()
+				case <-timer.C:
+				}
 			}
 		}
 
@@ -611,7 +621,7 @@ func RunWorkflowsOnGitHub(ctx context.Context, workflowNames []string, opts RunO
 			if err != nil {
 				return fmt.Errorf("failed to marshal JSON: %w", err)
 			}
-			fmt.Println(string(jsonBytes))
+			fmt.Fprintln(os.Stdout, string(jsonBytes))
 			return runErr
 		}
 	}

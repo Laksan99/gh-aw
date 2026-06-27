@@ -1,4 +1,5 @@
 ---
+emoji: "🔧"
 name: Daily Workflow Updater
 description: Automatically updates GitHub Actions versions and creates a PR if changes are detected
 on:
@@ -12,8 +13,11 @@ permissions:
   pull-requests: read
   issues: read
 
+  copilot-requests: write
 tracker-id: daily-workflow-updater
-engine: copilot
+engine:
+  id: copilot
+  copilot-sdk: true
 strict: true
 
 network:
@@ -39,10 +43,8 @@ tools:
 
 timeout-minutes: 15
 
-features:
-  copilot-requests: true
 imports:
-  - shared/observability-otlp.md
+  - shared/otlp.md
 ---
 
 {{#runtime-import? .github/shared-instructions.md}}

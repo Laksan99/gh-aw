@@ -1,4 +1,6 @@
 ---
+private: true
+emoji: "🔧"
 description: Scheduled workflow that recursively closes parent issues when all sub-issues are 100% complete
 name: Sub-Issue Closer
 on:
@@ -13,7 +15,7 @@ network:
   allowed:
     - defaults
 imports:
-  - shared/observability-otlp.md
+  - shared/otlp.md
 tools:
   cli-proxy: true
   github:
@@ -86,6 +88,9 @@ For each parent issue that is 100% complete:
    ```json
    {"type": "add_comment", "issue_number": 123, "body": "🎉 **Automatically closed by Sub-Issue Closer**\n\nAll sub-issues have been completed. This parent issue is now closed automatically.\n\n**Sub-issues status:** X/X closed (100%)"}
    ```
+   - Every `add_comment` must include `issue_number` set to the parent issue's numeric `number`.
+   - Never emit `add_comment` without a numeric target field (`issue_number`/`item_number`/`pr_number`/`pull_request_number`) when `target: "*"` is configured.
+   - Copy the same parent issue number used in `update_issue` into the matching `add_comment`; do not omit it or rely on event context fallback.
 
 ### Step 5: Report Summary
 

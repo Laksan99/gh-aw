@@ -37,6 +37,9 @@ The package is designed for use both in the main CLI binary and in WebAssembly c
 | `DeprecatedField` | struct | A deprecated frontmatter field with migration guidance |
 | `FileReader` | func type | `func(filePath string) ([]byte, error)` — abstraction for file reading |
 | `InlineSubAgent` | struct | A single inline sub-agent definition extracted via the `## agent: \`name\`` syntax |
+| `InlineSkill` | struct | A single inline skill definition extracted via the `## skill: \`name\`` syntax |
+| `BodyLevelImport` | struct | A `{{#runtime-import}}` directive found in the markdown body, with `Path` (workspace-root-relative) and `Optional` flag |
+| `PromptImportEntry` | struct | A single import contribution to prompt assembly; either a runtime-import path or inlined markdown |
 
 ### Functions
 
@@ -61,6 +64,7 @@ The package is designed for use both in the main CLI binary and in WebAssembly c
 | `ExpandIncludesWithManifest` | `func(content, baseDir string, extractTools bool) (string, []string, error)` | Expands `@include` directives in markdown body and returns included file paths |
 | `ExpandIncludesForEngines` | `func(content, baseDir string) ([]string, error)` | Returns engine names referenced via `@include` |
 | `ExpandIncludesForSafeOutputs` | `func(content, baseDir string) ([]string, error)` | Returns safe output types referenced via `@include` |
+| `ExtractBodyLevelImportPaths` | `func(content, baseDir string) []BodyLevelImport` | Scans markdown body for `{{#runtime-import}}` directives and returns them as workspace-root-relative `BodyLevelImport` entries |
 
 #### GitHub URL Parsing
 
@@ -70,7 +74,8 @@ The package is designed for use both in the main CLI binary and in WebAssembly c
 | `ParseRunURLExtended` | `func(input string) (*GitHubURLComponents, error)` | Parses a workflow run URL (extended formats) |
 | `ParsePRURL` | `func(prURL string) (owner, repo string, prNumber int, err error)` | Parses a pull request URL |
 | `ParseRepoFileURL` | `func(fileURL string) (owner, repo, ref, filePath string, err error)` | Parses a repository file URL |
-| `IsValidGitHubIdentifier` | `func(s string) bool` | Validates a GitHub username/org/repo name |
+| `IsValidGitHubIdentifier` | `func(s string) bool` | Validates a GitHub username/org identifier |
+| `IsValidGitHubRepositoryName` | `func(s string) bool` | Validates a GitHub repository name |
 | `GetGitHubHost` | `func() string` | Returns the GitHub host (supports GHES via `GH_HOST`) |
 | `GetGitHubHostForRepo` | `func(owner, repo string) string` | Returns the GitHub host for a specific repo |
 | `GetGitHubToken` | `func() (string, error)` | Returns the GitHub auth token from the environment |
@@ -84,6 +89,10 @@ The package is designed for use both in the main CLI binary and in WebAssembly c
 | `DownloadFileFromGitHubForHost` | `func(owner, repo, path, ref, host string) ([]byte, error)` | Downloads a file from a specific GitHub host |
 | `ResolveRefToSHAForHost` | `func(owner, repo, ref, host string) (string, error)` | Resolves a branch/tag ref to a commit SHA |
 | `ListWorkflowFiles` | `func(owner, repo, ref, workflowPath string) ([]string, error)` | Lists workflow files in a remote repository |
+| `ListWorkflowFilesForHost` | `func(owner, repo, ref, workflowPath, host string) ([]string, error)` | Lists workflow files in a remote repository on a specific GitHub host |
+| `ListDirAllFilesForHost` | `func(owner, repo, ref, dirPath, host string) ([]string, error)` | Lists all files (any extension) that are direct children of the given directory in a remote repository |
+| `ListDirAllFilesRecursivelyForHost` | `func(owner, repo, ref, dirPath, host string) ([]string, error)` | Lists all files under the given directory recursively in a remote repository |
+| `ListDirSubdirsForHost` | `func(owner, repo, ref, dirPath, host string) ([]string, error)` | Lists subdirectory paths that are direct children of the given directory in a remote repository |
 | `IsWorkflowSpec` | `func(path string) bool` | Returns whether a path is a workflow specification markdown file |
 
 #### MCP Configuration
@@ -111,10 +120,15 @@ The package is designed for use both in the main CLI binary and in WebAssembly c
 | Function | Signature | Description |
 |----------|-----------|-------------|
 | `ValidateMainWorkflowFrontmatterWithSchemaAndLocation` | `func(frontmatter map[string]any, filePath string) error` | JSON-schema validates frontmatter and returns located errors |
+| `ValidateIncludedFileFrontmatterWithSchemaAndLocation` | `func(frontmatter map[string]any, filePath string) error` | JSON-schema validates frontmatter of an included file fragment |
+| `ValidateMCPConfigWithSchema` | `func(mcpConfig map[string]any) error` | JSON-schema validates an MCP server configuration map |
+| `ValidateRepositoryPackageManifestWithSchemaAndLocation` | `func(manifest map[string]any, filePath string) error` | JSON-schema validates a repository package manifest |
 | `GetCompiledRepoConfigSchema` | `func() (*jsonschema.Schema, error)` | Returns the compiled JSON schema for repo config |
 | `GetSafeOutputTypeKeys` | `func() ([]string, error)` | Returns valid safe-output type keys from the schema |
 | `GetMainWorkflowDeprecatedFields` | `func() ([]DeprecatedField, error)` | Returns deprecated frontmatter fields with migration notes |
 | `FindDeprecatedFieldsInFrontmatter` | `func(map[string]any, []DeprecatedField) []DeprecatedField` | Finds deprecated fields present in a parsed frontmatter map |
+| `GetMainWorkflowDeprecatedFieldsDeep` | `func() ([]DeprecatedField, error)` | Returns deprecated fields at any schema nesting level (e.g. `tools.grep`) with dot-separated paths |
+| `FindDeprecatedFieldsInFrontmatterDeep` | `func(map[string]any, []DeprecatedField) []DeprecatedField` | Finds deprecated fields at any nesting depth in frontmatter using dot-separated paths |
 | `FindClosestMatches` | `func(target string, candidates []string, maxResults int) []string` | Finds the closest string matches (for typo suggestions) |
 | `LevenshteinDistance` | `func(a, b string) int` | Computes edit distance between two strings |
 
@@ -123,8 +137,11 @@ The package is designed for use both in the main CLI binary and in WebAssembly c
 | Function | Signature | Description |
 |----------|-----------|-------------|
 | `ComputeFrontmatterHashFromFile` | `func(filePath string, cache *ImportCache) (string, error)` | Computes a stable hash of a workflow's frontmatter (including imports) |
+| `ComputeFrontmatterHashFromParsedContent` | `func(frontmatterText, markdownBody string, parsedFrontmatter map[string]any, baseDir string, cache *ImportCache, fileReader FileReader) (string, error)` | Computes hash from already-extracted frontmatter text and markdown body |
 | `ComputeFrontmatterHashFromFileWithParsedFrontmatter` | `func(filePath string, parsedFrontmatter map[string]any, ...) (string, error)` | Computes hash from already-parsed frontmatter |
 | `ComputeFrontmatterHashFromFileWithReader` | `func(filePath string, cache *ImportCache, fileReader FileReader) (string, error)` | Computes hash with a custom file reader |
+| `ComputeBodyHashFromParsedContent` | `func(markdownBody, frontmatterText, baseDir string, fileReader FileReader) (string, error)` | Computes a stable hash of a workflow's markdown body, including the bodies of all transitively imported files |
+| `ComputeBodyHashFromFile` | `func(filePath string) (string, error)` | Computes the body hash for a workflow file from disk |
 
 #### Error Formatting
 
@@ -133,6 +150,8 @@ The package is designed for use both in the main CLI binary and in WebAssembly c
 | `FormatImportCycleError` | `func(*ImportCycleError) error` | Formats a cycle error with the import chain |
 | `FormatImportError` | `func(*ImportError, yamlContent string) error` | Formats an import error with YAML context |
 | `NewFormattedParserError` | `func(formatted string) *FormattedParserError` | Creates a pre-formatted parser error |
+| `FormatYAMLError` | `func(err error, frontmatterLineOffset int, sourceYAML string) string` | Formats a YAML error with source code context, adjusting line numbers by the frontmatter offset |
+| `TranslateYAMLMessage` | `func(message string) string` | Translates a cryptic YAML parser message to a user-friendly description |
 
 #### JSON Path Location
 
@@ -158,8 +177,17 @@ Inline sub-agents are secondary agent definitions embedded in the same markdown 
 | `ExtractInlineSubAgents` | `func(markdown string) (mainMarkdown string, agents []InlineSubAgent, err error)` | Splits markdown into the main workflow section and any inline sub-agent definitions |
 | `ValidateInlineSubAgentsFrontmatter` | `func(markdown string) []string` | Validates inline sub-agent frontmatter in a full workflow file (strips top-level frontmatter first); returns advisory warning strings |
 | `ValidateInlineSubAgentsInBody` | `func(body string) []string` | Validates inline sub-agent frontmatter in an already-stripped markdown body |
-| `GetEngineSubAgentDir` | `func(engineID string) string` | Returns the relative directory used for sub-agent files for a given engine (`claude` → `.claude/agents`, etc.) |
 | `GetEngineSubAgentExt` | `func(engineID string) string` | Returns the file extension for sub-agent files for a given engine (`.md` for `claude`/`codex`/`gemini`, `.agent.md` otherwise) |
+
+#### Inline Skill Processing
+
+Inline skills are secondary skill definitions embedded in the same markdown file as the primary workflow, delimited by `## skill: \`name\`` level-2 headings. Each skill may carry its own frontmatter block (only `description` is a valid field) plus a content body.
+
+| Function | Signature | Description |
+|----------|-----------|-------------|
+| `ExtractInlineSkills` | `func(markdown string) (mainMarkdown string, skills []InlineSkill, err error)` | Splits markdown into the main workflow section and any inline skill definitions |
+| `ValidateInlineSkillsFrontmatter` | `func(markdown string) []string` | Validates inline skill frontmatter in a full workflow file (strips top-level frontmatter first); returns advisory warning strings |
+| `ValidateInlineSkillsInBody` | `func(body string) []string` | Validates inline skill frontmatter in an already-stripped markdown body |
 
 #### Virtual Filesystem and Workflow Update Helpers
 
@@ -170,8 +198,12 @@ Inline sub-agents are secondary agent definitions embedded in the same markdown 
 | `GetBuiltinFrontmatterCache` | `func(path string) (*FrontmatterResult, bool)` | Gets cached frontmatter parse results for built-in virtual files |
 | `SetBuiltinFrontmatterCache` | `func(path string, result *FrontmatterResult) *FrontmatterResult` | Stores a frontmatter parse result in the built-in cache |
 | `ReadFile` | `func(path string) ([]byte, error)` | Reads file content through parser virtual/builtin-aware file resolution |
+| `SetVirtualFiles` | `func(files map[string][]byte)` | *(WASM only — `//go:build js \|\| wasm`)* Populates the in-memory virtual filesystem used by the WASM runtime; keys are workspace-relative file paths |
+| `ClearVirtualFiles` | `func()` | *(WASM only)* Removes all entries from the in-memory virtual filesystem |
+| `VirtualFileExists` | `func(path string) bool` | *(WASM only)* Returns whether a path is present in the in-memory virtual filesystem |
 | `MergeTools` | `func(base, additional map[string]any) (map[string]any, error)` | Merges two tool configuration maps with MCP-aware conflict handling |
 | `UpdateWorkflowFrontmatter` | `func(workflowPath string, updateFunc func(frontmatter map[string]any) error, verbose bool) error` | Reads, updates, and rewrites workflow frontmatter with a callback |
+| `ReconstructWorkflowFile` | `func(frontmatterYAML, markdownContent string) (string, error)` | Reconstructs a complete workflow file string from frontmatter YAML and markdown content |
 | `EnsureToolsSection` | `func(frontmatter map[string]any) map[string]any` | Ensures `tools` exists and is a map in frontmatter |
 | `QuoteCronExpressions` | `func(yamlContent string) string` | Ensures schedule cron values in YAML are quoted |
 
@@ -179,6 +211,7 @@ Inline sub-agents are secondary agent definitions embedded in the same markdown 
 
 | Name | Type | Description |
 |------|------|-------------|
+| `BuiltinPathPrefix` | `string` | Path prefix `"@builtin:"` used to identify registered virtual built-in files |
 | `ValidMCPTypes` | `[]string` | Valid MCP transport types: `"stdio"`, `"http"`, `"local"` |
 | `IncludeDirectivePattern` | `*regexp.Regexp` | Matches `@import`, `@include`, and `{{#import ...}}` directives |
 | `LegacyIncludeDirectivePattern` | `*regexp.Regexp` | Matches legacy `@import`/`@include` forms |
@@ -254,6 +287,7 @@ Import caching is crucial for performance and cycle detection. The `ImportCache`
 **Internal**:
 - `github.com/github/gh-aw/pkg/console` — parser-facing warning/error message formatting
 - `github.com/github/gh-aw/pkg/constants` — shared parser constants and default values
+- `github.com/github/gh-aw/pkg/errorutil` — shared error classification helpers for remote fetch and import errors
 - `github.com/github/gh-aw/pkg/fileutil` — file existence and path helper utilities
 - `github.com/github/gh-aw/pkg/gitutil` — Git remote and host detection helpers
 - `github.com/github/gh-aw/pkg/jsonutil` — compact JSON marshaling for frontmatter hash computation
@@ -262,6 +296,9 @@ Import caching is crucial for performance and cycle detection. The `ImportCache`
 - `github.com/github/gh-aw/pkg/logger` — debug logging
 - `github.com/github/gh-aw/pkg/sliceutil` — slice helper utilities for validation and merging
 - `github.com/github/gh-aw/pkg/stringutil` — string normalization and ANSI/format helpers
+
+**Test-only**:
+- `github.com/github/gh-aw/pkg/testutil` — shared test fixtures and assertion helpers used by parser package tests
 
 **External**:
 - `github.com/santhosh-tekuri/jsonschema/v6` — JSON schema validation

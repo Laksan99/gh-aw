@@ -1,4 +1,6 @@
 ---
+private: true
+emoji: "📝"
 name: Weekly Editors Health Check
 description: Checks that the workflow editors listed in the documentation are still valid, takes Playwright screenshots, and opens a PR to update the docs with preview images
 on:
@@ -21,7 +23,7 @@ network:
     - mossaka.github.io
 
 imports:
-  - shared/observability-otlp.md
+  - shared/otlp.md
 tools:
   cli-proxy: true
   playwright:
@@ -83,7 +85,7 @@ For each editor URL that responded with HTTP 200 in Step 1:
 
 1. Run `playwright-cli browser_navigate --url "<URL>"` to navigate to the URL.
 2. Wait for the page to fully load (wait for network idle).
-3. Run `playwright-cli browser_take_screenshot --filename /tmp/gh-aw/editors/<editor-id>-screenshot.png --full-page true` to take a full-page screenshot, where `<editor-id>` is the kebab-case id derived in Step 0.
+3. Run `playwright-cli browser_take_screenshot --filename /tmp/gh-aw/agent/editors/<editor-id>-screenshot.png --full-page true` to take a full-page screenshot, where `<editor-id>` is the kebab-case id derived in Step 0.
 
 ### Step 3: Upload Screenshots as Assets
 

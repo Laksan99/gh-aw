@@ -6,6 +6,7 @@ import (
 	"strings"
 
 	"github.com/github/gh-aw/pkg/logger"
+	"github.com/github/gh-aw/pkg/setutil"
 )
 
 var safeUpdateLog = logger.New("workflow:safe_update")
@@ -92,9 +93,11 @@ func EnforceSafeUpdate(manifest *GHAWManifest, secretNames []string, actionRefs 
 // previous manifest) and are not among the always-allowed secrets (GITHUB_TOKEN and
 // gh-aw-internal secrets automatically injected by the compiler).
 func collectSecretViolations(manifest *GHAWManifest, secretNames []string) []string {
-	known := make(map[string]bool, len(manifest.Secrets))
+	known := make(map[string]struct {
+	}, len(manifest.Secrets))
 	for _, s := range manifest.Secrets {
-		known[s] = true
+		known[s] = struct {
+		}{}
 	}
 
 	var violations []string
@@ -106,7 +109,7 @@ func collectSecretViolations(manifest *GHAWManifest, secretNames []string) []str
 		if ghAwInternalSecrets[full] {
 			continue
 		}
-		if known[full] {
+		if setutil.Contains(known, full) {
 			continue
 		}
 		violations = append(violations, full)
@@ -127,20 +130,6 @@ var ghAwActionPrefixes = []string{
 	"github/gh-aw-actions/",
 }
 
-// runtimeActionRepos is the set of action repos used by the runtime manager.
-// These are populated from knownRuntimes at init time so the trusted-action
-// list stays in sync with runtime_definitions.go automatically.
-var runtimeActionRepos map[string]bool
-
-func init() {
-	runtimeActionRepos = make(map[string]bool, len(knownRuntimes))
-	for _, rt := range knownRuntimes {
-		if rt.ActionRepo != "" {
-			runtimeActionRepos[rt.ActionRepo] = true
-		}
-	}
-}
-
 // isTrustedActionRepo reports whether a repo string belongs to a trusted org or project.
 // Trusted repos include the "actions/" GitHub org, gh-aw's own infrastructure actions,
 // and actions used by the runtime manager (e.g. ruby/setup-ruby, oven-sh/setup-bun).
@@ -153,7 +142,8 @@ func isTrustedActionRepo(repo string) bool {
 			return true
 		}
 	}
-	return runtimeActionRepos[repo]
+	_, ok := actionRepoToRuntime[repo]
+	return ok
 }
 
 // collectActionViolations compares the new action refs against the previous manifest
@@ -164,16 +154,20 @@ func isTrustedActionRepo(repo string) bool {
 // runtime manager repos are always trusted and never flagged.
 func collectActionViolations(manifest *GHAWManifest, actionRefs []string) (added []string, removed []string) {
 	// Build known repo set from previous manifest.
-	knownRepos := make(map[string]bool, len(manifest.Actions))
+	knownRepos := make(map[string]struct {
+	}, len(manifest.Actions))
 	for _, a := range manifest.Actions {
-		knownRepos[a.Repo] = true
+		knownRepos[a.Repo] = struct {
+		}{}
 	}
 
 	// Build new repo set from the freshly compiled action refs.
 	newActions := parseActionRefs(actionRefs)
-	newRepos := make(map[string]bool, len(newActions))
+	newRepos := make(map[string]struct {
+	}, len(newActions))
 	for _, a := range newActions {
-		newRepos[a.Repo] = true
+		newRepos[a.Repo] = struct {
+		}{}
 	}
 
 	// Find additions: repos present in the new compilation but absent from the manifest.
@@ -182,7 +176,7 @@ func collectActionViolations(manifest *GHAWManifest, actionRefs []string) (added
 		if isTrustedActionRepo(repo) {
 			continue
 		}
-		if !knownRepos[repo] {
+		if !setutil.Contains(knownRepos, repo) {
 			added = append(added, repo)
 		}
 	}
@@ -193,7 +187,7 @@ func collectActionViolations(manifest *GHAWManifest, actionRefs []string) (added
 		if isTrustedActionRepo(repo) {
 			continue
 		}
-		if !newRepos[repo] {
+		if !setutil.Contains(newRepos, repo) {
 			removed = append(removed, repo)
 		}
 	}

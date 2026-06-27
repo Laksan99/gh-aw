@@ -1,4 +1,6 @@
 ---
+private: true
+emoji: "💻"
 on:
   workflow_dispatch:
   label_command:
@@ -11,11 +13,8 @@ description: Daily status report for gh-aw project
 timeout-minutes: 30
 strict: false
 engine:
-  runtime:
-    id: pi
-  provider:
-    id: github
-    model: claude-sonnet-4-20250514
+  id: codex
+  model: gpt-5.4
 
 permissions:
   contents: read
@@ -28,12 +27,16 @@ safe-outputs:
     title-prefix: "[Daily Report] "
 
 imports:
-  - shared/observability-otlp.md
+  - shared/otlp.md
+  - shared/reporting.md
 tools:
   github:
     mode: gh-proxy
   cli-proxy: true
 
+sandbox:
+  agent:
+    sudo: false
 ---
 
 <!--

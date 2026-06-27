@@ -7,27 +7,34 @@ import (
 	"testing"
 
 	"github.com/github/gh-aw/pkg/constants"
+	"github.com/github/gh-aw/pkg/workflow/compilerenv"
 )
 
 // TestModelEnvVarInjectionForAgentJob tests that agent jobs get the correct model environment variable
 func TestModelEnvVarInjectionForAgentJob(t *testing.T) {
 	tests := []struct {
-		name            string
-		engine          string
-		expectedEnvVar  string
-		expectedCommand string
+		name                    string
+		engine                  string
+		expectedEnvVar          string
+		expectedCommand         string
+		expectedDefault         string
+		expectedDefaultOverride string
 	}{
 		{
-			name:            "Claude agent uses GH_AW_MODEL_AGENT_CLAUDE",
-			engine:          "claude",
-			expectedEnvVar:  constants.EnvVarModelAgentClaude,
-			expectedCommand: "${" + constants.EnvVarModelAgentClaude + ":+ --model",
+			name:                    "Claude agent uses GH_AW_MODEL_AGENT_CLAUDE",
+			engine:                  "claude",
+			expectedEnvVar:          constants.EnvVarModelAgentClaude,
+			expectedCommand:         "${" + constants.EnvVarModelAgentClaude + ":+ --model",
+			expectedDefault:         "", // Claude has no default model
+			expectedDefaultOverride: compilerenv.DefaultModelClaude,
 		},
 		{
-			name:            "Codex agent uses GH_AW_MODEL_AGENT_CODEX",
-			engine:          "codex",
-			expectedEnvVar:  constants.EnvVarModelAgentCodex,
-			expectedCommand: "${" + constants.EnvVarModelAgentCodex + `:+--model "`,
+			name:                    "Codex agent uses GH_AW_MODEL_AGENT_CODEX",
+			engine:                  "codex",
+			expectedEnvVar:          constants.EnvVarModelAgentCodex,
+			expectedCommand:         "${" + constants.EnvVarModelAgentCodex + `:+ --model "`,
+			expectedDefault:         constants.CodexDefaultModel,
+			expectedDefaultOverride: compilerenv.DefaultModelCodex,
 		},
 	}
 
@@ -75,8 +82,13 @@ func TestModelEnvVarInjectionForAgentJob(t *testing.T) {
 				t.Errorf("Expected command pattern '%s' not found in steps:\n%s", tt.expectedCommand, stepsContent)
 			}
 
-			// Verify env var has fallback to empty string for agent jobs
-			expectedEnvLine := tt.expectedEnvVar + ": ${{ vars." + tt.expectedEnvVar + " || '' }}"
+			// Verify env var has the correct fallback value
+			var expectedEnvLine string
+			if tt.expectedDefault != "" {
+				expectedEnvLine = tt.expectedEnvVar + ": ${{ vars." + tt.expectedEnvVar + " || vars." + tt.expectedDefaultOverride + " || '" + tt.expectedDefault + "' }}"
+			} else {
+				expectedEnvLine = tt.expectedEnvVar + ": ${{ vars." + tt.expectedEnvVar + " || vars." + tt.expectedDefaultOverride + " || '' }}"
+			}
 			if !strings.Contains(stepsContent, expectedEnvLine) {
 				t.Errorf("Expected env var line '%s' not found in steps:\n%s", expectedEnvLine, stepsContent)
 			}
@@ -87,22 +99,25 @@ func TestModelEnvVarInjectionForAgentJob(t *testing.T) {
 // TestModelEnvVarInjectionForDetectionJob tests that detection jobs get the correct model environment variable
 func TestModelEnvVarInjectionForDetectionJob(t *testing.T) {
 	tests := []struct {
-		name            string
-		engine          string
-		expectedEnvVar  string
-		expectedDefault string
+		name                    string
+		engine                  string
+		expectedEnvVar          string
+		expectedDefault         string
+		expectedDefaultOverride string
 	}{
 		{
-			name:            "Claude detection uses GH_AW_MODEL_DETECTION_CLAUDE",
-			engine:          "claude",
-			expectedEnvVar:  constants.EnvVarModelDetectionClaude,
-			expectedDefault: "", // Claude has no default detection model
+			name:                    "Claude detection uses GH_AW_MODEL_DETECTION_CLAUDE",
+			engine:                  "claude",
+			expectedEnvVar:          constants.EnvVarModelDetectionClaude,
+			expectedDefault:         "", // Claude has no default detection model
+			expectedDefaultOverride: compilerenv.DefaultModelClaude,
 		},
 		{
-			name:            "Codex detection uses GH_AW_MODEL_DETECTION_CODEX",
-			engine:          "codex",
-			expectedEnvVar:  constants.EnvVarModelDetectionCodex,
-			expectedDefault: "", // Codex has no default detection model
+			name:                    "Codex detection uses GH_AW_MODEL_DETECTION_CODEX",
+			engine:                  "codex",
+			expectedEnvVar:          constants.EnvVarModelDetectionCodex,
+			expectedDefault:         constants.CodexDefaultModel,
+			expectedDefaultOverride: compilerenv.DefaultModelCodex,
 		},
 	}
 
@@ -144,13 +159,13 @@ func TestModelEnvVarInjectionForDetectionJob(t *testing.T) {
 
 			// For Copilot, verify it has the default detection model as fallback
 			if tt.expectedDefault != "" {
-				expectedEnvLine := tt.expectedEnvVar + ": ${{ vars." + tt.expectedEnvVar + " || '" + tt.expectedDefault + "' }}"
+				expectedEnvLine := tt.expectedEnvVar + ": ${{ vars." + tt.expectedEnvVar + " || vars." + tt.expectedDefaultOverride + " || '" + tt.expectedDefault + "' }}"
 				if !strings.Contains(stepsContent, expectedEnvLine) {
 					t.Errorf("Expected env var line with default '%s' not found in steps:\n%s", expectedEnvLine, stepsContent)
 				}
 			} else {
 				// For other engines, verify empty string fallback
-				expectedEnvLine := tt.expectedEnvVar + ": ${{ vars." + tt.expectedEnvVar + " || '' }}"
+				expectedEnvLine := tt.expectedEnvVar + ": ${{ vars." + tt.expectedEnvVar + " || vars." + tt.expectedDefaultOverride + " || '' }}"
 				if !strings.Contains(stepsContent, expectedEnvLine) {
 					t.Errorf("Expected env var line '%s' not found in steps:\n%s", expectedEnvLine, stepsContent)
 				}
@@ -225,13 +240,13 @@ func TestCopilotFallbackModelMapsToNativeEnvVar(t *testing.T) {
 			name:           "Agent job maps GH_AW_MODEL_AGENT_COPILOT to COPILOT_MODEL",
 			safeOutputs:    &SafeOutputsConfig{},
 			expectedOrgVar: constants.EnvVarModelAgentCopilot,
-			expectedTail:   "'" + constants.CopilotBYOKDefaultModel + "'",
+			expectedTail:   "vars." + compilerenv.DefaultModelCopilot + " || '" + constants.CopilotBYOKDefaultModel + "'",
 		},
 		{
 			name:           "Detection job maps GH_AW_MODEL_DETECTION_COPILOT to COPILOT_MODEL",
 			safeOutputs:    nil,
 			expectedOrgVar: constants.EnvVarModelDetectionCopilot,
-			expectedTail:   "'" + constants.CopilotBYOKDefaultModel + "'",
+			expectedTail:   "vars." + compilerenv.DefaultModelCopilot + " || '" + constants.CopilotBYOKDefaultModel + "'",
 		},
 	}
 
@@ -455,5 +470,52 @@ func TestGetModelEnvVarName(t *testing.T) {
 				t.Errorf("Engine %s: GetModelEnvVarName() = %q, want %q", tt.engine, got, tt.expected)
 			}
 		})
+	}
+}
+
+// TestCodexModelFlagPositionAfterExec verifies that the --model flag appears after the exec
+// subcommand in the generated Codex command, not before it.
+// Regression test for: Codex lock compiler places --model flag before exec subcommand.
+func TestCodexModelFlagPositionAfterExec(t *testing.T) {
+	workflowData := &WorkflowData{
+		Name: "test-codex-model-position",
+		AI:   "codex",
+		Tools: map[string]any{
+			"bash": []any{"echo"},
+		},
+		SafeOutputs: &SafeOutputsConfig{},
+	}
+
+	engine, err := GetGlobalEngineRegistry().GetEngine("codex")
+	if err != nil {
+		t.Fatalf("Failed to get engine: %v", err)
+	}
+
+	steps := engine.GetExecutionSteps(workflowData, "/tmp/test.log")
+
+	var stepsStr strings.Builder
+	for _, step := range steps {
+		for _, line := range step {
+			stepsStr.WriteString(line)
+			stepsStr.WriteString("\n")
+		}
+	}
+	stepsContent := stepsStr.String()
+
+	// Find the model shell expansion pattern in the generated command
+	modelPattern := "${" + constants.EnvVarModelAgentCodex + ":+"
+	beforeModel, _, found := strings.Cut(stepsContent, modelPattern)
+	if !found {
+		t.Fatalf("Model expansion pattern '%s' not found in steps:\n%s", modelPattern, stepsContent)
+	}
+
+	// Find "codex exec" before the model pattern. Using "codex exec" (not just "exec") avoids
+	// false positives from unrelated occurrences like "GH_AW_NODE_EXEC" in the step content.
+	execMarker := "codex exec"
+	execIdx := strings.LastIndex(beforeModel, execMarker)
+	if execIdx == -1 {
+		t.Errorf("'codex exec' must appear before the model flag '%s' in the generated command.\n"+
+			"This indicates the model flag is placed before 'exec', causing Codex to ignore it.\n"+
+			"Got:\n%s", modelPattern, stepsContent)
 	}
 }

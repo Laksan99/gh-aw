@@ -5,6 +5,7 @@ import (
 	"os"
 	"strings"
 
+	"github.com/github/gh-aw/pkg/console"
 	"github.com/github/gh-aw/pkg/sliceutil"
 	"github.com/github/gh-aw/pkg/workflow"
 )
@@ -13,7 +14,7 @@ import (
 func (c *AddInteractiveConfig) checkExistingSecrets() error {
 	addInteractiveLog.Print("Checking existing repository secrets")
 
-	c.existingSecrets = make(map[string]bool)
+	c.existingSecrets = make(map[string]struct{})
 
 	// Use gh api to list repository secrets
 	output, err := workflow.RunGH("Checking repository secrets...", "api", fmt.Sprintf("/repos/%s/actions/secrets", c.RepoOverride), "--jq", ".secrets[].name")
@@ -22,7 +23,7 @@ func (c *AddInteractiveConfig) checkExistingSecrets() error {
 		// Continue without error - we'll just assume no secrets exist
 	} else {
 		for _, name := range parseSecretNames(output) {
-			c.existingSecrets[name] = true
+			c.existingSecrets[name] = struct{}{}
 			addInteractiveLog.Printf("Found existing repository secret: %s", name)
 		}
 	}
@@ -34,14 +35,14 @@ func (c *AddInteractiveConfig) checkExistingSecrets() error {
 			addInteractiveLog.Printf("Could not fetch org secrets (this is expected for personal repos or if org access is restricted): %v", orgErr)
 		} else {
 			for _, name := range parseSecretNames(orgOutput) {
-				c.existingSecrets[name] = true
+				c.existingSecrets[name] = struct{}{}
 				addInteractiveLog.Printf("Found existing org secret: %s", name)
 			}
 		}
 	}
 
 	if c.Verbose && len(c.existingSecrets) > 0 {
-		fmt.Fprintf(os.Stderr, "Found %d existing secret(s) (repository + organization)\n", len(c.existingSecrets))
+		fmt.Fprintln(os.Stderr, console.FormatInfoMessageStderr(fmt.Sprintf("Found %d existing secret(s) (repository + organization)", len(c.existingSecrets))))
 	}
 
 	return nil

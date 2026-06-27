@@ -4,10 +4,12 @@ import (
 	"encoding/json"
 	"fmt"
 	"regexp"
+	"slices"
 	"sort"
 	"strings"
 
 	"github.com/github/gh-aw/pkg/logger"
+	"github.com/github/gh-aw/pkg/setutil"
 )
 
 var safeUpdateManifestLog = logger.New("workflow:safe_update_manifest")
@@ -70,12 +72,14 @@ func NewGHAWManifest(secretNames []string, actionRefs []string, failures []GHAWM
 	safeUpdateManifestLog.Printf("Building gh-aw-manifest: raw_secrets=%d, raw_actions=%d, containers=%d", len(secretNames), len(actionRefs), len(containers))
 
 	// Normalize secret names to full "secrets.NAME" form and deduplicate.
-	seen := make(map[string]bool)
+	seen := make(map[string]struct {
+	})
 	secrets := make([]string, 0, len(secretNames))
 	for _, name := range secretNames {
 		full := normalizeSecretName(name)
-		if !seen[full] {
-			seen[full] = true
+		if !setutil.Contains(seen, full) {
+			seen[full] = struct {
+			}{}
 			secrets = append(secrets, full)
 		}
 	}
@@ -85,16 +89,25 @@ func NewGHAWManifest(secretNames []string, actionRefs []string, failures []GHAWM
 	resolutionFailures := normalizeResolutionFailures(failures)
 
 	// Deduplicate container entries by image name and sort for deterministic output.
-	seenContainers := make(map[string]bool, len(containers))
+	seenContainers := make(map[string]struct {
+	}, len(containers))
 	sortedContainers := make([]GHAWManifestContainer, 0, len(containers))
 	for _, c := range containers {
-		if c.Image != "" && !seenContainers[c.Image] {
-			seenContainers[c.Image] = true
+		if c.Image != "" && !setutil.Contains(seenContainers, c.Image) {
+			seenContainers[c.Image] = struct {
+			}{}
 			sortedContainers = append(sortedContainers, c)
 		}
 	}
-	sort.Slice(sortedContainers, func(i, j int) bool {
-		return sortedContainers[i].Image < sortedContainers[j].Image
+	slices.SortFunc(sortedContainers, func(a, b GHAWManifestContainer) int {
+		switch {
+		case a.Image < b.Image:
+			return -1
+		case a.Image > b.Image:
+			return 1
+		default:
+			return 0
+		}
 	})
 
 	safeUpdateManifestLog.Printf("Manifest built: version=%d, secrets=%d, actions=%d, containers=%d",
@@ -126,7 +139,8 @@ func normalizeSecretName(name string) string {
 //	"actions/checkout@abc1234 # v4"   → repo=actions/checkout, sha=abc1234, version=v4
 //	"actions/checkout@v4"             → repo=actions/checkout, sha=v4, version=v4
 func parseActionRefs(refs []string) []GHAWManifestAction {
-	seen := make(map[string]bool)
+	seen := make(map[string]struct {
+	})
 	actions := make([]GHAWManifestAction, 0, len(refs))
 
 	for _, raw := range refs {
@@ -152,10 +166,11 @@ func parseActionRefs(refs []string) []GHAWManifestAction {
 		}
 
 		key := repo + "@" + sha
-		if seen[key] {
+		if setutil.Contains(seen, key) {
 			continue
 		}
-		seen[key] = true
+		seen[key] = struct {
+		}{}
 
 		actions = append(actions, GHAWManifestAction{
 			Repo:    repo,
@@ -165,11 +180,21 @@ func parseActionRefs(refs []string) []GHAWManifestAction {
 	}
 
 	// Sort for deterministic output.
-	sort.Slice(actions, func(i, j int) bool {
-		if actions[i].Repo != actions[j].Repo {
-			return actions[i].Repo < actions[j].Repo
+	slices.SortFunc(actions, func(a, b GHAWManifestAction) int {
+		if a.Repo != b.Repo {
+			if a.Repo < b.Repo {
+				return -1
+			}
+			return 1
 		}
-		return actions[i].SHA < actions[j].SHA
+		switch {
+		case a.SHA < b.SHA:
+			return -1
+		case a.SHA > b.SHA:
+			return 1
+		default:
+			return 0
+		}
 	})
 
 	return actions
@@ -201,14 +226,27 @@ func normalizeResolutionFailures(failures []GHAWManifestResolutionFailure) []GHA
 			ErrorType: errorType,
 		})
 	}
-	sort.Slice(normalized, func(i, j int) bool {
-		if normalized[i].Repo != normalized[j].Repo {
-			return normalized[i].Repo < normalized[j].Repo
+	slices.SortFunc(normalized, func(a, b GHAWManifestResolutionFailure) int {
+		if a.Repo != b.Repo {
+			if a.Repo < b.Repo {
+				return -1
+			}
+			return 1
 		}
-		if normalized[i].Ref != normalized[j].Ref {
-			return normalized[i].Ref < normalized[j].Ref
+		if a.Ref != b.Ref {
+			if a.Ref < b.Ref {
+				return -1
+			}
+			return 1
 		}
-		return normalized[i].ErrorType < normalized[j].ErrorType
+		switch {
+		case a.ErrorType < b.ErrorType:
+			return -1
+		case a.ErrorType > b.ErrorType:
+			return 1
+		default:
+			return 0
+		}
 	})
 	return normalized
 }

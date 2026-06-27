@@ -1,4 +1,6 @@
 ---
+private: true
+emoji: "🧹"
 name: Stale PR Cleanup
 description: Triages and closes PRs open for 30+ days — covers draft PRs with no activity, Dependabot PRs with merge conflicts, and PRs superseded by merged work
 on:
@@ -9,10 +11,11 @@ permissions:
   pull-requests: read
   issues: read
   # Note: PR write operations handled via safe-outputs
+  copilot-requests: write
 engine: copilot
 strict: true
 imports:
-  - shared/observability-otlp.md
+  - shared/otlp.md
 tools:
   cli-proxy: true
   github:
@@ -35,9 +38,6 @@ safe-outputs:
     run-success: "✅ Stale PR cleanup complete! [{workflow_name}]({run_url}) has triaged the 30+ day PR backlog."
     run-failure: "❌ Stale PR cleanup failed! [{workflow_name}]({run_url}) {status}. Some PRs may not be processed."
 timeout-minutes: 30
-features:
-  copilot-requests: true
-
 ---
 
 # Stale PR Cleanup Agent 🧹

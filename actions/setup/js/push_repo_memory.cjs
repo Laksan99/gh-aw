@@ -48,6 +48,7 @@ async function main() {
   const maxFileCount = parseInt(process.env.MAX_FILE_COUNT || "100", 10);
   const maxPatchSize = parseInt(process.env.MAX_PATCH_SIZE || "10240", 10);
   const fileGlobFilter = process.env.FILE_GLOB_FILTER || "";
+  const formatJSON = process.env.FORMAT_JSON === "true";
 
   // Parse allowed extensions with error handling
   let allowedExtensions = [".json", ".jsonl", ".txt", ".md", ".csv"];
@@ -74,6 +75,7 @@ async function main() {
   core.info(`  ALLOWED_EXTENSIONS: ${JSON.stringify(allowedExtensions)}`);
   core.info(`  FILE_GLOB_FILTER: ${fileGlobFilter ? `"${fileGlobFilter}"` : "(empty - all files accepted)"}`);
   core.info(`  FILE_GLOB_FILTER length: ${fileGlobFilter.length}`);
+  core.info(`  FORMAT_JSON: ${formatJSON}`);
 
   /** @param {unknown} value */
   function isPlainObject(value) {
@@ -149,6 +151,10 @@ async function main() {
   const workspaceDir = process.env.GITHUB_WORKSPACE || process.cwd();
   core.info(`Working in repository: ${workspaceDir}`);
 
+  // Split targetRepo into owner and repo name here so they are available for
+  // the GitHub REST API seeding calls below (before the checkout block).
+  const [targetOwner, targetRepoName] = targetRepo.split("/");
+
   // Checkout or create the memory branch
   // Note: we do NOT disable sparse checkout here. Disabling sparse checkout on a
   // large repository forces git to materialize all tracked files into the working
@@ -187,24 +193,72 @@ async function main() {
         throw fetchError;
       }
 
-      // Branch doesn't exist, create orphan branch
-      // baseRef stays "" — pushSignedCommits will create the branch via
-      // rest.git.createRef before the first GraphQL mutation.
-      core.info(`Branch ${branchName} does not exist, creating orphan branch...`);
-      execGitSync(["checkout", "--orphan", branchName], { stdio: "inherit" });
-      // Reset the index to an empty tree. This is O(1) regardless of how many
-      // files the source branch contained, avoiding the ENOBUFS error that
-      // "git rm -rf ." (with stdio:pipe) causes on large repos (10K+ files).
-      execGitSync(["read-tree", "--empty"], { stdio: "pipe" });
-      // Clean the working directory using Node.js so we never pipe large git
-      // output back through spawnSync buffers.
-      core.info("Cleaning working directory for orphan branch...");
-      for (const entry of fs.readdirSync(workspaceDir)) {
-        if (entry !== ".git") {
-          fs.rmSync(path.join(workspaceDir, entry), { recursive: true, force: true });
+      // Branch doesn't exist – attempt to seed it via the GitHub REST API so
+      // the seed commit is server-signed, satisfying "Require signed commits"
+      // branch protection rules.  Commits created via the REST API with
+      // GITHUB_TOKEN are automatically signed by GitHub.
+      const EMPTY_TREE_SHA = "4b825dc642cb6eb9a060e54bf8d69288fbee4904";
+      try {
+        core.info(`Branch ${branchName} does not exist, seeding via GitHub REST API...`);
+        const { data: seedCommit } = await github.rest.git.createCommit({
+          owner: targetOwner,
+          repo: targetRepoName,
+          message: `Initialize ${branchName}`,
+          tree: EMPTY_TREE_SHA,
+          parents: [],
+        });
+        let useApiSeedSha = true;
+        try {
+          await github.rest.git.createRef({
+            owner: targetOwner,
+            repo: targetRepoName,
+            ref: `refs/heads/${branchName}`,
+            sha: seedCommit.sha,
+          });
+        } catch (createRefError) {
+          // GitHub returns HTTP 422 with "Reference already exists" when the
+          // branch was created concurrently between our fetch-check and this
+          // createRef call.  Check for either the status code or the message
+          // text since different Octokit versions surface errors differently.
+          // Treat as success and use the existing branch instead.
+          const createRefErrMsg = createRefError instanceof Error ? createRefError.message : String(createRefError);
+          if (!/422|Reference already exists/i.test(createRefErrMsg)) {
+            throw createRefError;
+          }
+          core.info(`Branch ${branchName} was created concurrently (422 Reference already exists); using existing branch.`);
+          useApiSeedSha = false;
         }
+        // Fetch the newly seeded (or concurrently created) branch and check it out.
+        execGitSync(["fetch", repoUrl, `${branchName}:${branchName}`], { stdio: "pipe", suppressLogs: true });
+        execGitSync(["checkout", branchName], { stdio: "inherit" });
+        // Set baseRef to the seed commit SHA (or the existing branch HEAD for
+        // the 422 concurrent-creation case) so pushSignedCommits can use the
+        // GraphQL signed-commit path instead of the unsigned git push fallback.
+        baseRef = useApiSeedSha ? seedCommit.sha : execGitSync(["rev-parse", "HEAD"]).trim();
+        core.info(`Seeded and checked out new branch ${branchName} via GitHub API (baseRef: ${baseRef})`);
+      } catch (seedError) {
+        // Fallback: API seeding failed (e.g. insufficient token permissions).
+        // Fall back to the original orphan-branch + git push path and emit a
+        // warning so the operator knows signed commits may not be produced.
+        core.warning(`Failed to seed branch ${branchName} via GitHub API, falling back to orphan branch: ${getErrorMessage(seedError)}`);
+        // baseRef stays "" — pushSignedCommits will use git push for this
+        // orphan-branch first push (unsigned, may be rejected by strict rulesets).
+        core.info(`Branch ${branchName} does not exist, creating orphan branch...`);
+        execGitSync(["checkout", "--orphan", branchName], { stdio: "inherit" });
+        // Reset the index to an empty tree. This is O(1) regardless of how many
+        // files the source branch contained, avoiding the ENOBUFS error that
+        // "git rm -rf ." (with stdio:pipe) causes on large repos (10K+ files).
+        execGitSync(["read-tree", "--empty"], { stdio: "pipe" });
+        // Clean the working directory using Node.js so we never pipe large git
+        // output back through spawnSync buffers.
+        core.info("Cleaning working directory for orphan branch...");
+        for (const entry of fs.readdirSync(workspaceDir)) {
+          if (entry !== ".git") {
+            fs.rmSync(path.join(workspaceDir, entry), { recursive: true, force: true });
+          }
+        }
+        core.info(`Created orphan branch: ${branchName}`);
       }
-      core.info(`Created orphan branch: ${branchName}`);
     }
   } catch (error) {
     core.setFailed(`Failed to checkout branch: ${getErrorMessage(error)}`);
@@ -315,12 +369,6 @@ async function main() {
     return;
   }
 
-  // Validate file count
-  if (filesToCopy.length > maxFileCount) {
-    core.setFailed(`Too many files (${filesToCopy.length} > ${maxFileCount})`);
-    return;
-  }
-
   if (filesToCopy.length === 0) {
     core.info("No files to copy from artifact");
     return;
@@ -365,21 +413,83 @@ async function main() {
     }
   }
 
+  // Format JSON files if requested
+  if (formatJSON) {
+    core.info("FORMAT_JSON is enabled: formatting .json files as human-readable...");
+
+    /**
+     * Recursively find and format all .json files under a directory
+     * @param {string} dirPath - Directory to scan
+     */
+    function formatJSONFilesInDir(dirPath) {
+      const entries = fs.readdirSync(dirPath, { withFileTypes: true });
+      for (const entry of entries) {
+        const fullPath = path.join(dirPath, entry.name);
+        if (entry.isDirectory()) {
+          if (entry.name !== ".git") {
+            formatJSONFilesInDir(fullPath);
+          }
+        } else if (entry.isFile() && entry.name.endsWith(".json")) {
+          try {
+            const raw = fs.readFileSync(fullPath, "utf8");
+            if (!raw.trim()) {
+              continue;
+            }
+            const parsed = JSON.parse(raw);
+            const formatted = JSON.stringify(parsed, null, 2) + "\n";
+            if (raw !== formatted) {
+              const formattedSize = Buffer.byteLength(formatted, "utf8");
+              if (formattedSize > maxFileSize) {
+                const sizeError = new Error(`Formatted JSON exceeds MAX_FILE_SIZE: ${path.relative(destMemoryPath, fullPath)} (${formattedSize} bytes > ${maxFileSize} bytes)`);
+                sizeError.name = "FormatJSONSizeLimitError";
+                throw sizeError;
+              }
+              fs.writeFileSync(fullPath, formatted, "utf8");
+              core.info(`Formatted JSON: ${path.relative(destMemoryPath, fullPath)}`);
+            }
+          } catch (/** @type {any} */ error) {
+            if (error?.name === "FormatJSONSizeLimitError") {
+              throw error;
+            }
+            core.warning(`Skipping JSON formatting for ${path.relative(destMemoryPath, fullPath)}: ${error.message}`);
+          }
+        }
+      }
+    }
+
+    try {
+      formatJSONFilesInDir(destMemoryPath);
+    } catch (error) {
+      core.setFailed(`Failed to format JSON files: ${getErrorMessage(error)}`);
+      return;
+    }
+  }
+
   // Check if we have any changes to commit
-  let hasChanges = false;
+  let changedFileCount = 0;
   try {
     const status = execGitSync(["status", "--porcelain"]);
-    hasChanges = status.trim().length > 0;
+    const changedEntries = status
+      .split("\n")
+      .map(line => line.trim())
+      .filter(Boolean);
+    changedFileCount = changedEntries.length;
   } catch (error) {
     core.setFailed(`Failed to check git status: ${getErrorMessage(error)}`);
     return;
   }
 
-  if (!hasChanges) {
+  if (changedFileCount === 0) {
     core.info("No changes detected after copying files");
     return;
   }
 
+  if (changedFileCount > maxFileCount) {
+    core.setFailed(`Too many changed files in working directory (${changedFileCount} > ${maxFileCount})`);
+    return;
+  }
+
+  core.info(`Changed files detected after copying: ${changedFileCount}`);
   core.info("Changes detected, committing and pushing...");
 
   // Stage all changes.
@@ -459,7 +569,6 @@ async function main() {
   // strict signed-commits ruleset that fallback will also be rejected —
   // that is expected behaviour: remove the unsupported file types and
   // re-run.
-  const [targetOwner, targetRepoName] = targetRepo.split("/");
   // URL with embedded token used for the pull-on-retry merge step only;
   // pushSignedCommits authenticates via the git extraheader set by
   // actions/checkout (and the gitAuthEnv fallback for the git-push path).

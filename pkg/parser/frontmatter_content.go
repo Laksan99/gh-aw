@@ -12,114 +12,168 @@ import (
 	"github.com/goccy/go-yaml"
 )
 
+// levelPattern matches heading markers (H1-H3) at the start of a line with flexible spacing
+var levelPattern = regexp.MustCompile(`^(#{1,3})[\s\t]+`)
+
 // FrontmatterResult holds parsed frontmatter and markdown content
 type FrontmatterResult struct {
 	Frontmatter map[string]any
 	Markdown    string
 	// Additional fields for error context
-	FrontmatterLines []string // Original frontmatter lines for error context
-	FrontmatterStart int      // Line number where frontmatter starts (1-based)
+	FrontmatterLines []string       // Original frontmatter lines for error context
+	FrontmatterStart int            // Line number where frontmatter starts (1-based)
+	FieldLines       map[string]int // Absolute line numbers (1-based) of top-level frontmatter keys in the file
 }
 
 // ExtractFrontmatterFromContent parses YAML frontmatter from markdown content string
 func ExtractFrontmatterFromContent(content string) (*FrontmatterResult, error) {
-	log.Printf("Extracting frontmatter from content: size=%d bytes", len(content))
-	// Fast-path: inspect only the first line to determine whether frontmatter exists.
-	firstNewline := strings.IndexByte(content, '\n')
-	firstLine := content
-	if firstNewline >= 0 {
-		firstLine = content[:firstNewline]
-	}
-
-	// Check if file starts with frontmatter delimiter.
+	parserLog.Printf("Extracting frontmatter from content: size=%d bytes", len(content))
+	firstNewline, firstLine := splitFirstLine(content)
 	if !isFrontmatterDelimiterLine(firstLine) {
-		log.Print("No frontmatter delimiter found, returning content as markdown")
-		// No frontmatter, return entire content as markdown
-		return &FrontmatterResult{
-			Frontmatter:      make(map[string]any),
-			Markdown:         content,
-			FrontmatterLines: []string{},
-			FrontmatterStart: 0,
-		}, nil
+		parserLog.Print("No frontmatter delimiter found, returning content as markdown")
+		return noFrontmatterResult(content), nil
 	}
 
-	// Find end of frontmatter by scanning line-by-line without splitting the entire document.
-	searchStart := len(content)
-	if firstNewline >= 0 {
-		searchStart = firstNewline + 1
+	searchStart := computeFrontmatterSearchStart(content, firstNewline)
+	frontmatterEndStart, markdownStart, err := findFrontmatterDelimiters(content, searchStart)
+	if err != nil {
+		return nil, err
 	}
+
+	frontmatterYAML := content[searchStart:frontmatterEndStart]
+	frontmatterLines, fieldLines := extractFrontmatterMetadata(frontmatterYAML, frontmatterStartLine)
+	frontmatter, err := parseFrontmatterYAML(frontmatterYAML)
+	if err != nil {
+		return nil, err
+	}
+	markdown := extractMarkdownAfterFrontmatter(content, markdownStart)
+
+	parserLog.Printf("Successfully extracted frontmatter: fields=%d, markdown_size=%d bytes", len(frontmatter), len(markdown))
+	return &FrontmatterResult{
+		Frontmatter:      frontmatter,
+		Markdown:         strings.TrimSpace(markdown),
+		FrontmatterLines: frontmatterLines,
+		FrontmatterStart: frontmatterStartLine,
+		FieldLines:       fieldLines,
+	}, nil
+}
+
+const frontmatterStartLine = 2 // Line 2 is where frontmatter content starts (after opening ---)
+
+func splitFirstLine(content string) (int, string) {
+	firstNewline := strings.IndexByte(content, '\n')
+	if firstNewline < 0 {
+		return firstNewline, content
+	}
+	return firstNewline, content[:firstNewline]
+}
+
+func noFrontmatterResult(content string) *FrontmatterResult {
+	return &FrontmatterResult{
+		Frontmatter:      make(map[string]any),
+		Markdown:         content,
+		FrontmatterLines: []string{},
+		FrontmatterStart: 0,
+	}
+}
+
+func computeFrontmatterSearchStart(content string, firstNewline int) int {
+	if firstNewline >= 0 {
+		return firstNewline + 1
+	}
+	return len(content)
+}
+
+func findFrontmatterDelimiters(content string, searchStart int) (int, int, error) {
 	frontmatterEndStart := -1
 	markdownStart := len(content)
 	for cursor := searchStart; cursor <= len(content); {
-		lineStart := cursor
-		lineEnd := len(content)
-		nextCursor := len(content) + 1
-
-		if cursor < len(content) {
-			if relNewline := strings.IndexByte(content[cursor:], '\n'); relNewline >= 0 {
-				lineEnd = cursor + relNewline
-				nextCursor = lineEnd + 1
-			}
-		}
-
+		lineStart, lineEnd, nextCursor := frontmatterLineBounds(content, cursor)
 		if isFrontmatterDelimiterLine(content[lineStart:lineEnd]) {
 			frontmatterEndStart = lineStart
 			markdownStart = nextCursor
 			break
 		}
-
 		if nextCursor > len(content) {
 			break
 		}
 		cursor = nextCursor
 	}
-
 	if frontmatterEndStart == -1 {
-		return nil, errors.New("frontmatter not properly closed")
+		return 0, 0, errors.New("frontmatter not properly closed")
+	}
+	return frontmatterEndStart, markdownStart, nil
+}
+
+func frontmatterLineBounds(content string, cursor int) (int, int, int) {
+	lineStart := cursor
+	lineEnd := len(content)
+	nextCursor := len(content) + 1
+	if cursor < len(content) {
+		if relNewline := strings.IndexByte(content[cursor:], '\n'); relNewline >= 0 {
+			lineEnd = cursor + relNewline
+			nextCursor = lineEnd + 1
+		}
+	}
+	return lineStart, lineEnd, nextCursor
+}
+
+func extractFrontmatterMetadata(frontmatterYAML string, frontmatterStart int) ([]string, map[string]int) {
+	if frontmatterYAML == "" {
+		return []string{}, map[string]int{}
 	}
 
-	// Extract frontmatter YAML
-	frontmatterYAML := content[searchStart:frontmatterEndStart]
-	frontmatterLines := []string{}
-	if frontmatterYAML != "" {
-		frontmatterLines = strings.Split(frontmatterYAML, "\n")
-		// Preserve previous behavior from lines[1:endIndex]: a trailing newline before
-		// the closing delimiter does not create an additional empty frontmatter line.
-		if strings.HasSuffix(frontmatterYAML, "\n") {
-			frontmatterLines = frontmatterLines[:len(frontmatterLines)-1]
+	lines := make([]string, 0, strings.Count(frontmatterYAML, "\n")+1)
+	fieldLines := make(map[string]int)
+	relLine := 0
+
+	for line := range strings.SplitSeq(frontmatterYAML, "\n") {
+		relLine++
+		lines = append(lines, line)
+
+		trimmed := strings.TrimSpace(line)
+		if trimmed == "" || strings.HasPrefix(trimmed, "#") {
+			continue
+		}
+
+		if len(line) > 0 && line[0] != ' ' && line[0] != '\t' {
+			colonIdx := strings.IndexByte(trimmed, ':')
+			if colonIdx > 0 {
+				key := strings.TrimSpace(trimmed[:colonIdx])
+				if key != "" && !strings.ContainsAny(key, " \t{}[]\"'") {
+					if _, alreadySeen := fieldLines[key]; !alreadySeen {
+						fieldLines[key] = relLine + frontmatterStart - 1
+					}
+				}
+			}
 		}
 	}
 
-	// Sanitize no-break whitespace characters (U+00A0) which break the YAML parser
-	frontmatterYAML = strings.ReplaceAll(frontmatterYAML, "\u00A0", " ")
+	if strings.HasSuffix(frontmatterYAML, "\n") {
+		lines = lines[:len(lines)-1]
+	}
 
-	// Parse YAML
+	return lines, fieldLines
+}
+
+func parseFrontmatterYAML(frontmatterYAML string) (map[string]any, error) {
+	frontmatterYAML = strings.ReplaceAll(frontmatterYAML, "\u00A0", " ")
 	var frontmatter map[string]any
 	if err := yaml.Unmarshal([]byte(frontmatterYAML), &frontmatter); err != nil {
-		// Use FormatYAMLError to provide source-positioned error output with adjusted line numbers
-		// FrontmatterStart is 2 (line 2 is where frontmatter content starts after opening ---)
 		formattedErr := FormatYAMLError(err, 2, frontmatterYAML)
 		return nil, &FormattedParserError{formatted: "failed to parse frontmatter:\n" + formattedErr, cause: err}
 	}
-
-	// Ensure frontmatter is never nil (yaml.Unmarshal sets it to nil for empty YAML)
 	if frontmatter == nil {
 		frontmatter = make(map[string]any)
 	}
+	return frontmatter, nil
+}
 
-	// Extract markdown content (everything after the closing ---)
-	markdown := ""
+func extractMarkdownAfterFrontmatter(content string, markdownStart int) string {
 	if markdownStart <= len(content) {
-		markdown = content[markdownStart:]
+		return content[markdownStart:]
 	}
-
-	log.Printf("Successfully extracted frontmatter: fields=%d, markdown_size=%d bytes", len(frontmatter), len(markdown))
-	return &FrontmatterResult{
-		Frontmatter:      frontmatter,
-		Markdown:         strings.TrimSpace(markdown),
-		FrontmatterLines: frontmatterLines,
-		FrontmatterStart: 2, // Line 2 is where frontmatter content starts (after opening ---)
-	}, nil
+	return ""
 }
 
 // isFrontmatterDelimiterLine returns true when a line consists of "---" with optional surrounding whitespace.
@@ -190,7 +244,7 @@ func ExtractFrontmatterFromBuiltinFile(path string, content []byte) (*Frontmatte
 // ExtractMarkdownSection extracts a specific section from markdown content
 // Supports H1-H3 headers and proper nesting (matches bash implementation)
 func ExtractMarkdownSection(content, sectionName string) (string, error) {
-	log.Printf("Extracting markdown section: section=%s, content_size=%d bytes", sectionName, len(content))
+	parserLog.Printf("Extracting markdown section: section=%s, content_size=%d bytes", sectionName, len(content))
 	scanner := bufio.NewScanner(strings.NewReader(content))
 	var sectionContent bytes.Buffer
 	inSection := false
@@ -198,7 +252,6 @@ func ExtractMarkdownSection(content, sectionName string) (string, error) {
 
 	// Create regex pattern to match headers at any level (H1-H3) with flexible spacing
 	headerPattern := regexp.MustCompile(`^(#{1,3})[\s\t]+` + regexp.QuoteMeta(sectionName) + `[\s\t]*$`)
-	levelPattern := regexp.MustCompile(`^(#{1,3})[\s\t]+`)
 
 	for scanner.Scan() {
 		line := scanner.Text()
@@ -225,12 +278,12 @@ func ExtractMarkdownSection(content, sectionName string) (string, error) {
 	}
 
 	if !inSection {
-		log.Printf("Section not found: %s", sectionName)
+		parserLog.Printf("Section not found: %s", sectionName)
 		return "", fmt.Errorf("section '%s' not found", sectionName)
 	}
 
 	extractedContent := strings.TrimSpace(sectionContent.String())
-	log.Printf("Successfully extracted section: size=%d bytes", len(extractedContent))
+	parserLog.Printf("Successfully extracted section: size=%d bytes", len(extractedContent))
 	return extractedContent, nil
 }
 
@@ -269,15 +322,15 @@ func findH1WorkflowName(markdownBody string) string {
 // avoids the redundant file-read and YAML-parse that those functions perform when the caller
 // already holds the parsed FrontmatterResult.
 func ExtractWorkflowNameFromMarkdownBody(markdownBody string, virtualPath string) (string, error) {
-	log.Printf("Extracting workflow name from markdown body: virtualPath=%s, size=%d bytes", virtualPath, len(markdownBody))
+	parserLog.Printf("Extracting workflow name from markdown body: virtualPath=%s, size=%d bytes", virtualPath, len(markdownBody))
 
 	if name := findH1WorkflowName(markdownBody); name != "" {
-		log.Printf("Found workflow name from H1 header: %s", name)
+		parserLog.Printf("Found workflow name from H1 header: %s", name)
 		return name, nil
 	}
 
 	defaultName := generateDefaultWorkflowName(virtualPath)
-	log.Printf("No H1 header found, using default name: %s", defaultName)
+	parserLog.Printf("No H1 header found, using default name: %s", defaultName)
 	return defaultName, nil
 }
 
@@ -285,7 +338,7 @@ func ExtractWorkflowNameFromMarkdownBody(markdownBody string, virtualPath string
 // This is the in-memory equivalent of ExtractWorkflowNameFromMarkdown, used by Wasm builds
 // where filesystem access is unavailable.
 func ExtractWorkflowNameFromContent(content string, virtualPath string) (string, error) {
-	log.Printf("Extracting workflow name from content: virtualPath=%s, size=%d bytes", virtualPath, len(content))
+	parserLog.Printf("Extracting workflow name from content: virtualPath=%s, size=%d bytes", virtualPath, len(content))
 
 	markdownContent, err := ExtractMarkdownContent(content)
 	if err != nil {
@@ -293,12 +346,12 @@ func ExtractWorkflowNameFromContent(content string, virtualPath string) (string,
 	}
 
 	if name := findH1WorkflowName(markdownContent); name != "" {
-		log.Printf("Found workflow name from H1 header: %s", name)
+		parserLog.Printf("Found workflow name from H1 header: %s", name)
 		return name, nil
 	}
 
 	defaultName := generateDefaultWorkflowName(virtualPath)
-	log.Printf("No H1 header found, using default name: %s", defaultName)
+	parserLog.Printf("No H1 header found, using default name: %s", defaultName)
 	return defaultName, nil
 }
 

@@ -4,30 +4,58 @@ description: Guide for reducing token consumption in agentic workflows — DataO
 
 # Token Consumption Optimization
 
-Tokens are the primary cost driver for agentic workflows. Apply the techniques below to reduce effective token consumption while preserving output quality.
-
 ## Quick-Reference Checklist
 
 Apply these in order — each check can halve costs:
 
+- [ ] **Cheap triage first**: classify duplicates, stale items, low-value events, and known cases before escalating
+- [ ] **Frontier model as planner**: use frontier models for planning, synthesis, ambiguous decisions, and final judgment — not bulk extraction
 - [ ] **DataOps**: Move data fetching into `steps:` — agent reads compact JSON, not raw API responses
 - [ ] **gh-proxy**: Set `tools.github.mode: gh-proxy` — skips Docker MCP server startup and extra tool definitions
 - [ ] **cli-proxy**: Mount additional MCP servers as CLIs via `cli-proxy: true` — agent pipes output through `jq` before it enters context
 - [ ] **Sub-agents**: Delegate repetitive per-item tasks to `model: small` sub-agents (~10–20× cheaper)
+- [ ] **Sub-skills**: Keep the main prompt as a short execution plan; move detailed playbooks/output layouts into `## skill:` blocks the agent invokes only when needed
 - [ ] **Prompt size**: Strip redundant instructions, examples, and pleasantries from the prompt body
 - [ ] **Dynamic context**: Inject only required fields — `${{ github.event.issue.number }}` not the full event payload
+- [ ] **Pull context on demand**: query logs/data only after a hypothesis forms; avoid preloading large raw dumps into the initial prompt
 - [ ] **Prompt caching**: Put stable instructions before dynamic content to maximize cache hits
+- [ ] **Context hygiene**: keep the orchestrator context compact; prefer short worker summaries over raw output
 - [ ] **Cadence**: If the result is not time-sensitive, schedule less often (`hourly` → `daily`, `daily` → `weekly`)
 - [ ] **Batching**: Prefer scheduled batch processing over reactive events when delayed processing is acceptable
 - [ ] **Telemetry**: Configure `observability.otlp` so token usage and run phases are measurable outside individual run logs
-- [ ] **Agentic Ops**: Add `copilot-token-audit` / `copilot-token-optimizer` workflows so the repository keeps finding waste automatically
-- [ ] **Measure first**: Back every change with an `experiments:` field and `metric: "effective_tokens"` before promoting
+- [ ] **AgenticOps**: Add `copilot-token-audit` / `copilot-token-optimizer` workflows so the repository keeps finding waste automatically
+- [ ] **Measure first**: Back every change with an `experiments:` field and `metric: "aic"` before promoting
+
+---
+
+## Frontier-Model Cost Pattern
+
+A frontier model can reduce **total** cost when architecture prevents unnecessary invocations and keeps expensive context narrow.
+
+- use frontier model for planning, hypothesis selection, synthesis, ambiguous decisions, final judgment
+- do not spend frontier turns on repetitive extraction, duplicate detection, or broad first-pass scanning
+- add a cheap triage stage for known/duplicate/stale/low-value events; stop with `noop` when escalation is unnecessary
+- escalate to frontier model only when triage is uncertain or the case is genuinely new/high-value
+- cap sub-agent fan-out so escalations cannot recurse without bound
+
+Cost wins come from architecture and selective execution, not model tier alone.
+
+---
+
+## Pull Context, Do Not Push Context
+
+Avoid front-loading large raw context when data can be fetched on demand. Prefer:
+
+- deterministic pre-steps that materialize compact files under `/tmp/gh-aw/`
+- `gh` + filtering commands (`jq`, `grep`, focused selectors) before context is exposed to the model
+- pre-aggregated summaries instead of full API payloads
+- directed tool calls issued after the agent forms a hypothesis
+
+Anchoring warning: preselecting raw logs too early can make the model over-focus and miss the actual cause.
 
 ---
 
 ## How to Measure Token Usage
-
-Establish a baseline before optimizing. The audit command is your main instrument.
 
 ### Single-run audit
 
@@ -37,19 +65,15 @@ gh aw audit <run-id> --json
 
 Key fields in the output:
 
-- `agent_usage.effective_tokens` — the normalized cost metric (accounts for model price differences and cache discounts)
+- `agent_usage.aic` — AI Credits (AIC), the normalized cost metric (1 AIC = $0.01; accounts for model price differences and cache discounts)
 - `agent_usage.input_tokens` / `agent_usage.output_tokens` — raw token counts
 - `agent_usage.cache_read_tokens` / `agent_usage.cache_write_tokens` — tokens served from the prompt cache
 
-Or via MCP tool:
+Equivalent via MCP: `audit` tool with `run_id: <run-id>`.
 
-```
-Use the audit tool with run_id: <run-id>
-```
+Treat optimization as successful only when quality remains acceptable. A quality regression is a failure even if AI Credits decrease.
 
 ### Comparing two runs (regression detection)
-
-Run the baseline and the optimized variant, then diff them:
 
 ```bash
 gh aw audit <base-run-id> <optimized-run-id> --json
@@ -57,13 +81,7 @@ gh aw audit <base-run-id> <optimized-run-id> --json
 gh aw audit <base-run-id> <variant-a-run-id> <variant-b-run-id> --json
 ```
 
-Or via MCP tool:
-
-```
-Use the audit tool with run_ids_or_urls: ["<base-run-id>", "<optimized-run-id>"]
-```
-
-The diff output highlights changes in effective tokens, tool calls, and safe outputs between runs — making it easy to confirm that an optimization actually reduced cost without degrading behavior.
+The diff highlights changes in AI credits, tool calls, and safe outputs between runs. Equivalent via MCP: `audit` tool with `run_ids_or_urls: ["<base-run-id>", "<optimized-run-id>"]`.
 
 ### Per-request token detail
 
@@ -74,13 +92,13 @@ gh aw audit <run-id>
 cat logs/run-<run-id>/firewall-audit-logs/api-proxy-logs/token-usage.jsonl
 ```
 
-Each line is one API call with `model`, `input_tokens`, `output_tokens`, `cache_read_tokens`, and `cache_write_tokens`. Use this to find which API calls are the most expensive.
+Each line is one API call with `model`, `input_tokens`, `output_tokens`, `cache_read_tokens`, and `cache_write_tokens` — useful for finding the most expensive calls.
 
 ---
 
 ## Technique 1 — DataOps: Move Compute to Steps
 
-**The single biggest optimization.** Replace agentic data fetching with deterministic shell commands in `steps:`. Shell steps run outside the AI sandbox (no tokens), produce structured output the agent reads directly, and are fast and reproducible.
+The single biggest optimization. Replace agentic data fetching with deterministic shell commands in `steps:`. Shell steps run outside the AI sandbox (no tokens) and produce structured output the agent reads directly.
 
 ### Before (agent does all the work)
 
@@ -95,8 +113,6 @@ tools:
 
 Fetch all open PRs in ${{ github.repository }}, compute the merge rate, identify authors with the most contributions, and create a weekly summary discussion.
 ```
-
-The agent calls GitHub APIs iteratively, consuming tokens for each call and for processing raw API responses.
 
 ### After (DataOps pattern)
 
@@ -137,16 +153,12 @@ Read the pre-computed stats at `/tmp/gh-aw/data/stats.json` and `/tmp/gh-aw/data
 Create a concise weekly PR summary discussion.
 ```
 
-**Why this saves tokens:**
-
-- API calls happen in shell steps — zero AI tokens spent on fetching
-- The agent receives compact, aggregated JSON instead of raw API responses
-- The agent's context window stays small, reducing per-turn input token counts
+Shell steps run outside the AI sandbox (zero tokens); the agent reads compact aggregated JSON.
 
 **Best practices:**
 
-- Write one JSON file per data source; use `jq` to pre-aggregate
-- Store files under `/tmp/gh-aw/` — this directory is available to the agent
+- One JSON file per data source; `jq` to pre-aggregate
+- Store files under `/tmp/gh-aw/`
 - Document file locations and schema in the prompt body so the agent doesn't need to explore
 
 See also: [DataOps pattern docs](https://github.com/github/gh-aw/blob/main/docs/src/content/docs/patterns/data-ops.md)
@@ -154,8 +166,6 @@ See also: [DataOps pattern docs](https://github.com/github/gh-aw/blob/main/docs/
 ---
 
 ## Technique 2 — Use `gh-proxy` and `cli-proxy` Instead of the MCP Server
-
-**Eliminates Docker startup overhead and reduces per-call context overhead.**
 
 ### `mode: gh-proxy` (GitHub reads)
 
@@ -166,12 +176,7 @@ tools:
     toolsets: [default]
 ```
 
-`gh-proxy` makes a pre-authenticated `gh` CLI available in bash. The agent reads GitHub data with `gh issue list`, `gh pr view`, etc. — no Docker container, no MCP server initialization, and tighter bash output that the agent can pipe through `jq` before reading.
-
-The alternative (`mode: local`) starts a Docker-based GitHub MCP Server, which:
-- Adds startup latency
-- Registers extra tool descriptions that expand the system prompt
-- Returns verbose JSON that the agent must process in full
+Agent reads GitHub via `gh issue list`, `gh pr view`, etc. and pipes through `jq` before data enters context. `mode: local` starts a Docker-based MCP server with startup latency and verbose tool results.
 
 ### `cli-proxy: true` (other MCP servers as CLIs)
 
@@ -186,7 +191,7 @@ tools:
     ...
 ```
 
-With `cli-proxy`, the agent can call `my-custom-mcp <tool> <args>` from bash, capturing output as text and processing it before passing results back into the conversation. This lets the agent use `jq` or `grep` to extract only the fields it needs — rather than receiving the full MCP tool response as a structured tool result in the conversation context.
+With `cli-proxy`, the agent calls `my-custom-mcp <tool> <args>` from bash and pipes output through `jq`/`grep` to extract only needed fields — instead of receiving the full MCP tool response in context.
 
 **Summary:**
 
@@ -200,9 +205,7 @@ With `cli-proxy`, the agent can call `my-custom-mcp <tool> <args>` from bash, ca
 
 ## Technique 3 — Inline Sub-Agents with Smaller Models
 
-**Delegate narrow, repetitive tasks to cheap models; reserve the large model for synthesis.**
-
-Sub-agents defined inside the workflow file with `model: small` cost 10–20× less than the parent model and are well-suited for classification, one-sentence summarization, structured extraction, and scoring.
+Sub-agents with `model: small` cost 10–20× less than the parent model. Use them for classification, one-sentence summarization, structured extraction, and scoring; reserve the large model for synthesis.
 
 ### Pattern
 
@@ -256,11 +259,15 @@ Read the JSON file provided. Return only:
 Nothing else.
 ```
 
-**Why this saves tokens:**
+**Why this saves tokens:** sub-agents run the cheap `small` model; main agent reads only compact `{"number":…, "category":…}` JSON; dispatches run in parallel.
 
-- 50 issues × ~200 tokens at `small` pricing = ~10,000 tokens (cheap model)
-- Main agent only reads compact `{"number":…, "category":…}` JSON — far fewer input tokens than reading 50 raw issue bodies
-- Parallelism: the main agent can dispatch multiple sub-agents concurrently
+### Pair sub-agents with sub-skills (progressive disclosure)
+
+- Keep the main prompt short and plan-like (what to do, in what order).
+- Put verbose instructions (report layout, rubric details, formatting constraints) into `## skill:` blocks.
+- Invoke skills only when needed (e.g., producing final output), so early turns stay lean.
+
+This delays expensive instruction payloads until the final phase, lowering ambient context.
 
 **Sub-agent model aliases:**
 
@@ -278,9 +285,7 @@ See also: [Inline Sub-Agents](subagents.md)
 
 ## Technique 4 — Apply the Caveman Technique
 
-**Measure the cost of verbosity with a prompt-style experiment.**
-
-The "caveman" technique uses an A/B experiment to compare a verbose prompt against a stripped-down minimal prompt. If the minimal variant produces equally useful output, adopt it permanently.
+A/B compare a verbose prompt against a minimal one. Adopt minimal if quality holds.
 
 ```yaml
 experiments:
@@ -295,29 +300,20 @@ List open issues by priority. Top 5 critical items. Be brief.
 {{/if}}
 ```
 
-Measure `effective_tokens` in each variant's run summary or via `gh aw audit`. If the `minimal` variant uses fewer tokens at acceptable quality, promote it as the baseline.
-
-**What to minimize:**
-
-- Remove redundant instructions (the model already knows common conventions)
-- Replace prose explanations with bullet constraints
-- Cut examples that don't constrain behavior
-- Remove hedging language and pleasantries
+Measure AIC via run summary or `gh aw audit`. If `minimal` wins on cost at acceptable quality, promote as baseline.
 
 ---
 
 ## Technique 5 — Use Experiments to Measure Impact
 
-**Never guess — measure every optimization with A/B experiments.**
-
-Declare an experiment before making any prompt or configuration change. Let both variants run for enough cycles to be statistically meaningful (≥ 20 runs per variant for high-frequency workflows).
+Declare an experiment before making any prompt or configuration change, and compare before/after cost and quality. Run ≥ 20 cycles per variant for statistical significance on high-frequency workflows.
 
 ```yaml
 experiments:
   optimization_v1:
     variants: [control, optimized]
     description: "DataOps refactor — move issue fetching to steps:"
-    metric: "effective_tokens"
+    metric: "aic"
     issue: "123"
 ```
 
@@ -334,8 +330,9 @@ Fetch open issues from ${{ github.repository }} using the GitHub tools.
 **After enough runs:**
 
 1. Compare variants using `gh aw audit <control-run-id> <optimized-run-id>`
-2. Check effective token deltas in the diff output
-3. If the optimized variant wins, rewrite the baseline prompt and remove the `experiments:` field
+2. Inspect `aic`, `input_tokens`, `output_tokens`, `cache_read_tokens`, and `cache_write_tokens`
+3. Validate output quality and decision accuracy against the control run
+4. If the optimized variant wins on cost **and** quality, rewrite the baseline prompt and remove the `experiments:` field
 
 **Key experiment dimensions for token optimization:**
 
@@ -353,41 +350,23 @@ See also: [A/B Testing Experiments](experiments.md)
 
 ## Technique 6 — Reduce Trigger Frequency and Batch Work
 
-**The cheapest run is the one you do not execute.** If a workflow does not need near-real-time feedback, run it less often and process multiple items in one pass.
+The cheapest run is the one you don't execute. If a workflow doesn't need near-real-time feedback, run it less often and batch.
 
 ### Prefer slower schedules when latency is acceptable
 
-Move high-frequency schedules down to the slowest cadence that still meets the operational need:
-
 - `hourly` → `daily on weekdays` for team-facing summaries or audits
-- `daily` → `weekly` for trend reports, optimization reviews, and backlog hygiene
-- `every N hours` → a daily or weekly batch when the workflow only produces guidance or reports
-
-This reduces total workflow runs, token usage, GitHub Actions minutes, and notification noise all at once.
+- `daily` → `weekly` for trend reports, optimization reviews, backlog hygiene
+- `every N hours` → daily/weekly batch when the workflow only produces guidance
 
 ### Prefer scheduled batches over reactive triggers
 
-Reactive triggers (`issues:`, `pull_request:`, comment commands) are appropriate when maintainers need immediate feedback. Otherwise, prefer `schedule:` and batch work:
-
-```yaml
-on:
-  schedule: daily on weekdays
-```
-
-Typical batch-friendly tasks:
-
-- daily or weekly triage summaries
-- stale backlog review
-- token usage audits
-- repository-wide quality or security digests
-
-Combine batching with `cache-memory` or `repo-memory` to track what was already processed so each scheduled run only handles new items.
+Reactive triggers (`issues:`, `pull_request:`, comment commands) suit immediate feedback. Otherwise prefer `schedule: daily on weekdays` and batch work. Typical batch-friendly tasks: triage summaries, stale backlog review, token audits, security digests. Combine with `cache-memory` or `repo-memory` to track processed items.
 
 ---
 
-## Technique 7 — Measure Continuously with OpenTelemetry and Agentic Ops
+## Technique 7 — Measure Continuously with OpenTelemetry and AgenticOps
 
-**Don't rely only on ad hoc audits.** Export telemetry automatically, then add workflows that keep looking for token waste over time.
+Export telemetry automatically and add workflows that keep finding token waste over time.
 
 ### Enable OTLP export
 
@@ -400,43 +379,42 @@ observability:
     headers: ${{ secrets.GH_AW_OTEL_HEADERS }}
 ```
 
-`gh-aw` emits setup, agent, and conclusion spans with token usage attributes, which makes it easier to:
+Setup, agent, and conclusion spans carry token usage attributes. See [Frontmatter syntax](syntax.md#observability).
 
-- compare workflows over time
-- identify expensive phases before opening logs
-- validate that an optimization reduced cost after rollout
-
-See also: [Frontmatter syntax](syntax.md#observability)
-
-### Add Agentic Ops token workflows
-
-Use the token-focused workflows from the Agentic Ops pattern to optimize continuously at the repository level:
+### Add AgenticOps token workflows
 
 - `copilot-token-audit` — scheduled audit of token usage across workflows
 - `copilot-token-optimizer` — scheduled follow-up that identifies one expensive workflow and proposes concrete savings
 
-This turns token optimization into an ongoing loop:
-
-1. export OTEL data
-2. collect and summarize repository-wide token usage
-3. open optimization issues for the highest-value fixes
-4. re-measure after changes land
-
-See the `gh-aw` repository for derived `copilot-token-audit` and `copilot-token-optimizer` examples under `.github/workflows/`.
+Loop: export OTEL → summarize usage → open optimization issues → re-measure. See `.github/workflows/` for examples.
 
 ---
 
 ## Technique 8 — Enable Prompt Caching
 
-**Repeated context (system prompt, shared preamble) is charged at ~10× less when cached.**
-
-Prompt caching is automatically enabled by the AWF gateway. Effective cached input tokens are weighted at `0.1` in the effective token formula (versus `1.0` for uncached input).
+Prompt caching is automatic via the AWF gateway. Cached input tokens are weighted at `0.1` versus `1.0` for uncached input — repeated context (system prompt, shared preamble) costs ~10× less when cached.
 
 To maximize cache hits:
 
-- **Keep stable content at the top of the prompt.** Instructions that don't change between runs (role description, output format rules, JSON schema) should appear before dynamic content (issue body, event context).
-- **Use `cache-memory`** for workflows that re-read the same large knowledge base across runs. The memory server avoids injecting duplicate context into every turn.
-- **Minimize dynamic context.** Inject only the fields the agent actually needs: use `${{ github.event.issue.number }}` instead of dumping the full event payload.
+- **Keep stable content at the top of the prompt** — instructions that don't change between runs (role, output format, schema) before dynamic content (issue body, event context).
+- **Use `cache-memory`** for workflows that re-read the same large knowledge base across runs; avoids duplicate context every turn.
+- **Minimize dynamic context** — inject only the fields the agent needs: `${{ github.event.issue.number }}` instead of the full event payload.
+
+---
+
+## Technique 9 — Cap Spend with AI-Credit Guardrails
+
+Two top-level frontmatter fields enforce AI Credit budgets directly, independent of the techniques above. Both accept an integer or a `K`/`M` short-form string (e.g. `100M`, `500K`). Typical workflow range: `100` to `2500`.
+
+- **`max-ai-credits:`** — Per-run AI credit budget enforced by the AWF firewall/API proxy (default `1000`). The agent is steered to stay within budget; set a negative value to disable enforcement and steering.
+- **`max-daily-ai-credits:`** — Per-user 24-hour guardrail. At activation, gh-aw sums the triggering user's AI credits across their runs of this workflow over the last 24 hours and blocks execution once the total exceeds the threshold. Enabled by default with a system default threshold; set `-1` to disable, or an explicit value to override the default.
+
+```yaml
+max-ai-credits: 100M        # per-run cap (short-form string)
+max-daily-ai-credits: 500M  # per-user 24h cap; -1 disables
+```
+
+For custom or private models, the top-level **`models:`** frontmatter field supplies pricing in the same structure as `models.json` (keyed `providers.<provider>.models.<model>.cost` with `input`/`output`/`cache_read`/`cache_write` per-token costs). Entries are merged with the built-in `models.json` at runtime — they override matching models and fill gaps for unknown ones — so AI Credit accounting stays accurate for models gh-aw does not price by default.
 
 ---
 

@@ -1,4 +1,5 @@
 ---
+emoji: "📝"
 name: Documentation Noob Tester
 description: Tests documentation as a new user would, identifying confusing or broken steps in getting started guides
 on:
@@ -8,7 +9,10 @@ permissions:
   contents: read
   issues: read
   pull-requests: read
-engine: copilot
+  copilot-requests: write
+engine:
+  id: copilot
+  copilot-sdk: true
 timeout-minutes: 30
 runtimes:
   node:
@@ -37,34 +41,49 @@ imports:
       expires: 1d
   - shared/docs-server-lifecycle.md
   - shared/keep-it-short.md
-  - shared/observability-otlp.md
+  - shared/otlp.md
 pre-agent-steps:
-  - name: Install docs dependencies
+  - name: Start docs server
+    env:
+      EXPR_GITHUB_WORKSPACE: ${{ github.workspace }}
     run: |
-      cd "${{ github.workspace }}/docs"
-      npm install
-  - name: Start documentation server
-    run: |
-      cd "${{ github.workspace }}/docs"
-      nohup npm run dev -- --host 0.0.0.0 --port 4321 > /tmp/preview.log 2>&1 &
+      cd "$EXPR_GITHUB_WORKSPACE"
+      nohup make dev-docs > /tmp/gh-aw/agent/preview.log 2>&1 &
       PID=$!
-      echo $PID > /tmp/server.pid
+      echo $PID > /tmp/gh-aw/agent/server.pid
       echo "Server PID: $PID"
   - name: Wait for server readiness
     run: |
       MAX_WAIT=135  # 45 attempts × 3s = 135s max wait
       WAITED=0
+      until (echo > /dev/tcp/127.0.0.1/4321) > /dev/null 2>&1; do
+        # Check if the server process has already died
+        if [ -f /tmp/gh-aw/agent/server.pid ] && ! kill -0 "$(cat /tmp/gh-aw/agent/server.pid)" 2>/dev/null; then
+          echo "::error::Documentation server process died before opening port 4321. Server log:"
+          cat /tmp/gh-aw/agent/preview.log
+          exit 1
+        fi
+        WAITED=$((WAITED + 3))
+        if [ $WAITED -ge $MAX_WAIT ]; then
+          echo "::error::Documentation server port 4321 did not open after ${MAX_WAIT}s. Server log:"
+          cat /tmp/gh-aw/agent/preview.log
+          exit 1
+        fi
+        echo "Waiting for docs port... ($WAITED/${MAX_WAIT}s)"
+        sleep 3
+      done
+      WAITED=0
       until curl -sf http://localhost:4321/gh-aw/ > /dev/null 2>&1; do
         # Check if the server process has already died
-        if [ -f /tmp/server.pid ] && ! kill -0 "$(cat /tmp/server.pid)" 2>/dev/null; then
+        if [ -f /tmp/gh-aw/agent/server.pid ] && ! kill -0 "$(cat /tmp/gh-aw/agent/server.pid)" 2>/dev/null; then
           echo "::error::Documentation server process died before becoming ready. Server log:"
-          cat /tmp/preview.log
+          cat /tmp/gh-aw/agent/preview.log
           exit 1
         fi
         WAITED=$((WAITED + 3))
         if [ $WAITED -ge $MAX_WAIT ]; then
           echo "::error::Documentation server did not start after ${MAX_WAIT}s. Server log:"
-          cat /tmp/preview.log
+          cat /tmp/gh-aw/agent/preview.log
           exit 1
         fi
         echo "Waiting for server... ($WAITED/${MAX_WAIT}s)"
@@ -77,8 +96,7 @@ pre-agent-steps:
       echo "http://localhost:4321/gh-aw/" > /tmp/gh-aw/agent/server-url.txt
       echo "Server URL: http://localhost:4321/gh-aw/"
 features:
-  copilot-requests: true
-
+  gh-aw-detection: true
 ---
 
 # Documentation Noob Testing
@@ -95,7 +113,7 @@ You are a brand new user trying to get started with GitHub Agentic Workflows for
 
 Act as a complete beginner who has never used GitHub Agentic Workflows before. Navigate the documentation site, follow tutorials step-by-step, and document any issues you encounter.
 
-> The documentation server is already running at `http://localhost:4321/gh-aw/`.
+> The workflow started the documentation server and verified readiness. It is running at `http://localhost:4321/gh-aw/`.
 
 ## Step 1: Navigate Documentation as a Noob
 
@@ -111,11 +129,11 @@ Using Playwright, visit exactly these 3 pages and stop:
 
 Before taking screenshots, create the screenshots directory:
 ```bash
-mkdir -p /tmp/gh-aw/screenshots
+mkdir -p /tmp/gh-aw/agent/screenshots
 ```
 
 1. **Visit the home page** (`http://localhost:4321/gh-aw/`)
-   - Take a screenshot: `playwright-cli browser_navigate --url "http://localhost:4321/gh-aw/" && playwright-cli browser_take_screenshot --filename /tmp/gh-aw/screenshots/home.png`
+   - Take a screenshot: `playwright-cli browser_navigate --url "http://localhost:4321/gh-aw/" && playwright-cli browser_take_screenshot --filename /tmp/gh-aw/agent/screenshots/home.png`
    - Note: Is it immediately clear what this tool does?
    - Note: Can you quickly find the "Get Started" or "Quick Start" link?
 
@@ -166,9 +184,9 @@ As you navigate, specifically look for:
 
 For each confusing or broken area:
 - Take a screenshot showing the issue
-- Save it to a descriptive filename (e.g., "confusing-quick-start-step-3.png") in `/tmp/gh-aw/screenshots/`
+- Save it to a descriptive filename (e.g., "confusing-quick-start-step-3.png") in `/tmp/gh-aw/agent/screenshots/`
 - Note the page URL and specific section
-- Upload the screenshot by calling the `upload_asset` safe-output tool with the absolute file path `path: "/tmp/gh-aw/screenshots/<filename>.png"`.
+- Upload the screenshot by calling the `upload_asset` safe-output tool with the absolute file path `path: "/tmp/gh-aw/agent/screenshots/<filename>.png"`.
   Record the returned asset URL.
 
 ## Step 4: Create Discussion Report

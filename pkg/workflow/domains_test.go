@@ -386,6 +386,7 @@ func TestThreatDetectionDomains(t *testing.T) {
 		"api.individual.githubcopilot.com",
 		"github.com",
 		"host.docker.internal",
+		"registry.npmjs.org",
 		"telemetry.enterprise.githubcopilot.com",
 	}
 	detectionMap := make(map[string]bool)
@@ -398,7 +399,6 @@ func TestThreatDetectionDomains(t *testing.T) {
 
 	// Detection domains must NOT include the domains excluded for supply-chain reduction
 	excludedDomains := []string{
-		"registry.npmjs.org",
 		"raw.githubusercontent.com",
 	}
 	for _, excluded := range excludedDomains {
@@ -418,8 +418,10 @@ func TestGetThreatDetectionAllowedDomains(t *testing.T) {
 	// Must include essential Copilot API domain
 	assert.Contains(t, result, "api.githubcopilot.com", "Detection domains must include Copilot API domain")
 
-	// Must NOT include npm registry or raw GitHub downloads
-	assert.NotContains(t, result, "registry.npmjs.org", "Detection domains must not include npm registry")
+	// Must include npm registry for read-only package validation
+	assert.Contains(t, result, "registry.npmjs.org", "Detection domains must include npm registry for read-only package validation")
+
+	// Must NOT include raw GitHub downloads
 	assert.NotContains(t, result, "raw.githubusercontent.com", "Detection domains must not include raw.githubusercontent.com")
 
 	// Must NOT include ecosystem-expansion domains (no tools/runtimes passed for detection)
@@ -431,8 +433,10 @@ func TestCodexDefaultDomains(t *testing.T) {
 	// Verify that expected Codex domains are present
 	expectedDomains := []string{
 		"172.30.0.1", // AWF gateway IP - Codex resolves host.docker.internal to this IP
+		"api.github.com",
 		"api.openai.com",
 		"chatgpt.com", // Codex CLI connects to chatgpt.com (and subdomains e.g. ab.chatgpt.com) for auth/telemetry
+		"github.com",
 		"host.docker.internal",
 		"openai.com",
 	}
@@ -1293,17 +1297,17 @@ func TestMergeAPITargetDomains(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			result := mergeAPITargetDomains(tt.domainsStr, tt.apiTarget)
 			domains := strings.Split(result, ",")
-			domainSet := make(map[string]bool)
+			domainSet := make(map[string]struct{})
 			for _, d := range domains {
-				domainSet[d] = true
+				domainSet[d] = struct{}{}
 			}
 			for _, want := range tt.wantIn {
-				if !domainSet[want] {
+				if _, ok := domainSet[want]; !ok {
 					t.Errorf("Expected domain %q in result %q, but not found", want, result)
 				}
 			}
 			for _, notWant := range tt.wantNotIn {
-				if domainSet[notWant] {
+				if _, ok := domainSet[notWant]; ok {
 					t.Errorf("Did not expect domain %q in result %q", notWant, result)
 				}
 			}

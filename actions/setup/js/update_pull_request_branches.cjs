@@ -59,14 +59,13 @@ async function filterMergeablePullRequests(owner, repo, pullNumbers) {
     const isMergeable = pull?.state === "open" && pull?.mergeable === true && pull?.draft !== true && isSameRepository;
     if (isMergeable) {
       mergeable.push(pullNumber);
-      continue;
+    } else {
+      let skipReason = "not_mergeable";
+      if (!isSameRepository) {
+        skipReason = headRepository ? "head_repository_mismatch" : "head_repository_missing";
+      }
+      core.info(`Skipping PR #${pullNumber}: reason=${skipReason}, mergeable=${String(pull?.mergeable)}, state=${pull?.state || "unknown"}, draft=${String(Boolean(pull?.draft))}, head_repo=${headRepository || "unknown"}`);
     }
-
-    let skipReason = "not_mergeable";
-    if (!isSameRepository) {
-      skipReason = headRepository ? "head_repository_mismatch" : "head_repository_missing";
-    }
-    core.info(`Skipping PR #${pullNumber}: reason=${skipReason}, mergeable=${String(pull?.mergeable)}, state=${pull?.state || "unknown"}, draft=${String(Boolean(pull?.draft))}, head_repo=${headRepository || "unknown"}`);
   }
 
   return mergeable;
@@ -151,8 +150,10 @@ async function main() {
   let skippedCount = 0;
   let failedCount = 0;
 
-  for (let i = 0; i < mergeablePullRequests.length; i++) {
-    const pullNumber = mergeablePullRequests[i];
+  for (const [i, pullNumber] of mergeablePullRequests.entries()) {
+    if (i > 0) {
+      await sleep(UPDATE_DELAY_MS);
+    }
     try {
       core.info(`Updating branch for PR #${pullNumber}`);
       await updatePullRequestBranch(owner, repo, pullNumber);
@@ -166,10 +167,6 @@ async function main() {
         failedCount++;
         core.error(`Failed to update branch for PR #${pullNumber}: ${getErrorMessage(error)}`);
       }
-    }
-
-    if (i < mergeablePullRequests.length - 1) {
-      await sleep(UPDATE_DELAY_MS);
     }
   }
 

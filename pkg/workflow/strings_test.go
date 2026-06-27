@@ -277,6 +277,11 @@ func TestShortenCommand(t *testing.T) {
 	}
 }
 
+func TestEscapeYAMLSingleQuoted(t *testing.T) {
+	assert.Equal(t, "owner''s workflow", escapeYAMLSingleQuoted("owner's workflow"))
+	assert.Equal(t, "plain", escapeYAMLSingleQuoted("plain"))
+}
+
 func TestSanitizeName(t *testing.T) {
 	tests := []struct {
 		name     string
@@ -507,28 +512,38 @@ func TestSanitizeName_NilOptions(t *testing.T) {
 	}
 }
 
-func TestGenerateHeredocDelimiterFromSeed_Stability(t *testing.T) {
-	// Sample SHA-256 hex string representing a typical workflow frontmatter hash.
-	seed := "49266e50774d7e6a8b1c50f64b2f790c214dcdcf7b75b6bc8478bb43257b9863"
+func TestGenerateHeredocDelimiterFromContent_Stability(t *testing.T) {
+	content := `{"key":"value","items":[1,2,3]}`
 
-	// Same seed and name must always produce the same delimiter (stable across compilations)
-	result1 := GenerateHeredocDelimiterFromSeed("PROMPT", seed)
-	result2 := GenerateHeredocDelimiterFromSeed("PROMPT", seed)
-	assert.Equal(t, result1, result2, "Same seed+name should produce identical delimiters")
+	// Same name and content must always produce the same delimiter.
+	result1 := GenerateHeredocDelimiterFromContent("MCP_CONFIG", content)
+	result2 := GenerateHeredocDelimiterFromContent("MCP_CONFIG", content)
+	assert.Equal(t, result1, result2, "Same name+content should produce identical delimiters")
 
-	// Format should still match the expected pattern
-	pattern := regexp.MustCompile(`^GH_AW_PROMPT_[0-9a-f]{16}_EOF$`)
-	assert.True(t, pattern.MatchString(result1), "Seeded delimiter should match expected format, got %q", result1)
+	// Format should match GH_AW_<NAME>_<16hex>_EOF.
+	pattern := regexp.MustCompile(`^GH_AW_MCP_CONFIG_[0-9a-f]{16}_EOF$`)
+	assert.True(t, pattern.MatchString(result1), "Content-based delimiter should match expected format, got %q", result1)
 }
 
-func TestGenerateHeredocDelimiterFromSeed_DifferentNames(t *testing.T) {
-	// Sample SHA-256 hex string representing a typical workflow frontmatter hash.
-	seed := "49266e50774d7e6a8b1c50f64b2f790c214dcdcf7b75b6bc8478bb43257b9863"
+func TestGenerateHeredocDelimiterFromContent_KnownChecksum(t *testing.T) {
+	result := GenerateHeredocDelimiterFromContent("MCP_CONFIG", `{"key":"value","items":[1,2,3]}`)
+	assert.Equal(t, "GH_AW_MCP_CONFIG_1987a252437b4244_EOF", result)
+}
 
-	// Different names with the same seed must produce different delimiters
-	promptDelim := GenerateHeredocDelimiterFromSeed("PROMPT", seed)
-	mcpDelim := GenerateHeredocDelimiterFromSeed("MCP_CONFIG", seed)
-	safeDelim := GenerateHeredocDelimiterFromSeed("SAFE_OUTPUTS_CONFIG", seed)
+func TestGenerateHeredocDelimiterFromContent_ContentSensitive(t *testing.T) {
+	// Different content should produce different delimiters.
+	delim1 := GenerateHeredocDelimiterFromContent("PROMPT", "hello world")
+	delim2 := GenerateHeredocDelimiterFromContent("PROMPT", "hello world!")
+	assert.NotEqual(t, delim1, delim2, "Different content should produce different delimiters")
+}
+
+func TestGenerateHeredocDelimiterFromContent_DifferentNames(t *testing.T) {
+	content := "shared content"
+
+	// Same content, different names → different delimiters.
+	promptDelim := GenerateHeredocDelimiterFromContent("PROMPT", content)
+	mcpDelim := GenerateHeredocDelimiterFromContent("MCP_CONFIG", content)
+	safeDelim := GenerateHeredocDelimiterFromContent("SAFE_OUTPUTS_CONFIG", content)
 
 	assert.NotEqual(t, promptDelim, mcpDelim, "Different names should produce different delimiters")
 	assert.NotEqual(t, mcpDelim, safeDelim, "Different names should produce different delimiters")
@@ -539,37 +554,28 @@ func TestGenerateHeredocDelimiterFromSeed_DifferentNames(t *testing.T) {
 	assert.Contains(t, safeDelim, "GH_AW_SAFE_OUTPUTS_CONFIG_", "Delimiter should contain the name")
 }
 
-func TestGenerateHeredocDelimiterFromSeed_DifferentSeeds(t *testing.T) {
-	// Sample SHA-256 hex strings representing two different workflow frontmatter hashes.
-	seed1 := "aaaa0000bbbb1111cccc2222dddd3333eeee4444ffff5555000011112222333344"
-	seed2 := "1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef"
-
-	// Different seeds with the same name must produce different delimiters
-	delim1 := GenerateHeredocDelimiterFromSeed("PROMPT", seed1)
-	delim2 := GenerateHeredocDelimiterFromSeed("PROMPT", seed2)
-
-	assert.NotEqual(t, delim1, delim2, "Different seeds should produce different delimiters")
+func TestGenerateHeredocDelimiterFromContent_EmptyName(t *testing.T) {
+	// Empty name should produce GH_AW_<16hex>_EOF (no name segment).
+	result := GenerateHeredocDelimiterFromContent("", "some content")
+	pattern := regexp.MustCompile(`^GH_AW_[0-9a-f]{16}_EOF$`)
+	assert.True(t, pattern.MatchString(result), "Empty-name content delimiter should match GH_AW_<hex>_EOF, got %q", result)
 }
 
-func TestGenerateHeredocDelimiterFromSeed_EmptySeedFallback(t *testing.T) {
-	// Empty seed should fall back to crypto/rand — each call returns a different value
-	result1 := GenerateHeredocDelimiterFromSeed("PROMPT", "")
-	result2 := GenerateHeredocDelimiterFromSeed("PROMPT", "")
+func TestGenerateHeredocDelimiterFromContent_EmptyContent(t *testing.T) {
+	// Empty content should still produce a valid, stable delimiter.
+	result1 := GenerateHeredocDelimiterFromContent("PROMPT", "")
+	result2 := GenerateHeredocDelimiterFromContent("PROMPT", "")
+	assert.Equal(t, result1, result2, "Empty content should produce a stable delimiter")
 
 	pattern := regexp.MustCompile(`^GH_AW_PROMPT_[0-9a-f]{16}_EOF$`)
-	assert.True(t, pattern.MatchString(result1), "Empty-seed delimiter should match expected format, got %q", result1)
-	assert.True(t, pattern.MatchString(result2), "Empty-seed delimiter should match expected format, got %q", result2)
-	assert.NotEqual(t, result1, result2, "Empty-seed should produce unique (random) delimiters")
+	assert.True(t, pattern.MatchString(result1), "Empty-content delimiter should match expected format, got %q", result1)
 }
 
-func TestGenerateHeredocDelimiterFromSeed_EmptyName(t *testing.T) {
-	// Sample SHA-256 hex string representing a typical workflow frontmatter hash.
-	seed := "49266e50774d7e6a8b1c50f64b2f790c214dcdcf7b75b6bc8478bb43257b9863"
-
-	// Empty name should produce GH_AW_<16hex>_EOF (no name segment)
-	result := GenerateHeredocDelimiterFromSeed("", seed)
-	pattern := regexp.MustCompile(`^GH_AW_[0-9a-f]{16}_EOF$`)
-	assert.True(t, pattern.MatchString(result), "Empty-name seeded delimiter should match GH_AW_<hex>_EOF, got %q", result)
+func TestGenerateHeredocDelimiterFromContent_NameCaseNormalized(t *testing.T) {
+	// Name should be uppercased, so mixed and upper case produce the same delimiter.
+	lower := GenerateHeredocDelimiterFromContent("prompt", "content")
+	upper := GenerateHeredocDelimiterFromContent("PROMPT", "content")
+	assert.Equal(t, lower, upper, "Name casing should be normalised to uppercase")
 }
 
 func TestValidateHeredocContent(t *testing.T) {

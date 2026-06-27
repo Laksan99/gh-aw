@@ -111,6 +111,23 @@ func TestClaudeEngineHasSecretValidation(t *testing.T) {
 	}
 }
 
+func TestClaudeEngineWIFSkipsSecretValidation(t *testing.T) {
+	engine := NewClaudeEngine()
+	workflowData := &WorkflowData{
+		EngineConfig: &EngineConfig{
+			Auth: &EngineAuthConfig{
+				Type:     "github-oidc",
+				Provider: "anthropic",
+			},
+		},
+	}
+
+	step := engine.GetSecretValidationStep(workflowData)
+	if len(step) != 0 {
+		t.Errorf("Expected empty secret validation step for Anthropic WIF, got %d entries", len(step))
+	}
+}
+
 func TestCopilotEngineHasSecretValidation(t *testing.T) {
 	engine := NewCopilotEngine()
 	workflowData := &WorkflowData{}
@@ -161,6 +178,22 @@ func TestCopilotEngineSkipsSecretValidationWhenBYOKBearerTokenSet(t *testing.T) 
 	step := engine.GetSecretValidationStep(workflowData)
 	if len(step) != 0 {
 		t.Errorf("Expected empty validation step when BYOK COPILOT_PROVIDER_BEARER_TOKEN is set, got:\n%s", strings.Join(step, "\n"))
+	}
+}
+
+func TestCopilotEngineSkipsSecretValidationWhenBYOKBaseURLOnlySet(t *testing.T) {
+	engine := NewCopilotEngine()
+	workflowData := &WorkflowData{
+		EngineConfig: &EngineConfig{
+			Env: map[string]string{
+				"COPILOT_PROVIDER_BASE_URL": "http://localhost:11434/v1",
+			},
+		},
+	}
+
+	step := engine.GetSecretValidationStep(workflowData)
+	if len(step) != 0 {
+		t.Errorf("Expected empty validation step when BYOK COPILOT_PROVIDER_BASE_URL is set, got:\n%s", strings.Join(step, "\n"))
 	}
 }
 

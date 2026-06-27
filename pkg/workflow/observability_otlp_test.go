@@ -151,6 +151,185 @@ func TestGetOTLPEndpointEnvValue(t *testing.T) {
 	}
 }
 
+func TestGetOTLPIfMissingMode(t *testing.T) {
+	t.Run("uses parsed frontmatter value", func(t *testing.T) {
+		got := getOTLPIfMissingMode(&FrontmatterConfig{
+			Observability: &ObservabilityConfig{
+				OTLP: &OTLPConfig{IfMissing: "ignore"},
+			},
+		}, nil)
+		assert.Equal(t, "ignore", got)
+	})
+
+	t.Run("returns warn for parsed if-missing warn", func(t *testing.T) {
+		got := getOTLPIfMissingMode(&FrontmatterConfig{
+			Observability: &ObservabilityConfig{
+				OTLP: &OTLPConfig{IfMissing: "warn"},
+			},
+		}, nil)
+		assert.Equal(t, "warn", got)
+	})
+
+	t.Run("returns error for parsed if-missing error", func(t *testing.T) {
+		got := getOTLPIfMissingMode(&FrontmatterConfig{
+			Observability: &ObservabilityConfig{
+				OTLP: &OTLPConfig{IfMissing: "error"},
+			},
+		}, nil)
+		assert.Equal(t, "error", got)
+	})
+
+	t.Run("falls back to raw frontmatter if-missing value", func(t *testing.T) {
+		got := getOTLPIfMissingMode(nil, map[string]any{
+			"observability": map[string]any{
+				"otlp": map[string]any{
+					"if-missing": "ignore",
+				},
+			},
+		})
+		assert.Equal(t, "ignore", got)
+	})
+
+	t.Run("falls back to raw frontmatter warn value", func(t *testing.T) {
+		got := getOTLPIfMissingMode(nil, map[string]any{
+			"observability": map[string]any{
+				"otlp": map[string]any{
+					"if-missing": "warn",
+				},
+			},
+		})
+		assert.Equal(t, "warn", got)
+	})
+
+	t.Run("returns empty for invalid raw frontmatter value", func(t *testing.T) {
+		got := getOTLPIfMissingMode(nil, map[string]any{
+			"observability": map[string]any{
+				"otlp": map[string]any{
+					"if-missing": "ignor",
+				},
+			},
+		})
+		assert.Empty(t, got)
+	})
+
+	t.Run("returns empty when unset", func(t *testing.T) {
+		got := getOTLPIfMissingMode(nil, map[string]any{
+			"observability": map[string]any{
+				"otlp": map[string]any{},
+			},
+		})
+		assert.Empty(t, got)
+	})
+}
+
+func TestGetOTLPGitHubApp(t *testing.T) {
+	t.Run("returns parsed github-app config", func(t *testing.T) {
+		got := getOTLPGitHubApp(&FrontmatterConfig{
+			Observability: &ObservabilityConfig{
+				OTLP: &OTLPConfig{
+					GitHubApp: &OTLPGitHubAppConfig{
+						Audience: "https://collector.example.com",
+					},
+				},
+			},
+		}, nil)
+		require.NotNil(t, got)
+		assert.Equal(t, "https://collector.example.com", got.Audience)
+	})
+
+	t.Run("returns raw github-app config", func(t *testing.T) {
+		got := getOTLPGitHubApp(nil, map[string]any{
+			"observability": map[string]any{
+				"otlp": map[string]any{
+					"github-app": map[string]any{
+						"audience": "api://AzureADTokenExchange",
+					},
+				},
+			},
+		})
+		require.NotNil(t, got)
+		assert.Equal(t, "api://AzureADTokenExchange", got.Audience)
+	})
+
+	t.Run("returns nil when github-app is missing", func(t *testing.T) {
+		got := getOTLPGitHubApp(nil, map[string]any{
+			"observability": map[string]any{
+				"otlp": map[string]any{},
+			},
+		})
+		assert.Nil(t, got)
+	})
+
+	t.Run("returns nil for invalid raw structure", func(t *testing.T) {
+		assert.Nil(t, getOTLPGitHubApp(nil, map[string]any{
+			"observability": "invalid",
+		}))
+		assert.Nil(t, getOTLPGitHubApp(nil, map[string]any{
+			"observability": map[string]any{
+				"otlp": "invalid",
+			},
+		}))
+		assert.Nil(t, getOTLPGitHubApp(nil, map[string]any{
+			"observability": map[string]any{
+				"otlp": map[string]any{
+					"github-app": "invalid",
+				},
+			},
+		}))
+	})
+}
+
+func TestHasOTLPGitHubOIDCAuth(t *testing.T) {
+	assert.True(t, hasOTLPGitHubOIDCAuth(&FrontmatterConfig{
+		Observability: &ObservabilityConfig{
+			OTLP: &OTLPConfig{
+				GitHubApp: &OTLPGitHubAppConfig{},
+			},
+		},
+	}, nil))
+
+	assert.True(t, hasOTLPGitHubOIDCAuth(nil, map[string]any{
+		"observability": map[string]any{
+			"otlp": map[string]any{
+				"github-app": map[string]any{},
+			},
+		},
+	}))
+
+	assert.False(t, hasOTLPGitHubOIDCAuth(nil, map[string]any{
+		"observability": map[string]any{
+			"otlp": map[string]any{},
+		},
+	}))
+
+	assert.False(t, hasOTLPGitHubOIDCAuth(nil, map[string]any{
+		"observability": map[string]any{
+			"otlp": map[string]any{
+				"github-app": map[string]any{
+					"app-id":      "${{ vars.APP_ID }}",
+					"private-key": "${{ secrets.APP_PRIVATE_KEY }}",
+				},
+			},
+		},
+	}))
+}
+
+func TestGetOTLPGitHubAppTokenConfig(t *testing.T) {
+	got := getOTLPGitHubAppTokenConfig(map[string]any{
+		"observability": map[string]any{
+			"otlp": map[string]any{
+				"github-app": map[string]any{
+					"app-id":      "${{ vars.APP_ID }}",
+					"private-key": "${{ secrets.APP_PRIVATE_KEY }}",
+				},
+			},
+		},
+	})
+	require.NotNil(t, got)
+	assert.Equal(t, "${{ vars.APP_ID }}", got.AppID)
+	assert.Equal(t, "${{ secrets.APP_PRIVATE_KEY }}", got.PrivateKey)
+}
+
 // TestInjectOTLPConfig verifies that injectOTLPConfig correctly modifies WorkflowData.
 func TestInjectOTLPConfig(t *testing.T) {
 	newCompiler := func() *Compiler { return &Compiler{} }
@@ -193,7 +372,40 @@ func TestInjectOTLPConfig(t *testing.T) {
 		require.NotEmpty(t, wd.Env, "Env should be set")
 		assert.Contains(t, wd.Env, "OTEL_EXPORTER_OTLP_ENDPOINT: ${{ secrets.OTLP_ENDPOINT }}", "should contain endpoint var")
 		assert.Contains(t, wd.Env, "OTEL_SERVICE_NAME: gh-aw", "should contain service name")
-		assert.Contains(t, wd.Env, "COPILOT_OTEL_FILE_EXPORTER_PATH: /tmp/gh-aw/copilot-otel.jsonl", "should configure Copilot OTEL file exporter path")
+	})
+
+	t.Run("injects if-missing env var when if-missing is set to ignore", func(t *testing.T) {
+		c := newCompiler()
+		wd := &WorkflowData{
+			ParsedFrontmatter: &FrontmatterConfig{
+				Observability: &ObservabilityConfig{
+					OTLP: &OTLPConfig{
+						Endpoint:  "${{ secrets.OTLP_ENDPOINT }}",
+						IfMissing: "ignore",
+					},
+				},
+			},
+		}
+		c.injectOTLPConfig(wd)
+		require.NotEmpty(t, wd.Env)
+		assert.Contains(t, wd.Env, "GH_AW_OTLP_IF_MISSING: ignore")
+	})
+
+	t.Run("injects if-missing env var when if-missing is set to warn", func(t *testing.T) {
+		c := newCompiler()
+		wd := &WorkflowData{
+			ParsedFrontmatter: &FrontmatterConfig{
+				Observability: &ObservabilityConfig{
+					OTLP: &OTLPConfig{
+						Endpoint:  "${{ secrets.OTLP_ENDPOINT }}",
+						IfMissing: "warn",
+					},
+				},
+			},
+		}
+		c.injectOTLPConfig(wd)
+		require.NotEmpty(t, wd.Env)
+		assert.Contains(t, wd.Env, "GH_AW_OTLP_IF_MISSING: warn")
 	})
 
 	t.Run("adds domain to new NetworkPermissions and injects env vars for static URL", func(t *testing.T) {
@@ -213,8 +425,126 @@ func TestInjectOTLPConfig(t *testing.T) {
 		require.NotEmpty(t, wd.Env, "Env should be set")
 		assert.Contains(t, wd.Env, "OTEL_EXPORTER_OTLP_ENDPOINT: https://traces.example.com:4317")
 		assert.Contains(t, wd.Env, "OTEL_SERVICE_NAME: gh-aw")
-		assert.Contains(t, wd.Env, "COPILOT_OTEL_FILE_EXPORTER_PATH: /tmp/gh-aw/copilot-otel.jsonl")
 		assert.True(t, strings.HasPrefix(wd.Env, "env:"), "Env should start with 'env:'")
+	})
+
+	t.Run("injects OTEL_RESOURCE_ATTRIBUTES with gh-aw context and engine id", func(t *testing.T) {
+		c := newCompiler()
+		wd := &WorkflowData{
+			AI: "copilot",
+			ParsedFrontmatter: &FrontmatterConfig{
+				Observability: &ObservabilityConfig{
+					OTLP: &OTLPConfig{Endpoint: "https://traces.example.com:4317"},
+				},
+			},
+		}
+		c.injectOTLPConfig(wd)
+
+		assert.Contains(
+			t,
+			wd.Env,
+			"OTEL_RESOURCE_ATTRIBUTES: 'gh-aw.workflow.name=unknown,gh-aw.repository=${{ github.repository }},gh-aw.run.id=${{ github.run_id }},github.run_id=${{ github.run_id }},gh-aw.engine.id=copilot'",
+		)
+	})
+
+	t.Run("injects OTEL_RESOURCE_ATTRIBUTES without engine id when unavailable", func(t *testing.T) {
+		c := newCompiler()
+		wd := &WorkflowData{
+			ParsedFrontmatter: &FrontmatterConfig{
+				Observability: &ObservabilityConfig{
+					OTLP: &OTLPConfig{Endpoint: "https://traces.example.com:4317"},
+				},
+			},
+		}
+		c.injectOTLPConfig(wd)
+
+		assert.Contains(
+			t,
+			wd.Env,
+			"OTEL_RESOURCE_ATTRIBUTES: 'gh-aw.workflow.name=unknown,gh-aw.repository=${{ github.repository }},gh-aw.run.id=${{ github.run_id }},github.run_id=${{ github.run_id }}'",
+		)
+		assert.NotContains(t, wd.Env, "gh-aw.engine.id=")
+	})
+
+	t.Run("percent-encodes OTEL_RESOURCE_ATTRIBUTES engine id value", func(t *testing.T) {
+		c := newCompiler()
+		wd := &WorkflowData{
+			AI: `copilot,eq=uals\slash`,
+			ParsedFrontmatter: &FrontmatterConfig{
+				Observability: &ObservabilityConfig{
+					OTLP: &OTLPConfig{Endpoint: "https://traces.example.com:4317"},
+				},
+			},
+		}
+		c.injectOTLPConfig(wd)
+
+		assert.Contains(
+			t,
+			wd.Env,
+			`gh-aw.engine.id=copilot%2Ceq%3Duals%5Cslash`,
+		)
+	})
+
+	t.Run("percent-encodes OTEL_RESOURCE_ATTRIBUTES workflow name value", func(t *testing.T) {
+		c := newCompiler()
+		wd := &WorkflowData{
+			Name: "triage weekly,run\\v2",
+			ParsedFrontmatter: &FrontmatterConfig{
+				Observability: &ObservabilityConfig{
+					OTLP: &OTLPConfig{Endpoint: "https://traces.example.com:4317"},
+				},
+			},
+		}
+		c.injectOTLPConfig(wd)
+
+		assert.Contains(t, wd.Env, `gh-aw.workflow.name=triage%20weekly%2Crun%5Cv2`)
+	})
+
+	t.Run("percent-encodes apostrophes in OTEL_RESOURCE_ATTRIBUTES values", func(t *testing.T) {
+		c := newCompiler()
+		wd := &WorkflowData{
+			Name: "owner's workflow",
+			ParsedFrontmatter: &FrontmatterConfig{
+				Observability: &ObservabilityConfig{
+					OTLP: &OTLPConfig{Endpoint: "https://traces.example.com:4317"},
+				},
+			},
+		}
+		c.injectOTLPConfig(wd)
+
+		assert.Contains(t, wd.Env, "OTEL_RESOURCE_ATTRIBUTES:", "resource attributes should be injected")
+		assert.Contains(
+			t,
+			wd.Env,
+			"OTEL_RESOURCE_ATTRIBUTES: 'gh-aw.workflow.name=owner%27s%20workflow,gh-aw.repository=${{ github.repository }},gh-aw.run.id=${{ github.run_id }},github.run_id=${{ github.run_id }}'",
+			"resource attributes should remain fully single-quoted after percent-encoding",
+		)
+	})
+
+	t.Run("appends custom OTLP resource attributes", func(t *testing.T) {
+		c := newCompiler()
+		wd := &WorkflowData{
+			AI:   "copilot",
+			Name: "triage weekly",
+			ParsedFrontmatter: &FrontmatterConfig{
+				Observability: &ObservabilityConfig{
+					OTLP: &OTLPConfig{
+						Endpoint: "https://traces.example.com:4317",
+						ResourceAttributes: map[string]string{
+							"my.actor":       "${{ github.actor }}",
+							"my.target repo": "owner/repo,weekly",
+						},
+					},
+				},
+			},
+		}
+		c.injectOTLPConfig(wd)
+
+		assert.Contains(
+			t,
+			wd.Env,
+			"OTEL_RESOURCE_ATTRIBUTES: 'gh-aw.workflow.name=triage%20weekly,gh-aw.repository=${{ github.repository }},gh-aw.run.id=${{ github.run_id }},github.run_id=${{ github.run_id }},gh-aw.engine.id=copilot,my.actor=${{ github.actor }},my.target%20repo=owner%2Frepo%2Cweekly'",
+		)
 	})
 
 	t.Run("appends domain to existing NetworkPermissions.Allowed", func(t *testing.T) {
@@ -255,9 +585,10 @@ func TestInjectOTLPConfig(t *testing.T) {
 		assert.Equal(t, 1, strings.Count(wd.Env, "env:"), "should have exactly one env: key")
 	})
 
-	t.Run("OTEL_SERVICE_NAME is always gh-aw", func(t *testing.T) {
+	t.Run("OTEL_SERVICE_NAME includes sanitized workflow ID when available", func(t *testing.T) {
 		c := newCompiler()
 		wd := &WorkflowData{
+			WorkflowID: "Repo Triage/Weekly",
 			ParsedFrontmatter: &FrontmatterConfig{
 				Observability: &ObservabilityConfig{
 					OTLP: &OTLPConfig{Endpoint: "https://otel.corp.com"},
@@ -265,7 +596,7 @@ func TestInjectOTLPConfig(t *testing.T) {
 			},
 		}
 		c.injectOTLPConfig(wd)
-		assert.Contains(t, wd.Env, "OTEL_SERVICE_NAME: gh-aw", "service name should always be gh-aw")
+		assert.Contains(t, wd.Env, "OTEL_SERVICE_NAME: gh-aw.repo-triage-weekly", "service name should include sanitized workflow ID")
 	})
 
 	t.Run("injects OTEL_EXPORTER_OTLP_HEADERS when headers are configured", func(t *testing.T) {
@@ -417,10 +748,31 @@ func TestObservabilityConfigParsing(t *testing.T) {
 			require.NotNil(t, config.Observability.OTLP, "OTLP should not be nil")
 			assert.Equal(t, tt.expectedEndpoint, config.Observability.OTLP.Endpoint, "Endpoint should match")
 			// Normalize Headers (any) to string for comparison
-			normalizedHeaders := normalizeOTLPHeaders(config.Observability.OTLP.Headers)
+			normalizedHeaders := normalizeOTLPHeadersForEndpoint(config.Observability.OTLP.Headers, "")
 			assert.Equal(t, tt.expectedHeaders, normalizedHeaders, "Headers should match")
 		})
 	}
+}
+
+func TestObservabilityConfigParsing_OTLPResourceAttributes(t *testing.T) {
+	config, err := ParseFrontmatterConfig(map[string]any{
+		"observability": map[string]any{
+			"otlp": map[string]any{
+				"resource-attributes": map[string]any{
+					"my.target-repo": "${{ github.repository }}",
+					"my.event":       "repository_dispatch",
+				},
+			},
+		},
+	})
+	require.NoError(t, err)
+	require.NotNil(t, config)
+	require.NotNil(t, config.Observability)
+	require.NotNil(t, config.Observability.OTLP)
+	assert.Equal(t, map[string]string{
+		"my.target-repo": "${{ github.repository }}",
+		"my.event":       "repository_dispatch",
+	}, config.Observability.OTLP.ResourceAttributes)
 }
 
 // TestInjectOTLPConfig_RawFrontmatterFallback verifies that injectOTLPConfig works
@@ -556,6 +908,128 @@ func TestInjectOTLPConfig_HeadersPresenceAfterInjection(t *testing.T) {
 	})
 }
 
+// TestIsOTLPAttributesPresent verifies that isOTLPAttributesPresent correctly detects
+// whether GH_AW_OTLP_ATTRIBUTES is present in the workflow env block.
+func TestIsOTLPAttributesPresent(t *testing.T) {
+	tests := []struct {
+		name     string
+		data     *WorkflowData
+		expected bool
+	}{
+		{
+			name:     "nil WorkflowData returns false",
+			data:     nil,
+			expected: false,
+		},
+		{
+			name:     "empty Env returns false",
+			data:     &WorkflowData{},
+			expected: false,
+		},
+		{
+			name: "Env without GH_AW_OTLP_ATTRIBUTES returns false",
+			data: &WorkflowData{
+				Env: "env:\n  OTEL_EXPORTER_OTLP_ENDPOINT: https://traces.example.com\n  OTEL_SERVICE_NAME: gh-aw",
+			},
+			expected: false,
+		},
+		{
+			name: "Env with GH_AW_OTLP_ATTRIBUTES returns true",
+			data: &WorkflowData{
+				Env: `env:
+  OTEL_EXPORTER_OTLP_ENDPOINT: https://traces.example.com
+  OTEL_SERVICE_NAME: gh-aw
+  GH_AW_OTLP_ATTRIBUTES: '{"langfuse.session.id":"abc"}'`,
+			},
+			expected: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := isOTLPAttributesPresent(tt.data)
+			assert.Equal(t, tt.expected, got, "isOTLPAttributesPresent")
+		})
+	}
+}
+
+// TestGenerateOTLPAttributesMaskStep verifies that generateOTLPAttributesMaskStep
+// emits a step that delegates to mask_otlp_attributes.sh.
+func TestGenerateOTLPAttributesMaskStep(t *testing.T) {
+	step := generateOTLPAttributesMaskStep()
+
+	assert.Contains(t, step, "- name: Mask OTLP custom attribute values", "should have the masking step name")
+	assert.Contains(t, step, "mask_otlp_attributes.sh", "should delegate to the mask_otlp_attributes.sh script")
+	assert.Contains(t, step, "${RUNNER_TEMP}/gh-aw/actions/", "should reference the runtime actions directory")
+}
+
+// TestInjectOTLPConfig_AttributesPresenceAfterInjection verifies that
+// isOTLPAttributesPresent returns true after injectOTLPConfig injects attributes.
+func TestInjectOTLPConfig_AttributesPresenceAfterInjection(t *testing.T) {
+	t.Run("isOTLPAttributesPresent returns true after attributes are injected", func(t *testing.T) {
+		c := &Compiler{}
+		wd := &WorkflowData{
+			ParsedFrontmatter: &FrontmatterConfig{
+				Observability: &ObservabilityConfig{
+					OTLP: &OTLPConfig{
+						Endpoint: "https://traces.example.com",
+						Attributes: map[string]string{
+							"langfuse.session.id": "my-session",
+						},
+					},
+				},
+			},
+		}
+		c.injectOTLPConfig(wd)
+		assert.True(t, isOTLPAttributesPresent(wd), "isOTLPAttributesPresent should return true after attributes are injected")
+	})
+
+	t.Run("isOTLPAttributesPresent returns false when no attributes are configured", func(t *testing.T) {
+		c := &Compiler{}
+		wd := &WorkflowData{
+			ParsedFrontmatter: &FrontmatterConfig{
+				Observability: &ObservabilityConfig{
+					OTLP: &OTLPConfig{
+						Endpoint: "https://traces.example.com",
+					},
+				},
+			},
+		}
+		c.injectOTLPConfig(wd)
+		assert.False(t, isOTLPAttributesPresent(wd), "isOTLPAttributesPresent should return false when no attributes are configured")
+	})
+}
+
+func TestOTELServiceName(t *testing.T) {
+	t.Run("uses workflow-specific service name when workflow ID is present", func(t *testing.T) {
+		got := otelServiceName(&WorkflowData{WorkflowID: "Repo Triage/Weekly"})
+		assert.Equal(t, "gh-aw.repo-triage-weekly", got, "should use WorkflowID as service name suffix when present")
+	})
+
+	t.Run("falls back to workflow name when workflow ID is empty", func(t *testing.T) {
+		got := otelServiceName(&WorkflowData{Name: "Repo Triage/Weekly"})
+		assert.Equal(t, "gh-aw.repo-triage-weekly", got, "should fall back to workflow name when WorkflowID is empty")
+	})
+
+	t.Run("workflow ID takes precedence over workflow name", func(t *testing.T) {
+		got := otelServiceName(&WorkflowData{
+			WorkflowID: "Unique Workflow ID",
+			Name:       "Shared Display Name",
+		})
+		assert.Equal(t, "gh-aw.unique-workflow-id", got, "should prefer WorkflowID over workflow name when both are present")
+	})
+
+	t.Run("falls back when workflow ID and name are empty", func(t *testing.T) {
+		got := otelServiceName(&WorkflowData{})
+		assert.Equal(t, "gh-aw", got, "should return default service name when WorkflowID and name are empty")
+	})
+
+	t.Run("falls back when workflow data is nil", func(t *testing.T) {
+		got := otelServiceName(nil)
+		assert.Equal(t, "gh-aw", got, "should return default service name when workflow data is nil")
+	})
+}
+
 // TestInjectOTLPConfig_OTLPEndpointField verifies that injectOTLPConfig sets workflowData.OTLPEndpoint
 // so that downstream code (buildMCPGatewayConfig, mcp_setup_generator) can use it as the
 // single source of truth for "is OTLP configured?" without re-reading raw frontmatter.
@@ -585,7 +1059,7 @@ func TestInjectOTLPConfig_OTLPEndpointField(t *testing.T) {
 	})
 
 	t.Run("sets OTLPEndpoint from imported observability merged into RawFrontmatter", func(t *testing.T) {
-		// Simulate what compiler_orchestrator_workflow.go does when importing shared/observability-otlp.md:
+		// Simulate what compiler_orchestrator_workflow.go does when importing shared/otlp.md:
 		// the imported observability JSON is decoded and injected into RawFrontmatter before injectOTLPConfig runs.
 		wd := &WorkflowData{
 			RawFrontmatter: map[string]any{
@@ -652,78 +1126,72 @@ func TestInjectOTLPConfig_OTLPHeadersField(t *testing.T) {
 	})
 }
 
-// TestNormalizeOTLPHeaders verifies the normalizeOTLPHeaders helper function.
-func TestNormalizeOTLPHeaders(t *testing.T) {
+func TestNormalizeOTLPHeadersForEndpoint(t *testing.T) {
+	t.Run("rewrites Authorization header for sentry URL", func(t *testing.T) {
+		gotHeaders := normalizeOTLPHeadersForEndpoint(
+			map[string]any{"Authorization": "Bearer tok"},
+			"https://o123.ingest.sentry.io/api/123/envelope/",
+		)
+		assert.Equal(t, "x-sentry-auth=Bearer tok", gotHeaders, "Sentry endpoints should use x-sentry-auth")
+	})
+
+	t.Run("rewrites Authorization header for known sentry endpoint expression", func(t *testing.T) {
+		gotHeaders := normalizeOTLPHeadersForEndpoint(
+			"Authorization=Bearer tok,X-Tenant=acme",
+			"${{ secrets.GH_AW_OTEL_SENTRY_ENDPOINT }}",
+		)
+		assert.Equal(t, "x-sentry-auth=Bearer tok,X-Tenant=acme", gotHeaders, "Sentry-named endpoint expressions should use x-sentry-auth")
+	})
+
+	t.Run("rewrites Authorization header for sentry URL with additional headers", func(t *testing.T) {
+		gotHeaders := normalizeOTLPHeadersForEndpoint(
+			"Authorization=Bearer tok,X-Tenant=acme",
+			"https://o123.ingest.sentry.io/api/123/envelope/",
+		)
+		assert.Equal(t, "x-sentry-auth=Bearer tok,X-Tenant=acme", gotHeaders, "Sentry endpoints should rewrite Authorization while preserving additional headers")
+	})
+
+	t.Run("preserves Authorization header for non-standard sentry endpoint expressions", func(t *testing.T) {
+		gotHeaders := normalizeOTLPHeadersForEndpoint(
+			"Authorization=Bearer tok,X-Tenant=acme",
+			"${{ secrets.TEAM_SENTRY_PROXY_ENDPOINT }}",
+		)
+		assert.Equal(t, "Authorization=Bearer tok,X-Tenant=acme", gotHeaders, "Only the known Sentry endpoint expression should use x-sentry-auth")
+	})
+
+	t.Run("preserves Authorization header for grafana endpoint", func(t *testing.T) {
+		gotHeaders := normalizeOTLPHeadersForEndpoint(
+			map[string]any{"Authorization": "Bearer tok", "X-Scope-OrgID": "tenant"},
+			"https://otlp-gateway-prod-us-central-0.grafana.net/otlp",
+		)
+		assert.Equal(t, "Authorization=Bearer tok,X-Scope-OrgID=tenant", gotHeaders, "Non-Sentry endpoints should keep Authorization")
+	})
+
+	t.Run("preserves Authorization header when sentry appears outside URL host", func(t *testing.T) {
+		gotHeaders := normalizeOTLPHeadersForEndpoint(
+			"Authorization=Bearer tok,X-Tenant=acme",
+			"https://otlp-gateway-prod-us-central-0.grafana.net/sentry/proxy",
+		)
+		assert.Equal(t, "Authorization=Bearer tok,X-Tenant=acme", gotHeaders, "Only Sentry hosts should use x-sentry-auth")
+	})
+}
+
+func TestIsGitHubActionsExpression(t *testing.T) {
 	tests := []struct {
-		name            string
-		input           any
-		expectedHeaders string
+		name     string
+		input    string
+		expected bool
 	}{
-		{
-			name:            "nil returns empty",
-			input:           nil,
-			expectedHeaders: "",
-		},
-		{
-			name:            "empty string returns empty",
-			input:           "",
-			expectedHeaders: "",
-		},
-		{
-			name:            "non-empty string returns string",
-			input:           "Authorization=Bearer tok",
-			expectedHeaders: "Authorization=Bearer tok",
-		},
-		{
-			name:            "secret expression string",
-			input:           "${{ secrets.OTLP_HEADERS }}",
-			expectedHeaders: "${{ secrets.OTLP_HEADERS }}",
-		},
-		{
-			name:            "empty map returns empty",
-			input:           map[string]any{},
-			expectedHeaders: "",
-		},
-		{
-			name:            "single-entry map",
-			input:           map[string]any{"Authorization": "Bearer tok"},
-			expectedHeaders: "Authorization=Bearer tok",
-		},
-		{
-			name: "multi-entry map sorts keys deterministically",
-			input: map[string]any{
-				"X-Tenant":      "acme",
-				"Authorization": "Bearer tok",
-			},
-			expectedHeaders: "Authorization=Bearer tok,X-Tenant=acme",
-		},
-		{
-			name: "map with secret expression value",
-			input: map[string]any{
-				"Authorization": "${{ secrets.TOKEN }}",
-				"X-Tenant":      "acme",
-			},
-			expectedHeaders: "Authorization=${{ secrets.TOKEN }},X-Tenant=acme",
-		},
-		{
-			name:            "unsupported type returns empty",
-			input:           42,
-			expectedHeaders: "",
-		},
-		{
-			name: "non-string map values are skipped",
-			input: map[string]any{
-				"Authorization": "Bearer tok",
-				"bad-value":     123, // non-string: skipped
-			},
-			expectedHeaders: "Authorization=Bearer tok",
-		},
+		{name: "valid expression", input: "${{ secrets.FOO }}", expected: true},
+		{name: "valid expression with surrounding whitespace", input: "  ${{ secrets.FOO }}  ", expected: true},
+		{name: "missing suffix", input: "${{ secrets.FOO }", expected: false},
+		{name: "missing prefix", input: "secrets.FOO }}", expected: false},
+		{name: "plain string", input: "https://o123.ingest.sentry.io/api/123/envelope/", expected: false},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			gotHeaders := normalizeOTLPHeaders(tt.input)
-			assert.Equal(t, tt.expectedHeaders, gotHeaders, "headers should match")
+			assert.Equal(t, tt.expected, isGitHubActionsExpression(tt.input))
 		})
 	}
 }
@@ -937,6 +1405,29 @@ func TestCollectAllOTLPEndpoints(t *testing.T) {
 			},
 		},
 		{
+			name: "array form: sentry endpoint rewrites Authorization while grafana keeps it",
+			frontmatter: map[string]any{
+				"observability": map[string]any{
+					"otlp": map[string]any{
+						"endpoint": []any{
+							map[string]any{
+								"url":     "${{ secrets.GH_AW_OTEL_SENTRY_ENDPOINT }}",
+								"headers": map[string]any{"Authorization": "Bearer sentry-token"},
+							},
+							map[string]any{
+								"url":     "${{ secrets.GH_AW_OTEL_GRAFANA_ENDPOINT }}",
+								"headers": map[string]any{"Authorization": "Bearer grafana-token"},
+							},
+						},
+					},
+				},
+			},
+			wantEntries: []otlpEndpointEntry{
+				{URL: "${{ secrets.GH_AW_OTEL_SENTRY_ENDPOINT }}", Headers: "x-sentry-auth=Bearer sentry-token"},
+				{URL: "${{ secrets.GH_AW_OTEL_GRAFANA_ENDPOINT }}", Headers: "Authorization=Bearer grafana-token"},
+			},
+		},
+		{
 			name: "array form: entries with empty URL are skipped",
 			frontmatter: map[string]any{
 				"observability": map[string]any{
@@ -1114,6 +1605,31 @@ func TestInjectOTLPConfig_MultipleEndpoints(t *testing.T) {
 
 		assert.Contains(t, wd.Env, "GH_AW_OTLP_ALL_HEADERS:", "all-headers env var should be injected for multiple endpoints")
 		assert.True(t, isOTLPHeadersPresent(wd), "isOTLPHeadersPresent should detect GH_AW_OTLP_ALL_HEADERS")
+	})
+
+	t.Run("rewrites sentry auth header without changing grafana auth header", func(t *testing.T) {
+		wd := &WorkflowData{
+			RawFrontmatter: map[string]any{
+				"observability": map[string]any{
+					"otlp": map[string]any{
+						"endpoint": []any{
+							map[string]any{
+								"url":     "${{ secrets.GH_AW_OTEL_SENTRY_ENDPOINT }}",
+								"headers": map[string]any{"Authorization": "${{ secrets.GH_AW_OTEL_SENTRY_AUTHORIZATION }}"},
+							},
+							map[string]any{
+								"url":     "${{ secrets.GH_AW_OTEL_GRAFANA_ENDPOINT }}",
+								"headers": map[string]any{"Authorization": "${{ secrets.GH_AW_OTEL_GRAFANA_AUTHORIZATION }}"},
+							},
+						},
+					},
+				},
+			},
+		}
+		c.injectOTLPConfig(wd)
+
+		assert.Contains(t, wd.Env, "OTEL_EXPORTER_OTLP_HEADERS: x-sentry-auth=${{ secrets.GH_AW_OTEL_SENTRY_AUTHORIZATION }}", "primary Sentry endpoint should use x-sentry-auth with the configured header value")
+		assert.Contains(t, wd.Env, `GH_AW_OTLP_ENDPOINTS: '[{"url":"${{ secrets.GH_AW_OTEL_SENTRY_ENDPOINT }}","headers":"x-sentry-auth=${{ secrets.GH_AW_OTEL_SENTRY_AUTHORIZATION }}"},{"url":"${{ secrets.GH_AW_OTEL_GRAFANA_ENDPOINT }}","headers":"Authorization=${{ secrets.GH_AW_OTEL_GRAFANA_AUTHORIZATION }}"}]'`, "fan-out endpoints should preserve per-vendor auth headers")
 	})
 
 	t.Run("does not set GH_AW_OTLP_ALL_HEADERS for single endpoint (string form)", func(t *testing.T) {
@@ -1322,4 +1838,320 @@ func TestExtractRawOTLPEndpointMaps(t *testing.T) {
 			assert.Equal(t, tt.want, got, "extractRawOTLPEndpointMaps")
 		})
 	}
+}
+
+func TestExtractRawOTLPGitHubAppMap(t *testing.T) {
+	t.Run("returns shallow copy when github-app exists", func(t *testing.T) {
+		obs := map[string]any{
+			"otlp": map[string]any{
+				"github-app": map[string]any{
+					"audience": "api://AzureADTokenExchange",
+				},
+			},
+		}
+
+		got := extractRawOTLPGitHubAppMap(obs)
+		require.NotNil(t, got)
+		assert.Equal(t, "api://AzureADTokenExchange", got["audience"])
+
+		got["audience"] = "changed"
+		original := obs["otlp"].(map[string]any)["github-app"].(map[string]any)["audience"]
+		assert.Equal(t, "api://AzureADTokenExchange", original)
+	})
+
+	t.Run("returns nil for invalid values", func(t *testing.T) {
+		assert.Nil(t, extractRawOTLPGitHubAppMap(nil))
+		assert.Nil(t, extractRawOTLPGitHubAppMap(map[string]any{}))
+		assert.Nil(t, extractRawOTLPGitHubAppMap(map[string]any{
+			"otlp": map[string]any{
+				"github-app": "invalid",
+			},
+		}))
+	})
+}
+
+// TestCollectOTLPCustomAttributes verifies that custom attributes are read from the
+// frontmatter and returned as a map[string]string.
+func TestCollectOTLPCustomAttributes(t *testing.T) {
+	tests := []struct {
+		name        string
+		frontmatter map[string]any
+		want        map[string]string
+	}{
+		{
+			name:        "nil frontmatter returns nil",
+			frontmatter: nil,
+			want:        nil,
+		},
+		{
+			name:        "no observability key returns nil",
+			frontmatter: map[string]any{"name": "my-workflow"},
+			want:        nil,
+		},
+		{
+			name: "no otlp key in observability returns nil",
+			frontmatter: map[string]any{
+				"observability": map[string]any{},
+			},
+			want: nil,
+		},
+		{
+			name: "no attributes key in otlp returns nil",
+			frontmatter: map[string]any{
+				"observability": map[string]any{
+					"otlp": map[string]any{
+						"endpoint": "https://traces.example.com",
+					},
+				},
+			},
+			want: nil,
+		},
+		{
+			name: "empty attributes map returns nil",
+			frontmatter: map[string]any{
+				"observability": map[string]any{
+					"otlp": map[string]any{
+						"attributes": map[string]any{},
+					},
+				},
+			},
+			want: nil,
+		},
+		{
+			name: "string attributes are collected",
+			frontmatter: map[string]any{
+				"observability": map[string]any{
+					"otlp": map[string]any{
+						"endpoint": "https://traces.example.com",
+						"attributes": map[string]any{
+							"langfuse.session.id": "{{ gh-aw.episode.id }}",
+							"langfuse.user.id":    "{{ github.actor }}",
+						},
+					},
+				},
+			},
+			want: map[string]string{
+				"langfuse.session.id": "{{ gh-aw.episode.id }}",
+				"langfuse.user.id":    "{{ github.actor }}",
+			},
+		},
+		{
+			name: "non-string values are silently ignored",
+			frontmatter: map[string]any{
+				"observability": map[string]any{
+					"otlp": map[string]any{
+						"attributes": map[string]any{
+							"valid.key":  "valid-value",
+							"number.key": 42,
+							"bool.key":   true,
+						},
+					},
+				},
+			},
+			want: map[string]string{
+				"valid.key": "valid-value",
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := collectOTLPCustomAttributes(tt.frontmatter)
+			assert.Equal(t, tt.want, got)
+		})
+	}
+}
+
+func TestCollectOTLPResourceAttributes(t *testing.T) {
+	frontmatter := map[string]any{
+		"observability": map[string]any{
+			"otlp": map[string]any{
+				"resource-attributes": map[string]any{
+					"my.actor":        "${{ github.actor }}",
+					"my.target-repo":  "owner/repo",
+					"ignored.numeric": 42,
+				},
+			},
+		},
+	}
+
+	assert.Equal(t, map[string]string{
+		"my.actor":       "${{ github.actor }}",
+		"my.target-repo": "owner/repo",
+	}, collectOTLPResourceAttributes(frontmatter))
+}
+
+func TestValidateOTLPResourceAttributes(t *testing.T) {
+	tests := []struct {
+		name          string
+		workflowData  *WorkflowData
+		errorContains string
+	}{
+		{
+			name: "allows safe expressions",
+			workflowData: &WorkflowData{
+				ParsedFrontmatter: &FrontmatterConfig{
+					Observability: &ObservabilityConfig{
+						OTLP: &OTLPConfig{
+							ResourceAttributes: map[string]string{
+								"my.actor": "${{ github.actor }}",
+							},
+						},
+					},
+				},
+			},
+		},
+		{
+			name: "rejects secrets expressions",
+			workflowData: &WorkflowData{
+				RawFrontmatter: map[string]any{
+					"observability": map[string]any{
+						"otlp": map[string]any{
+							"resource-attributes": map[string]any{
+								"api.key": "${{ secrets.OTLP_KEY }}",
+							},
+						},
+					},
+				},
+			},
+			errorContains: "observability.otlp.resource-attributes.api.key must not reference secrets.* or vars.*",
+		},
+		{
+			name: "rejects vars expressions",
+			workflowData: &WorkflowData{
+				ParsedFrontmatter: &FrontmatterConfig{
+					Observability: &ObservabilityConfig{
+						OTLP: &OTLPConfig{
+							ResourceAttributes: map[string]string{
+								"tenant": "${{ vars.OTLP_TENANT }}",
+							},
+						},
+					},
+				},
+			},
+			errorContains: "observability.otlp.resource-attributes.tenant must not reference secrets.* or vars.*",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := validateOTLPResourceAttributes(tt.workflowData)
+			if tt.errorContains == "" {
+				require.NoError(t, err)
+				return
+			}
+			require.Error(t, err)
+			assert.Contains(t, err.Error(), tt.errorContains)
+		})
+	}
+}
+
+// TestInjectOTLPConfig_CustomAttributes verifies that injectOTLPConfig injects the
+// GH_AW_OTLP_ATTRIBUTES env var when observability.otlp.attributes is configured.
+func TestInjectOTLPConfig_CustomAttributes(t *testing.T) {
+	c := &Compiler{}
+
+	t.Run("injects GH_AW_OTLP_ATTRIBUTES when attributes are configured via ParsedFrontmatter", func(t *testing.T) {
+		wd := &WorkflowData{
+			ParsedFrontmatter: &FrontmatterConfig{
+				Observability: &ObservabilityConfig{
+					OTLP: &OTLPConfig{
+						Endpoint: "https://traces.example.com",
+						Attributes: map[string]string{
+							"langfuse.session.id": "{{ gh-aw.episode.id }}",
+							"langfuse.user.id":    "{{ github.actor }}",
+						},
+					},
+				},
+			},
+		}
+		c.injectOTLPConfig(wd)
+		assert.Contains(t, wd.Env, "GH_AW_OTLP_ATTRIBUTES", "should inject GH_AW_OTLP_ATTRIBUTES env var")
+		assert.Contains(t, wd.Env, "langfuse.session.id", "should include the attribute key")
+		assert.Contains(t, wd.Env, "gh-aw.episode.id", "should include the template value")
+	})
+
+	t.Run("injects GH_AW_OTLP_ATTRIBUTES when attributes are configured via RawFrontmatter", func(t *testing.T) {
+		wd := &WorkflowData{
+			RawFrontmatter: map[string]any{
+				"observability": map[string]any{
+					"otlp": map[string]any{
+						"endpoint": "https://traces.example.com",
+						"attributes": map[string]any{
+							"session.id": "{{ gh-aw.episode.id }}",
+							"user.id":    "{{ github.actor }}",
+						},
+					},
+				},
+			},
+			ParsedFrontmatter: &FrontmatterConfig{},
+		}
+		c.injectOTLPConfig(wd)
+		assert.Contains(t, wd.Env, "GH_AW_OTLP_ATTRIBUTES", "should inject GH_AW_OTLP_ATTRIBUTES env var")
+		assert.Contains(t, wd.Env, "session.id", "should include the attribute key")
+	})
+
+	t.Run("does not inject GH_AW_OTLP_ATTRIBUTES when no attributes are configured", func(t *testing.T) {
+		wd := &WorkflowData{
+			ParsedFrontmatter: &FrontmatterConfig{
+				Observability: &ObservabilityConfig{
+					OTLP: &OTLPConfig{
+						Endpoint: "https://traces.example.com",
+					},
+				},
+			},
+		}
+		c.injectOTLPConfig(wd)
+		assert.NotContains(t, wd.Env, "GH_AW_OTLP_ATTRIBUTES", "should not inject GH_AW_OTLP_ATTRIBUTES when no attributes are set")
+	})
+}
+
+// TestMergeOTLPStringMaps verifies that mergeOTLPStringMaps correctly
+// merges two attribute maps with base taking precedence.
+func TestMergeOTLPStringMaps(t *testing.T) {
+	t.Run("nil inputs return nil", func(t *testing.T) {
+		assert.Nil(t, mergeOTLPStringMaps(nil, nil))
+	})
+
+	t.Run("base only is returned as-is", func(t *testing.T) {
+		base := map[string]string{"a": "1"}
+		result := mergeOTLPStringMaps(base, nil)
+		assert.Equal(t, map[string]string{"a": "1"}, result)
+	})
+
+	t.Run("override only is returned as-is", func(t *testing.T) {
+		override := map[string]string{"b": "2"}
+		result := mergeOTLPStringMaps(nil, override)
+		assert.Equal(t, map[string]string{"b": "2"}, result)
+	})
+
+	t.Run("base keys override the same key from override", func(t *testing.T) {
+		base := map[string]string{"a": "base-value", "b": "base-b"}
+		override := map[string]string{"a": "override-value", "c": "override-c"}
+		result := mergeOTLPStringMaps(base, override)
+		require.NotNil(t, result)
+		assert.Equal(t, "base-value", result["a"], "base should win for key 'a'")
+		assert.Equal(t, "base-b", result["b"], "base-only key 'b' should be present")
+		assert.Equal(t, "override-c", result["c"], "override-only key 'c' should be present")
+	})
+}
+
+// TestEncodeOTLPCustomAttributes verifies serialisation to JSON.
+func TestEncodeOTLPCustomAttributes(t *testing.T) {
+	t.Run("nil returns empty string", func(t *testing.T) {
+		assert.Empty(t, encodeOTLPCustomAttributes(nil))
+	})
+
+	t.Run("empty map returns empty string", func(t *testing.T) {
+		assert.Empty(t, encodeOTLPCustomAttributes(map[string]string{}))
+	})
+
+	t.Run("non-empty map is valid JSON", func(t *testing.T) {
+		encoded := encodeOTLPCustomAttributes(map[string]string{
+			"langfuse.session.id": "{{ gh-aw.episode.id }}",
+		})
+		assert.NotEmpty(t, encoded)
+		assert.Contains(t, encoded, "langfuse.session.id")
+		assert.True(t, strings.HasPrefix(encoded, "{"), "should be a JSON object")
+	})
 }

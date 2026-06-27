@@ -6,9 +6,18 @@ import (
 	"os/exec"
 	"testing"
 
+	"github.com/github/gh-aw/pkg/syncutil"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
+
+// resetDockerDaemonStateForTest resets the package-level daemon state so
+// individual tests can control it without interference from earlier tests.
+// We use a zero-value assignment to clear the cached state.
+func resetDockerDaemonStateForTest() {
+	// Clear by assigning a new zero-value loader that will re-run detection on next call
+	dockerDaemonLoader = syncutil.OnceLoader[bool]{}
+}
 
 // TestValidateDockerImage_SkipsWhenDockerUnavailable verifies that
 // validateDockerImage degrades gracefully (returns nil) when Docker
@@ -111,4 +120,36 @@ func TestValidateContainerImages_RequireDockerFailsWhenUnavailable(t *testing.T)
 	compiler.SetRequireDocker(true)
 	err := compiler.validateContainerImages(workflowData)
 	require.Error(t, err, "container image validation should fail when Docker is unavailable and requireDocker is true")
+}
+
+// TestMarkDockerDaemonUnavailable_UpdatesState verifies that markDockerDaemonUnavailable
+// updates the cached daemon state so subsequent calls to isDockerDaemonRunning return false.
+func TestMarkDockerDaemonUnavailable_UpdatesState(t *testing.T) {
+	t.Cleanup(resetDockerDaemonStateForTest)
+
+	// Seed the cache as "available"
+	dockerDaemonLoader.Override(true, nil)
+
+	assert.True(t, isDockerDaemonRunning(), "daemon should appear available before marking unavailable")
+
+	markDockerDaemonUnavailable()
+
+	assert.False(t, isDockerDaemonRunning(), "daemon should appear unavailable after markDockerDaemonUnavailable")
+}
+
+// TestMarkDockerDaemonUnavailable_SkipsSubsequentValidation verifies that once the daemon
+// is marked unavailable, validateDockerImage returns nil for additional images immediately,
+// without attempting further docker commands.
+func TestMarkDockerDaemonUnavailable_SkipsSubsequentValidation(t *testing.T) {
+	if _, lookErr := exec.LookPath("docker"); lookErr != nil {
+		t.Skip("Docker not installed — this test requires docker binary on PATH")
+	}
+	t.Cleanup(resetDockerDaemonStateForTest)
+
+	// Mark daemon unavailable as if a previous pull had discovered "Cannot connect to the Docker daemon"
+	dockerDaemonLoader.Override(false, nil)
+
+	// Subsequent validation of any image (even a clearly non-existent one) should return nil, not an error.
+	err := validateDockerImage("ghcr.io/github/serena-mcp-server:latest", false, false)
+	assert.NoError(t, err, "should skip validation when daemon is already marked unavailable")
 }

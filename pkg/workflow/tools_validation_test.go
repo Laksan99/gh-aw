@@ -4,6 +4,7 @@ package workflow
 
 import (
 	"fmt"
+	"strings"
 	"testing"
 
 	"github.com/github/gh-aw/pkg/constants"
@@ -342,7 +343,17 @@ func TestValidateGitHubGuardPolicy(t *testing.T) {
 				},
 			},
 			shouldError: true,
-			errorMsg:    "'github.allowed-repos' string must be 'all' or 'public'",
+			errorMsg:    "'github.allowed-repos' string must be 'all', 'public', or '${{ github.repository }}'",
+		},
+		{
+			name: "allowed-repos github.repository expression is valid",
+			toolsMap: map[string]any{
+				"github": map[string]any{
+					"allowed-repos": "${{ github.repository }}",
+					"min-integrity": "approved",
+				},
+			},
+			shouldError: false,
 		},
 		{
 			name: "empty repos array",
@@ -593,6 +604,89 @@ func TestValidateGitHubGuardPolicy(t *testing.T) {
 	}
 }
 
+func TestValidateGitHubGuardPolicyLockdownWarning(t *testing.T) {
+	tests := []struct {
+		name     string
+		toolsMap map[string]any
+	}{
+		{
+			name: "allowed-repos and min-integrity",
+			toolsMap: map[string]any{
+				"github": map[string]any{
+					"lockdown":      true,
+					"allowed-repos": "all",
+					"min-integrity": "approved",
+				},
+			},
+		},
+		{
+			name: "blocked-users with min-integrity",
+			toolsMap: map[string]any{
+				"github": map[string]any{
+					"lockdown":      true,
+					"min-integrity": "approved",
+					"blocked-users": []string{"spam-bot"},
+				},
+			},
+		},
+		{
+			name: "trusted-users with min-integrity",
+			toolsMap: map[string]any{
+				"github": map[string]any{
+					"lockdown":      true,
+					"min-integrity": "approved",
+					"trusted-users": []any{"trusted-user"},
+				},
+			},
+		},
+		{
+			name: "approval-labels with min-integrity",
+			toolsMap: map[string]any{
+				"github": map[string]any{
+					"lockdown":        true,
+					"min-integrity":   "approved",
+					"approval-labels": []string{"human-reviewed"},
+				},
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			tools := NewTools(tt.toolsMap)
+			require.NoError(t, validateGitHubGuardPolicy(tools, "test-workflow"))
+
+			compiler := NewCompiler()
+			stderrOutput := captureStderr(func() {
+				emitGitHubLockdownGuardPolicyWarning(compiler, tools, "test-workflow.md")
+			})
+
+			assert.Contains(t, stderrOutput, "tools.github.lockdown: true")
+			assert.Contains(t, stderrOutput, "guard policy fields")
+			assert.Contains(t, stderrOutput, "will be ignored")
+			assert.Equal(t, 1, compiler.GetWarningCount())
+		})
+	}
+}
+
+func TestValidateGitHubGuardPolicyLockdownWarningWithoutCompiler(t *testing.T) {
+	tools := NewTools(map[string]any{
+		"github": map[string]any{
+			"lockdown":      true,
+			"allowed-repos": "all",
+			"min-integrity": "approved",
+		},
+	})
+
+	require.NoError(t, validateGitHubGuardPolicy(tools, "test-workflow"))
+
+	stderrOutput := captureStderr(func() {
+		emitGitHubLockdownGuardPolicyWarning(nil, tools, "test-workflow.md")
+	})
+
+	assert.Empty(t, strings.TrimSpace(stderrOutput))
+}
+
 func TestValidateReposScopeWithStringSlice(t *testing.T) {
 	tests := []struct {
 		name        string
@@ -603,6 +697,11 @@ func TestValidateReposScopeWithStringSlice(t *testing.T) {
 		{
 			name:        "valid []string repos array",
 			repos:       []string{"owner/repo", "owner/*"},
+			shouldError: false,
+		},
+		{
+			name:        "valid []string repos array with github.repository expression",
+			repos:       []string{"${{ github.repository }}", "owner/repo"},
 			shouldError: false,
 		},
 		{
@@ -959,7 +1058,7 @@ func TestGetDIFCProxyPolicyJSONWithReactions(t *testing.T) {
 
 	tests := []struct {
 		name             string
-		githubTool       any
+		githubTool       map[string]any
 		data             *WorkflowData
 		gatewayConfig    *MCPGatewayRuntimeConfig
 		expectedContains []string

@@ -10,6 +10,7 @@
 package cli
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -71,24 +72,27 @@ func buildCreatedFilter(startDate, endDate, beforeDate string) string {
 	}
 }
 
-// fetchJobStatuses gets job information for a workflow run and counts failed jobs
-func fetchJobStatuses(runID int64, verbose bool) (int, error) {
-	logsGitHubAPILog.Printf("Fetching job statuses: runID=%d", runID)
-
+// fetchJobDetailsWithCounts fetches all job information for a workflow run in a single API
+// call and returns the full detail slice together with the count of failed jobs.
+// It is the single source of truth for the jobs endpoint; fetchJobDetails and
+// fetchJobStatuses are thin wrappers that each return only the value they need.
+func fetchJobDetailsWithCounts(runID int64, verbose bool) ([]JobInfoWithDuration, int, error) {
+	logsGitHubAPILog.Printf("Fetching job details: runID=%d", runID)
 	if verbose {
-		fmt.Fprintln(os.Stderr, console.FormatVerboseMessage(fmt.Sprintf("Fetching job statuses for run %d", runID)))
+		fmt.Fprintln(os.Stderr, console.FormatVerboseMessage(fmt.Sprintf("Fetching job details for run %d", runID)))
 	}
 
-	output, err := workflow.RunGHCombined("Fetching job statuses...", "api", fmt.Sprintf("repos/{owner}/{repo}/actions/runs/%d/jobs", runID), "--jq", ".jobs[] | {name: .name, status: .status, conclusion: .conclusion}")
+	output, err := workflow.RunGHCombined("Fetching job details...", "api",
+		fmt.Sprintf("repos/{owner}/{repo}/actions/runs/%d/jobs", runID),
+		"--jq", ".jobs[] | {name: .name, status: .status, conclusion: .conclusion, started_at: .started_at, completed_at: .completed_at}")
 	if err != nil {
 		if verbose {
-			fmt.Fprintln(os.Stderr, console.FormatVerboseMessage(fmt.Sprintf("Failed to fetch job statuses for run %d: %v", runID, err)))
+			fmt.Fprintln(os.Stderr, console.FormatVerboseMessage(fmt.Sprintf("Failed to fetch job details for run %d: %v", runID, err)))
 		}
-		// Don't fail the entire operation if we can't get job info
-		return 0, nil
+		return nil, 0, err
 	}
 
-	// Parse each line as a separate JSON object
+	var jobs []JobInfoWithDuration
 	failedJobs := 0
 	lines := strings.SplitSeq(strings.TrimSpace(string(output)), "\n")
 	for line := range lines {
@@ -104,7 +108,12 @@ func fetchJobStatuses(runID int64, verbose bool) (int, error) {
 			continue
 		}
 
-		// Count jobs with failure conclusions as errors
+		jobWithDuration := JobInfoWithDuration{JobInfo: job}
+		if !job.StartedAt.IsZero() && !job.CompletedAt.IsZero() {
+			jobWithDuration.Duration = job.CompletedAt.Sub(job.StartedAt)
+		}
+		jobs = append(jobs, jobWithDuration)
+
 		if isFailureConclusion(job.Conclusion) {
 			failedJobs++
 			logsGitHubAPILog.Printf("Found failed job: name=%s, conclusion=%s", job.Name, job.Conclusion)
@@ -114,70 +123,53 @@ func fetchJobStatuses(runID int64, verbose bool) (int, error) {
 		}
 	}
 
-	logsGitHubAPILog.Printf("Job status check complete: failedJobs=%d", failedJobs)
-	return failedJobs, nil
+	logsGitHubAPILog.Printf("Job fetch complete: total=%d failed=%d", len(jobs), failedJobs)
+	return jobs, failedJobs, nil
 }
 
-// fetchJobDetails gets detailed job information including durations for a workflow run
+// fetchJobDetails gets detailed job information including durations for a workflow run.
+// Errors from the underlying API call are suppressed so that callers can continue
+// processing even when job data is unavailable (e.g. missing permissions).
 func fetchJobDetails(runID int64, verbose bool) ([]JobInfoWithDuration, error) {
-	logsGitHubAPILog.Printf("Fetching job details: runID=%d", runID)
-	if verbose {
-		fmt.Fprintln(os.Stderr, console.FormatVerboseMessage(fmt.Sprintf("Fetching job details for run %d", runID)))
-	}
-
-	output, err := workflow.RunGHCombined("Fetching job details...", "api", fmt.Sprintf("repos/{owner}/{repo}/actions/runs/%d/jobs", runID), "--jq", ".jobs[] | {name: .name, status: .status, conclusion: .conclusion, started_at: .started_at, completed_at: .completed_at}")
+	jobs, _, err := fetchJobDetailsWithCounts(runID, verbose)
 	if err != nil {
-		if verbose {
-			fmt.Fprintln(os.Stderr, console.FormatVerboseMessage(fmt.Sprintf("Failed to fetch job details for run %d: %v", runID, err)))
-		}
 		// Don't fail the entire operation if we can't get job info
 		return nil, nil
 	}
-
-	var jobs []JobInfoWithDuration
-	lines := strings.SplitSeq(strings.TrimSpace(string(output)), "\n")
-	for line := range lines {
-		if strings.TrimSpace(line) == "" {
-			continue
-		}
-
-		var job JobInfo
-		if err := json.Unmarshal([]byte(line), &job); err != nil {
-			if verbose {
-				fmt.Fprintln(os.Stderr, console.FormatVerboseMessage("Failed to parse job info: "+line))
-			}
-			continue
-		}
-
-		jobWithDuration := JobInfoWithDuration{
-			JobInfo: job,
-		}
-
-		// Calculate duration if both timestamps are available
-		if !job.StartedAt.IsZero() && !job.CompletedAt.IsZero() {
-			jobWithDuration.Duration = job.CompletedAt.Sub(job.StartedAt)
-		}
-
-		jobs = append(jobs, jobWithDuration)
-	}
-
 	return jobs, nil
+}
+
+// fetchJobStatuses gets the count of failed jobs for a workflow run.
+// Errors from the underlying API call are suppressed so that callers can continue
+// processing even when job data is unavailable (e.g. missing permissions).
+func fetchJobStatuses(runID int64, verbose bool) (int, error) {
+	_, failedJobs, err := fetchJobDetailsWithCounts(runID, verbose)
+	if err != nil {
+		// Don't fail the entire operation if we can't get job info
+		return 0, nil
+	}
+	return failedJobs, nil
 }
 
 // ListWorkflowRunsOptions holds the options for listWorkflowRunsWithPagination
 type ListWorkflowRunsOptions struct {
-	WorkflowName   string // filter by specific workflow (if empty, fetches all agentic workflows)
-	Limit          int    // maximum number of runs to fetch in this API call (batch size)
-	StartDate      string // filter by creation date (>=); combined with EndDate/BeforeDate into a single --created range
-	EndDate        string // filter by creation date (<=); combined with StartDate into a single --created range
-	BeforeDate     string // exclusive upper bound used for pagination (<); combined with StartDate into a single --created range
-	Ref            string // filter by branch or tag name
-	BeforeRunID    int64  // filter by run database ID (< this ID)
-	AfterRunID     int64  // filter by run database ID (> this ID)
-	RepoOverride   string // fetch from a specific repository instead of current
-	ProcessedCount int    // number of runs already processed (for progress display)
-	TargetCount    int    // target number of runs to fetch (for progress display)
-	Verbose        bool   // enable verbose logging
+	Context      context.Context
+	WorkflowName string // filter by specific workflow (if empty, fetches all agentic workflows)
+	Status       string // filter by run status/conclusion (for example: completed, success, failure)
+	Limit        int    // maximum number of runs to fetch in this API call (batch size)
+	StartDate    string // filter by creation date (>=); combined with EndDate/BeforeDate into a single --created range
+	EndDate      string // filter by creation date (<=); combined with StartDate into a single --created range
+	BeforeDate   string // exclusive upper bound used for pagination (<); combined with StartDate into a single --created range
+	Ref          string // filter by branch or tag name
+	BeforeRunID  int64  // filter by run database ID (< this ID)
+	AfterRunID   int64  // filter by run database ID (> this ID)
+	RepoOverride string // fetch from a specific repository instead of current
+	// OldestFetchedCreatedAt, when set, is populated with the oldest run creation
+	// timestamp returned by GitHub in this batch before any workflow/conclusion filtering.
+	OldestFetchedCreatedAt *time.Time
+	ProcessedCount         int  // number of runs already processed (for progress display)
+	TargetCount            int  // target number of runs to fetch (for progress display)
+	Verbose                bool // enable verbose logging
 }
 
 // listWorkflowRunsWithPagination fetches workflow runs from GitHub Actions using the GitHub CLI.
@@ -205,6 +197,9 @@ func listWorkflowRunsWithPagination(opts ListWorkflowRunsOptions) ([]WorkflowRun
 	if opts.WorkflowName != "" {
 		args = append(args, "--workflow", opts.WorkflowName)
 	}
+	if opts.Status != "" {
+		args = append(args, "--status", opts.Status)
+	}
 	if opts.Limit > 0 {
 		args = append(args, "--limit", strconv.Itoa(opts.Limit))
 	}
@@ -230,13 +225,17 @@ func listWorkflowRunsWithPagination(opts ListWorkflowRunsOptions) ([]WorkflowRun
 	}
 
 	// Start spinner for network operation
-	spinnerMsg := fmt.Sprintf("Fetching workflow runs from GitHub... (%d / %d)", opts.ProcessedCount, opts.TargetCount)
+	spinnerMsg := workflowRunsSpinnerMessage(opts)
 	spinner := console.NewSpinner(spinnerMsg)
 	if !opts.Verbose {
 		spinner.Start()
 	}
 
-	cmd := workflow.ExecGH(args...)
+	cmdCtx := opts.Context
+	if cmdCtx == nil {
+		cmdCtx = context.Background()
+	}
+	cmd := workflow.ExecGHContext(cmdCtx, args...)
 	output, err := cmd.CombinedOutput()
 
 	if err != nil {
@@ -283,11 +282,7 @@ func listWorkflowRunsWithPagination(opts ListWorkflowRunsOptions) ([]WorkflowRun
 		// "exit status 1" is intentionally omitted: gh exits 1 for many non-auth
 		// errors (e.g. unsupported JSON fields), so matching it caused misleading
 		// "authentication required" messages for unrelated failures.
-		if strings.Contains(combinedMsg, "exit status 4") ||
-			strings.Contains(combinedMsg, "not logged into any GitHub hosts") ||
-			strings.Contains(combinedMsg, "To use GitHub CLI in a GitHub Actions workflow") ||
-			strings.Contains(combinedMsg, "authentication required") ||
-			strings.Contains(outputMsg, "gh auth login") {
+		if isPermissionErrorStr(combinedMsg) {
 			return nil, 0, errors.New("GitHub CLI authentication required. Run 'gh auth login' first")
 		}
 
@@ -313,6 +308,13 @@ func listWorkflowRunsWithPagination(opts ListWorkflowRunsOptions) ([]WorkflowRun
 
 	// Store the total count fetched from API before filtering
 	totalFetched := len(runs)
+	if opts.OldestFetchedCreatedAt != nil {
+		var oldest time.Time
+		if totalFetched > 0 {
+			oldest = runs[totalFetched-1].CreatedAt
+		}
+		*opts.OldestFetchedCreatedAt = oldest
+	}
 
 	// Filter only agentic workflow runs when no specific workflow is specified
 	// If a workflow name was specified, we already filtered by it in the API call
@@ -352,5 +354,25 @@ func listWorkflowRunsWithPagination(opts ListWorkflowRunsOptions) ([]WorkflowRun
 		agenticRuns = filteredRuns
 	}
 
+	// Filter out skipped and cancelled runs — they carry no useful agentic data
+	// and should not count toward the requested run count.
+	{
+		filtered := agenticRuns[:0]
+		for _, run := range agenticRuns {
+			if run.Conclusion == "skipped" || run.Conclusion == "cancelled" {
+				continue
+			}
+			filtered = append(filtered, run)
+		}
+		agenticRuns = filtered
+	}
+
 	return agenticRuns, totalFetched, nil
+}
+
+func workflowRunsSpinnerMessage(opts ListWorkflowRunsOptions) string {
+	if opts.TargetCount > 0 {
+		return fmt.Sprintf("Fetching workflow runs from GitHub... (%d / %d)", opts.ProcessedCount, opts.TargetCount)
+	}
+	return "Fetching workflow runs from GitHub..."
 }

@@ -42,6 +42,12 @@ func (c *Compiler) extractNetworkPermissions(frontmatter map[string]any) *Networ
 				}
 			}
 
+			if allowedInput, hasAllowedInput := networkObj["allowed-input"]; hasAllowedInput {
+				if allowedInputBool, ok := allowedInput.(bool); ok {
+					permissions.AllowedInput = allowedInputBool
+				}
+			}
+
 			// Extract blocked domains if present
 			if blocked, hasBlocked := networkObj["blocked"]; hasBlocked {
 				if blockedSlice, ok := blocked.([]any); ok {
@@ -191,6 +197,24 @@ func (c *Compiler) extractAgentSandboxConfig(agentVal any) *AgentSandboxConfig {
 		}
 	}
 
+	// Extract platform (AWF platform.type override)
+	if platformVal, hasPlatform := agentObj["platform"]; hasPlatform {
+		if platformStr, ok := platformVal.(string); ok {
+			agentConfig.Platform = platformStr
+		}
+	}
+
+	// Extract sudo (AWF topology egress mode).
+	// Semantics are inverted from the frontmatter field:
+	//   sudo: false  → no sudo = network isolation mode  → NetworkIsolation=true
+	//   sudo: true   → sudo enabled = normal mode        → NetworkIsolation=false
+	//   (omitted)      → sudo enabled = normal mode        → NetworkIsolation=false (zero value)
+	if sudoVal, hasSudo := agentObj["sudo"]; hasSudo {
+		if sudoBool, ok := sudoVal.(bool); ok {
+			agentConfig.NetworkIsolation = !sudoBool
+		}
+	}
+
 	// Extract config for SRT
 	if configVal, hasConfig := agentObj["config"]; hasConfig {
 		agentConfig.Config = c.extractSRTConfig(configVal)
@@ -233,6 +257,25 @@ func (c *Compiler) extractAgentSandboxConfig(agentVal any) *AgentSandboxConfig {
 				if mountStr, ok := mount.(string); ok {
 					agentConfig.Mounts = append(agentConfig.Mounts, mountStr)
 				}
+			}
+		}
+	}
+
+	// Extract model-fallback (AWF API proxy model fallback enable/disable flag)
+	if mfVal, hasMF := agentObj["model-fallback"]; hasMF {
+		switch v := mfVal.(type) {
+		case bool:
+			value := TemplatableBool("false")
+			if v {
+				value = TemplatableBool("true")
+			}
+			agentConfig.ModelFallback = &value
+			frontmatterExtractionSecurityLog.Printf("Extracted sandbox.agent.model-fallback")
+		case string:
+			if isExpression(v) {
+				value := TemplatableBool(v)
+				agentConfig.ModelFallback = &value
+				frontmatterExtractionSecurityLog.Printf("Extracted sandbox.agent.model-fallback")
 			}
 		}
 	}

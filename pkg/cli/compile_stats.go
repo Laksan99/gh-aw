@@ -4,7 +4,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"sort"
+	"slices"
 	"strconv"
 
 	"github.com/github/gh-aw/pkg/console"
@@ -12,6 +12,7 @@ import (
 	"github.com/github/gh-aw/pkg/stringutil"
 	"github.com/github/gh-aw/pkg/styles"
 	"github.com/github/gh-aw/pkg/tty"
+	"github.com/github/gh-aw/pkg/workflow"
 	"github.com/goccy/go-yaml"
 )
 
@@ -136,13 +137,21 @@ func trackWorkflowFailure(stats *CompilationStats, workflowPath string, errorCou
 }
 
 // printCompilationSummary prints a summary of the compilation results
-func printCompilationSummary(stats *CompilationStats) {
+func printCompilationSummary(stats *CompilationStats, showAllErrors bool) {
 	if stats.Total == 0 {
 		return
 	}
 
 	summary := fmt.Sprintf("Compiled %d workflow(s): %d error(s), %d warning(s)",
 		stats.Total, stats.Errors, stats.Warnings)
+	failedWorkflowCount := len(stats.FailureDetails)
+	if failedWorkflowCount == 0 {
+		failedWorkflowCount = len(stats.FailedWorkflows)
+	}
+	if stats.Errors > 0 && failedWorkflowCount > 0 {
+		summary = fmt.Sprintf("Compiled %d workflow(s): %d error(s) across %d failed workflow(s), %d warning(s)",
+			stats.Total, stats.Errors, failedWorkflowCount, stats.Warnings)
+	}
 
 	// Use different formatting based on whether there were errors
 	if stats.Errors > 0 {
@@ -153,22 +162,58 @@ func printCompilationSummary(stats *CompilationStats) {
 			fmt.Fprintln(os.Stderr)
 			fmt.Fprintln(os.Stderr, console.FormatErrorMessage("Failed workflows:"))
 			for _, failure := range stats.FailureDetails {
-				fmt.Fprintf(os.Stderr, "  ✗ %s\n", filepath.Base(failure.Path))
+				fmt.Fprintln(os.Stderr, console.FormatErrorMessage(filepath.Base(failure.Path)))
 			}
 			fmt.Fprintln(os.Stderr)
 
 			// Display the actual error messages for each failed workflow
 			for _, failure := range stats.FailureDetails {
-				for _, errMsg := range failure.ErrorMessages {
-					fmt.Fprintln(os.Stderr, errMsg)
+				report := workflow.BuildPrioritizedErrorReportFromMessages(failure.ErrorMessages, showAllErrors)
+				if report.TotalCount == 0 {
+					continue
+				}
+
+				header := fmt.Sprintf("%s (%d error(s)", filepath.Base(failure.Path), report.TotalCount)
+				if !showAllErrors && report.HiddenCount > 0 {
+					header += fmt.Sprintf(", showing top %d", len(report.DisplayedErrors))
+				}
+				header += "):"
+				fmt.Fprintln(os.Stderr, console.FormatErrorMessage(header))
+
+				lastHeading := ""
+				for i, prioritized := range report.DisplayedErrors {
+					heading := prioritized.Severity.Heading()
+					if heading != lastHeading {
+						fmt.Fprintln(os.Stderr, console.FormatListItem(fmt.Sprintf("%s %s:", prioritized.Severity.Icon(), heading)))
+						lastHeading = heading
+					}
+					fmt.Fprintln(os.Stderr, console.FormatListItem(fmt.Sprintf("%d. %s", i+1, prioritized.Message)))
+					if prioritized.Suggestion != "" {
+						fmt.Fprintln(os.Stderr, console.FormatInfoMessage("→ "+prioritized.Suggestion))
+					}
+				}
+
+				if report.RecoveryPlan != nil && len(report.RecoveryPlan.Steps) > 0 {
+					fmt.Fprintln(os.Stderr, console.FormatInfoMessage("💡 Recovery plan:"))
+					for i, step := range report.RecoveryPlan.Steps {
+						fmt.Fprintln(os.Stderr, console.FormatListItem(fmt.Sprintf("%d. %s", i+1, step)))
+					}
+				}
+
+				if report.SuppressedCount > 0 {
+					fmt.Fprintln(os.Stderr, console.FormatInfoMessage(fmt.Sprintf("Suppressed %d cascading error(s) until the root cause is fixed.", report.SuppressedCount)))
+				}
+
+				if !showAllErrors && report.HiddenCount > 0 {
+					fmt.Fprintln(os.Stderr, console.FormatInfoMessage(fmt.Sprintf("Run 'gh aw compile --show-all' to see all %d prioritized error(s).", report.TotalCount)))
 				}
 			}
 		} else if len(stats.FailedWorkflows) > 0 {
 			// Fallback for backward compatibility if FailureDetails is not populated
 			fmt.Fprintln(os.Stderr)
 			fmt.Fprintln(os.Stderr, console.FormatErrorMessage("Failed workflows:"))
-			for _, workflow := range stats.FailedWorkflows {
-				fmt.Fprintf(os.Stderr, "  ✗ %s\n", workflow)
+			for _, wf := range stats.FailedWorkflows {
+				fmt.Fprintln(os.Stderr, console.FormatErrorMessage(wf))
 			}
 			fmt.Fprintln(os.Stderr)
 		}
@@ -208,8 +253,14 @@ func displayStatsTable(statsList []*WorkflowStats) {
 	compileStatsLog.Printf("Displaying stats table: workflow_count=%d", len(statsList))
 
 	// Sort by file size (descending)
-	sort.Slice(statsList, func(i, j int) bool {
-		return statsList[i].FileSize > statsList[j].FileSize
+	slices.SortFunc(statsList, func(a, b *WorkflowStats) int {
+		if a.FileSize > b.FileSize {
+			return -1
+		}
+		if a.FileSize < b.FileSize {
+			return 1
+		}
+		return 0
 	})
 
 	// Calculate totals
@@ -278,11 +329,11 @@ func displayStatsTable(statsList []*WorkflowStats) {
 	// Print summary
 	fmt.Fprintln(os.Stderr, console.FormatInfoMessage("Summary:"))
 	if len(statsList) > maxDisplay {
-		fmt.Fprintf(os.Stderr, "  Showing top %d of %d workflows (sorted by size)\n", maxDisplay, len(statsList))
+		fmt.Fprintln(os.Stderr, console.FormatListItem(fmt.Sprintf("Showing top %d of %d workflows (sorted by size)", maxDisplay, len(statsList))))
 	}
-	fmt.Fprintf(os.Stderr, "  Total workflows: %d\n", len(statsList))
-	fmt.Fprintf(os.Stderr, "  Total size:      %s\n", console.FormatFileSize(totalSize))
-	fmt.Fprintf(os.Stderr, "  Total jobs:      %d\n", totalJobs)
-	fmt.Fprintf(os.Stderr, "  Total steps:     %d\n", totalSteps)
-	fmt.Fprintf(os.Stderr, "  Total scripts:   %d (%s)\n", totalScripts, console.FormatFileSize(int64(totalScriptSize)))
+	fmt.Fprintln(os.Stderr, console.FormatListItem(fmt.Sprintf("Total workflows: %d", len(statsList))))
+	fmt.Fprintln(os.Stderr, console.FormatListItem("Total size:      "+console.FormatFileSize(totalSize)))
+	fmt.Fprintln(os.Stderr, console.FormatListItem(fmt.Sprintf("Total jobs:      %d", totalJobs)))
+	fmt.Fprintln(os.Stderr, console.FormatListItem(fmt.Sprintf("Total steps:     %d", totalSteps)))
+	fmt.Fprintln(os.Stderr, console.FormatListItem(fmt.Sprintf("Total scripts:   %d (%s)", totalScripts, console.FormatFileSize(int64(totalScriptSize)))))
 }

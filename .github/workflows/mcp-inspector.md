@@ -1,4 +1,5 @@
 ---
+emoji: "🔍"
 description: Inspects MCP (Model Context Protocol) server configurations and validates their functionality
 on:
   schedule: weekly on monday around 18:00
@@ -8,7 +9,9 @@ permissions:
   issues: read
   pull-requests: read
   actions: read
-engine: copilot
+engine:
+  id: copilot
+  copilot-sdk: true
 network:
   allowed:
     - defaults
@@ -17,7 +20,9 @@ network:
     - node-cdns
     - fonts
 sandbox:
-  agent: awf  # Firewall enabled (migrated from network.firewall)
+  agent:
+    id: awf
+    sudo: false
 timeout-minutes: 20
 strict: false
 imports:
@@ -41,7 +46,7 @@ imports:
   - shared/mcp/slack.md
   - shared/mcp/tavily.md
   - shared/mcp/serena-go.md
-  - shared/observability-otlp.md
+  - shared/otlp.md
 tools:
   cli-proxy: true
   agentic-workflows:

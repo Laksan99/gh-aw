@@ -3,6 +3,8 @@
 package workflow
 
 import (
+	"encoding/json"
+	"strings"
 	"testing"
 )
 
@@ -101,6 +103,7 @@ func TestAddCommentsConfigHideOlderComments(t *testing.T) {
 		name                      string
 		configMap                 map[string]any
 		expectedHideOlderComments *string
+		expectedMatch             []string
 	}{
 		{
 			name: "hide-older-comments enabled",
@@ -110,7 +113,8 @@ func TestAddCommentsConfigHideOlderComments(t *testing.T) {
 					"hide-older-comments": true,
 				},
 			},
-			expectedHideOlderComments: testStringPtr("true"),
+			expectedHideOlderComments: new("true"),
+			expectedMatch:             nil,
 		},
 		{
 			name: "hide-older-comments disabled",
@@ -120,7 +124,8 @@ func TestAddCommentsConfigHideOlderComments(t *testing.T) {
 					"hide-older-comments": false,
 				},
 			},
-			expectedHideOlderComments: testStringPtr("false"),
+			expectedHideOlderComments: new("false"),
+			expectedMatch:             nil,
 		},
 		{
 			name: "hide-older-comments not specified (default nil)",
@@ -130,6 +135,7 @@ func TestAddCommentsConfigHideOlderComments(t *testing.T) {
 				},
 			},
 			expectedHideOlderComments: nil,
+			expectedMatch:             nil,
 		},
 		{
 			name: "hide-older-comments with other fields",
@@ -141,7 +147,35 @@ func TestAddCommentsConfigHideOlderComments(t *testing.T) {
 					"hide-older-comments": true,
 				},
 			},
-			expectedHideOlderComments: testStringPtr("true"),
+			expectedHideOlderComments: new("true"),
+			expectedMatch:             nil,
+		},
+		{
+			name: "hide-older-comments object form defaults enabled and parses match list",
+			configMap: map[string]any{
+				"add-comment": map[string]any{
+					"max": 1,
+					"hide-older-comments": map[string]any{
+						"match": []any{"other_workflow", "yet-another"},
+					},
+				},
+			},
+			expectedHideOlderComments: new("true"),
+			expectedMatch:             []string{"other_workflow", "yet-another"},
+		},
+		{
+			name: "hide-older-comments object form supports explicit enabled false",
+			configMap: map[string]any{
+				"add-comment": map[string]any{
+					"max": 1,
+					"hide-older-comments": map[string]any{
+						"enabled": false,
+						"match":   []any{"other_workflow"},
+					},
+				},
+			},
+			expectedHideOlderComments: new("false"),
+			expectedMatch:             []string{"other_workflow"},
 		},
 	}
 
@@ -162,6 +196,21 @@ func TestAddCommentsConfigHideOlderComments(t *testing.T) {
 					t.Errorf("Expected HideOlderComments = %v, got nil", *tt.expectedHideOlderComments)
 				} else if *config.HideOlderComments != *tt.expectedHideOlderComments {
 					t.Errorf("Expected HideOlderComments = %v, got %v", *tt.expectedHideOlderComments, *config.HideOlderComments)
+				}
+			}
+
+			if tt.expectedMatch == nil {
+				if len(config.HideOlderCommentsMatch) != 0 {
+					t.Errorf("Expected HideOlderCommentsMatch to be empty, got %v", config.HideOlderCommentsMatch)
+				}
+			} else {
+				if len(config.HideOlderCommentsMatch) != len(tt.expectedMatch) {
+					t.Fatalf("Expected %d hide-older match values, got %d", len(tt.expectedMatch), len(config.HideOlderCommentsMatch))
+				}
+				for i := range tt.expectedMatch {
+					if config.HideOlderCommentsMatch[i] != tt.expectedMatch[i] {
+						t.Errorf("Expected HideOlderCommentsMatch[%d] = %q, got %q", i, tt.expectedMatch[i], config.HideOlderCommentsMatch[i])
+					}
 				}
 			}
 		})
@@ -256,6 +305,121 @@ func TestAddCommentsConfigAllowedReasons(t *testing.T) {
 			} else {
 				if len(config.AllowedReasons) != 0 {
 					t.Errorf("Expected empty AllowedReasons, got %v", config.AllowedReasons)
+				}
+			}
+		})
+	}
+}
+
+// TestAddCommentMentionsInHandlerConfig verifies that when safe-outputs.mentions.allowed
+// is configured, the top-level "mentions" key is present in GH_AW_SAFE_OUTPUTS_HANDLER_CONFIG
+// so that safe_output_handler_manager.cjs can pass it through to the add_comment handler
+// and prevent configured usernames from being escaped as @mentions.
+func TestAddCommentMentionsInHandlerConfig(t *testing.T) {
+	compiler := NewCompiler()
+
+	tests := []struct {
+		name           string
+		safeOutputs    *SafeOutputsConfig
+		wantMentions   map[string]any // nil means no "mentions" key expected
+		wantNoMentions bool
+	}{
+		{
+			name: "mentions.allowed propagates to handler config",
+			safeOutputs: &SafeOutputsConfig{
+				AddComments: &AddCommentsConfig{},
+				Mentions: &MentionsConfig{
+					Allowed: []string{"copilot"},
+				},
+			},
+			wantMentions: map[string]any{
+				"allowed": []any{"copilot"},
+			},
+		},
+		{
+			name: "mentions.enabled=false propagates to handler config",
+			safeOutputs: &SafeOutputsConfig{
+				AddComments: &AddCommentsConfig{},
+				Mentions: &MentionsConfig{
+					Enabled: boolPtr(false),
+				},
+			},
+			wantMentions: map[string]any{
+				"enabled": false,
+			},
+		},
+		{
+			name: "no mentions config omits mentions from handler config",
+			safeOutputs: &SafeOutputsConfig{
+				AddComments: &AddCommentsConfig{},
+			},
+			wantNoMentions: true,
+		},
+		{
+			name: "mentions without add_comment still included in handler config",
+			safeOutputs: &SafeOutputsConfig{
+				CreateIssues: &CreateIssuesConfig{},
+				Mentions: &MentionsConfig{
+					Allowed: []string{"copilot"},
+				},
+			},
+			wantMentions: map[string]any{
+				"allowed": []any{"copilot"},
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			workflowData := &WorkflowData{
+				Name:        "Test",
+				SafeOutputs: tt.safeOutputs,
+			}
+
+			steps, err := compiler.buildHandlerManagerStep(workflowData)
+			if err != nil {
+				t.Fatalf("buildHandlerManagerStep returned error: %v", err)
+			}
+
+			// Extract and parse the HANDLER_CONFIG JSON using the shared helper which
+			// properly unquotes the %q-encoded YAML value.
+			config := extractHandlerConfig(t, strings.Join(steps, ""))
+
+			if tt.wantNoMentions {
+				if _, ok := config["mentions"]; ok {
+					t.Error("expected no 'mentions' key in handler config, but it was present")
+				}
+				return
+			}
+
+			mentionsRaw, ok := config["mentions"]
+			if !ok {
+				t.Fatal("expected 'mentions' key in handler config, but it was absent")
+			}
+			mentionsJSON, err := json.Marshal(mentionsRaw)
+			if err != nil {
+				t.Fatalf("failed to marshal mentions config: %v", err)
+			}
+			var got map[string]any
+			if err := json.Unmarshal(mentionsJSON, &got); err != nil {
+				t.Fatalf("failed to unmarshal mentions config: %v", err)
+			}
+			for k, wantVal := range tt.wantMentions {
+				gotVal, exists := got[k]
+				if !exists {
+					t.Errorf("mentions config missing key %q", k)
+					continue
+				}
+				wantJSON, err := json.Marshal(wantVal)
+				if err != nil {
+					t.Fatalf("failed to marshal expected mentions[%q]: %v", k, err)
+				}
+				gotJSON, err := json.Marshal(gotVal)
+				if err != nil {
+					t.Fatalf("failed to marshal actual mentions[%q]: %v", k, err)
+				}
+				if string(wantJSON) != string(gotJSON) {
+					t.Errorf("mentions[%q]: want %s, got %s", k, wantJSON, gotJSON)
 				}
 			}
 		})

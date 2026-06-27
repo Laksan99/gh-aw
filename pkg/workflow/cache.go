@@ -2,7 +2,9 @@ package workflow
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
+	"math"
 	"os"
 	"slices"
 	"sort"
@@ -58,7 +60,7 @@ var validCacheMemoryScopes = []string{"workflow", "repo"}
 // This prevents path-traversal attacks (e.g. "../../etc") when the ID is
 // appended to cacheMemoryDirPrefix to form a filesystem path.
 func isValidCacheID(id string) bool {
-	if len(id) == 0 || len(id) > 64 {
+	if id == "" || len(id) > 64 {
 		return false
 	}
 	for _, c := range id {
@@ -125,175 +127,191 @@ func parseCacheMemoryEntry(cacheMap map[string]any, defaultID string) (CacheMemo
 		ID:  defaultID,
 		Key: generateDefaultCacheKey(defaultID),
 	}
-
-	// Parse ID (for array notation)
-	if id, exists := cacheMap["id"]; exists {
-		if idStr, ok := id.(string); ok {
-			if idStr != "default" && !isValidCacheID(idStr) {
-				return entry, fmt.Errorf("invalid cache-memory id %q: must contain only letters, digits, underscores, or hyphens (1-64 characters)", idStr)
-			}
-			entry.ID = idStr
-		}
+	if err := parseCacheMemoryIdentity(cacheMap, defaultID, &entry); err != nil {
+		return entry, err
 	}
-	// Update key if ID changed
+	parseCacheMemoryDescription(cacheMap, &entry)
+	if err := parseCacheMemoryRetentionDays(cacheMap, &entry); err != nil {
+		return entry, err
+	}
+	parseCacheMemoryRestoreOnly(cacheMap, &entry)
+	if err := parseCacheMemoryScope(cacheMap, &entry); err != nil {
+		return entry, err
+	}
+	if err := parseCacheMemoryAllowedExtensions(cacheMap, &entry); err != nil {
+		return entry, err
+	}
+	applyDefaultAllowedExtensions(&entry)
+	cacheLog.Printf("Parsed cache-memory entry: id=%s, scope=%s, restore-only=%v, retention-days=%v", entry.ID, entry.Scope, entry.RestoreOnly, entry.RetentionDays)
+	return entry, nil
+}
+
+func parseCacheMemoryIdentity(cacheMap map[string]any, defaultID string, entry *CacheMemoryEntry) error {
+	if idStr, ok := cacheMap["id"].(string); ok {
+		if idStr != "default" && !isValidCacheID(idStr) {
+			return fmt.Errorf("invalid cache-memory id %q: must contain only letters, digits, underscores, or hyphens (1-64 characters)", idStr)
+		}
+		entry.ID = idStr
+	}
 	if entry.ID != defaultID {
 		entry.Key = generateDefaultCacheKey(entry.ID)
 	}
-
-	// Parse custom key
-	if key, exists := cacheMap["key"]; exists {
-		if keyStr, ok := key.(string); ok {
-			if err := validateNoCacheKeyRunID(keyStr); err != nil {
-				return entry, err
-			}
-			entry.Key = keyStr
-			// Automatically append -${{ github.run_id }} if the key doesn't already end with it
-			runIdSuffix := "-${{ github.run_id }}"
-			if !strings.HasSuffix(entry.Key, runIdSuffix) {
-				entry.Key = entry.Key + runIdSuffix
-			}
-		}
+	keyStr, ok := cacheMap["key"].(string)
+	if !ok {
+		return nil
 	}
-
-	// Parse description
-	if description, exists := cacheMap["description"]; exists {
-		if descStr, ok := description.(string); ok {
-			entry.Description = descStr
-		}
+	if err := validateNoCacheKeyRunID(keyStr); err != nil {
+		return err
 	}
+	entry.Key = ensureCacheRunIDSuffix(keyStr)
+	return nil
+}
 
-	// Parse retention days
-	if retentionDays, exists := cacheMap["retention-days"]; exists {
-		if retentionDaysInt, ok := retentionDays.(int); ok {
-			entry.RetentionDays = &retentionDaysInt
-		} else if retentionDaysFloat, ok := retentionDays.(float64); ok {
-			retentionDaysIntValue := int(retentionDaysFloat)
-			entry.RetentionDays = &retentionDaysIntValue
-		} else if retentionDaysUint64, ok := retentionDays.(uint64); ok {
-			retentionDaysIntValue := int(retentionDaysUint64)
-			entry.RetentionDays = &retentionDaysIntValue
-		}
-		// Validate retention-days bounds
-		if entry.RetentionDays != nil {
-			if err := validateIntRange(*entry.RetentionDays, 1, 90, "retention-days"); err != nil {
-				return entry, err
-			}
-		}
+func ensureCacheRunIDSuffix(key string) string {
+	runIdSuffix := "-${{ github.run_id }}"
+	if strings.HasSuffix(key, runIdSuffix) {
+		return key
 	}
+	return key + runIdSuffix
+}
 
-	// Parse restore-only flag
-	if restoreOnly, exists := cacheMap["restore-only"]; exists {
-		if restoreOnlyBool, ok := restoreOnly.(bool); ok {
-			entry.RestoreOnly = restoreOnlyBool
-		}
+func parseCacheMemoryDescription(cacheMap map[string]any, entry *CacheMemoryEntry) {
+	if descStr, ok := cacheMap["description"].(string); ok {
+		entry.Description = descStr
 	}
+}
 
-	// Parse scope field
-	if scope, exists := cacheMap["scope"]; exists {
-		if scopeStr, ok := scope.(string); ok {
-			entry.Scope = scopeStr
-		}
+func parseCacheMemoryRetentionDays(cacheMap map[string]any, entry *CacheMemoryEntry) error {
+	retentionDays, exists := cacheMap["retention-days"]
+	if !exists {
+		return nil
 	}
-	// Default to "workflow" scope if not specified
+	entry.RetentionDays = parseOptionalInt(retentionDays)
+	if entry.RetentionDays == nil {
+		return nil
+	}
+	return validateIntRange(*entry.RetentionDays, 1, 90, "retention-days")
+}
+
+// parseOptionalInt safely converts YAML numeric values (int, float64, uint64) to *int.
+//
+// It returns nil when the input cannot be represented as an integer for the current
+// architecture, including:
+//   - NaN/Inf float64 values
+//   - fractional float64 values
+//   - float64 values outside the exact-integer range [-2^53, 2^53]
+//   - float64 values outside the current architecture int range
+//   - uint64 values larger than math.MaxInt
+//   - unsupported types
+func parseOptionalInt(value any) *int {
+	// YAML unmarshaling can yield int, float64, or uint64 depending on parser/input.
+	if intValue, ok := value.(int); ok {
+		return &intValue
+	}
+	if floatValue, ok := value.(float64); ok {
+		if math.IsNaN(floatValue) || math.IsInf(floatValue, 0) {
+			return nil
+		}
+		if floatValue != math.Trunc(floatValue) {
+			return nil
+		}
+		if floatValue < float64(math.MinInt) || floatValue > float64(math.MaxInt) {
+			return nil
+		}
+		// float64 can exactly represent integers only in [-2^53, 2^53].
+		const maxExactFloatInt = float64(1 << 53)
+		if floatValue < -maxExactFloatInt || floatValue > maxExactFloatInt {
+			return nil
+		}
+		intValue := int(floatValue)
+		return &intValue
+	}
+	if uintValue, ok := value.(uint64); ok {
+		// Guard int conversion on 32-bit/64-bit architectures.
+		if uintValue > uint64(math.MaxInt) {
+			return nil
+		}
+		intValue := int(uintValue)
+		return &intValue
+	}
+	return nil
+}
+
+func parseCacheMemoryRestoreOnly(cacheMap map[string]any, entry *CacheMemoryEntry) {
+	if restoreOnlyBool, ok := cacheMap["restore-only"].(bool); ok {
+		entry.RestoreOnly = restoreOnlyBool
+	}
+}
+
+func parseCacheMemoryScope(cacheMap map[string]any, entry *CacheMemoryEntry) error {
+	if scopeStr, ok := cacheMap["scope"].(string); ok {
+		entry.Scope = scopeStr
+	}
 	if entry.Scope == "" {
 		entry.Scope = "workflow"
 	}
-	// Validate scope value
-	if !slices.Contains(validCacheMemoryScopes, entry.Scope) {
-		return entry, fmt.Errorf("invalid cache-memory scope %q: must be one of %v", entry.Scope, validCacheMemoryScopes)
+	if slices.Contains(validCacheMemoryScopes, entry.Scope) {
+		return nil
 	}
+	return fmt.Errorf("invalid cache-memory scope %q: must be one of %v", entry.Scope, validCacheMemoryScopes)
+}
 
-	// Parse allowed-extensions field
-	if allowedExts, exists := cacheMap["allowed-extensions"]; exists {
-		if extArray, ok := allowedExts.([]any); ok {
-			entry.AllowedExtensions = make([]string, 0, len(extArray))
-			for _, ext := range extArray {
-				if extStr, ok := ext.(string); ok {
-					// Validate: must be of the form ^\.[A-Za-z0-9]+$ to prevent YAML injection
-					// and ensure the shell sanitization script handles them correctly.
-					if !isValidFileExtension(extStr) {
-						return entry, fmt.Errorf("invalid allowed-extension %q: must start with '.' followed by alphanumeric characters only (e.g. .json)", extStr)
-					}
-					entry.AllowedExtensions = append(entry.AllowedExtensions, extStr)
-				}
-			}
-		}
+func parseCacheMemoryAllowedExtensions(cacheMap map[string]any, entry *CacheMemoryEntry) error {
+	allowedExts, exists := cacheMap["allowed-extensions"]
+	if !exists {
+		return nil
 	}
-	// Default to standard allowed extensions if not specified
+	extArray, ok := allowedExts.([]any)
+	if !ok {
+		return nil
+	}
+	entry.AllowedExtensions = make([]string, 0, len(extArray))
+	for _, ext := range extArray {
+		extStr, ok := ext.(string)
+		if !ok {
+			continue
+		}
+		if !isValidFileExtension(extStr) {
+			return fmt.Errorf("invalid allowed-extension %q: must start with '.' followed by alphanumeric characters only (e.g. .json)", extStr)
+		}
+		entry.AllowedExtensions = append(entry.AllowedExtensions, extStr)
+	}
+	return nil
+}
+
+func applyDefaultAllowedExtensions(entry *CacheMemoryEntry) {
 	if len(entry.AllowedExtensions) == 0 {
 		entry.AllowedExtensions = constants.DefaultAllowedMemoryExtensions
 	}
-
-	cacheLog.Printf("Parsed cache-memory entry: id=%s, scope=%s, restore-only=%v, retention-days=%v", entry.ID, entry.Scope, entry.RestoreOnly, entry.RetentionDays)
-	return entry, nil
 }
 
 // extractCacheMemoryConfig extracts cache-memory configuration from tools section
 // Updated to use ToolsConfig instead of map[string]any
 func (c *Compiler) extractCacheMemoryConfig(toolsConfig *ToolsConfig) (*CacheMemoryConfig, error) {
-	// Check if cache-memory tool is configured
 	if toolsConfig == nil || toolsConfig.CacheMemory == nil {
 		return nil, nil
 	}
-
 	cacheLog.Print("Extracting cache-memory configuration from ToolsConfig")
-
 	config := &CacheMemoryConfig{}
 	cacheMemoryValue := toolsConfig.CacheMemory.Raw
-
-	// Handle nil value (simple enable with defaults) - same as true
-	// This handles the case where cache-memory: is specified without a value
 	if cacheMemoryValue == nil {
-		config.Caches = []CacheMemoryEntry{
-			{
-				ID:                "default",
-				Key:               generateDefaultCacheKey("default"),
-				AllowedExtensions: constants.DefaultAllowedMemoryExtensions,
-			},
-		}
+		config.Caches = defaultCacheMemoryEntries()
 		return config, nil
 	}
-
-	// Handle boolean value (simple enable/disable)
 	if boolValue, ok := cacheMemoryValue.(bool); ok {
 		if boolValue {
-			// Create a single default cache entry
-			config.Caches = []CacheMemoryEntry{
-				{
-					ID:                "default",
-					Key:               generateDefaultCacheKey("default"),
-					AllowedExtensions: constants.DefaultAllowedMemoryExtensions,
-				},
-			}
+			config.Caches = defaultCacheMemoryEntries()
 		}
-		// If false, return empty config (empty array means disabled)
 		return config, nil
 	}
-
-	// Handle array of cache configurations
 	if cacheArray, ok := cacheMemoryValue.([]any); ok {
-		cacheLog.Printf("Processing cache array with %d entries", len(cacheArray))
-		config.Caches = make([]CacheMemoryEntry, 0, len(cacheArray))
-		for _, item := range cacheArray {
-			if cacheMap, ok := item.(map[string]any); ok {
-				entry, err := parseCacheMemoryEntry(cacheMap, "default")
-				if err != nil {
-					return nil, err
-				}
-				config.Caches = append(config.Caches, entry)
-			}
-		}
-
-		// Check for duplicate cache IDs
-		if err := validateNoDuplicateCacheIDs(config.Caches); err != nil {
+		entries, err := parseCacheMemoryEntries(cacheArray)
+		if err != nil {
 			return nil, err
 		}
-
+		config.Caches = entries
 		return config, nil
 	}
-
-	// Handle object configuration (single cache, backward compatible)
-	// Convert to array with single entry
 	if configMap, ok := cacheMemoryValue.(map[string]any); ok {
 		entry, err := parseCacheMemoryEntry(configMap, "default")
 		if err != nil {
@@ -304,6 +322,36 @@ func (c *Compiler) extractCacheMemoryConfig(toolsConfig *ToolsConfig) (*CacheMem
 	}
 
 	return nil, nil
+}
+
+func defaultCacheMemoryEntries() []CacheMemoryEntry {
+	return []CacheMemoryEntry{
+		{
+			ID:                "default",
+			Key:               generateDefaultCacheKey("default"),
+			AllowedExtensions: constants.DefaultAllowedMemoryExtensions,
+		},
+	}
+}
+
+func parseCacheMemoryEntries(cacheArray []any) ([]CacheMemoryEntry, error) {
+	cacheLog.Printf("Processing cache array with %d entries", len(cacheArray))
+	entries := make([]CacheMemoryEntry, 0, len(cacheArray))
+	for _, item := range cacheArray {
+		cacheMap, ok := item.(map[string]any)
+		if !ok {
+			continue
+		}
+		entry, err := parseCacheMemoryEntry(cacheMap, "default")
+		if err != nil {
+			return nil, err
+		}
+		entries = append(entries, entry)
+	}
+	if err := validateNoDuplicateCacheIDs(entries); err != nil {
+		return nil, err
+	}
+	return entries, nil
 }
 
 // extractCacheMemoryConfigFromMap is a backward compatibility wrapper for extractCacheMemoryConfig
@@ -324,101 +372,107 @@ func generateCacheSteps(builder *strings.Builder, data *WorkflowData, verbose bo
 	}
 
 	cacheLog.Print("Generating cache steps from frontmatter cache configuration")
-
-	// Add comment indicating cache configuration was processed
 	builder.WriteString("      # Cache configuration from frontmatter processed below\n")
-
-	// Parse cache configuration to determine if it's a single cache or array
-	var caches []map[string]any
-
-	// Try to parse the cache YAML string back to determine structure
-	var topLevel map[string]any
-	if err := yaml.Unmarshal([]byte(data.Cache), &topLevel); err != nil {
+	caches, err := parseCacheStepConfigs(data.Cache)
+	if err != nil {
 		if verbose {
 			fmt.Fprintf(os.Stderr, "Warning: Failed to parse cache configuration: %v\n", err)
 		}
 		return
 	}
+	for i, cache := range caches {
+		writeCacheStep(builder, cache, i, len(caches))
+	}
+}
 
-	// Extract the cache section from the top-level map
+func parseCacheStepConfigs(cacheYAML string) ([]map[string]any, error) {
+	var topLevel map[string]any
+	if err := yaml.Unmarshal([]byte(cacheYAML), &topLevel); err != nil {
+		return nil, err
+	}
 	cacheConfig, exists := topLevel["cache"]
 	if !exists {
-		if verbose {
-			fmt.Fprintf(os.Stderr, "Warning: No cache key found in parsed configuration\n")
+		return nil, errors.New("no cache key found in parsed configuration")
+	}
+	if cacheArray, isArray := cacheConfig.([]any); isArray {
+		cacheLog.Printf("Processing %d cache entries (array format)", len(cacheArray))
+		return normalizeCacheStepArray(cacheArray), nil
+	}
+	if cacheMap, isMap := cacheConfig.(map[string]any); isMap {
+		cacheLog.Print("Processing single cache entry (object format)")
+		return []map[string]any{cacheMap}, nil
+	}
+	return nil, nil
+}
+
+func normalizeCacheStepArray(cacheArray []any) []map[string]any {
+	caches := make([]map[string]any, 0, len(cacheArray))
+	for _, cacheItem := range cacheArray {
+		if cacheMap, ok := cacheItem.(map[string]any); ok {
+			caches = append(caches, cacheMap)
+		}
+	}
+	return caches
+}
+
+func writeCacheStep(builder *strings.Builder, cache map[string]any, idx int, total int) {
+	stepName := resolveCacheStepName(cache, idx, total)
+	fmt.Fprintf(builder, "      - name: %s\n", stepName)
+	fmt.Fprintf(builder, "        uses: %s\n", getActionPin("actions/cache"))
+	builder.WriteString("        with:\n")
+	writeCacheStepValue(builder, "key", cache["key"])
+	writeCachePath(builder, cache["path"])
+	writeCacheRestoreKeys(builder, cache["restore-keys"])
+	writeCacheStepValue(builder, "upload-chunk-size", cache["upload-chunk-size"])
+	writeCacheStepValue(builder, "fail-on-cache-miss", cache["fail-on-cache-miss"])
+	writeCacheStepValue(builder, "lookup-only", cache["lookup-only"])
+}
+
+func resolveCacheStepName(cache map[string]any, idx int, total int) string {
+	stepName := "Cache"
+	if total > 1 {
+		stepName = fmt.Sprintf("Cache %d", idx+1)
+	}
+	if nameStr, ok := cache["name"].(string); ok && nameStr != "" {
+		return nameStr
+	}
+	if keyStr, ok := cache["key"].(string); ok && keyStr != "" {
+		return fmt.Sprintf("Cache (%s)", keyStr)
+	}
+	return stepName
+}
+
+func writeCachePath(builder *strings.Builder, path any) {
+	if path == nil {
+		return
+	}
+	if pathArray, isArray := path.([]any); isArray {
+		builder.WriteString("          path: |\n")
+		for _, p := range pathArray {
+			fmt.Fprintf(builder, "            %v\n", p)
 		}
 		return
 	}
+	fmt.Fprintf(builder, "          path: %v\n", path)
+}
 
-	// Handle both single cache object and array of caches
-	if cacheArray, isArray := cacheConfig.([]any); isArray {
-		// Multiple caches
-		cacheLog.Printf("Processing %d cache entries (array format)", len(cacheArray))
-		for _, cacheItem := range cacheArray {
-			if cacheMap, ok := cacheItem.(map[string]any); ok {
-				caches = append(caches, cacheMap)
-			}
-		}
-	} else if cacheMap, isMap := cacheConfig.(map[string]any); isMap {
-		// Single cache
-		cacheLog.Print("Processing single cache entry (object format)")
-		caches = append(caches, cacheMap)
+func writeCacheRestoreKeys(builder *strings.Builder, restoreKeys any) {
+	if restoreKeys == nil {
+		return
 	}
+	if restoreArray, isArray := restoreKeys.([]any); isArray {
+		builder.WriteString("          restore-keys: |\n")
+		for _, key := range restoreArray {
+			fmt.Fprintf(builder, "            %v\n", key)
+		}
+		return
+	}
+	fmt.Fprintf(builder, "          restore-keys: %v\n", restoreKeys)
+}
 
-	// Generate cache steps
-	for i, cache := range caches {
-		stepName := "Cache"
-		if len(caches) > 1 {
-			stepName = fmt.Sprintf("Cache %d", i+1)
-		}
-		if nameVal, hasName := cache["name"]; hasName {
-			if nameStr, ok := nameVal.(string); ok && nameStr != "" {
-				stepName = nameStr
-			}
-		} else if key, hasKey := cache["key"]; hasKey {
-			if keyStr, ok := key.(string); ok && keyStr != "" {
-				stepName = fmt.Sprintf("Cache (%s)", keyStr)
-			}
-		}
-
-		fmt.Fprintf(builder, "      - name: %s\n", stepName)
-		fmt.Fprintf(builder, "        uses: %s\n", getActionPin("actions/cache"))
-		builder.WriteString("        with:\n")
-
-		// Add required cache parameters
-		if key, hasKey := cache["key"]; hasKey {
-			fmt.Fprintf(builder, "          key: %v\n", key)
-		}
-		if path, hasPath := cache["path"]; hasPath {
-			if pathArray, isArray := path.([]any); isArray {
-				builder.WriteString("          path: |\n")
-				for _, p := range pathArray {
-					fmt.Fprintf(builder, "            %v\n", p)
-				}
-			} else {
-				fmt.Fprintf(builder, "          path: %v\n", path)
-			}
-		}
-
-		// Add optional cache parameters
-		if restoreKeys, hasRestoreKeys := cache["restore-keys"]; hasRestoreKeys {
-			if restoreArray, isArray := restoreKeys.([]any); isArray {
-				builder.WriteString("          restore-keys: |\n")
-				for _, key := range restoreArray {
-					fmt.Fprintf(builder, "            %v\n", key)
-				}
-			} else {
-				fmt.Fprintf(builder, "          restore-keys: %v\n", restoreKeys)
-			}
-		}
-		if uploadChunkSize, hasSize := cache["upload-chunk-size"]; hasSize {
-			fmt.Fprintf(builder, "          upload-chunk-size: %v\n", uploadChunkSize)
-		}
-		if failOnMiss, hasFail := cache["fail-on-cache-miss"]; hasFail {
-			fmt.Fprintf(builder, "          fail-on-cache-miss: %v\n", failOnMiss)
-		}
-		if lookupOnly, hasLookup := cache["lookup-only"]; hasLookup {
-			fmt.Fprintf(builder, "          lookup-only: %v\n", lookupOnly)
-		}
+func writeCacheStepValue(builder *strings.Builder, key string, value any) {
+	if value != nil {
+		fmt.Fprintf(builder, "          %s: %v\n", key, value)
 	}
 }
 
@@ -444,9 +498,9 @@ func generateCacheMemorySteps(builder *strings.Builder, data *WorkflowData) {
 		githubConfig = data.ParsedTools.GitHub
 	}
 	integrityLevel := cacheIntegrityLevel(githubConfig)
-
-	for _, cache := range data.CacheMemoryConfig.Caches {
+	for i, cache := range data.CacheMemoryConfig.Caches {
 		cacheDir := cacheMemoryDirFor(cache.ID)
+		restoreStepID := fmt.Sprintf("restore_cache_memory_%d", i)
 
 		// Add step to create cache-memory directory for this cache
 		if useBackwardCompatiblePaths {
@@ -521,6 +575,7 @@ func generateCacheMemorySteps(builder *strings.Builder, data *WorkflowData) {
 		} else {
 			fmt.Fprintf(builder, "      - name: %s (%s)\n", actionName, cache.ID)
 		}
+		fmt.Fprintf(builder, "        id: %s\n", restoreStepID)
 
 		// Use actions/cache/restore@v4 when restore-only or threat detection enabled
 		// Use actions/cache@v4 for normal caches
@@ -545,6 +600,7 @@ func generateCacheMemorySteps(builder *strings.Builder, data *WorkflowData) {
 		// checks out the current integrity branch, and merges down from higher-integrity branches.
 		generateCacheMemoryGitSetupStep(builder, cache, cacheDir, integrityLevel, useBackwardCompatiblePaths)
 	}
+
 }
 
 // generateCacheMemoryGitSetupStep emits a pre-agent step that sets up the git-backed integrity
@@ -633,7 +689,7 @@ func generateCacheMemoryValidation(builder *strings.Builder, data *WorkflowData)
 		cacheDir := cacheMemoryDirFor(cache.ID)
 
 		// Prepare allowed extensions array for JavaScript
-		allowedExtsJSON, _ := json.Marshal(cache.AllowedExtensions)
+		allowedExtsJSON, _ := json.Marshal(cache.AllowedExtensions) //nolint:jsonmarshalignoredeerror // marshaling a string slice cannot fail
 
 		// Build validation script
 		var validationScript strings.Builder
@@ -687,6 +743,19 @@ func generateCacheMemoryArtifactUpload(builder *strings.Builder, data *WorkflowD
 
 		cacheDir := cacheMemoryDirFor(cache.ID)
 
+		// Add a best-effort git integrity check and reseed step before upload.
+		// This prevents upload-artifact from failing on torn/corrupt .git object stores.
+		if useBackwardCompatiblePaths {
+			builder.WriteString("      - name: Check cache-memory git integrity\n")
+		} else {
+			fmt.Fprintf(builder, "      - name: Check cache-memory git integrity (%s)\n", cache.ID)
+		}
+		builder.WriteString("        if: always()\n")
+		builder.WriteString("        continue-on-error: true\n")
+		builder.WriteString("        env:\n")
+		fmt.Fprintf(builder, "          GH_AW_CACHE_DIR: %s\n", cacheDir)
+		builder.WriteString("        run: bash \"${RUNNER_TEMP}/gh-aw/actions/check_cache_memory_git_integrity.sh\"\n")
+
 		// Add upload-artifact step for each cache (runs always)
 		if useBackwardCompatiblePaths {
 			builder.WriteString("      - name: Upload cache-memory data as artifact\n")
@@ -702,6 +771,7 @@ func generateCacheMemoryArtifactUpload(builder *strings.Builder, data *WorkflowD
 		} else {
 			fmt.Fprintf(builder, "          name: %scache-memory-%s\n", prefix, cache.ID)
 		}
+		builder.WriteString("          include-hidden-files: true\n")
 		fmt.Fprintf(builder, "          path: %s\n", cacheDir)
 		// Add retention-days if configured
 		if cache.RetentionDays != nil {
@@ -726,15 +796,15 @@ func buildCacheMemoryPromptSection(config *CacheMemoryConfig) *PromptSection {
 		// Build description text
 		descriptionText := ""
 		if cache.Description != "" {
-			descriptionText = " " + cache.Description
+			descriptionText = cache.Description
 		}
 
 		// Build allowed extensions text.
-		// When non-empty, wrap as an XML element so the agent knows about file-type restrictions.
+		// When non-empty, add a compact plain-text restriction line.
 		// When empty (all extensions allowed), the placeholder is replaced with nothing.
 		var allowedExtsText string
 		if len(cache.AllowedExtensions) > 0 {
-			allowedExtsText = "\n<allowed-extensions>" + strings.Join(cache.AllowedExtensions, ", ") + "</allowed-extensions>"
+			allowedExtsText = "\nAllowed file extensions: " + strings.Join(cache.AllowedExtensions, ", ") + "."
 		}
 
 		cacheLog.Printf("Building cache memory prompt section with env vars: cache_dir=%s, description=%s, allowed_extensions=%v", cacheDir, descriptionText, cache.AllowedExtensions)
@@ -768,7 +838,7 @@ func buildCacheMemoryPromptSection(config *CacheMemoryConfig) *PromptSection {
 
 	// Build allowed extensions text.
 	// Compute the union of all allowed extensions across all caches.
-	// When non-empty, wrap as an XML element so the agent knows about file-type restrictions.
+	// When non-empty, add a compact plain-text restriction line.
 	// When empty (all extensions allowed for all caches), the placeholder is replaced with nothing.
 	allSame := true
 	for i := 1; i < len(config.Caches); i++ {
@@ -791,10 +861,12 @@ func buildCacheMemoryPromptSection(config *CacheMemoryConfig) *PromptSection {
 	if allSame {
 		extsUnion = config.Caches[0].AllowedExtensions
 	} else {
-		extensionSet := make(map[string]bool)
+		extensionSet := make(map[string]struct {
+		})
 		for _, cache := range config.Caches {
 			for _, ext := range cache.AllowedExtensions {
-				extensionSet[ext] = true
+				extensionSet[ext] = struct {
+				}{}
 			}
 		}
 		for ext := range extensionSet {
@@ -805,7 +877,7 @@ func buildCacheMemoryPromptSection(config *CacheMemoryConfig) *PromptSection {
 
 	var allowedExtsText string
 	if len(extsUnion) > 0 {
-		allowedExtsText = "\n<allowed-extensions>" + strings.Join(extsUnion, ", ") + "</allowed-extensions>"
+		allowedExtsText = "\nAllowed file extensions: " + strings.Join(extsUnion, ", ") + "."
 	}
 
 	// Build cache examples
@@ -900,7 +972,7 @@ func (c *Compiler) buildUpdateCacheMemoryJob(data *WorkflowData, threatDetection
 			cacheLog.Printf("Skipping validation step for cache %s in update job (empty allowed-extensions means all files are allowed)", cache.ID)
 		} else {
 			// Prepare allowed extensions array for JavaScript
-			allowedExtsJSON, _ := json.Marshal(cache.AllowedExtensions)
+			allowedExtsJSON, _ := json.Marshal(cache.AllowedExtensions) //nolint:jsonmarshalignoredeerror // marshaling a string slice cannot fail
 
 			// Build validation script
 			var validationScript strings.Builder
@@ -965,14 +1037,16 @@ func (c *Compiler) buildUpdateCacheMemoryJob(data *WorkflowData, threatDetection
 	// Prepend setup steps to all cache steps
 	steps = append(setupSteps, steps...)
 
-	// Job condition: run if detection job succeeded (no threats found) or was skipped (no outputs to detect),
+	// Job condition: run only if detection job succeeded (no threats found),
 	// AND the agent job succeeded (do not persist cache when agent failed or was skipped).
-	// Using always() so the job runs even when detection is skipped (which sets result = 'skipped').
+	// Using always() so this condition is evaluated even if an upstream job is skipped/failed.
+	// Detection always runs when the agent ran (even for noop), so detection.result == 'success'
+	// is sufficient — detection short-circuits with success=true when there is nothing to analyze.
 	agentSucceeded := BuildEquals(
 		BuildPropertyAccess(fmt.Sprintf("needs.%s.result", constants.AgentJobName)),
 		BuildStringLiteral("success"),
 	)
-	jobCondition := RenderCondition(BuildAnd(BuildAnd(BuildFunctionCall("always"), buildDetectionPassedCondition()), agentSucceeded))
+	jobCondition := RenderCondition(BuildAnd(BuildAnd(BuildFunctionCall("always"), buildDetectionSuccessCondition()), agentSucceeded))
 
 	// Set up permissions for the cache update job
 	// If using local actions (dev mode without action-tag), we need contents: read to checkout the actions folder
@@ -992,7 +1066,7 @@ func (c *Compiler) buildUpdateCacheMemoryJob(data *WorkflowData, threatDetection
 	}
 
 	job := &Job{
-		Name:        "update_cache_memory",
+		Name:        updateCacheMemoryJobName,
 		DisplayName: "", // No display name - job ID is sufficient
 		RunsOn:      c.formatFrameworkJobRunsOn(data),
 		If:          jobCondition,

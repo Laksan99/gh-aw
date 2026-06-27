@@ -15,6 +15,8 @@
  * @property {(text: string) => number} estimateTokens
  * @property {(ms: number) => string} formatDuration
  * @property {(text: string) => string} unfenceMarkdown
+ * @property {(entries: Array<any>) => boolean} isCopilotEventLogEntries
+ * @property {(entries: Array<any>) => Array<any>} convertCopilotEventsToLegacyLogEntries
  * @property {number} MAX_AGENT_TEXT_LENGTH
  * @property {string} SIZE_LIMIT_WARNING
  */
@@ -48,11 +50,20 @@ function createLogParserFormatters(deps) {
     estimateTokens,
     formatDuration,
     unfenceMarkdown,
+    isCopilotEventLogEntries,
+    convertCopilotEventsToLegacyLogEntries,
     MAX_AGENT_TEXT_LENGTH,
     SIZE_LIMIT_WARNING,
   } = deps;
 
   const INTERNAL_TOOLS = ["Read", "Write", "Edit", "MultiEdit", "LS", "Grep", "Glob", "TodoWrite"];
+
+  function normalizeEntriesForRendering(logEntries) {
+    if (isCopilotEventLogEntries(logEntries)) {
+      return convertCopilotEventsToLegacyLogEntries(logEntries);
+    }
+    return logEntries;
+  }
 
   /**
    * Generates markdown summary from conversation log entries
@@ -70,8 +81,9 @@ function createLogParserFormatters(deps) {
    */
   function generateConversationMarkdown(logEntries, options) {
     const { formatToolCallback, formatInitCallback, summaryTracker } = options;
+    const renderEntries = normalizeEntriesForRendering(logEntries);
 
-    const toolUsePairs = collectToolUsePairs(logEntries);
+    const toolUsePairs = collectToolUsePairs(renderEntries);
 
     let markdown = "";
     let sizeLimitReached = false;
@@ -85,7 +97,7 @@ function createLogParserFormatters(deps) {
       return true;
     }
 
-    const initEntry = logEntries.find(entry => entry.type === "system" && entry.subtype === "init");
+    const initEntry = renderEntries.find(entry => entry.type === "system" && entry.subtype === "init");
 
     if (initEntry && formatInitCallback) {
       if (!addContent("## 🚀 Initialization\n\n")) {
@@ -110,7 +122,7 @@ function createLogParserFormatters(deps) {
       return { markdown, commandSummary: [], sizeLimitReached };
     }
 
-    for (const entry of logEntries) {
+    for (const entry of renderEntries) {
       if (sizeLimitReached) break;
 
       if (entry.type === "assistant" && entry.message?.content) {
@@ -122,6 +134,14 @@ function createLogParserFormatters(deps) {
             text = unfenceMarkdown(text);
             if (text && text.length > 0) {
               if (!addContent(text + "\n\n")) {
+                break;
+              }
+            }
+          } else if (content.type === "thinking" && content.thinking) {
+            let text = content.thinking.trim();
+            text = unfenceMarkdown(text);
+            if (text && text.length > 0) {
+              if (!addContent(`<sub>◐ <em>${text.replace(/\n/g, "<br>")}</em></sub>\n\n`)) {
                 break;
               }
             }
@@ -150,7 +170,7 @@ function createLogParserFormatters(deps) {
 
     const commandSummary = [];
 
-    for (const entry of logEntries) {
+    for (const entry of renderEntries) {
       if (entry.type === "assistant" && entry.message?.content) {
         for (const content of entry.message.content) {
           if (content.type === "tool_use") {
@@ -372,7 +392,29 @@ function createLogParserFormatters(deps) {
 
     const textLines = displayText.split("\n");
     for (let i = 0; i < textLines.length; i++) {
-      const prefix = i === 0 ? "◆ " : "  ";
+      if (i === 0) {
+        state.traceEventCount += 1;
+      }
+      const prefix = i === 0 ? `[${state.traceEventCount}] ◆ ` : "  ";
+      if (!appendConversationLine(lines, `${prefix}${textLines[i]}`, state)) {
+        return;
+      }
+    }
+    appendConversationLine(lines, "", state);
+  }
+
+  function appendReasoningText(lines, text, state) {
+    let displayText = text;
+    if (displayText.length > MAX_AGENT_TEXT_LENGTH) {
+      displayText = displayText.substring(0, MAX_AGENT_TEXT_LENGTH) + `... [truncated: showing first ${MAX_AGENT_TEXT_LENGTH} of ${text.length} chars]`;
+    }
+
+    const textLines = displayText.split("\n");
+    for (let i = 0; i < textLines.length; i++) {
+      if (i === 0) {
+        state.traceEventCount += 1;
+      }
+      const prefix = i === 0 ? `[${state.traceEventCount}] ◐ ` : "  ";
       if (!appendConversationLine(lines, `${prefix}${textLines[i]}`, state)) {
         return;
       }
@@ -420,7 +462,8 @@ function createLogParserFormatters(deps) {
       }
     }
 
-    if (!appendConversationLine(lines, `${statusIcon} ${displayName}`, state)) {
+    state.traceEventCount += 1;
+    if (!appendConversationLine(lines, `[${state.traceEventCount}] ${statusIcon} ${displayName}`, state)) {
       return;
     }
 
@@ -491,16 +534,18 @@ function createLogParserFormatters(deps) {
   }
 
   function generateSummaryLines(logEntries) {
+    const renderEntries = normalizeEntriesForRendering(logEntries);
     const lines = [];
-    const toolUsePairs = collectToolUsePairs(logEntries);
+    const toolUsePairs = collectToolUsePairs(renderEntries);
 
     const state = {
       conversationLineCount: 0,
       maxConversationLines: 5000,
       conversationTruncated: false,
+      traceEventCount: 0,
     };
 
-    for (const entry of logEntries) {
+    for (const entry of renderEntries) {
       if (state.conversationLineCount >= state.maxConversationLines) {
         state.conversationTruncated = true;
         break;
@@ -519,6 +564,12 @@ function createLogParserFormatters(deps) {
             if (text && text.length > 0) {
               appendAgentText(lines, text, state);
             }
+          } else if (content.type === "thinking" && content.thinking) {
+            let text = content.thinking.trim();
+            text = unfenceMarkdown(text);
+            if (text && text.length > 0) {
+              appendReasoningText(lines, text, state);
+            }
           } else if (content.type === "tool_use") {
             appendToolExecutionLine(lines, content, toolUsePairs, state);
           }
@@ -531,7 +582,7 @@ function createLogParserFormatters(deps) {
       lines.push("");
     }
 
-    appendStatistics(lines, logEntries, toolUsePairs);
+    appendStatistics(lines, renderEntries, toolUsePairs);
 
     return lines;
   }

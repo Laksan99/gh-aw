@@ -1,12 +1,32 @@
 # typeutil Package
 
-The `typeutil` package provides general-purpose type conversion utilities for working with heterogeneous `any` values, particularly those arising from JSON and YAML parsing.
+> General-purpose type conversion utilities for heterogeneous `any` values, particularly those arising from JSON and YAML parsing.
 
 ## Overview
 
 JSON and YAML parsers produce `any` values whose concrete type varies at runtime (`int`, `float64`, `string`, etc.). This package provides safe, well-documented conversion functions that handle the common cases without requiring callers to write their own type switches.
 
+Functions are grouped into three categories: **strict conversions** (return a `(value, ok)` pair to distinguish zero from missing/invalid), **safe overflow conversions** (clamp to zero on overflow instead of panicking), and **lenient conversions** (also handle string inputs, returning zero on failure). A separate group handles token-limit strings with optional `K`/`M` multiplier suffixes.
+
+Choose the right category based on the source: use strict conversions for YAML config fields where the YAML library has already typed the value; use lenient conversions for heterogeneous sources such as JSON metrics or log-parsed data where a zero default on failure is acceptable.
+
 ## Public API
+
+### Exported Functions
+
+| Function | Description |
+|----------|-------------|
+| `ParseIntValue` | Strict numeric parsing to `int` with `(value, ok)` result |
+| `ParseBool` | Boolean extraction from `map[string]any` |
+| `ParseInt64KMSuffix` | Parse a positive integer string with optional `K`/`M` suffix to `int64` |
+| `NormalizeInt64KMSuffix` | Normalize a positive integer string with optional `K`/`M` suffix to a canonical base-10 string |
+| `SafeUint64ToInt` | Overflow-safe conversion from `uint64` to `int` |
+| `SafeUintToInt` | Overflow-safe conversion from `uint` to `int` |
+| `ConvertToInt` | Lenient conversion of mixed inputs to `int` |
+| `ConvertToFloat` | Lenient conversion of mixed inputs to `float64` |
+| `LookupMap` | Safe map extraction from `map[string]any` by key |
+| `LookupString` | Safe string extraction from `map[string]any` by key |
+| `LookupStringPath` | Safe nested string extraction by key path |
 
 ### Strict Conversions
 
@@ -29,6 +49,38 @@ Extracts a boolean value from a `map[string]any` by key. Returns `false` if the 
 
 ```go
 enabled := typeutil.ParseBool(config, "enabled")
+```
+
+### K/M Suffix Parsing
+
+#### `ParseInt64KMSuffix(raw string) (int64, bool)`
+
+Parses a positive base-10 integer string with an optional `K`/`k` (×1,000) or `M`/`m` (×1,000,000) suffix. Returns `(value, true)` on success and `(0, false)` for empty input, non-positive values, non-numeric strings, or overflow.
+
+```go
+v, ok := typeutil.ParseInt64KMSuffix("128K")
+// v == 128000, ok == true
+
+v, ok = typeutil.ParseInt64KMSuffix("2M")
+// v == 2000000, ok == true
+
+v, ok = typeutil.ParseInt64KMSuffix("512")
+// v == 512, ok == true
+
+_, ok = typeutil.ParseInt64KMSuffix("0")
+// ok == false  (must be positive)
+```
+
+#### `NormalizeInt64KMSuffix(raw string) (string, bool)`
+
+Returns a canonical base-10 string for a positive integer string with an optional `K`/`k` or `M`/`m` suffix. Delegates to `ParseInt64KMSuffix` and formats the result with `strconv.FormatInt`.
+
+```go
+s, ok := typeutil.NormalizeInt64KMSuffix("128K")
+// s == "128000", ok == true
+
+s, ok = typeutil.NormalizeInt64KMSuffix("2m")
+// s == "2000000", ok == true
 ```
 
 ### Safe Overflow Conversions
@@ -69,6 +121,8 @@ ratio := typeutil.ConvertToFloat(jsonData["ratio"])
 | Boolean flag in a `map[string]any` | `ParseBool` |
 | Casting `uint64` counter to `int` | `SafeUint64ToInt` |
 | Numeric value from any source as float | `ConvertToFloat` |
+| Token/limit string with optional `K`/`M` suffix | `ParseInt64KMSuffix` |
+| Canonicalize a `K`/`M`-suffixed string to base-10 | `NormalizeInt64KMSuffix` |
 
 ## Usage Examples
 
@@ -89,6 +143,12 @@ count := typeutil.ConvertToInt(jsonData["count"])
 
 // Safe uint64 to int conversion
 n := typeutil.SafeUint64ToInt(uint64Value)
+
+// Parse an effective token limit string with optional K/M suffix
+limit, ok := typeutil.ParseInt64KMSuffix("128K")
+if !ok {
+    return errors.New("invalid token limit value")
+}
 ```
 
 ## Dependencies

@@ -3,7 +3,6 @@ package workflow
 import (
 	"context"
 	"encoding/base64"
-	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -11,9 +10,11 @@ import (
 	"strings"
 	"time"
 
+	"github.com/github/gh-aw/pkg/gitutil"
 	"github.com/github/gh-aw/pkg/logger"
+	"github.com/github/gh-aw/pkg/sliceutil"
 	"github.com/github/gh-aw/pkg/stringutil"
-	"go.yaml.in/yaml/v3"
+	"github.com/goccy/go-yaml"
 )
 
 var safeOutputActionsLog = logger.New("workflow:safe_outputs_actions")
@@ -267,7 +268,7 @@ func extractSHAFromPinnedRef(pinned string) string {
 		afterAt = strings.TrimSpace(afterAt[:commentIdx])
 	}
 	// Validate it looks like a full SHA (40 hex chars)
-	if isValidFullSHA(afterAt) {
+	if gitutil.IsValidFullSHA(afterAt) {
 		return afterAt
 	}
 	return ""
@@ -287,10 +288,15 @@ func fetchRemoteActionYAML(repo, subdir, ref string) (*actionYAMLFile, error) {
 		apiPath := fmt.Sprintf("/repos/%s/contents/%s?ref=%s", repo, contentPath, ref)
 		safeOutputActionsLog.Printf("Fetching action YAML from: %s", apiPath)
 
-		ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
-		cmd := ExecGHContext(ctx, "api", apiPath, "--jq", ".content")
-		output, err := cmd.Output()
-		cancel()
+		// Wrap the context creation and command execution in a function literal so that
+		// defer cancel() runs when the literal returns (not when the outer function returns),
+		// avoiding a defer-inside-loop resource-lifecycle issue.
+		output, err := func() ([]byte, error) {
+			ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+			defer cancel()
+			cmd := ExecGHContext(ctx, "api", apiPath, "--jq", ".content")
+			return cmd.Output()
+		}()
 		if err != nil {
 			safeOutputActionsLog.Printf("Failed to fetch %s from %s@%s: %v", filename, repo, ref, err)
 			continue
@@ -407,14 +413,14 @@ func generateActionToolDefinition(actionName string, config *SafeOutputActionCon
 	}
 
 	var requiredFields []string
-	properties := inputSchema["properties"].(map[string]any)
+	properties, ok := inputSchema["properties"].(map[string]any)
+	if !ok {
+		properties = make(map[string]any)
+		inputSchema["properties"] = properties
+	}
 
 	// Sort for deterministic output
-	inputNames := make([]string, 0, len(config.Inputs))
-	for k := range config.Inputs {
-		inputNames = append(inputNames, k)
-	}
-	sort.Strings(inputNames)
+	inputNames := sliceutil.SortedKeys(config.Inputs)
 
 	for _, inputName := range inputNames {
 		inputDef := config.Inputs[inputName]
@@ -460,30 +466,19 @@ func buildCustomSafeOutputActionsJSON(data *WorkflowData) string {
 		return ""
 	}
 
-	actionMapping := make(map[string]string, len(data.SafeOutputs.Actions))
+	actionNames := make([]string, 0, len(data.SafeOutputs.Actions))
 	for actionName := range data.SafeOutputs.Actions {
-		normalizedName := stringutil.NormalizeSafeOutputIdentifier(actionName)
-		actionMapping[normalizedName] = normalizedName
+		actionNames = append(actionNames, actionName)
 	}
 
-	// Sort keys for deterministic output
-	keys := make([]string, 0, len(actionMapping))
-	for k := range actionMapping {
-		keys = append(keys, k)
-	}
-	sort.Strings(keys)
-
-	ordered := make(map[string]string, len(keys))
-	for _, k := range keys {
-		ordered[k] = actionMapping[k]
-	}
-
-	jsonBytes, err := json.Marshal(ordered)
+	jsonStr, err := buildNormalizedSortedJSON(actionNames, func(normalizedName string) string {
+		return normalizedName
+	})
 	if err != nil {
 		safeOutputActionsLog.Printf("Warning: failed to marshal custom safe output actions: %v", err)
 		return ""
 	}
-	return string(jsonBytes)
+	return jsonStr
 }
 
 // actionOutputKey returns the step output key for a given normalized action name.
@@ -503,11 +498,7 @@ func (c *Compiler) buildActionSteps(data *WorkflowData) []string {
 	}
 
 	// Sort action names for deterministic output
-	actionNames := make([]string, 0, len(data.SafeOutputs.Actions))
-	for name := range data.SafeOutputs.Actions {
-		actionNames = append(actionNames, name)
-	}
-	sort.Strings(actionNames)
+	actionNames := sliceutil.SortedKeys(data.SafeOutputs.Actions)
 
 	var steps []string
 
@@ -540,11 +531,7 @@ func (c *Compiler) buildActionSteps(data *WorkflowData) []string {
 		// Build optional env: block for per-action environment variables
 		if len(config.Env) > 0 {
 			steps = append(steps, "        env:\n")
-			envKeys := make([]string, 0, len(config.Env))
-			for k := range config.Env {
-				envKeys = append(envKeys, k)
-			}
-			sort.Strings(envKeys)
+			envKeys := sliceutil.SortedKeys(config.Env)
 			for _, envKey := range envKeys {
 				steps = append(steps, fmt.Sprintf("          %s: %s\n", envKey, config.Env[envKey]))
 			}

@@ -281,7 +281,33 @@ func TestDetectFromMCPConfigs(t *testing.T) {
 					t.Errorf("Expected runtime %s to be detected", expectedID)
 				}
 			}
+
 		})
+	}
+}
+
+func TestDetectFromMCPScripts(t *testing.T) {
+	requirements := make(map[string]*RuntimeRequirement)
+	detectFromMCPScripts(&MCPScriptsConfig{
+		Tools: map[string]*MCPScriptToolConfig{
+			"js-tool": {Script: "return { ok: true }"},
+			"py-tool": {Py: "print('ok')"},
+			"go-tool": {Go: `fmt.Println("ok")`},
+			"sh-tool": {Run: "echo ok"},
+		},
+	}, requirements)
+
+	if _, ok := requirements["node"]; !ok {
+		t.Fatal("expected node runtime for script tool")
+	}
+	if _, ok := requirements["python"]; !ok {
+		t.Fatal("expected python runtime for py tool")
+	}
+	if _, ok := requirements["go"]; !ok {
+		t.Fatal("expected go runtime for go tool")
+	}
+	if _, ok := requirements["shell"]; ok {
+		t.Fatal("did not expect shell runtime requirement")
 	}
 }
 
@@ -433,7 +459,7 @@ func TestGenerateRuntimeSetupSteps(t *testing.T) {
 			checkContent: []string{
 				"Setup Go",
 				"actions/setup-go@",
-				"go-version: '1.25'",
+				"go-version: '1.26'",
 				"cache: false",
 				"Capture GOROOT for AWF chroot mode",
 			},
@@ -456,7 +482,7 @@ func TestGenerateRuntimeSetupSteps(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			steps := GenerateRuntimeSetupSteps(tt.requirements)
+			steps := GenerateRuntimeSetupSteps(tt.requirements, nil)
 
 			if len(steps) != tt.expectSteps {
 				t.Errorf("Expected %d steps, got %d", tt.expectSteps, len(steps))
@@ -765,6 +791,51 @@ func TestDeduplicatePreservesUserNodeVersion(t *testing.T) {
 	}
 }
 
+// TestDeduplicatePreservesUserNodeVersionFile tests that when a user specifies
+// node-version-file instead of node-version, deduplication preserves the step.
+func TestDeduplicatePreservesUserNodeVersionFile(t *testing.T) {
+	customSteps := `steps:
+  - name: Setup Node
+    uses: actions/setup-node@v6
+    with:
+      node-version-file: '.node-version'
+      cache: yarn
+  - name: Bootstrap
+    run: yarn kbn bootstrap`
+
+	nodeRuntime := findRuntimeByID("node")
+	if nodeRuntime == nil {
+		t.Fatal("Node runtime not found")
+	}
+
+	requirements := []RuntimeRequirement{
+		{
+			Runtime: nodeRuntime,
+			Version: "", // Auto-detected
+		},
+	}
+
+	deduplicatedSteps, filteredRequirements, err := DeduplicateRuntimeSetupStepsFromCustomSteps(customSteps, requirements)
+	if err != nil {
+		t.Fatalf("Deduplication failed: %v", err)
+	}
+
+	// Node runtime should be filtered out (user owns the setup step)
+	if len(filteredRequirements) != 0 {
+		t.Errorf("Expected 0 filtered requirements, got %d", len(filteredRequirements))
+	}
+
+	// User setup step should be preserved with node-version-file.
+	if !strings.Contains(deduplicatedSteps, "node-version-file") {
+		t.Error("Expected deduplicated steps to contain 'node-version-file'")
+	}
+
+	// The engine default node-version should not be added.
+	if strings.Contains(deduplicatedSteps, "node-version: '24'") {
+		t.Error("Expected default node-version not to be injected when user specifies node-version-file")
+	}
+}
+
 func TestGenerateRuntimeSetupStepsWithIfCondition(t *testing.T) {
 	tests := []struct {
 		name         string
@@ -872,7 +943,7 @@ func TestGenerateRuntimeSetupStepsWithIfCondition(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			steps := GenerateRuntimeSetupSteps(tt.requirements)
+			steps := GenerateRuntimeSetupSteps(tt.requirements, nil)
 
 			if len(steps) != tt.expectSteps {
 				t.Errorf("Expected %d steps, got %d", tt.expectSteps, len(steps))

@@ -3,6 +3,7 @@
 package workflow
 
 import (
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"strings"
@@ -212,6 +213,217 @@ func TestExtractYAMLSections_MissingSections(t *testing.T) {
 	assert.Empty(t, workflowData.Cache)
 }
 
+func TestExtractYAMLSections_EmptyRunsOnSlimTreatedAsUnset(t *testing.T) {
+	compiler := NewCompiler()
+
+	tests := []struct {
+		name  string
+		value any
+	}{
+		{
+			name:  "empty string",
+			value: "",
+		},
+		{
+			name:  "empty array",
+			value: []any{},
+		},
+		{
+			name:  "empty object",
+			value: map[string]any{},
+		},
+		{
+			name:  "object with empty group and labels",
+			value: map[string]any{"group": "", "labels": []any{}},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			workflowData := &WorkflowData{}
+			frontmatter := map[string]any{
+				"runs-on-slim": tt.value,
+			}
+
+			compiler.extractYAMLSections(frontmatter, workflowData)
+
+			assert.Empty(t, workflowData.RunsOnSlim)
+		})
+	}
+}
+
+// TestExtractYAMLSections_NonEmptyRunsOnSlimRenderedSnippet pins the rendered
+// snippet format that extractYAMLSections stores in WorkflowData.RunsOnSlim for
+// non-empty values. Downstream helpers (indentYAMLLines, formatRunsOnSnippetForInlineValue)
+// depend on these exact forms, so changes to the rendering path are intentional.
+func TestExtractYAMLSections_NonEmptyRunsOnSlimRenderedSnippet(t *testing.T) {
+	compiler := NewCompiler()
+
+	tests := []struct {
+		name            string
+		value           any
+		expectedSnippet string
+	}{
+		{
+			name:            "string value produces plain string snippet",
+			value:           "self-hosted",
+			expectedSnippet: "runs-on: self-hosted",
+		},
+		{
+			// Array branch uses standard yaml.Marshal (no DefaultMarshalOptions),
+			// which produces zero-indented list items.
+			name:            "array value produces zero-indented list snippet",
+			value:           []any{"self-hosted", "ubuntu2404"},
+			expectedSnippet: "runs-on:\n- self-hosted\n- ubuntu2404",
+		},
+		{
+			// Object branch uses DefaultMarshalOptions (yaml.Indent(2)), so
+			// map continuation lines carry exactly 2-space indentation.
+			// formatRunsOnSnippetForInlineValue's TrimPrefix("  ") and
+			// indentYAMLLines rely on this exact form.
+			name: "group+labels object produces 2-space-indented map snippet",
+			value: map[string]any{
+				"group":  "runner-group",
+				"labels": []any{"ubuntu2404", "x64"},
+			},
+			expectedSnippet: "runs-on:\n  group: runner-group\n  labels:\n  - ubuntu2404\n  - x64",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			workflowData := &WorkflowData{}
+			frontmatter := map[string]any{
+				"runs-on-slim": tt.value,
+			}
+
+			compiler.extractYAMLSections(frontmatter, workflowData)
+
+			assert.Equal(t, tt.expectedSnippet, workflowData.RunsOnSlim)
+		})
+	}
+}
+
+func TestValidateWorkflowEngineSettings_PreservesLegacyErrorOrder(t *testing.T) {
+	compiler := NewCompiler()
+	compiler.strictMode = true
+
+	workflowData := &WorkflowData{
+		RunInstallScripts: true,
+		EngineConfig: &EngineConfig{
+			HarnessScript: "invalid/path.js",
+		},
+	}
+
+	err := compiler.validateWorkflowEngineSettings("workflow.md", workflowData)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "workflow.md: strict mode: run-install-scripts: true is set")
+	assert.NotContains(t, err.Error(), "engine.harness")
+}
+
+func TestMergeRawOTLPEndpoints_DedupesAndCountsSources(t *testing.T) {
+	mainObs := map[string]any{
+		"otlp": map[string]any{
+			"endpoint": []any{
+				map[string]any{"url": "https://main.example/otlp"},
+				map[string]any{"url": "https://main.example/otlp"},
+				map[string]any{"url": "https://shared.example/otlp"},
+			},
+		},
+	}
+	importedObs := map[string]any{
+		"otlp": map[string]any{
+			"endpoint": []any{
+				map[string]any{"url": "https://shared.example/otlp"},
+				map[string]any{"url": "https://import.example/otlp"},
+				map[string]any{"url": "https://import.example/otlp"},
+			},
+		},
+	}
+
+	mergedEndpoints, mainCount, importAdded := mergeRawOTLPEndpoints(mainObs, importedObs)
+
+	require.Len(t, mergedEndpoints, 3)
+	assert.Equal(t, 2, mainCount)
+	assert.Equal(t, 1, importAdded)
+	assert.Equal(t, "https://main.example/otlp", mergedEndpoints[0].(map[string]any)["url"])
+	assert.Equal(t, "https://shared.example/otlp", mergedEndpoints[1].(map[string]any)["url"])
+	assert.Equal(t, "https://import.example/otlp", mergedEndpoints[2].(map[string]any)["url"])
+}
+
+func TestMergeImportedObservability_MergesResourceAttributesWithMainPrecedence(t *testing.T) {
+	importedObsJSON, err := json.Marshal(map[string]any{
+		"otlp": map[string]any{
+			"resource-attributes": map[string]any{
+				"shared.key":      "from-import",
+				"import.only.key": "import-value",
+			},
+		},
+	})
+	require.NoError(t, err)
+
+	workflowData := &WorkflowData{
+		RawFrontmatter: map[string]any{
+			"observability": map[string]any{
+				"otlp": map[string]any{
+					"resource-attributes": map[string]any{
+						"shared.key":    "from-main",
+						"main.only.key": "main-value",
+					},
+				},
+			},
+		},
+	}
+
+	NewCompiler().mergeImportedObservability(workflowData, string(importedObsJSON))
+
+	obs := workflowData.RawFrontmatter["observability"].(map[string]any)
+	otlp := obs["otlp"].(map[string]any)
+	assert.Equal(t, map[string]string{
+		"shared.key":      "from-main",
+		"main.only.key":   "main-value",
+		"import.only.key": "import-value",
+	}, otlp["resource-attributes"])
+}
+
+func TestBuildMergedEnvSources_MainWorkflowWins(t *testing.T) {
+	mergedEnv := map[string]any{
+		"MAIN_ONLY":   "1",
+		"IMPORT_ONLY": "2",
+		"BOTH":        "3",
+	}
+	topEnv := map[string]any{
+		"MAIN_ONLY": "1",
+		"BOTH":      "3",
+	}
+	importedSources := map[string]string{
+		"IMPORT_ONLY": "imports/shared.md",
+		"BOTH":        "imports/overridden.md",
+	}
+
+	envSources := buildMergedEnvSources(mergedEnv, topEnv, importedSources)
+
+	assert.Equal(t, map[string]string{
+		"MAIN_ONLY":   "(main workflow)",
+		"IMPORT_ONLY": "imports/shared.md",
+		"BOTH":        "(main workflow)",
+	}, envSources)
+}
+
+func TestSetMainWorkflowEnvSources_OnlyTracksPresentKeys(t *testing.T) {
+	workflowData := &WorkflowData{}
+
+	setMainWorkflowEnvSources(workflowData, map[string]any{
+		"FOO": "1",
+		"BAR": "2",
+	})
+
+	assert.Equal(t, map[string]string{
+		"FOO": "(main workflow)",
+		"BAR": "(main workflow)",
+	}, workflowData.EnvSources)
+}
+
 // TestProcessAndMergeSteps_NoSteps tests processAndMergeSteps with no steps
 func TestProcessAndMergeSteps_NoSteps(t *testing.T) {
 	compiler := NewCompiler()
@@ -219,7 +431,7 @@ func TestProcessAndMergeSteps_NoSteps(t *testing.T) {
 	frontmatter := map[string]any{}
 	importsResult := &parser.ImportsResult{}
 
-	compiler.processAndMergeSteps(frontmatter, workflowData, importsResult)
+	require.NoError(t, compiler.processAndMergeSteps(frontmatter, workflowData, importsResult))
 
 	// CustomSteps should be empty when no steps are defined
 	assert.Empty(t, workflowData.CustomSteps)
@@ -246,7 +458,7 @@ func TestProcessAndMergeSteps_MainStepsOnly(t *testing.T) {
 	}
 	importsResult := &parser.ImportsResult{}
 
-	compiler.processAndMergeSteps(frontmatter, workflowData, importsResult)
+	require.NoError(t, compiler.processAndMergeSteps(frontmatter, workflowData, importsResult))
 
 	// CustomSteps should contain the main workflow steps
 	assert.NotEmpty(t, workflowData.CustomSteps)
@@ -287,7 +499,7 @@ func TestProcessAndMergeSteps_WithImportedSteps(t *testing.T) {
 		MergedSteps: string(importedStepsYAML),
 	}
 
-	compiler.processAndMergeSteps(frontmatter, workflowData, importsResult)
+	require.NoError(t, compiler.processAndMergeSteps(frontmatter, workflowData, importsResult))
 
 	// CustomSteps should contain both imported and main steps
 	assert.NotEmpty(t, workflowData.CustomSteps)
@@ -332,7 +544,7 @@ func TestProcessAndMergeSteps_WithCopilotSetupSteps(t *testing.T) {
 		CopilotSetupSteps: string(copilotSetupYAML),
 	}
 
-	compiler.processAndMergeSteps(frontmatter, workflowData, importsResult)
+	require.NoError(t, compiler.processAndMergeSteps(frontmatter, workflowData, importsResult))
 
 	// CustomSteps should contain both copilot-setup and main steps
 	assert.NotEmpty(t, workflowData.CustomSteps)
@@ -380,7 +592,7 @@ func TestProcessAndMergeSteps_AllStepTypes(t *testing.T) {
 		MergedSteps:       string(otherStepsYAML),
 	}
 
-	compiler.processAndMergeSteps(frontmatter, workflowData, importsResult)
+	require.NoError(t, compiler.processAndMergeSteps(frontmatter, workflowData, importsResult))
 
 	// All steps should be present
 	assert.Contains(t, workflowData.CustomSteps, "Copilot setup")
@@ -403,7 +615,7 @@ func TestProcessAndMergePostSteps_NoPostSteps(t *testing.T) {
 	frontmatter := map[string]any{}
 	importsResult := &parser.ImportsResult{}
 
-	compiler.processAndMergePostSteps(frontmatter, workflowData, importsResult)
+	require.NoError(t, compiler.processAndMergePostSteps(frontmatter, workflowData, importsResult))
 
 	assert.Empty(t, workflowData.PostSteps)
 }
@@ -433,7 +645,7 @@ func TestProcessAndMergePostSteps_WithPostSteps(t *testing.T) {
 	}
 	importsResult := &parser.ImportsResult{}
 
-	compiler.processAndMergePostSteps(frontmatter, workflowData, importsResult)
+	require.NoError(t, compiler.processAndMergePostSteps(frontmatter, workflowData, importsResult))
 
 	assert.NotEmpty(t, workflowData.PostSteps)
 	assert.Contains(t, workflowData.PostSteps, "Cleanup")
@@ -459,7 +671,7 @@ func TestProcessAndMergePostSteps_WithImportedPostSteps(t *testing.T) {
 		MergedPostSteps: string(importedPostStepsYAML),
 	}
 
-	compiler.processAndMergePostSteps(frontmatter, workflowData, importsResult)
+	require.NoError(t, compiler.processAndMergePostSteps(frontmatter, workflowData, importsResult))
 
 	assert.Contains(t, workflowData.PostSteps, "Main post step")
 	assert.Contains(t, workflowData.PostSteps, "Imported post step")
@@ -477,7 +689,7 @@ func TestProcessAndMergePreSteps_NoPreSteps(t *testing.T) {
 	frontmatter := map[string]any{}
 	importsResult := &parser.ImportsResult{}
 
-	compiler.processAndMergePreSteps(frontmatter, workflowData, importsResult)
+	require.NoError(t, compiler.processAndMergePreSteps(frontmatter, workflowData, importsResult))
 
 	assert.Empty(t, workflowData.PreSteps)
 }
@@ -494,7 +706,7 @@ func TestProcessAndMergePreSteps_WithPreSteps(t *testing.T) {
 	}
 	importsResult := &parser.ImportsResult{}
 
-	compiler.processAndMergePreSteps(frontmatter, workflowData, importsResult)
+	require.NoError(t, compiler.processAndMergePreSteps(frontmatter, workflowData, importsResult))
 
 	assert.NotEmpty(t, workflowData.PreSteps)
 	assert.Contains(t, workflowData.PreSteps, "Mint token")
@@ -519,7 +731,7 @@ func TestProcessAndMergePreSteps_WithImportedPreSteps(t *testing.T) {
 		MergedPreSteps: string(importedPreStepsYAML),
 	}
 
-	compiler.processAndMergePreSteps(frontmatter, workflowData, importsResult)
+	require.NoError(t, compiler.processAndMergePreSteps(frontmatter, workflowData, importsResult))
 
 	assert.Contains(t, workflowData.PreSteps, "Main pre step")
 	assert.Contains(t, workflowData.PreSteps, "Imported pre step")
@@ -537,7 +749,7 @@ func TestProcessAndMergePreAgentSteps_NoPreAgentSteps(t *testing.T) {
 	frontmatter := map[string]any{}
 	importsResult := &parser.ImportsResult{}
 
-	compiler.processAndMergePreAgentSteps(frontmatter, workflowData, importsResult)
+	require.NoError(t, compiler.processAndMergePreAgentSteps(frontmatter, workflowData, importsResult))
 
 	assert.Empty(t, workflowData.PreAgentSteps)
 }
@@ -554,7 +766,7 @@ func TestProcessAndMergePreAgentSteps_WithPreAgentSteps(t *testing.T) {
 	}
 	importsResult := &parser.ImportsResult{}
 
-	compiler.processAndMergePreAgentSteps(frontmatter, workflowData, importsResult)
+	require.NoError(t, compiler.processAndMergePreAgentSteps(frontmatter, workflowData, importsResult))
 
 	assert.NotEmpty(t, workflowData.PreAgentSteps)
 	assert.Contains(t, workflowData.PreAgentSteps, "Prepare final context")
@@ -579,7 +791,7 @@ func TestProcessAndMergePreAgentSteps_WithImportedPreAgentSteps(t *testing.T) {
 		MergedPreAgentSteps: string(importedPreAgentStepsYAML),
 	}
 
-	compiler.processAndMergePreAgentSteps(frontmatter, workflowData, importsResult)
+	require.NoError(t, compiler.processAndMergePreAgentSteps(frontmatter, workflowData, importsResult))
 
 	assert.Contains(t, workflowData.PreAgentSteps, "Main pre-agent step")
 	assert.Contains(t, workflowData.PreAgentSteps, "Imported pre-agent step")
@@ -792,6 +1004,85 @@ func TestMergeJobsFromYAMLImports_MergesPreStepsOnConflict(t *testing.T) {
 	second := preSteps[1].(map[string]any)
 	assert.Equal(t, "import pre", first["name"], "Imported pre-steps should run first")
 	assert.Equal(t, "main pre", second["name"], "Main workflow pre-steps should run after imported pre-steps")
+}
+
+// TestMergeJobsFromYAMLImports_MergesSetupStepsOnConflict tests deterministic merging of
+// jobs.<job-id>.setup-steps when main and imported workflows define the same job.
+func TestMergeJobsFromYAMLImports_MergesSetupStepsOnConflict(t *testing.T) {
+	compiler := NewCompiler()
+
+	mainJobs := map[string]any{
+		"test": map[string]any{
+			"runs-on": "ubuntu-latest",
+			"setup-steps": []any{
+				map[string]any{"name": "main setup", "run": "echo main"},
+			},
+			"steps": []any{
+				map[string]any{"run": "echo main job"},
+			},
+		},
+	}
+
+	importedJobsJSON := `{"test": {"runs-on": "macos-latest", "setup-steps": [{"name": "import setup", "run": "echo import"}], "steps": [{"run": "echo imported job"}]}}`
+	result := compiler.mergeJobsFromYAMLImports(mainJobs, importedJobsJSON)
+
+	assert.Len(t, result, 1)
+	testJob := result["test"].(map[string]any)
+
+	// Main job fields still take precedence.
+	assert.Equal(t, "ubuntu-latest", testJob["runs-on"])
+
+	setupSteps, ok := testJob["setup-steps"].([]any)
+	require.True(t, ok, "Expected merged setup-steps array")
+	require.Len(t, setupSteps, 2, "Expected imported+main setup-steps to be merged")
+
+	first := setupSteps[0].(map[string]any)
+	second := setupSteps[1].(map[string]any)
+	assert.Equal(t, "import setup", first["name"], "Imported setup-steps should run first")
+	assert.Equal(t, "main setup", second["name"], "Main workflow setup-steps should run after imported setup-steps")
+}
+
+func TestMergeJobsFromYAMLImports_MergesSetupAndPreStepsIndependentlyOnConflict(t *testing.T) {
+	compiler := NewCompiler()
+
+	mainJobs := map[string]any{
+		"test": map[string]any{
+			"runs-on": "ubuntu-latest",
+			"setup-steps": []any{
+				map[string]any{"name": "main setup", "run": "echo main"},
+			},
+			"pre-steps": []any{
+				map[string]any{"name": "main pre", "run": "echo main pre"},
+			},
+			"steps": []any{
+				map[string]any{"run": "echo main job"},
+			},
+		},
+	}
+
+	importedJobsJSON := `{"test": {"runs-on": "macos-latest", "setup-steps": [{"name": "import setup", "run": "echo import setup"}], "pre-steps": [{"name": "import pre", "run": "echo import pre"}], "steps": [{"run": "echo imported job"}]}}`
+	result := compiler.mergeJobsFromYAMLImports(mainJobs, importedJobsJSON)
+
+	assert.Len(t, result, 1)
+	testJob := result["test"].(map[string]any)
+
+	setupSteps, ok := testJob["setup-steps"].([]any)
+	require.True(t, ok, "Expected merged setup-steps array")
+	require.Len(t, setupSteps, 2, "Expected imported+main setup-steps to be merged")
+
+	preSteps, ok := testJob["pre-steps"].([]any)
+	require.True(t, ok, "Expected merged pre-steps array")
+	require.Len(t, preSteps, 2, "Expected imported+main pre-steps to be merged")
+
+	first := setupSteps[0].(map[string]any)
+	second := setupSteps[1].(map[string]any)
+	assert.Equal(t, "import setup", first["name"], "Imported setup-steps should run first")
+	assert.Equal(t, "main setup", second["name"], "Main workflow setup-steps should run after imported setup-steps")
+
+	firstPre := preSteps[0].(map[string]any)
+	secondPre := preSteps[1].(map[string]any)
+	assert.Equal(t, "import pre", firstPre["name"], "Imported pre-steps should run first")
+	assert.Equal(t, "main pre", secondPre["name"], "Main workflow pre-steps should run after imported pre-steps")
 }
 
 // TestMergeJobsFromYAMLImports_MultipleImportedJobs tests merging multiple imported jobs
@@ -1516,9 +1807,9 @@ func TestMergeJobsFromYAMLImports_PreservesJobOrder(t *testing.T) {
 	assert.Contains(t, result, "job-d")
 }
 
-// TestProcessAndMergeSteps_InvalidYAML tests handling of invalid YAML in imported steps
-func TestProcessAndMergeSteps_InvalidYAML(t *testing.T) {
-	tmpDir := testutil.TempDir(t, "invalid-steps-yaml")
+// TestProcessAndMergeSteps_InvalidYAML_MergedSteps tests that malformed MergedSteps YAML returns an error
+func TestProcessAndMergeSteps_InvalidYAML_MergedSteps(t *testing.T) {
+	tmpDir := testutil.TempDir(t, "invalid-merged-steps-yaml")
 	compiler := NewCompiler()
 	actionCache := NewActionCache(tmpDir)
 	actionResolver := NewActionResolver(actionCache)
@@ -1538,12 +1829,73 @@ func TestProcessAndMergeSteps_InvalidYAML(t *testing.T) {
 		MergedSteps: "invalid: [yaml",
 	}
 
-	// Should handle gracefully without panicking
-	compiler.processAndMergeSteps(frontmatter, workflowData, importsResult)
+	// Malformed MergedSteps YAML must propagate as an error
+	err := compiler.processAndMergeSteps(frontmatter, workflowData, importsResult)
+	require.Error(t, err, "malformed MergedSteps YAML should return an error")
+	assert.Contains(t, err.Error(), "failed to parse imported steps")
+}
 
-	// Should still have main steps
-	assert.NotEmpty(t, workflowData.CustomSteps)
-	assert.Contains(t, workflowData.CustomSteps, "Main")
+// TestProcessAndMergePreSteps_InvalidYAML tests that malformed imported pre-steps YAML returns an error
+func TestProcessAndMergePreSteps_InvalidYAML(t *testing.T) {
+	tmpDir := testutil.TempDir(t, "invalid-pre-steps-yaml")
+	compiler := NewCompiler()
+	actionCache := NewActionCache(tmpDir)
+	actionResolver := NewActionResolver(actionCache)
+	workflowData := &WorkflowData{
+		ActionCache:    actionCache,
+		ActionResolver: actionResolver,
+	}
+
+	frontmatter := map[string]any{}
+	importsResult := &parser.ImportsResult{
+		MergedPreSteps: "invalid: [yaml",
+	}
+
+	err := compiler.processAndMergePreSteps(frontmatter, workflowData, importsResult)
+	require.Error(t, err, "malformed imported pre-steps YAML should return an error")
+	assert.Contains(t, err.Error(), "failed to parse imported pre-steps")
+}
+
+// TestProcessAndMergePreAgentSteps_InvalidYAML tests that malformed imported pre-agent-steps YAML returns an error
+func TestProcessAndMergePreAgentSteps_InvalidYAML(t *testing.T) {
+	tmpDir := testutil.TempDir(t, "invalid-pre-agent-steps-yaml")
+	compiler := NewCompiler()
+	actionCache := NewActionCache(tmpDir)
+	actionResolver := NewActionResolver(actionCache)
+	workflowData := &WorkflowData{
+		ActionCache:    actionCache,
+		ActionResolver: actionResolver,
+	}
+
+	frontmatter := map[string]any{}
+	importsResult := &parser.ImportsResult{
+		MergedPreAgentSteps: "invalid: [yaml",
+	}
+
+	err := compiler.processAndMergePreAgentSteps(frontmatter, workflowData, importsResult)
+	require.Error(t, err, "malformed imported pre-agent-steps YAML should return an error")
+	assert.Contains(t, err.Error(), "failed to parse imported pre-agent-steps")
+}
+
+// TestProcessAndMergePostSteps_InvalidYAML tests that malformed imported post-steps YAML returns an error
+func TestProcessAndMergePostSteps_InvalidYAML(t *testing.T) {
+	tmpDir := testutil.TempDir(t, "invalid-post-steps-yaml")
+	compiler := NewCompiler()
+	actionCache := NewActionCache(tmpDir)
+	actionResolver := NewActionResolver(actionCache)
+	workflowData := &WorkflowData{
+		ActionCache:    actionCache,
+		ActionResolver: actionResolver,
+	}
+
+	frontmatter := map[string]any{}
+	importsResult := &parser.ImportsResult{
+		MergedPostSteps: "invalid: [yaml",
+	}
+
+	err := compiler.processAndMergePostSteps(frontmatter, workflowData, importsResult)
+	require.Error(t, err, "malformed imported post-steps YAML should return an error")
+	assert.Contains(t, err.Error(), "failed to parse imported post-steps")
 }
 
 // TestProcessAndMergeServices_EmptyImportedServices tests handling of empty imported services

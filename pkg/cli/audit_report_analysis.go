@@ -7,6 +7,7 @@ import (
 
 	"github.com/github/gh-aw/pkg/console"
 	"github.com/github/gh-aw/pkg/sliceutil"
+	"github.com/github/gh-aw/pkg/stringutil"
 	"github.com/github/gh-aw/pkg/timeutil"
 )
 
@@ -34,22 +35,35 @@ func generateFindings(processedRun ProcessedRun, metrics MetricsData, errors []E
 	if run.Conclusion == "failure" {
 		var desc string
 		if metrics.ErrorCount == 0 && len(errors) == 0 {
-			// No log data available — run likely failed before agent activation (e.g. cancelled,
-			// infrastructure failure, or no downloadable artifacts).  Saying "failed with 0 error(s)"
-			// is logically contradictory, so surface a clearer message instead.
-			desc = fmt.Sprintf("Workflow '%s' failed before agent activation — no error logs were available to analyze", run.WorkflowName)
+			if agentJob, ok := findFailedAgentJob(processedRun.JobDetails); ok {
+				// The agent job ran and failed, but telemetry/error artifacts were not exported.
+				// Surface this explicitly rather than misclassifying as pre-activation failure.
+				desc = fmt.Sprintf("Workflow '%s' failed after agent activation — agent job ran for %s before failing and no agent telemetry was available to analyze", run.WorkflowName, timeutil.FormatDuration(agentJob.Duration))
+			} else {
+				// No log data available — run likely failed before agent activation (e.g. cancelled,
+				// infrastructure failure, or no downloadable artifacts).  Saying "failed with 0 error(s)"
+				// is logically contradictory, so surface a clearer message instead.
+				desc = fmt.Sprintf("Workflow '%s' failed before agent activation — no error logs were available to analyze", run.WorkflowName)
+			}
 		} else {
-			desc = fmt.Sprintf("Workflow '%s' failed with %d error(s)", run.WorkflowName, metrics.ErrorCount)
+			// Prefer the length of the actual errors slice as the count, since it is the
+			// ground-truth list that is included in the audit output.  Fall back to
+			// metrics.ErrorCount only when no individual error details were collected
+			// (e.g. the log was unavailable but a count was extracted from a summary).
+			errorCount := len(errors)
+			if errorCount == 0 {
+				errorCount = metrics.ErrorCount
+			}
+
+			desc = fmt.Sprintf("Workflow '%s' failed with %d error(s)", run.WorkflowName, errorCount)
 			if len(errors) > 0 {
 				// Append a truncated first error message to help quickly identify the root cause.
 				// Keep descriptions short enough to be useful in a key findings summary.
 				const maxErrMsgLen = 200
-				msg := errors[0].Message
-				if len(msg) > maxErrMsgLen {
-					msg = msg[:maxErrMsgLen] + "..."
-				}
+				msg := stringutil.Truncate(errors[0].Message, maxErrMsgLen)
 				desc += ": " + msg
 			}
+
 		}
 		findings = append(findings, Finding{
 			Category:    "error",
@@ -67,25 +81,6 @@ func generateFindings(processedRun ProcessedRun, metrics MetricsData, errors []E
 			Title:       "Workflow Timeout",
 			Description: "Workflow exceeded time limit and was terminated",
 			Impact:      "Tasks may be incomplete, consider optimizing workflow or increasing timeout",
-		})
-	}
-
-	// Cost findings
-	if metrics.EstimatedCost > 1.0 {
-		findings = append(findings, Finding{
-			Category:    "cost",
-			Severity:    "high",
-			Title:       "High Cost Detected",
-			Description: fmt.Sprintf("Estimated cost of $%.2f exceeds typical threshold", metrics.EstimatedCost),
-			Impact:      "Review token usage and consider optimization opportunities",
-		})
-	} else if metrics.EstimatedCost > 0.5 {
-		findings = append(findings, Finding{
-			Category:    "cost",
-			Severity:    "medium",
-			Title:       "Moderate Cost",
-			Description: fmt.Sprintf("Estimated cost of $%.2f is moderate", metrics.EstimatedCost),
-			Impact:      "Monitor costs if this workflow runs frequently",
 		})
 	}
 
@@ -190,6 +185,16 @@ func generateFindings(processedRun ProcessedRun, metrics MetricsData, errors []E
 	}
 
 	return findings
+}
+
+func findFailedAgentJob(jobDetails []JobInfoWithDuration) (JobInfoWithDuration, bool) {
+	for _, job := range jobDetails {
+		if strings.EqualFold(strings.TrimSpace(job.Name), "agent") && strings.EqualFold(job.Conclusion, "failure") {
+			return job, true
+		}
+	}
+
+	return JobInfoWithDuration{}, false
 }
 
 // generateRecommendations creates actionable recommendations based on findings
@@ -304,27 +309,11 @@ func generatePerformanceMetrics(processedRun ProcessedRun, metrics MetricsData, 
 	auditReportLog.Printf("Generating performance metrics: token_usage=%d, tool_count=%d, duration=%v", metrics.TokenUsage, len(toolUsage), run.Duration)
 	pm := &PerformanceMetrics{}
 
-	auditReportLog.Printf("Calculating cost efficiency: estimated_cost=$%.2f", metrics.EstimatedCost)
-
 	// Calculate tokens per minute
 	if run.Duration > 0 && metrics.TokenUsage > 0 {
 		minutes := run.Duration.Minutes()
 		if minutes > 0 {
 			pm.TokensPerMinute = float64(metrics.TokenUsage) / minutes
-		}
-	}
-
-	// Determine cost efficiency
-	if metrics.EstimatedCost > 0 && run.Duration > 0 {
-		costPerMinute := metrics.EstimatedCost / run.Duration.Minutes()
-		if costPerMinute < 0.01 {
-			pm.CostEfficiency = "excellent"
-		} else if costPerMinute < 0.05 {
-			pm.CostEfficiency = "good"
-		} else if costPerMinute < 0.10 {
-			pm.CostEfficiency = "moderate"
-		} else {
-			pm.CostEfficiency = "poor"
 		}
 	}
 

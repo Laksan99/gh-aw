@@ -1,11 +1,11 @@
 // This file implements the Model Alias Format (MAF) identifier parser as defined in
-// the Model Alias Format Specification (docs/src/content/docs/reference/model-alias-specification.md).
+// the Model Alias Format Specification (docs/src/content/docs/specs/model-alias-specification.md).
 //
 // # Model Identifier Syntax (Section 4)
 //
 // A model identifier string takes one of the following forms:
 //
-//	bare-name                         e.g. "sonnet", "auto"
+//	bare-name                         e.g. "sonnet", "agent"
 //	provider/model-token              e.g. "copilot/gpt-5"
 //	provider/model-glob-token         e.g. "copilot/*sonnet*"
 //	any of the above + "?" params     e.g. "opus?effort=high"

@@ -158,16 +158,16 @@ func TestGenerateSafeOutputsConfigMissingToolWithIssue(t *testing.T) {
 // TestGenerateSafeOutputsConfigMentions tests the mentions configuration generation.
 func TestGenerateSafeOutputsConfigMentions(t *testing.T) {
 	enabled := true
-	allowTeamMembers := false
+	allowedCollaborators := false
 	max := 5
 
 	data := &WorkflowData{
 		SafeOutputs: &SafeOutputsConfig{
 			Mentions: &MentionsConfig{
-				Enabled:          &enabled,
-				AllowTeamMembers: &allowTeamMembers,
-				Max:              &max,
-				Allowed:          []string{"user1", "user2"},
+				Enabled:              &enabled,
+				AllowedCollaborators: &allowedCollaborators,
+				Max:                  &max,
+				Allowed:              []string{"user1", "user2"},
 			},
 		},
 	}
@@ -182,8 +182,33 @@ func TestGenerateSafeOutputsConfigMentions(t *testing.T) {
 	mentions, ok := parsed["mentions"].(map[string]any)
 	require.True(t, ok, "Expected mentions key in config")
 	assert.True(t, mentions["enabled"].(bool), "enabled should be true")
-	assert.False(t, mentions["allowTeamMembers"].(bool), "allowTeamMembers should be false")
+	assert.False(t, mentions["allowedCollaborators"].(bool), "allowedCollaborators should be false")
 	assert.InDelta(t, float64(5), mentions["max"], 0.0001, "max should be 5")
+}
+
+func TestGenerateSafeOutputsConfigNormalizeClosingKeywordsPerType(t *testing.T) {
+	enabled := true
+	data := &WorkflowData{
+		SafeOutputs: &SafeOutputsConfig{
+			CreatePullRequests: &CreatePullRequestsConfig{
+				BaseSafeOutputConfig: BaseSafeOutputConfig{
+					NormalizeClosingKeywords: &enabled,
+				},
+			},
+		},
+	}
+
+	result, err := generateSafeOutputsConfig(data)
+	require.NoError(t, err, "generateSafeOutputsConfig should not return an error")
+	require.NotEmpty(t, result, "Expected non-empty config")
+
+	var parsed map[string]any
+	require.NoError(t, json.Unmarshal([]byte(result), &parsed), "Result must be valid JSON")
+	createPR, ok := parsed["create_pull_request"].(map[string]any)
+	require.True(t, ok, "create_pull_request config should be present")
+	assert.Equal(t, true, createPR["normalize_closing_keywords"], "create_pull_request.normalize_closing_keywords should be true")
+	_, hasTopLevel := parsed["normalize_closing_keywords"]
+	assert.False(t, hasTopLevel, "top-level normalize_closing_keywords should not be emitted")
 }
 
 // TestPopulateDispatchWorkflowFilesNoSafeOutputs tests that the function handles nil SafeOutputs gracefully.
@@ -525,6 +550,81 @@ func TestGenerateSafeOutputsConfigCreatePullRequestBackwardCompat(t *testing.T) 
 	assert.False(t, hasTargetRepo, "target-repo should not be present when not configured")
 	_, hasAllowedRepos := prConfig["allowed_repos"]
 	assert.False(t, hasAllowedRepos, "allowed_repos should not be present when not configured")
+}
+
+func TestGenerateSafeOutputsConfigInjectsCurrentCheckoutPatchWorkspacePath(t *testing.T) {
+	data := &WorkflowData{
+		CheckoutConfigs: []*CheckoutConfig{
+			{
+				Repository: "caido/proxy-frontend",
+				Path:       "./proxy-frontend",
+				Current:    true,
+			},
+		},
+		SafeOutputs: &SafeOutputsConfig{
+			CreatePullRequests: &CreatePullRequestsConfig{
+				BaseSafeOutputConfig: BaseSafeOutputConfig{Max: strPtr("1")},
+				TargetRepoSlug:       "caido/proxy-frontend",
+			},
+			PushToPullRequestBranch: &PushToPullRequestBranchConfig{
+				TargetRepoSlug: "caido/proxy-frontend",
+			},
+		},
+	}
+
+	result, err := generateSafeOutputsConfig(data)
+	require.NoError(t, err)
+	require.NotEmpty(t, result)
+
+	var parsed map[string]any
+	require.NoError(t, json.Unmarshal([]byte(result), &parsed))
+
+	prConfig, ok := parsed["create_pull_request"].(map[string]any)
+	require.True(t, ok, "Expected create_pull_request key in config")
+	assert.Equal(t, "proxy-frontend", prConfig["patch_workspace_path"])
+	assert.Equal(t, "caido/proxy-frontend", prConfig["current_checkout_repo"])
+
+	pushConfig, ok := parsed["push_to_pull_request_branch"].(map[string]any)
+	require.True(t, ok, "Expected push_to_pull_request_branch key in config")
+	assert.Equal(t, "proxy-frontend", pushConfig["patch_workspace_path"])
+	assert.Equal(t, "caido/proxy-frontend", pushConfig["current_checkout_repo"])
+}
+
+func TestGenerateSafeOutputsConfigSkipsPatchWorkspacePathForExplicitTargetRepoWhenCurrentRepoIsWorkflowRepo(t *testing.T) {
+	data := &WorkflowData{
+		CheckoutConfigs: []*CheckoutConfig{
+			{
+				Path:    "./proxy-frontend",
+				Current: true,
+			},
+		},
+		SafeOutputs: &SafeOutputsConfig{
+			CreatePullRequests: &CreatePullRequestsConfig{
+				BaseSafeOutputConfig: BaseSafeOutputConfig{Max: strPtr("1")},
+				TargetRepoSlug:       "caido/proxy-frontend",
+			},
+			PushToPullRequestBranch: &PushToPullRequestBranchConfig{
+				TargetRepoSlug: "caido/proxy-frontend",
+			},
+		},
+	}
+
+	result, err := generateSafeOutputsConfig(data)
+	require.NoError(t, err)
+	require.NotEmpty(t, result)
+
+	var parsed map[string]any
+	require.NoError(t, json.Unmarshal([]byte(result), &parsed))
+
+	prConfig, ok := parsed["create_pull_request"].(map[string]any)
+	require.True(t, ok, "Expected create_pull_request key in config")
+	assert.NotContains(t, prConfig, "patch_workspace_path")
+	assert.NotContains(t, prConfig, "current_checkout_repo")
+
+	pushConfig, ok := parsed["push_to_pull_request_branch"].(map[string]any)
+	require.True(t, ok, "Expected push_to_pull_request_branch key in config")
+	assert.NotContains(t, pushConfig, "patch_workspace_path")
+	assert.NotContains(t, pushConfig, "current_checkout_repo")
 }
 
 func TestGenerateSafeOutputsConfigCreatePullRequestIncludesEngineManifests(t *testing.T) {
@@ -885,7 +985,7 @@ func TestGenerateSafeOutputsConfigClosePullRequestStaged(t *testing.T) {
 		SafeOutputs: &SafeOutputsConfig{
 			ClosePullRequests: &ClosePullRequestsConfig{
 				BaseSafeOutputConfig: BaseSafeOutputConfig{
-					Staged: true,
+					Staged: templatableBoolPtr("true"),
 				},
 			},
 		},

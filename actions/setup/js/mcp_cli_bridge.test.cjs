@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-import { formatResponse, hasStdinJsonPayload, parseToolArgs, readStdinSync } from "./mcp_cli_bridge.cjs";
+import { formatResponse, hasStdinJsonPayload, parseToolArgs, readStdinSync, showHelp, showToolHelp, writeStdoutAndFlush } from "./mcp_cli_bridge.cjs";
 
 describe("mcp_cli_bridge.cjs", () => {
   let originalCore;
@@ -172,8 +172,8 @@ describe("mcp_cli_bridge.cjs", () => {
     });
   });
 
-  it("treats MCP result envelopes with isError=true as errors", () => {
-    formatResponse(
+  it("treats MCP result envelopes with isError=true as errors", async () => {
+    await formatResponse(
       {
         result: {
           isError: true,
@@ -188,28 +188,143 @@ describe("mcp_cli_bridge.cjs", () => {
     expect(process.exitCode).toBe(1);
   });
 
-  it("prints progress notifications to stderr and final text result to stdout for SSE responses", () => {
+  it("prints progress notifications to stderr and final text result to stdout for SSE responses", async () => {
     const sseBody = [
       'data: {"jsonrpc":"2.0","method":"notifications/progress","params":{"progressToken":"abc","progress":1,"total":3,"message":"Step 1/3"}}',
       'data: {"jsonrpc":"2.0","id":2,"result":{"content":[{"type":"text","text":"done"}]}}',
       "",
     ].join("\n");
 
-    formatResponse(sseBody, "agenticworkflows");
+    await formatResponse(sseBody, "agenticworkflows");
 
     expect(stderrChunks.join("")).toContain("Step 1/3");
     expect(stdoutChunks.join("")).toBe("done\n");
     expect(process.exitCode).toBe(0);
   });
 
-  it("prints numeric progress to stderr when progress notification has no message", () => {
+  it("prints numeric progress to stderr when progress notification has no message", async () => {
     const sseBody = ['data: {"jsonrpc":"2.0","method":"notifications/progress","params":{"progressToken":"abc","progress":2,"total":5}}', 'data: {"jsonrpc":"2.0","id":2,"result":{"content":[{"type":"text","text":"ok"}]}}', ""].join("\n");
 
-    formatResponse(sseBody, "agenticworkflows");
+    await formatResponse(sseBody, "agenticworkflows");
 
     expect(stderrChunks.join("")).toContain("Progress: 2/5");
     expect(stdoutChunks.join("")).toBe("ok\n");
     expect(process.exitCode).toBe(0);
+  });
+
+  it("keeps top-level help compact for many commands", () => {
+    const tools = Array.from({ length: 25 }, (_, i) => ({
+      name: `tool_${i + 1}`,
+      description: `Description for command ${i + 1} that is intentionally verbose for truncation checks.`,
+    }));
+
+    showHelp("safeoutputs", tools);
+
+    const outputLines = stdoutChunks.join("").trimEnd().split("\n");
+    const output = outputLines.join("\n");
+    expect(outputLines.length).toBeLessThanOrEqual(20);
+    expect(output).not.toMatch(/\.\.\. \+\d+ more command\(s\)/);
+    for (const tool of tools) {
+      expect(output).toContain(tool.name);
+    }
+  });
+
+  it("does not truncate top-level help when commands exactly fit the line budget", () => {
+    const tools = Array.from({ length: 14 }, (_, i) => ({
+      name: `tool_${i + 1}`,
+      description: `Description for command ${i + 1}.`,
+    }));
+
+    showHelp("safeoutputs", tools);
+
+    const outputLines = stdoutChunks.join("").trimEnd().split("\n");
+    const output = outputLines.join("\n");
+    expect(outputLines.length).toBeLessThanOrEqual(20);
+    expect(output).not.toMatch(/\.\.\. \+\d+ more command\(s\)/);
+    for (const tool of tools) {
+      expect(output).toContain(tool.name);
+    }
+  });
+
+  it("keeps command help compact for many options", () => {
+    const properties = {};
+    for (let i = 1; i <= 24; i++) {
+      properties[`field_${i}`] = { type: "string", description: `Field ${i} description with additional details for truncation.` };
+    }
+
+    showToolHelp("safeoutputs", "create_issue", [
+      {
+        name: "create_issue",
+        description: "Create an issue with many available fields and optional metadata.",
+        inputSchema: {
+          properties,
+          required: ["field_1", "field_2"],
+        },
+      },
+    ]);
+
+    const outputLines = stdoutChunks.join("").trimEnd().split("\n");
+    const output = outputLines.join("\n");
+    expect(outputLines.length).toBeLessThanOrEqual(30);
+    expect(output).not.toMatch(/\.\.\. \+\d+ more option\(s\)/);
+    expect(output).toContain("Required options are marked with *.");
+    for (let i = 1; i <= 24; i++) {
+      expect(output).toContain(`--field_${i}`);
+    }
+    expect(output).toContain("--field_1*");
+    expect(output).toContain("--field_2*");
+  });
+
+  it("does not truncate command help when options exactly fit the line budget", () => {
+    const properties = {};
+    for (let i = 1; i <= 13; i++) {
+      properties[`field_${i}`] = { type: "string", description: `Field ${i}.` };
+    }
+
+    showToolHelp("safeoutputs", "create_issue", [
+      {
+        name: "create_issue",
+        description: "Create an issue.",
+        inputSchema: {
+          properties,
+          required: ["field_1"],
+        },
+      },
+    ]);
+
+    const outputLines = stdoutChunks.join("").trimEnd().split("\n");
+    const output = outputLines.join("\n");
+    expect(outputLines.length).toBeLessThanOrEqual(30);
+    expect(output).not.toMatch(/\.\.\. \+\d+ more option\(s\)/);
+    expect(output).toContain("Required options are marked with *.");
+    for (let i = 1; i <= 13; i++) {
+      expect(output).toContain(`--field_${i}`);
+    }
+  });
+
+  it("keeps required note when required options are in the compact list", () => {
+    const properties = {};
+    for (let i = 1; i <= 24; i++) {
+      properties[`field_${i}`] = { type: "string", description: `Field ${i}.` };
+    }
+
+    showToolHelp("safeoutputs", "create_issue", [
+      {
+        name: "create_issue",
+        description: "Create an issue.",
+        inputSchema: {
+          properties,
+          required: ["field_23", "field_24"],
+        },
+      },
+    ]);
+
+    const outputLines = stdoutChunks.join("").trimEnd().split("\n");
+    const output = outputLines.join("\n");
+    expect(output).not.toMatch(/\.\.\. \+\d+ more option\(s\)/);
+    expect(output).toContain("Required options are marked with *.");
+    expect(output).toContain("--field_23*");
+    expect(output).toContain("--field_24*");
   });
 
   describe("stdin placeholder removed — '-' is always a literal value", () => {
@@ -320,6 +435,22 @@ describe("mcp_cli_bridge.cjs", () => {
       expect(hasStdinJsonPayload([".", "--extra", "value"])).toBe(false);
     });
 
+    it("returns true for '--key .' (per-field stdin marker, space-separated)", () => {
+      expect(hasStdinJsonPayload(["--body", "."])).toBe(true);
+    });
+
+    it("returns true for '--key=.' (per-field stdin marker, equals-separated)", () => {
+      expect(hasStdinJsonPayload(["--body=."])).toBe(true);
+    });
+
+    it("returns true for mixed flags when one uses the per-field sentinel", () => {
+      expect(hasStdinJsonPayload(["--title", "My title", "--body", "."])).toBe(true);
+    });
+
+    it("returns false when flag value is not '.' (not a sentinel)", () => {
+      expect(hasStdinJsonPayload(["--body", "hello"])).toBe(false);
+    });
+
     it("parses stdin JSON object when '.' sentinel is used", () => {
       const schemaProperties = {
         issue_number: { type: "integer" },
@@ -403,6 +534,195 @@ describe("mcp_cli_bridge.cjs", () => {
       const { args } = parseToolArgs(["."], schemaProperties, stdinContent);
 
       expect(args).toEqual({ body: "### Title\n\nLine one.\n\nLine two." });
+    });
+  });
+
+  describe("per-field stdin marker ('.')", () => {
+    it("substitutes '--body .' with stdin content (space-separated form)", () => {
+      const schemaProperties = { title: { type: "string" }, body: { type: "string" } };
+      const stdinContent = "This is a long body from stdin.";
+
+      const { args } = parseToolArgs(["--title", "My issue", "--body", "."], schemaProperties, stdinContent);
+
+      expect(args).toEqual({ title: "My issue", body: "This is a long body from stdin." });
+    });
+
+    it("substitutes '--body=.' with stdin content (equals-separated form)", () => {
+      const schemaProperties = { body: { type: "string" } };
+      const stdinContent = "Body content from stdin.";
+
+      const { args } = parseToolArgs(["--body=."], schemaProperties, stdinContent);
+
+      expect(args).toEqual({ body: "Body content from stdin." });
+    });
+
+    it("trims leading/trailing whitespace from stdin content", () => {
+      const schemaProperties = { body: { type: "string" } };
+      const stdinContent = "  \n  Trimmed content.  \n  ";
+
+      const { args } = parseToolArgs(["--body", "."], schemaProperties, stdinContent);
+
+      expect(args).toEqual({ body: "Trimmed content." });
+    });
+
+    it("falls back to literal '.' when stdinContent is null", () => {
+      const schemaProperties = { body: { type: "string" } };
+
+      const { args } = parseToolArgs(["--body", "."], schemaProperties, null);
+
+      expect(args).toEqual({ body: "." });
+    });
+
+    it("falls back to literal '.' when stdinContent is empty", () => {
+      const schemaProperties = { body: { type: "string" } };
+
+      const { args } = parseToolArgs(["--body", "."], schemaProperties, "");
+
+      expect(args).toEqual({ body: "." });
+    });
+
+    it("falls back to literal '.' when stdinContent is whitespace-only", () => {
+      const schemaProperties = { body: { type: "string" } };
+
+      const { args } = parseToolArgs(["--body", "."], schemaProperties, "   \n   ");
+
+      expect(args).toEqual({ body: "." });
+    });
+
+    it("all fields using '.' receive the same stdin content", () => {
+      const schemaProperties = { title: { type: "string" }, body: { type: "string" } };
+      const stdinContent = "Shared stdin content.";
+
+      const { args } = parseToolArgs(["--title", ".", "--body", "."], schemaProperties, stdinContent);
+
+      expect(args).toEqual({ title: "Shared stdin content.", body: "Shared stdin content." });
+    });
+  });
+
+  describe("writeStdoutAndFlush", () => {
+    it("resolves immediately when stdout.write returns true (no backpressure)", async () => {
+      // The beforeEach mock captures chunks and returns true (no backpressure).
+      // writeStdoutAndFlush should resolve synchronously in this case.
+      await writeStdoutAndFlush("hello world\n");
+
+      expect(stdoutChunks[0]).toBe("hello world\n");
+    });
+
+    it("waits for drain event when stdout.write returns false (pipe buffer full)", async () => {
+      // Arrange: stdout.write returns false (simulates full pipe buffer like a ~64KiB payload)
+      let drainCb = null;
+      stdoutSpy.mockImplementation(chunk => {
+        stdoutChunks.push(String(chunk));
+        return false; // signal backpressure
+      });
+      const onceStub = vi.spyOn(process.stdout, "once").mockImplementation((event, cb) => {
+        if (event === "drain") {
+          drainCb = cb;
+        }
+        return process.stdout;
+      });
+
+      try {
+        const writePromise = writeStdoutAndFlush("large payload\n");
+
+        // Drain callback not yet called — promise should still be pending
+        let resolved = false;
+        writePromise.then(() => {
+          resolved = true;
+        });
+
+        // Let microtasks run; drain hasn't fired yet so still pending
+        await Promise.resolve();
+        expect(resolved).toBe(false);
+        expect(drainCb).not.toBeNull();
+
+        // Fire the drain event
+        drainCb();
+
+        await writePromise;
+        expect(resolved).toBe(true);
+        expect(stdoutChunks).toContain("large payload\n");
+      } finally {
+        onceStub.mockRestore();
+      }
+    });
+
+    it("rejects when stdout emits error while waiting for drain (EPIPE)", async () => {
+      // Arrange: stdout.write returns false, then stdout emits an error
+      stdoutSpy.mockImplementation(chunk => {
+        stdoutChunks.push(String(chunk));
+        return false; // signal backpressure
+      });
+      const error = new Error("EPIPE");
+      let errorCb = null;
+      const onceStub = vi.spyOn(process.stdout, "once").mockImplementation((event, cb) => {
+        if (event === "error") {
+          errorCb = cb;
+        }
+        return process.stdout;
+      });
+
+      try {
+        const writePromise = writeStdoutAndFlush("data\n");
+        // Verify the error callback was registered before firing it
+        expect(errorCb).not.toBeNull();
+        // Fire the error event asynchronously (simulates broken pipe)
+        Promise.resolve().then(() => errorCb(error));
+        await expect(writePromise).rejects.toThrow("EPIPE");
+      } finally {
+        onceStub.mockRestore();
+      }
+    });
+
+    it("formatResponse awaits stdout drain before writing to stderr (no interleaving)", async () => {
+      // This test verifies that core.info (→ stderr) is NOT called until after
+      // stdout has been fully drained. Before the fix, process.stdout.write()
+      // returning false would allow subsequent core.info calls to reach stderr
+      // while stdout was still buffering, corrupting combined output.
+      const callOrder = [];
+      let drainCb = null;
+
+      stdoutSpy.mockImplementation(chunk => {
+        callOrder.push({ stream: "stdout", data: String(chunk) });
+        return false; // simulate pipe buffer full
+      });
+      const onceStub = vi.spyOn(process.stdout, "once").mockImplementation((event, cb) => {
+        if (event === "drain") {
+          drainCb = cb;
+        }
+        return process.stdout;
+      });
+      global.core.info = vi.fn(msg => {
+        callOrder.push({ stream: "stderr-info", data: String(msg) });
+      });
+
+      const body = {
+        result: {
+          content: [{ type: "text", text: "large json output" }],
+        },
+      };
+
+      try {
+        const formatPromise = formatResponse(body, "agenticworkflows");
+
+        // Yield to microtasks — stdout write is queued, drain not yet fired
+        await Promise.resolve();
+
+        // core.info should NOT have been called yet (stdout hasn't drained)
+        expect(callOrder.filter(e => e.stream === "stderr-info")).toHaveLength(0);
+
+        // Now fire the drain event
+        if (drainCb) drainCb();
+        await formatPromise;
+
+        // After drain: stdout write AND then core.info (order preserved)
+        const stdoutIdx = callOrder.findIndex(e => e.stream === "stdout");
+        const infoIdx = callOrder.findIndex(e => e.stream === "stderr-info");
+        expect(stdoutIdx).toBeGreaterThanOrEqual(0);
+        expect(infoIdx).toBeGreaterThan(stdoutIdx);
+      } finally {
+        onceStub.mockRestore();
+      }
     });
   });
 });

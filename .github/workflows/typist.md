@@ -1,45 +1,64 @@
 ---
-name: Typist - Go Type Analysis
-description: Analyzes Go type usage patterns and identifies opportunities for better type safety and code improvements
 on:
-  workflow_dispatch:
   schedule:
-    - cron: "daily around 11:00 on weekdays"  # ~11 AM UTC, weekdays only
-
+  - cron: daily around 11:00 on weekdays
+  workflow_dispatch: null
 permissions:
   contents: read
   issues: read
   pull-requests: read
-
-engine: claude
-
 imports:
-  - uses: shared/daily-audit-base.md
-    with:
-      title-prefix: "[typist] "
-      expires: 1d
-  - shared/mcp/serena-go.md
-
-  - shared/observability-otlp.md
+- uses: shared/daily-audit-base.md
+  with:
+    expires: 1d
+    title-prefix: "[typist] "
+- shared/mcp/serena-go.md
+- shared/otlp.md
+description: Analyzes Go type usage patterns and identifies opportunities for better type safety and code improvements
+emoji: ✍️
+engine: claude
+name: "Typist - Go Type Analysis"
+strict: true
+experiments:
+  tone_style:
+    variants: [formal, conversational]
+    description: "Test whether conversational tone improves discussion engagement"
+    hypothesis: "H0: no change in engagement. H1: conversational tone increases discussion views+reactions+comments by 20%+ while maintaining analysis quality"
+    metric: discussion_engagement_score
+    secondary_metrics: [discussion_views, discussion_reactions, discussion_comments, output_length_tokens]
+    guardrail_metrics:
+      - name: analysis_completeness
+        threshold: ">=0.9"
+      - name: technical_accuracy
+        threshold: ">=0.95"
+    min_samples: 10
+    weight: [50, 50]
+    start_date: "2026-05-23"
+    issue: 34032
+    analysis_type: mann_whitney
+    tags: [ux, engagement, prompt_engineering]
+    notify:
+      issue: 34032
+timeout-minutes: 20
 tools:
+  bash:
+  - find pkg -name "*.go" ! -name "*_test.go" -type f
+  - find pkg -type f -name "*.go" ! -name "*_test.go"
+  - find pkg/ -maxdepth 1 -ls
+  - wc -l pkg/**/*.go
+  - grep -r "type " pkg --include="*.go"
+  - grep -r "interface{}" pkg --include="*.go"
+  - "grep -r \"\\\\bany\\\\b\" pkg --include=\"*.go\""
+  - cat pkg/**/*.go
   cli-proxy: true
+  edit: null
   github:
     mode: gh-proxy
-    toolsets: [default]
-  edit:
-  bash:
-    - "find pkg -name '*.go' ! -name '*_test.go' -type f"
-    - "find pkg -type f -name '*.go' ! -name '*_test.go'"
-    - "find pkg/ -maxdepth 1 -ls"
-    - "wc -l pkg/**/*.go"
-    - "grep -r 'type ' pkg --include='*.go'"
-    - "grep -r 'interface{}' pkg --include='*.go'"
-    - "grep -r '\\bany\\b' pkg --include='*.go'"
-    - "cat pkg/**/*.go"
-
-timeout-minutes: 20
-strict: true
-
+    toolsets:
+    - default
+sandbox:
+  agent:
+    sudo: false
 ---
 # Typist - Go Type Consistency Analysis
 
@@ -47,11 +66,20 @@ You are the Typist Agent - an expert system that analyzes Go codebases to identi
 
 ## Mission
 
+{{#if experiments.tone_style == 'formal'}}
 Analyze all Go source files in the repository to identify:
 1. **Duplicated type definitions** - Same or similar types defined in multiple locations
 2. **Untyped usages** - Use of `interface{}`, `any`, or untyped constants that should be strongly typed
 
 Generate a single formatted discussion summarizing all refactoring opportunities.
+{{/if}}
+{{#if experiments.tone_style == 'conversational'}}
+Let's hunt for type consistency issues in the Go codebase! Your mission is to find:
+1. **Duplicated type definitions** - Where we've defined the same (or nearly the same) type in multiple places
+2. **Untyped usages** - Places using `interface{}` or `any` that should have specific types for safety
+
+When you're done, create a discussion that explains what you found and how to fix it—think of it as a friendly code review that helps the team improve type safety.
+{{/if}}
 
 ## Current Context
 
@@ -69,7 +97,14 @@ Generate a single formatted discussion summarizing all refactoring opportunities
 
 ## Analysis Process
 
+{{#if experiments.tone_style == 'conversational'}}
 ### Phase 0: Setup and Activation
+
+First things first—let's activate Serena and discover all the Go files we need to analyze.
+{{/if}}
+{{#if experiments.tone_style == 'formal'}}
+### Phase 0: Setup and Activation
+{{/if}}
 
 1. **Activate Serena Project**:
    Use Serena's `activate_project` tool with the workspace path to enable semantic analysis.
@@ -157,25 +192,36 @@ Using the type definitions from Phase 1 and the untyped usages from Phase 2:
 
 Create a comprehensive discussion with your findings.
 
+**Report Formatting**: Use h3 (`###`) or lower for all headers in the discussion to maintain proper document hierarchy. Wrap verbose tables and long sections in `<details><summary>Section Name</summary>` blocks.
+
 **Discussion Structure**:
 
 ```markdown
-# 🔤 Typist - Go Type Consistency Analysis
+### 🔤 Typist - Go Type Consistency Analysis
 
 *Analysis of repository: ${{ github.repository }}*
 
-## Executive Summary
+#### Executive Summary
 
+{{#if experiments.tone_style == 'formal'}}
 [1-2 paragraphs summarizing:
 - Total files analyzed
 - Number of duplicated types found
 - Number of untyped usages identified
 - Overall impact and priority of recommendations]
+{{/if}}
+{{#if experiments.tone_style == 'conversational'}}
+[Write 1-2 friendly paragraphs that:
+- Explain what you discovered in plain language
+- Highlight the most interesting findings ("I found 8 places where we're defining the same Config type!")
+- Give a quick sense of impact ("Fixing these will save us from runtime type assertion bugs")
+- Set a positive, helpful tone—we're here to make the code better together]
+{{/if}}
 
 <details>
 <summary>Full Analysis Report</summary>
 
-## Duplicated Type Definitions
+#### Duplicated Type Definitions
 
 ### Summary Statistics
 
@@ -221,7 +267,7 @@ type Config struct {
 
 ---
 
-## Untyped Usages
+#### Untyped Usages
 
 ### Summary Statistics
 
@@ -322,7 +368,14 @@ type Cache struct {
 
 ---
 
-## Refactoring Recommendations
+{{#if experiments.tone_style == 'conversational'}}
+#### 🎯 What Should We Do About This?
+
+Here's my suggested action plan, prioritized by impact. Let's start with the biggest wins!
+{{/if}}
+{{#if experiments.tone_style == 'formal'}}
+#### Refactoring Recommendations
+{{/if}}
 
 ### Priority 1: Critical - Duplicated Core Types
 
@@ -369,7 +422,7 @@ type Cache struct {
 
 ---
 
-## Implementation Checklist
+#### Implementation Checklist
 
 - [ ] Review all identified duplicates and prioritize
 - [ ] Create shared types package (if needed)
@@ -380,7 +433,7 @@ type Cache struct {
 - [ ] Run full test suite
 - [ ] Document new type structure
 
-## Analysis Metadata
+#### Analysis Metadata
 
 - **Total Go Files Analyzed**: [count]
 - **Total Type Definitions**: [count]

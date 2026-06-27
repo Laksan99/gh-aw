@@ -24,7 +24,7 @@ func isFeatureEnabled(flag constants.FeatureFlag, workflowData *WorkflowData) bo
 
 	// Inline sub-agents are now enabled by default and the corresponding
 	// frontmatter flag is deprecated/no-op.
-	if flagLower == "inline-agents" {
+	if strings.EqualFold(flagLower, "inline-agents") {
 		if logEnabled {
 			featuresLog.Printf("Feature %s is deprecated and always enabled", flagLower)
 		}
@@ -66,7 +66,7 @@ func getFeatureValueFromFrontmatter(flagLower string, workflowData *WorkflowData
 	}
 
 	for key, value := range workflowData.Features {
-		if strings.ToLower(key) == flagLower {
+		if strings.EqualFold(key, flagLower) {
 			if enabled, found := parseFeatureValue(value); found {
 				if logEnabled {
 					featuresLog.Printf("Feature found in frontmatter (case-insensitive): %s=%v", flagLower, enabled)
@@ -102,7 +102,7 @@ func isFeatureInEnvironment(flagLower string, logEnabled bool) bool {
 		featuresLog.Printf("Checking GH_AW_FEATURES environment variable: %s", features)
 	}
 	for feature := range strings.SplitSeq(features, ",") {
-		if strings.ToLower(strings.TrimSpace(feature)) == flagLower {
+		if strings.EqualFold(strings.TrimSpace(feature), flagLower) {
 			return true
 		}
 	}

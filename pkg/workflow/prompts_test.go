@@ -8,6 +8,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/github/gh-aw/pkg/parser"
 	"github.com/github/gh-aw/pkg/stringutil"
 )
 
@@ -238,6 +239,234 @@ func TestDailyFunctionNamerColdStartHandling(t *testing.T) {
 	stepFiveGuidance := "If the state file was missing at the start of the run, initialize it from scratch here instead of reporting missing cache data."
 	if !strings.Contains(workflow, stepFiveGuidance) {
 		t.Fatal("Expected daily-function-namer workflow to initialize missing cold-start state instead of reporting missing data")
+	}
+}
+
+func TestDailyFunctionNamerUsesConcreteClaudeModelsForExperiment(t *testing.T) {
+	// daily-function-namer was migrated to the Pi engine (copilot/gpt-5.4). The
+	// orphaned Claude experiments block was removed because Pi never consumed those
+	// variants. Verify no experiments block is present to prevent future drift.
+	repoRoot, err := findRepoRoot()
+	if err != nil {
+		t.Fatalf("Failed to find repo root: %v", err)
+	}
+
+	workflowFile := filepath.Join(repoRoot, ".github", "workflows", "daily-function-namer.md")
+	content, err := os.ReadFile(workflowFile)
+	if err != nil {
+		t.Fatalf("Failed to read workflow file: %v", err)
+	}
+
+	parsed, err := parser.ExtractFrontmatterFromContent(string(content))
+	if err != nil {
+		t.Fatalf("Failed to parse workflow frontmatter: %v", err)
+	}
+
+	if _, ok := parsed.Frontmatter["experiments"]; ok {
+		t.Fatal("daily-function-namer uses Pi engine and must not have an experiments block; remove orphaned experiment variants")
+	}
+
+	// Verify it uses the Pi engine
+	engine, ok := parsed.Frontmatter["engine"].(map[string]any)
+	if !ok {
+		t.Fatal("Expected daily-function-namer to define engine")
+	}
+	if engine["id"] != "pi" {
+		t.Fatalf("Expected daily-function-namer to use Pi engine, got %q", engine["id"])
+	}
+}
+
+func TestDailyCavemanOptimizerUsesConcreteClaudeModelsForExperiment(t *testing.T) {
+	repoRoot, err := findRepoRoot()
+	if err != nil {
+		t.Fatalf("Failed to find repo root: %v", err)
+	}
+
+	workflowFile := filepath.Join(repoRoot, ".github", "workflows", "daily-caveman-optimizer.md")
+	content, err := os.ReadFile(workflowFile)
+	if err != nil {
+		t.Fatalf("Failed to read workflow file: %v", err)
+	}
+
+	parsed, err := parser.ExtractFrontmatterFromContent(string(content))
+	if err != nil {
+		t.Fatalf("Failed to parse workflow frontmatter: %v", err)
+	}
+
+	experiments, ok := parsed.Frontmatter["experiments"].(map[string]any)
+	if !ok {
+		t.Fatal("Expected daily-caveman-optimizer workflow to define experiments")
+	}
+	modelSize, ok := experiments["model_size"].(map[string]any)
+	if !ok {
+		t.Fatal("Expected daily-caveman-optimizer workflow to define experiments.model_size")
+	}
+	variants, ok := modelSize["variants"].([]any)
+	if !ok {
+		t.Fatal("Expected daily-caveman-optimizer workflow to define experiments.model_size.variants")
+	}
+	if len(variants) != 2 {
+		t.Fatalf("Expected exactly 2 concrete Claude variants, got %#v", variants)
+	}
+	expected := map[any]bool{
+		"claude-sonnet-4.6": true,
+		"claude-haiku-4.5":  true,
+	}
+	for _, variant := range variants {
+		if !expected[variant] {
+			t.Fatalf("Expected concrete Claude variants [claude-sonnet-4.6, claude-haiku-4.5], got %#v", variants)
+		}
+	}
+}
+
+func TestDailyFormalSpecVerifierDefinesDirectSafeOutputContract(t *testing.T) {
+	repoRoot, err := findRepoRoot()
+	if err != nil {
+		t.Fatalf("Failed to find repo root: %v", err)
+	}
+
+	workflowFile := filepath.Join(repoRoot, ".github", "workflows", "daily-formal-spec-verifier.md")
+	content, err := os.ReadFile(workflowFile)
+	if err != nil {
+		t.Fatalf("Failed to read workflow file: %v", err)
+	}
+
+	workflow := string(content)
+	requiredContract := "Draft the title and body locally first if needed, but emit exactly one final `create_issue` safe output only after the full payload is complete."
+	if !strings.Contains(workflow, requiredContract) {
+		t.Fatal("Expected daily-formal-spec-verifier workflow to require a single final create_issue safe output")
+	}
+
+	noShellGuidance := "Do **not** use `bash`, `cli-proxy`, or the `safeoutputs` CLI to create the issue or inspect the tool schema. Emit the safe output directly with `title` and `body` arguments."
+	if !strings.Contains(workflow, noShellGuidance) {
+		t.Fatal("Expected daily-formal-spec-verifier workflow to forbid bash/CLI safe-output invocation")
+	}
+
+	reportIncompleteGuidance := "If the quality checks below cannot be met, emit `report_incomplete` directly as a safe output instead of `create_issue`."
+	if !strings.Contains(workflow, reportIncompleteGuidance) {
+		t.Fatal("Expected daily-formal-spec-verifier workflow to require direct report_incomplete fallback")
+	}
+}
+
+func TestDailyFormalSpecVerifierAllowsReadOnlyFileInspection(t *testing.T) {
+	repoRoot, err := findRepoRoot()
+	if err != nil {
+		t.Fatalf("Failed to find repo root: %v", err)
+	}
+
+	workflowFile := filepath.Join(repoRoot, ".github", "workflows", "daily-formal-spec-verifier.md")
+	content, err := os.ReadFile(workflowFile)
+	if err != nil {
+		t.Fatalf("Failed to read workflow file: %v", err)
+	}
+
+	workflow := string(content)
+	if !strings.Contains(workflow, "edit: null") {
+		t.Fatal("Expected daily-formal-spec-verifier workflow to enable built-in file inspection tools")
+	}
+	if !strings.Contains(workflow, `- "sed *"`) {
+		t.Fatal("Expected daily-formal-spec-verifier workflow to allow ranged sed reads")
+	}
+}
+
+func TestDailySPDDSpecPlannerAllowsReadOnlyFileInspection(t *testing.T) {
+	repoRoot, err := findRepoRoot()
+	if err != nil {
+		t.Fatalf("Failed to find repo root: %v", err)
+	}
+
+	workflowFile := filepath.Join(repoRoot, ".github", "workflows", "daily-spdd-spec-planner.md")
+	content, err := os.ReadFile(workflowFile)
+	if err != nil {
+		t.Fatalf("Failed to read workflow file: %v", err)
+	}
+
+	workflow := string(content)
+	if !strings.Contains(workflow, "edit: null") {
+		t.Fatal("Expected daily-spdd-spec-planner workflow to enable built-in file inspection tools")
+	}
+	if !strings.Contains(workflow, `- "sed *"`) {
+		t.Fatal("Expected daily-spdd-spec-planner workflow to allow ranged sed reads")
+	}
+	if !strings.Contains(workflow, `"cat specs/**/*.md"`) {
+		t.Fatal("Expected daily-spdd-spec-planner workflow to allow reading spec files in subdirectories")
+	}
+}
+
+func TestDailyCacheStrategyAnalyzerUsesCodexCompatibleModelsForExperiment(t *testing.T) {
+	repoRoot, err := findRepoRoot()
+	if err != nil {
+		t.Fatalf("Failed to find repo root: %v", err)
+	}
+
+	workflowFile := filepath.Join(repoRoot, ".github", "workflows", "daily-cache-strategy-analyzer.md")
+	content, err := os.ReadFile(workflowFile)
+	if err != nil {
+		t.Fatalf("Failed to read workflow file: %v", err)
+	}
+
+	parsed, err := parser.ExtractFrontmatterFromContent(string(content))
+	if err != nil {
+		t.Fatalf("Failed to parse workflow frontmatter: %v", err)
+	}
+
+	experiments, ok := parsed.Frontmatter["experiments"].(map[string]any)
+	if !ok {
+		t.Fatal("Expected daily-cache-strategy-analyzer workflow to define experiments")
+	}
+	modelSize, ok := experiments["model_size"].(map[string]any)
+	if !ok {
+		t.Fatal("Expected daily-cache-strategy-analyzer workflow to define experiments.model_size")
+	}
+	variants, ok := modelSize["variants"].([]any)
+	if !ok {
+		t.Fatal("Expected daily-cache-strategy-analyzer workflow to define experiments.model_size.variants")
+	}
+	if len(variants) != 2 {
+		t.Fatalf("Expected exactly 2 codex-compatible variants, got %#v", variants)
+	}
+	want := map[string]bool{
+		"gpt-5.4":      true,
+		"gpt-5.4-mini": true,
+	}
+	got := make(map[string]bool, len(variants))
+	for _, v := range variants {
+		s, ok := v.(string)
+		if !ok {
+			t.Fatalf("Expected all variants to be strings, got %T in %#v", v, variants)
+		}
+		if !want[s] {
+			t.Fatalf("Unexpected variant %q; want exactly [gpt-5.4, gpt-5.4-mini], got %#v", s, variants)
+		}
+		got[s] = true
+	}
+	for k := range want {
+		if !got[k] {
+			t.Fatalf("Missing expected variant %q; got %#v", k, variants)
+		}
+	}
+}
+
+func TestDailyModelResolutionUsesCodexCompatibleSubAgentModel(t *testing.T) {
+	repoRoot, err := findRepoRoot()
+	if err != nil {
+		t.Fatalf("Failed to find repo root: %v", err)
+	}
+
+	workflowFile := filepath.Join(repoRoot, ".github", "workflows", "daily-model-resolution.md")
+	content, err := os.ReadFile(workflowFile)
+	if err != nil {
+		t.Fatalf("Failed to read workflow file: %v", err)
+	}
+
+	workflow := string(content)
+	agentStart := strings.Index(workflow, "## agent: `run-analyzer`")
+	if agentStart == -1 {
+		t.Fatal("Expected daily-model-resolution workflow to define the run-analyzer sub-agent")
+	}
+	agentBlock := workflow[agentStart:]
+	if !strings.Contains(agentBlock, "\nmodel: gpt-5.4-mini\n") {
+		t.Fatal("Expected daily-model-resolution run-analyzer sub-agent to use explicit codex-compatible model gpt-5.4-mini")
 	}
 }
 
@@ -629,102 +858,4 @@ This is a test workflow without contents read permission.
 	}
 
 	t.Logf("Successfully verified PR context instructions are NOT included without contents permission")
-}
-
-// ============================================================================
-// Agentic Workflows Guide Prompt Tests
-// ============================================================================
-
-func TestAgenticWorkflowsGuideIncludedWhenEnabled(t *testing.T) {
-	tmpDir, err := os.MkdirTemp("", "gh-aw-agentic-guide-test-*")
-	if err != nil {
-		t.Fatalf("Failed to create temp dir: %v", err)
-	}
-	defer os.RemoveAll(tmpDir)
-
-	testFile := filepath.Join(tmpDir, "test-workflow.md")
-	testContent := `---
-on: schedule daily
-engine: claude
-tools:
-  agentic-workflows:
-permissions:
-  actions: read
----
-
-# Test Workflow with Agentic Workflows
-
-This workflow uses the agentic-workflows MCP server.
-`
-
-	if err := os.WriteFile(testFile, []byte(testContent), 0644); err != nil {
-		t.Fatalf("Failed to create test workflow: %v", err)
-	}
-
-	compiler := NewCompiler()
-	if err := compiler.CompileWorkflow(testFile); err != nil {
-		t.Fatalf("Failed to compile workflow: %v", err)
-	}
-
-	lockFile := stringutil.MarkdownToLockFile(testFile)
-	lockContent, err := os.ReadFile(lockFile)
-	if err != nil {
-		t.Fatalf("Failed to read generated lock file: %v", err)
-	}
-
-	lockStr := string(lockContent)
-
-	if !strings.Contains(lockStr, "- name: Create prompt with built-in context") {
-		t.Error("Expected 'Create prompt with built-in context' step in generated workflow")
-	}
-
-	if !strings.Contains(lockStr, "cat \"${RUNNER_TEMP}/gh-aw/prompts/agentic_workflows_guide.md\"") {
-		t.Error("Expected cat command for agentic_workflows_guide.md in generated workflow")
-	}
-
-	t.Logf("Successfully verified agentic-workflows guide is included when agentic-workflows tool is enabled")
-}
-
-func TestAgenticWorkflowsGuideNotIncludedWhenDisabled(t *testing.T) {
-	tmpDir, err := os.MkdirTemp("", "gh-aw-no-agentic-guide-test-*")
-	if err != nil {
-		t.Fatalf("Failed to create temp dir: %v", err)
-	}
-	defer os.RemoveAll(tmpDir)
-
-	testFile := filepath.Join(tmpDir, "test-workflow.md")
-	testContent := `---
-on: push
-engine: codex
-tools:
-  github:
----
-
-# Test Workflow without Agentic Workflows
-
-This workflow does not use the agentic-workflows MCP server.
-`
-
-	if err := os.WriteFile(testFile, []byte(testContent), 0644); err != nil {
-		t.Fatalf("Failed to create test workflow: %v", err)
-	}
-
-	compiler := NewCompiler()
-	if err := compiler.CompileWorkflow(testFile); err != nil {
-		t.Fatalf("Failed to compile workflow: %v", err)
-	}
-
-	lockFile := stringutil.MarkdownToLockFile(testFile)
-	lockContent, err := os.ReadFile(lockFile)
-	if err != nil {
-		t.Fatalf("Failed to read generated lock file: %v", err)
-	}
-
-	lockStr := string(lockContent)
-
-	if strings.Contains(lockStr, "agentic_workflows_guide.md") {
-		t.Error("Did not expect 'agentic_workflows_guide.md' reference in workflow without agentic-workflows tool")
-	}
-
-	t.Logf("Successfully verified agentic-workflows guide is NOT included when agentic-workflows tool is disabled")
 }

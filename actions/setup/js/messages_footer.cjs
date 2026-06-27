@@ -8,11 +8,12 @@
  * for safe-output workflows.
  */
 
-const { getMessages, renderTemplate, toSnakeCase } = require("./messages_core.cjs");
+const { getMessages, renderTemplate, renderTemplateFromFile, toSnakeCase, getPromptPath } = require("./messages_core.cjs");
 const { getMissingInfoSections } = require("./missing_messages_helper.cjs");
 const { getBlockedDomains, generateBlockedDomainsSection } = require("./firewall_blocked_domains.cjs");
 const { getDifcFilteredEvents, generateDifcFilteredSection } = require("./gateway_difc_filtered.cjs");
-const { formatET } = require("./effective_tokens.cjs");
+const { formatCompactInteger } = require("./compact_numbers.cjs");
+const { formatAIC } = require("./model_costs.cjs");
 const { getDetectionWarningMessage } = require("./messages_run_status.cjs");
 
 /**
@@ -33,20 +34,98 @@ function getDetectionCautionAlert(workflowName, runUrl) {
 }
 
 /**
- * Read effective tokens from the GH_AW_EFFECTIVE_TOKENS environment variable and return
- * both the raw count, compact formatted string, and a pre-formatted suffix.
- * Returns undefined/empty for all fields when the variable is absent or the parsed value
- * is not a positive integer.
- * @returns {{ effectiveTokens: number|undefined, effectiveTokensFormatted: string|undefined, effectiveTokensSuffix: string }}
+ * @param {string|undefined} raw
+ * @returns {number|undefined}
  */
-function getEffectiveTokensFromEnv() {
-  const raw = process.env.GH_AW_EFFECTIVE_TOKENS;
-  const parsed = raw ? parseInt(raw, 10) : NaN;
-  if (!isNaN(parsed) && parsed > 0) {
-    const effectiveTokensFormatted = formatET(parsed);
-    return { effectiveTokens: parsed, effectiveTokensFormatted, effectiveTokensSuffix: ` · ● ${effectiveTokensFormatted}` };
-  }
-  return { effectiveTokens: undefined, effectiveTokensFormatted: undefined, effectiveTokensSuffix: "" };
+function parsePositiveAIC(raw) {
+  const parsed = raw ? Number.parseFloat(raw) : NaN;
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : undefined;
+}
+
+/**
+ * @param {number|string|undefined} raw
+ * @returns {number|undefined}
+ */
+function parseExplicitContextAIC(raw) {
+  const parsed = raw !== undefined && raw !== null && raw !== "" ? Number.parseFloat(String(raw)) : NaN;
+  return Number.isFinite(parsed) && parsed >= 0 ? parsed : undefined;
+}
+
+/**
+ * @param {string|undefined} raw
+ * @returns {number|undefined}
+ */
+function parsePositiveAmbientContext(raw) {
+  const parsed = raw ? Number.parseInt(raw, 10) : NaN;
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : undefined;
+}
+
+/**
+ * @returns {{ ambientContext: number|undefined, ambientContextFormatted: string|undefined, ambientContextSuffix: string }}
+ */
+function getAmbientContextFromEnv() {
+  const ambientContext = parsePositiveAmbientContext(process.env.GH_AW_AMBIENT_CONTEXT);
+  const ambientContextFormatted = typeof ambientContext === "number" ? formatCompactInteger(ambientContext) : undefined;
+  return {
+    ambientContext,
+    ambientContextFormatted,
+    ambientContextSuffix: ambientContextFormatted ? ` · ⊞ ${ambientContextFormatted}` : "",
+  };
+}
+
+/**
+ * @param {string} label
+ * @param {number|undefined} value
+ * @returns {{ value: number|undefined, formatted: string|undefined, suffix: string }}
+ */
+function buildAICEntry(label, value) {
+  const formatted = typeof value === "number" ? formatAIC(value) : undefined;
+  const labelPrefix = label ? `${label} ` : "";
+  return {
+    value,
+    formatted,
+    suffix: formatted ? ` · ${labelPrefix}${formatted} AIC` : "",
+  };
+}
+
+/**
+ * Read AI Credits from the environment and return the total, separate entries when
+ * threat detection consumed credits, and the pre-formatted footer suffix.
+ * @returns {{
+ *   aiCredits: number|undefined,
+ *   aiCreditsFormatted: string|undefined,
+ *   aiCreditsSuffix: string,
+ *   agentAiCredits: number|undefined,
+ *   agentAiCreditsFormatted: string|undefined,
+ *   agentAiCreditsSuffix: string,
+ *   threatDetectionAiCredits: number|undefined,
+ *   threatDetectionAiCreditsFormatted: string|undefined,
+ *   threatDetectionAiCreditsSuffix: string
+ * }}
+ */
+function getAICFromEnv() {
+  const totalAIC = parsePositiveAIC(process.env.GH_AW_AIC);
+  const explicitAgentAIC = parsePositiveAIC(process.env.GH_AW_AGENT_AIC);
+  const threatDetectionAIC = parsePositiveAIC(process.env.GH_AW_THREAT_DETECTION_AIC);
+  const agentAIC = typeof explicitAgentAIC === "number" ? explicitAgentAIC : totalAIC;
+  const agentEntry = buildAICEntry("", agentAIC);
+  const threatDetectionEntry = buildAICEntry("⌖", threatDetectionAIC);
+  const useBreakdown = threatDetectionEntry.suffix.length > 0;
+  const aiCredits = useBreakdown ? (agentAIC || 0) + (threatDetectionAIC || 0) : typeof totalAIC === "number" ? totalAIC : agentAIC;
+  const aiCreditsFormatted = typeof aiCredits === "number" ? formatAIC(aiCredits) : undefined;
+  const aiCreditsSuffix = useBreakdown ? `${agentEntry.suffix}${threatDetectionEntry.suffix}` : aiCreditsFormatted ? ` · ${aiCreditsFormatted} AIC` : "";
+
+  return {
+    aiCredits,
+    aiCreditsFormatted,
+    aiCreditsSuffix,
+    agentAiCredits: agentEntry.value,
+    agentAiCreditsFormatted: agentEntry.formatted,
+    agentAiCreditsSuffix: agentEntry.suffix,
+    threatDetectionAiCredits: threatDetectionEntry.value,
+    threatDetectionAiCreditsFormatted: threatDetectionEntry.formatted,
+    threatDetectionAiCreditsSuffix: threatDetectionEntry.suffix,
+  };
 }
 
 /**
@@ -57,9 +136,13 @@ function getEffectiveTokensFromEnv() {
  * @property {string} [workflowSource] - Source of the workflow (owner/repo/path@ref)
  * @property {string} [workflowSourceUrl] - GitHub URL for the workflow source
  * @property {number|string} [triggeringNumber] - Issue, PR, or discussion number that triggered this workflow
+ * @property {"issue"|"PR"|"discussion"} [triggeringType] - Triggering item type used in the default footer
  * @property {string} [historyUrl] - GitHub search URL for items created by this workflow (for the history link)
  * @property {string} [historyLink] - Pre-formatted markdown history link (e.g. " · [◷](url)"), or "" if unavailable
- * @property {number} [effectiveTokens] - Total effective token count for the run (shown as ● N when > 0, in compact format)
+ * @property {number|string} [aiCredits] - Total AI Credits cost for the run (1 AIC == 0.01 USD)
+ * @property {string} [emoji] - Optional emoji representing the workflow (from frontmatter)
+ * @property {string} [slashCommand] - Slash command name (without leading slash) for the run-again hint, when applicable
+ * @property {string} [slashCommandPlaceholder] - Custom hint text appended after the command name (replaces default "to run again")
  */
 
 /**
@@ -70,37 +153,86 @@ function getEffectiveTokensFromEnv() {
 function getFooterMessage(ctx) {
   const messages = getMessages();
 
+  const {
+    aiCredits: envAIC,
+    aiCreditsFormatted: envAICFormatted,
+    aiCreditsSuffix: envAICSuffix,
+    agentAiCredits,
+    agentAiCreditsFormatted,
+    agentAiCreditsSuffix,
+    threatDetectionAiCredits,
+    threatDetectionAiCreditsFormatted,
+    threatDetectionAiCreditsSuffix,
+  } = getAICFromEnv();
+  const { ambientContext: envAmbientContext, ambientContextFormatted: envAmbientContextFormatted, ambientContextSuffix: envAmbientContextSuffix } = getAmbientContextFromEnv();
+  const aiCredits = ctx.aiCredits ?? envAIC;
+  const ambientContext = envAmbientContext;
+
   // Pre-compute history_link as a ready-to-use markdown suffix (empty string when unavailable)
   const historyLink = ctx.historyUrl ? ` · [◷](${ctx.historyUrl})` : "";
 
   // Pre-compute agentic_workflow_url as the direct link to the agentic workflow page
   const agenticWorkflowUrl = ctx.agenticWorkflowUrl || (ctx.runUrl ? `${ctx.runUrl}/agentic_workflow` : "");
 
-  // Pre-compute effective_tokens_formatted and effective_tokens_suffix for use in custom templates
-  const effectiveTokensFormatted = ctx.effectiveTokens ? formatET(ctx.effectiveTokens) : undefined;
-  // effective_tokens_suffix is always a string: either " · ● 1.2K" or "" (for safe use in templates)
-  const effectiveTokensSuffix = effectiveTokensFormatted ? ` · ● ${effectiveTokensFormatted}` : "";
+  const hasExplicitContextAIC = ctx.aiCredits !== undefined && ctx.aiCredits !== null;
+  const explicitContextAIC = parseExplicitContextAIC(ctx.aiCredits);
+  let aiCreditsFormatted = envAICFormatted;
+  let aiCreditsSuffix = envAICSuffix;
+  if (hasExplicitContextAIC) {
+    aiCreditsFormatted = explicitContextAIC ? formatAIC(explicitContextAIC) : undefined;
+    aiCreditsSuffix = aiCreditsFormatted ? ` · ${aiCreditsFormatted} AIC` : "";
+  }
+  const aiCreditsSuffixForTemplate = `${aiCreditsSuffix}${envAmbientContextSuffix}`;
 
   // Create context with both camelCase and snake_case keys, including computed history_link and agentic_workflow_url
-  const templateContext = toSnakeCase({ ...ctx, historyLink, agenticWorkflowUrl, effectiveTokensFormatted, effectiveTokensSuffix });
+  const templateContext = toSnakeCase({
+    ...ctx,
+    aiCredits,
+    historyLink,
+    agenticWorkflowUrl,
+    aiCreditsFormatted,
+    aiCreditsSuffix: aiCreditsSuffixForTemplate,
+    ambientContext,
+    ambientContextFormatted: envAmbientContextFormatted,
+    ambientContextSuffix: envAmbientContextSuffix,
+    agentAiCredits,
+    agentAiCreditsFormatted,
+    agentAiCreditsSuffix,
+    threatDetectionAiCredits,
+    threatDetectionAiCreditsFormatted,
+    threatDetectionAiCreditsSuffix,
+  });
 
   // Use custom footer template if configured (no automatic suffix appended)
   if (messages?.footer) {
     return renderTemplate(messages.footer, templateContext);
   }
 
-  // Default footer template - includes triggering reference if available
-  let defaultFooter = "> Generated by [{workflow_name}]({run_url})";
+  // Default footer template - includes emoji prefix when available
+  const workflowLabel = ctx.emoji ? `${ctx.emoji} {workflow_name}` : "{workflow_name}";
+  let defaultFooter = `> Generated by [${workflowLabel}]({run_url})`;
   if (ctx.triggeringNumber) {
-    defaultFooter += " for issue #{triggering_number}";
+    const prefix = ctx.triggeringType === "discussion" ? "discussion " : "";
+    defaultFooter += ` for ${prefix}#{triggering_number}`;
   }
-  // Append effective tokens with ● symbol when available (compact format, no "ET" label)
-  if (ctx.effectiveTokens) {
-    defaultFooter += ` · ● ${formatET(ctx.effectiveTokens)}`;
+  const metricSuffixes = [];
+  if (aiCredits) {
+    metricSuffixes.push(aiCreditsSuffix);
+  }
+  if (ambientContext) {
+    metricSuffixes.push(envAmbientContextSuffix);
+  }
+  if (metricSuffixes.length > 0) {
+    defaultFooter += metricSuffixes.join("");
   }
   // Append history link when available
   if (ctx.historyUrl) {
     defaultFooter += " · [◷]({history_url})";
+  }
+  // Append slash command hint when applicable (workflow has a slash command trigger)
+  if (ctx.slashCommand) {
+    const hintText = ctx.slashCommandPlaceholder || "to run again";
+    defaultFooter += `\n> <sub>Comment <em>/{slash_command}</em> ${hintText}</sub>`;
   }
   return renderTemplate(defaultFooter, templateContext);
 }
@@ -123,11 +255,10 @@ function getFooterInstallMessage(ctx) {
   // Create context with both camelCase and snake_case keys, including computed agentic_workflow_url
   const templateContext = toSnakeCase({ ...ctx, agenticWorkflowUrl });
 
-  // Default installation template
-  const defaultInstall = "> To install this [agentic workflow]({workflow_source_url}), run\n> ```\n> gh aw add {workflow_source}\n> ```";
+  const defaultInstallTemplatePath = getPromptPath("workflow_install_note.md");
 
   // Use custom installation message if configured
-  return messages?.footerInstall ? renderTemplate(messages.footerInstall, templateContext) : renderTemplate(defaultInstall, templateContext);
+  return messages?.footerInstall ? renderTemplate(messages.footerInstall, templateContext) : renderTemplateFromFile(defaultInstallTemplatePath, templateContext);
 }
 
 /**
@@ -149,11 +280,8 @@ function getFooterWorkflowRecompileMessage(ctx) {
   // Pre-compute agentic_workflow_url as the direct link to the agentic workflow page
   const agenticWorkflowUrl = ctx.agenticWorkflowUrl || (ctx.runUrl ? `${ctx.runUrl}/agentic_workflow` : "");
 
-  // Read effective tokens from environment variable if available
-  const { effectiveTokens, effectiveTokensFormatted, effectiveTokensSuffix } = getEffectiveTokensFromEnv();
-
   // Create context with both camelCase and snake_case keys
-  const templateContext = toSnakeCase({ ...ctx, agenticWorkflowUrl, effectiveTokens, effectiveTokensFormatted, effectiveTokensSuffix });
+  const templateContext = toSnakeCase({ ...ctx, agenticWorkflowUrl });
 
   // Default footer template
   const defaultFooter = "> Generated by [{workflow_name}]({run_url})";
@@ -175,11 +303,8 @@ function getFooterWorkflowRecompileCommentMessage(ctx) {
   // Pre-compute agentic_workflow_url as the direct link to the agentic workflow page
   const agenticWorkflowUrl = ctx.agenticWorkflowUrl || (ctx.runUrl ? `${ctx.runUrl}/agentic_workflow` : "");
 
-  // Read effective tokens from environment variable if available
-  const { effectiveTokens, effectiveTokensFormatted, effectiveTokensSuffix } = getEffectiveTokensFromEnv();
-
   // Create context with both camelCase and snake_case keys
-  const templateContext = toSnakeCase({ ...ctx, agenticWorkflowUrl, effectiveTokens, effectiveTokensFormatted, effectiveTokensSuffix });
+  const templateContext = toSnakeCase({ ...ctx, agenticWorkflowUrl });
 
   // Default footer template
   const defaultFooter = "> Updated by [{workflow_name}]({run_url})";
@@ -198,6 +323,7 @@ function getFooterWorkflowRecompileCommentMessage(ctx) {
  * @property {string} [workflowSource] - Source of the workflow (owner/repo/path@ref)
  * @property {string} [workflowSourceUrl] - GitHub URL for the workflow source
  * @property {string} [historyUrl] - GitHub search URL for issues created by this workflow (for the history link)
+ * @property {number|string} [aiCredits] - Total AI Credits cost for the run (1 AIC == 0.01 USD)
  */
 
 /**
@@ -214,11 +340,43 @@ function getFooterAgentFailureIssueMessage(ctx) {
   // Pre-compute agentic_workflow_url as the direct link to the agentic workflow page
   const agenticWorkflowUrl = ctx.agenticWorkflowUrl || (ctx.runUrl ? `${ctx.runUrl}/agentic_workflow` : "");
 
-  // Read effective tokens from environment variable if available
-  const { effectiveTokens, effectiveTokensFormatted, effectiveTokensSuffix } = getEffectiveTokensFromEnv();
+  const {
+    aiCredits: envAIC,
+    aiCreditsFormatted: envAICFormatted,
+    aiCreditsSuffix: envAICSuffix,
+    agentAiCredits,
+    agentAiCreditsFormatted,
+    agentAiCreditsSuffix,
+    threatDetectionAiCredits,
+    threatDetectionAiCreditsFormatted,
+    threatDetectionAiCreditsSuffix,
+  } = getAICFromEnv();
+  const { ambientContext, ambientContextFormatted, ambientContextSuffix } = getAmbientContextFromEnv();
+  const hasExplicitContextAIC = ctx.aiCredits !== undefined && ctx.aiCredits !== null;
+  const explicitContextAIC = parseExplicitContextAIC(ctx.aiCredits);
+  const aiCredits = hasExplicitContextAIC ? explicitContextAIC : envAIC;
+  const aiCreditsFormatted = hasExplicitContextAIC ? (explicitContextAIC ? formatAIC(explicitContextAIC) : undefined) : envAICFormatted;
+  const aiCreditsSuffix = hasExplicitContextAIC ? (aiCreditsFormatted ? ` · ${aiCreditsFormatted} AIC` : "") : envAICSuffix;
+  const aiCreditsSuffixForTemplate = `${aiCreditsSuffix}${ambientContextSuffix}`;
 
   // Create context with both camelCase and snake_case keys, including computed history_link and agentic_workflow_url
-  const templateContext = toSnakeCase({ ...ctx, historyLink, agenticWorkflowUrl, effectiveTokens, effectiveTokensFormatted, effectiveTokensSuffix });
+  const templateContext = toSnakeCase({
+    ...ctx,
+    historyLink,
+    agenticWorkflowUrl,
+    aiCredits,
+    aiCreditsFormatted,
+    aiCreditsSuffix: aiCreditsSuffixForTemplate,
+    agentAiCredits,
+    agentAiCreditsFormatted,
+    agentAiCreditsSuffix,
+    threatDetectionAiCredits,
+    threatDetectionAiCreditsFormatted,
+    threatDetectionAiCreditsSuffix,
+    ambientContext,
+    ambientContextFormatted,
+    ambientContextSuffix,
+  });
 
   // Use custom agent failure issue footer if configured, otherwise use default footer
   let footer;
@@ -227,9 +385,11 @@ function getFooterAgentFailureIssueMessage(ctx) {
   } else {
     // Default footer template with link to workflow run
     let defaultFooter = "> Generated from [{workflow_name}]({run_url})";
-    // Append effective tokens with ● symbol when available (compact format, no "ET" label)
-    if (effectiveTokens) {
-      defaultFooter += `{effective_tokens_suffix}`;
+    if (aiCredits) {
+      defaultFooter += aiCreditsSuffix;
+    }
+    if (ambientContext) {
+      defaultFooter += ambientContextSuffix;
     }
     // Append history link when available
     if (ctx.historyUrl) {
@@ -255,11 +415,43 @@ function getFooterAgentFailureCommentMessage(ctx) {
   // Pre-compute agentic_workflow_url as the direct link to the agentic workflow page
   const agenticWorkflowUrl = ctx.agenticWorkflowUrl || (ctx.runUrl ? `${ctx.runUrl}/agentic_workflow` : "");
 
-  // Read effective tokens from environment variable if available
-  const { effectiveTokens, effectiveTokensFormatted, effectiveTokensSuffix } = getEffectiveTokensFromEnv();
+  const {
+    aiCredits: envAIC,
+    aiCreditsFormatted: envAICFormatted,
+    aiCreditsSuffix: envAICSuffix,
+    agentAiCredits,
+    agentAiCreditsFormatted,
+    agentAiCreditsSuffix,
+    threatDetectionAiCredits,
+    threatDetectionAiCreditsFormatted,
+    threatDetectionAiCreditsSuffix,
+  } = getAICFromEnv();
+  const { ambientContext, ambientContextFormatted, ambientContextSuffix } = getAmbientContextFromEnv();
+  const hasExplicitContextAIC = ctx.aiCredits !== undefined && ctx.aiCredits !== null;
+  const explicitContextAIC = parseExplicitContextAIC(ctx.aiCredits);
+  const aiCredits = hasExplicitContextAIC ? explicitContextAIC : envAIC;
+  const aiCreditsFormatted = hasExplicitContextAIC ? (explicitContextAIC ? formatAIC(explicitContextAIC) : undefined) : envAICFormatted;
+  const aiCreditsSuffix = hasExplicitContextAIC ? (aiCreditsFormatted ? ` · ${aiCreditsFormatted} AIC` : "") : envAICSuffix;
+  const aiCreditsSuffixForTemplate = `${aiCreditsSuffix}${ambientContextSuffix}`;
 
   // Create context with both camelCase and snake_case keys, including computed history_link and agentic_workflow_url
-  const templateContext = toSnakeCase({ ...ctx, historyLink, agenticWorkflowUrl, effectiveTokens, effectiveTokensFormatted, effectiveTokensSuffix });
+  const templateContext = toSnakeCase({
+    ...ctx,
+    historyLink,
+    agenticWorkflowUrl,
+    aiCredits,
+    aiCreditsFormatted,
+    aiCreditsSuffix: aiCreditsSuffixForTemplate,
+    agentAiCredits,
+    agentAiCreditsFormatted,
+    agentAiCreditsSuffix,
+    threatDetectionAiCredits,
+    threatDetectionAiCreditsFormatted,
+    threatDetectionAiCreditsSuffix,
+    ambientContext,
+    ambientContextFormatted,
+    ambientContextSuffix,
+  });
 
   // Use custom agent failure comment footer if configured, otherwise use default footer
   let footer;
@@ -268,9 +460,11 @@ function getFooterAgentFailureCommentMessage(ctx) {
   } else {
     // Default footer template with link to workflow run
     let defaultFooter = "> Generated from [{workflow_name}]({run_url})";
-    // Append effective tokens with ● symbol when available (compact format, no "ET" label)
-    if (effectiveTokens) {
-      defaultFooter += `{effective_tokens_suffix}`;
+    if (aiCredits) {
+      defaultFooter += aiCreditsSuffix;
+    }
+    if (ambientContext) {
+      defaultFooter += ambientContextSuffix;
     }
     // Append history link when available
     if (ctx.historyUrl) {
@@ -368,18 +562,42 @@ function generateXMLMarker(workflowName, runUrl) {
 function generateFooterWithMessages(workflowName, runUrl, workflowSource, workflowSourceURL, triggeringIssueNumber, triggeringPRNumber, triggeringDiscussionNumber, historyUrl, options) {
   // Determine triggering number (issue takes precedence, then PR, then discussion)
   let triggeringNumber;
+  /** @type {"issue"|"PR"|"discussion"|undefined} */
+  let triggeringType;
   if (triggeringIssueNumber) {
     triggeringNumber = triggeringIssueNumber;
+    triggeringType = "issue";
   } else if (triggeringPRNumber) {
     triggeringNumber = triggeringPRNumber;
+    triggeringType = "PR";
   } else if (triggeringDiscussionNumber) {
-    triggeringNumber = `discussion #${triggeringDiscussionNumber}`;
+    triggeringNumber = triggeringDiscussionNumber;
+    triggeringType = "discussion";
   }
 
-  // Read effective tokens from environment variable if available.
-  // GH_AW_EFFECTIVE_TOKENS is set by parse_mcp_gateway_log.cjs after computing ET
-  // from the token-usage.jsonl produced by the firewall proxy.
-  const { effectiveTokens } = getEffectiveTokensFromEnv();
+  // Read workflow emoji from environment variable if available.
+  const emoji = process.env.GH_AW_WORKFLOW_EMOJI || undefined;
+
+  // Read slash command from GH_AW_COMMANDS (JSON array) when available.
+  // Use the first command as the hint. This is only set when the workflow has a slash command trigger.
+  let slashCommand;
+  const commandsJSON = process.env.GH_AW_COMMANDS;
+  if (commandsJSON) {
+    try {
+      const commands = JSON.parse(commandsJSON);
+      if (Array.isArray(commands) && commands.length > 0 && typeof commands[0] === "string") {
+        slashCommand = commands[0];
+      }
+    } catch {
+      // Silently ignore malformed GH_AW_COMMANDS; the hint is a non-critical enhancement
+      // and omitting it is always safe. The value is compiler-generated JSON, so this
+      // path should not occur in practice.
+    }
+  }
+
+  // Read optional footer hint placeholder from GH_AW_COMMAND_PLACEHOLDER.
+  // When set, it replaces the default "to run again" suffix in the slash command hint.
+  const slashCommandPlaceholder = process.env.GH_AW_COMMAND_PLACEHOLDER;
 
   const ctx = {
     workflowName,
@@ -387,8 +605,11 @@ function generateFooterWithMessages(workflowName, runUrl, workflowSource, workfl
     workflowSource,
     workflowSourceUrl: workflowSourceURL,
     triggeringNumber,
+    triggeringType,
     historyUrl: historyUrl || undefined,
-    effectiveTokens,
+    emoji,
+    slashCommand,
+    slashCommandPlaceholder,
   };
 
   const { skipDetectionCaution = false } = options || {};

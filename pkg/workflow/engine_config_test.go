@@ -29,14 +29,6 @@ func TestExtractEngineConfig(t *testing.T) {
 			expectedConfig:        nil,
 		},
 		{
-			name: "top-level max-effective-tokens without engine",
-			frontmatter: map[string]any{
-				"max-effective-tokens": 10000000,
-			},
-			expectedEngineSetting: "",
-			expectedConfig:        &EngineConfig{MaxEffectiveTokens: 10000000},
-		},
-		{
 			name: "top-level max-runs without engine",
 			frontmatter: map[string]any{
 				"max-runs": 25,
@@ -45,14 +37,69 @@ func TestExtractEngineConfig(t *testing.T) {
 			expectedConfig:        &EngineConfig{MaxRuns: 25},
 		},
 		{
-			name: "top-level firewall effective-token-steering without engine",
+			name: "top-level max-turns takes precedence over deprecated max-runs",
 			frontmatter: map[string]any{
-				"firewall": map[string]any{
-					"effective-token-steering": true,
-				},
+				"max-runs":  25,
+				"max-turns": 30,
 			},
 			expectedEngineSetting: "",
-			expectedConfig:        &EngineConfig{EnableTokenSteering: true},
+			expectedConfig:        &EngineConfig{MaxTurns: "30", MaxRuns: 30},
+		},
+		{
+			name: "top-level max-turns without engine",
+			frontmatter: map[string]any{
+				"max-turns": 25,
+			},
+			expectedEngineSetting: "",
+			expectedConfig:        &EngineConfig{MaxTurns: "25", MaxRuns: 25},
+		},
+		{
+			name: "top-level max-turns expression without engine",
+			frontmatter: map[string]any{
+				"max-turns": "${{ inputs.max-turns }}",
+			},
+			expectedEngineSetting: "",
+			expectedConfig:        &EngineConfig{MaxTurns: "${{ inputs.max-turns }}"},
+		},
+		{
+			name: "top-level max-tool-denials without engine",
+			frontmatter: map[string]any{
+				"max-tool-denials": 5,
+			},
+			expectedEngineSetting: "",
+			expectedConfig:        &EngineConfig{MaxToolDenials: "5"},
+		},
+		{
+			name: "top-level max-tool-denials expression without engine",
+			frontmatter: map[string]any{
+				"max-tool-denials": "${{ inputs.max-tool-denials }}",
+			},
+			expectedEngineSetting: "",
+			expectedConfig:        &EngineConfig{MaxToolDenials: "${{ inputs.max-tool-denials }}"},
+		},
+		{
+			name: "top-level max-turn-cache-misses without engine",
+			frontmatter: map[string]any{
+				"max-turn-cache-misses": 6,
+			},
+			expectedEngineSetting: "",
+			expectedConfig:        &EngineConfig{MaxTurnCacheMisses: 6},
+		},
+		{
+			name: "top-level max-turns zero is ignored",
+			frontmatter: map[string]any{
+				"max-turns": 0,
+			},
+			expectedEngineSetting: "",
+			expectedConfig:        nil,
+		},
+		{
+			name: "top-level max-turns negative is ignored",
+			frontmatter: map[string]any{
+				"max-turns": -1,
+			},
+			expectedEngineSetting: "",
+			expectedConfig:        nil,
 		},
 		{
 			name:                  "string format - claude",
@@ -132,6 +179,28 @@ func TestExtractEngineConfig(t *testing.T) {
 			expectedConfig:        &EngineConfig{ID: "codex", Model: "gpt-4o"},
 		},
 		{
+			name: "object format - with model-provider override",
+			frontmatter: map[string]any{
+				"engine": map[string]any{
+					"id":             "claude",
+					"model-provider": "github",
+				},
+			},
+			expectedEngineSetting: "claude",
+			expectedConfig:        &EngineConfig{ID: "claude", LLMProvider: "github"},
+		},
+		{
+			name: "object format - deprecated llm-provider ignored",
+			frontmatter: map[string]any{
+				"engine": map[string]any{
+					"id":           "claude",
+					"llm-provider": "github",
+				},
+			},
+			expectedEngineSetting: "claude",
+			expectedConfig:        &EngineConfig{ID: "claude"},
+		},
+		{
 			name: "object format - complete",
 			frontmatter: map[string]any{
 				"engine": map[string]any{
@@ -155,17 +224,6 @@ func TestExtractEngineConfig(t *testing.T) {
 			expectedConfig:        &EngineConfig{ID: "claude", MaxTurns: "5"},
 		},
 		{
-			name: "object format - with top-level max-effective-tokens",
-			frontmatter: map[string]any{
-				"engine": map[string]any{
-					"id": "claude",
-				},
-				"max-effective-tokens": 10000000,
-			},
-			expectedEngineSetting: "claude",
-			expectedConfig:        &EngineConfig{ID: "claude", MaxEffectiveTokens: 10000000},
-		},
-		{
 			name: "object format - with top-level max-runs",
 			frontmatter: map[string]any{
 				"engine": map[string]any{
@@ -177,6 +235,40 @@ func TestExtractEngineConfig(t *testing.T) {
 			expectedConfig:        &EngineConfig{ID: "claude", MaxRuns: 12},
 		},
 		{
+			name: "object format - with top-level max-turns",
+			frontmatter: map[string]any{
+				"engine": map[string]any{
+					"id": "codex",
+				},
+				"max-turns": 12,
+			},
+			expectedEngineSetting: "codex",
+			expectedConfig:        &EngineConfig{ID: "codex", MaxTurns: "12", MaxRuns: 12},
+		},
+		{
+			name: "object format - with top-level max-tool-denials",
+			frontmatter: map[string]any{
+				"engine": map[string]any{
+					"id": "copilot",
+				},
+				"max-tool-denials": 8,
+			},
+			expectedEngineSetting: "copilot",
+			expectedConfig:        &EngineConfig{ID: "copilot", MaxToolDenials: "8"},
+		},
+		{
+			name: "object format - top-level max-turns overrides engine max-turns",
+			frontmatter: map[string]any{
+				"engine": map[string]any{
+					"id":        "codex",
+					"max-turns": 3,
+				},
+				"max-turns": "${{ inputs.max-turns }}",
+			},
+			expectedEngineSetting: "codex",
+			expectedConfig:        &EngineConfig{ID: "codex", MaxTurns: "${{ inputs.max-turns }}"},
+		},
+		{
 			name: "object format - with top-level max-runs as string",
 			frontmatter: map[string]any{
 				"engine": map[string]any{
@@ -186,30 +278,6 @@ func TestExtractEngineConfig(t *testing.T) {
 			},
 			expectedEngineSetting: "claude",
 			expectedConfig:        &EngineConfig{ID: "claude", MaxRuns: 12},
-		},
-		{
-			name: "object format - with top-level max-effective-tokens as string",
-			frontmatter: map[string]any{
-				"engine": map[string]any{
-					"id": "claude",
-				},
-				"max-effective-tokens": "10000000",
-			},
-			expectedEngineSetting: "claude",
-			expectedConfig:        &EngineConfig{ID: "claude", MaxEffectiveTokens: 10000000},
-		},
-		{
-			name: "object format - with top-level firewall effective-token-steering",
-			frontmatter: map[string]any{
-				"engine": map[string]any{
-					"id": "claude",
-				},
-				"firewall": map[string]any{
-					"effective-token-steering": true,
-				},
-			},
-			expectedEngineSetting: "claude",
-			expectedConfig:        &EngineConfig{ID: "claude", EnableTokenSteering: true},
 		},
 		{
 			name: "object format - complete with max-turns",
@@ -250,6 +318,23 @@ func TestExtractEngineConfig(t *testing.T) {
 			},
 			expectedEngineSetting: "claude",
 			expectedConfig:        &EngineConfig{ID: "claude", Env: map[string]string{"CUSTOM_VAR": "value1", "ANOTHER_VAR": "${{ secrets.SECRET_VAR }}"}},
+		},
+		{
+			name: "object format - with non-string scalar env vars",
+			frontmatter: map[string]any{
+				"engine": map[string]any{
+					"id": "claude",
+					"env": map[string]any{
+						"STRING_VAR":      "value1",
+						"INT_VAR":         1,
+						"FLOAT_VAR":       float64(1000),
+						"LARGE_FLOAT_VAR": float64(1000000),
+						"BOOL_VAR":        true,
+					},
+				},
+			},
+			expectedEngineSetting: "claude",
+			expectedConfig:        &EngineConfig{ID: "claude", Env: map[string]string{"STRING_VAR": "value1", "INT_VAR": "1", "FLOAT_VAR": "1000", "LARGE_FLOAT_VAR": "1000000", "BOOL_VAR": "true"}},
 		},
 		{
 			name: "object format - complete with env vars",
@@ -300,6 +385,51 @@ func TestExtractEngineConfig(t *testing.T) {
 			},
 			expectedEngineSetting: "copilot",
 			expectedConfig:        &EngineConfig{ID: "copilot", HarnessScript: "custom_copilot_harness.cjs"},
+		},
+		{
+			name: "object format - with copilot sdk driver script",
+			frontmatter: map[string]any{
+				"engine": map[string]any{
+					"id":                 "copilot",
+					"copilot-sdk-driver": "custom_copilot_sdk_driver.cjs",
+				},
+			},
+			expectedEngineSetting: "copilot",
+			expectedConfig:        &EngineConfig{ID: "copilot", CopilotSDK: true, Driver: "custom_copilot_sdk_driver.cjs"},
+		},
+		{
+			name: "object format - copilot sdk driver implies copilot sdk even when false",
+			frontmatter: map[string]any{
+				"engine": map[string]any{
+					"id":                 "copilot",
+					"copilot-sdk":        false,
+					"copilot-sdk-driver": "custom_copilot_sdk_driver.cjs",
+				},
+			},
+			expectedEngineSetting: "copilot",
+			expectedConfig:        &EngineConfig{ID: "copilot", CopilotSDK: true, Driver: "custom_copilot_sdk_driver.cjs"},
+		},
+		{
+			name: "object format - cwd literal path",
+			frontmatter: map[string]any{
+				"engine": map[string]any{
+					"id":  "copilot",
+					"cwd": "/custom/workspace",
+				},
+			},
+			expectedEngineSetting: "copilot",
+			expectedConfig:        &EngineConfig{ID: "copilot", Cwd: "/custom/workspace"},
+		},
+		{
+			name: "object format - cwd github actions expression",
+			frontmatter: map[string]any{
+				"engine": map[string]any{
+					"id":  "claude",
+					"cwd": "${{ github.workspace }}/subdir",
+				},
+			},
+			expectedEngineSetting: "claude",
+			expectedConfig:        &EngineConfig{ID: "claude", Cwd: "${{ github.workspace }}/subdir"},
 		},
 		{
 			name: "object format - complete with user-agent",
@@ -353,9 +483,8 @@ func TestExtractEngineConfig(t *testing.T) {
 				if config.MaxTurns != test.expectedConfig.MaxTurns {
 					t.Errorf("Expected config.MaxTurns '%s', got '%s'", test.expectedConfig.MaxTurns, config.MaxTurns)
 				}
-
-				if config.MaxEffectiveTokens != test.expectedConfig.MaxEffectiveTokens {
-					t.Errorf("Expected config.MaxEffectiveTokens '%d', got '%d'", test.expectedConfig.MaxEffectiveTokens, config.MaxEffectiveTokens)
+				if config.MaxToolDenials != test.expectedConfig.MaxToolDenials {
+					t.Errorf("Expected config.MaxToolDenials '%s', got '%s'", test.expectedConfig.MaxToolDenials, config.MaxToolDenials)
 				}
 
 				if config.MaxRuns != test.expectedConfig.MaxRuns {
@@ -368,6 +497,18 @@ func TestExtractEngineConfig(t *testing.T) {
 
 				if config.HarnessScript != test.expectedConfig.HarnessScript {
 					t.Errorf("Expected config.HarnessScript '%s', got '%s'", test.expectedConfig.HarnessScript, config.HarnessScript)
+				}
+
+				if config.Driver != test.expectedConfig.Driver {
+					t.Errorf("Expected config.Driver '%s', got '%s'", test.expectedConfig.Driver, config.Driver)
+				}
+
+				if config.CopilotSDK != test.expectedConfig.CopilotSDK {
+					t.Errorf("Expected config.CopilotSDK '%v', got '%v'", test.expectedConfig.CopilotSDK, config.CopilotSDK)
+				}
+
+				if config.Cwd != test.expectedConfig.Cwd {
+					t.Errorf("Expected config.Cwd '%s', got '%s'", test.expectedConfig.Cwd, config.Cwd)
 				}
 
 				if len(config.Env) != len(test.expectedConfig.Env) {
@@ -440,6 +581,40 @@ func TestExtractEngineConfig_EngineEnvTakesPrecedenceOverEngineAuth(t *testing.T
 	assert.NotNil(t, config)
 	assert.Equal(t, "static", config.Env["AWF_AUTH_TYPE"])
 	assert.Equal(t, "from-engine-env", config.Env["AWF_AUTH_OIDC_AUDIENCE"])
+}
+
+func TestExtractEngineConfig_AnthropicWIFMapsToAWFEnv(t *testing.T) {
+	compiler := NewCompiler()
+	_, config := compiler.ExtractEngineConfig(map[string]any{
+		"engine": map[string]any{
+			"id": "claude",
+			"auth": map[string]any{
+				"type":               "github-oidc",
+				"provider":           "anthropic",
+				"federation-rule-id": "fr_01ABC",
+				"organization-id":    "org_01XYZ",
+				"service-account-id": "sa_01DEF",
+				"workspace-id":       "ws_01GHI",
+			},
+		},
+	})
+
+	assert.NotNil(t, config)
+	if assert.NotNil(t, config.Auth) {
+		assert.Equal(t, "github-oidc", config.Auth.Type)
+		assert.Equal(t, "anthropic", config.Auth.Provider)
+		assert.Equal(t, "fr_01ABC", config.Auth.AnthropicFederationRuleID)
+		assert.Equal(t, "org_01XYZ", config.Auth.AnthropicOrganizationID)
+		assert.Equal(t, "sa_01DEF", config.Auth.AnthropicServiceAccountID)
+		assert.Equal(t, "ws_01GHI", config.Auth.AnthropicWorkspaceID)
+	}
+
+	assert.Equal(t, "github-oidc", config.Env["AWF_AUTH_TYPE"])
+	assert.Equal(t, "anthropic", config.Env["AWF_AUTH_PROVIDER"])
+	assert.Equal(t, "fr_01ABC", config.Env["AWF_AUTH_ANTHROPIC_FEDERATION_RULE_ID"])
+	assert.Equal(t, "org_01XYZ", config.Env["AWF_AUTH_ANTHROPIC_ORGANIZATION_ID"])
+	assert.Equal(t, "sa_01DEF", config.Env["AWF_AUTH_ANTHROPIC_SERVICE_ACCOUNT_ID"])
+	assert.Equal(t, "ws_01GHI", config.Env["AWF_AUTH_ANTHROPIC_WORKSPACE_ID"])
 }
 
 func TestCompileWorkflowWithExtendedEngine(t *testing.T) {

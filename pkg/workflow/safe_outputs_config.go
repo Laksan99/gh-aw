@@ -1,10 +1,13 @@
 package workflow
 
 import (
+	"encoding/json"
+	"fmt"
 	"math"
 	"strings"
 
 	"github.com/github/gh-aw/pkg/logger"
+	"github.com/github/gh-aw/pkg/sliceutil"
 	"github.com/github/gh-aw/pkg/typeutil"
 )
 
@@ -63,7 +66,7 @@ func (c *Compiler) extractSafeOutputsConfig(frontmatter map[string]any) *SafeOut
 			config = &SafeOutputsConfig{}
 
 			// Handle create-issue
-			issuesConfig := c.parseIssuesConfig(outputMap)
+			issuesConfig := c.parseCreateIssuesConfig(outputMap)
 			if issuesConfig != nil {
 				safeOutputsConfigLog.Print("Configured create-issue output handler")
 				config.CreateIssues = issuesConfig
@@ -94,7 +97,7 @@ func (c *Compiler) extractSafeOutputsConfig(frontmatter map[string]any) *SafeOut
 			}
 
 			// Handle create-discussion
-			discussionsConfig := c.parseDiscussionsConfig(outputMap)
+			discussionsConfig := c.parseCreateDiscussionsConfig(outputMap)
 			if discussionsConfig != nil {
 				config.CreateDiscussions = discussionsConfig
 			}
@@ -130,7 +133,7 @@ func (c *Compiler) extractSafeOutputsConfig(frontmatter map[string]any) *SafeOut
 			}
 
 			// Handle create-pull-request
-			pullRequestsConfig := c.parsePullRequestsConfig(outputMap)
+			pullRequestsConfig := c.parseCreatePullRequestsConfig(outputMap)
 			if pullRequestsConfig != nil {
 				safeOutputsConfigLog.Print("Configured create-pull-request output handler")
 				config.CreatePullRequests = pullRequestsConfig
@@ -172,6 +175,12 @@ func (c *Compiler) extractSafeOutputsConfig(frontmatter map[string]any) *SafeOut
 				config.AutofixCodeScanningAlert = autofixCodeScanningAlertConfig
 			}
 
+			// Handle create-check-run
+			createCheckRunConfig := c.parseCreateCheckRunConfig(outputMap)
+			if createCheckRunConfig != nil {
+				config.CreateCheckRun = createCheckRunConfig
+			}
+
 			// Parse allowed-domains configuration (additional domains, unioned with network.allowed; supports ecosystem identifiers)
 			if allowedDomains, exists := outputMap["allowed-domains"]; exists {
 				if domainsArray, ok := allowedDomains.([]any); ok {
@@ -183,6 +192,13 @@ func (c *Compiler) extractSafeOutputsConfig(frontmatter map[string]any) *SafeOut
 					}
 					config.AllowedDomains = domainStrings
 					safeOutputsConfigLog.Printf("Configured allowed-domains with %d domain(s)", len(domainStrings))
+				}
+			}
+
+			// Parse URL sanitization policy
+			if urls, exists := outputMap["urls"]; exists {
+				if urlsStr, ok := urls.(string); ok {
+					config.URLs = urlsStr
 				}
 			}
 
@@ -209,6 +225,12 @@ func (c *Compiler) extractSafeOutputsConfig(frontmatter map[string]any) *SafeOut
 			removeLabelsConfig := c.parseRemoveLabelsConfig(outputMap)
 			if removeLabelsConfig != nil {
 				config.RemoveLabels = removeLabelsConfig
+			}
+
+			// Parse replace-label configuration
+			replaceLabelConfig := c.parseReplaceLabelConfig(outputMap)
+			if replaceLabelConfig != nil {
+				config.ReplaceLabel = replaceLabelConfig
 			}
 
 			// Parse add-reviewer configuration
@@ -396,13 +418,17 @@ func (c *Compiler) extractSafeOutputsConfig(frontmatter map[string]any) *SafeOut
 			}
 
 			// Handle staged flag
-			if staged, exists := outputMap["staged"]; exists {
-				if stagedBool, ok := staged.(bool); ok {
-					config.Staged = stagedBool
+			if err := preprocessBoolFieldAsString(outputMap, "staged", safeOutputsConfigLog); err != nil {
+				safeOutputsConfigLog.Printf("staged: %v", err)
+			} else if staged, exists := outputMap["staged"]; exists {
+				if stagedStr, ok := staged.(string); ok && stagedStr != "" {
+					value := TemplatableBool(stagedStr)
+					config.Staged = &value
 				}
 			}
 			if c.forceStaged {
-				config.Staged = true
+				value := TemplatableBool("true")
+				config.Staged = &value
 			}
 
 			// Handle env configuration
@@ -453,7 +479,7 @@ func (c *Compiler) extractSafeOutputsConfig(frontmatter map[string]any) *SafeOut
 
 			// Set default value if not specified or invalid
 			if config.MaximumPatchSize == 0 {
-				config.MaximumPatchSize = 1024 // Default to 1MB = 1024 KB
+				config.MaximumPatchSize = 4096 // Default to 4MB = 4096 KB
 			}
 
 			// Handle max-patch-files configuration (maximum unique files allowed in
@@ -518,8 +544,48 @@ func (c *Compiler) extractSafeOutputsConfig(frontmatter map[string]any) *SafeOut
 
 			// Handle runs-on configuration
 			if runsOn, exists := outputMap["runs-on"]; exists {
-				if runsOnStr, ok := runsOn.(string); ok {
-					config.RunsOn = runsOnStr
+				config.RunsOn = renderRunsOnSnippet(runsOn)
+			}
+
+			// Handle timeout-minutes configuration
+			if timeoutMinutes, exists := outputMap["timeout-minutes"]; exists {
+				switch v := timeoutMinutes.(type) {
+				case int:
+					if v >= 1 {
+						config.TimeoutMinutes = v
+					}
+				case int64:
+					if v >= 1 {
+						if v > int64(math.MaxInt) {
+							safeOutputsConfigLog.Printf("timeout-minutes: int64 value %d exceeds platform int range, clamping to %d", v, math.MaxInt)
+							config.TimeoutMinutes = math.MaxInt
+						} else {
+							config.TimeoutMinutes = int(v)
+						}
+					}
+				case uint64:
+					if v >= 1 {
+						if v > uint64(math.MaxInt) {
+							safeOutputsConfigLog.Printf("timeout-minutes: uint64 value %d exceeds platform int range, clamping to %d", v, math.MaxInt)
+							config.TimeoutMinutes = math.MaxInt
+						} else {
+							config.TimeoutMinutes = int(v)
+						}
+					}
+				case float64:
+					// Reject NaN/Inf and out-of-range floats before narrowing — int(NaN)/int(±Inf)
+					// are implementation-defined and can produce surprising values.
+					if v != v || v > float64(math.MaxInt) || v < float64(math.MinInt) {
+						safeOutputsConfigLog.Printf("timeout-minutes: float value %.2f is out of range, ignoring", v)
+						break
+					}
+					intVal := int(v)
+					if v != float64(intVal) {
+						safeOutputsConfigLog.Printf("timeout-minutes: float value %.2f truncated to integer %d", v, intVal)
+					}
+					if intVal >= 1 {
+						config.TimeoutMinutes = intVal
+					}
 				}
 			}
 
@@ -564,11 +630,37 @@ func (c *Compiler) extractSafeOutputsConfig(frontmatter map[string]any) *SafeOut
 				}
 			}
 
-			// Handle report-failure-as-issue flag
+			// Handle report-failure-as-issue flag or array of categories
 			if reportFailureAsIssue, exists := outputMap["report-failure-as-issue"]; exists {
+				// Support both bool (legacy) and []any (new with categories filter)
 				if reportFailureAsIssueBool, ok := reportFailureAsIssue.(bool); ok {
-					config.ReportFailureAsIssue = &reportFailureAsIssueBool
+					config.ReportFailureAsIssue = reportFailureAsIssueBool
 					safeOutputsConfigLog.Printf("Report failure as issue: %t", reportFailureAsIssueBool)
+				} else if categoriesList, ok := reportFailureAsIssue.([]any); ok {
+					// Parse as array of category strings, separating included (no prefix) and excluded (! prefix)
+					includedCategories := make([]string, 0, len(categoriesList))
+					excludedCategories := make([]string, 0, len(categoriesList))
+					for _, cat := range categoriesList {
+						if catStr, ok := cat.(string); ok {
+							if category, found := strings.CutPrefix(catStr, "!"); found {
+								// Excluded category: "!" prefix was found and removed
+								excludedCategories = append(excludedCategories, category)
+							} else {
+								// Included category: no prefix
+								includedCategories = append(includedCategories, catStr)
+							}
+						}
+					}
+					config.ReportFailureAsIssue = reportFailureAsIssue // Preserve original value for proper serialization
+					config.ReportFailureAsIssueCategories = includedCategories
+					config.ReportFailureAsIssueExcludedCategories = excludedCategories
+					if len(includedCategories) > 0 && len(excludedCategories) > 0 {
+						safeOutputsConfigLog.Printf("Report failure as issue with include filter: %v, exclude filter: %v", includedCategories, excludedCategories)
+					} else if len(includedCategories) > 0 {
+						safeOutputsConfigLog.Printf("Report failure as issue with include filter: %v", includedCategories)
+					} else if len(excludedCategories) > 0 {
+						safeOutputsConfigLog.Printf("Report failure as issue with exclude filter: %v", excludedCategories)
+					}
 				}
 			}
 
@@ -640,7 +732,7 @@ func (c *Compiler) extractSafeOutputsConfig(frontmatter map[string]any) *SafeOut
 			// Handle jobs (safe-jobs must be under safe-outputs)
 			if jobs, exists := outputMap["jobs"]; exists {
 				if jobsMap, ok := jobs.(map[string]any); ok {
-					c := &Compiler{} // Create a temporary compiler instance for parsing
+					c := NewCompiler() // Create a temporary compiler instance for parsing
 					config.Jobs = c.parseSafeJobsConfig(jobsMap)
 				}
 			}
@@ -684,6 +776,14 @@ func (c *Compiler) extractSafeOutputsConfig(frontmatter map[string]any) *SafeOut
 		}
 	}
 
+	// Force-disable threat detection when --use-samples is active: the replay driver
+	// emits synthetic outputs solely for deterministic end-to-end tests, and running
+	// an LLM-backed detection pass would defeat that determinism.
+	if config != nil && c.useSamples && config.ThreatDetection != nil {
+		safeOutputsConfigLog.Print("Disabling threat-detection because --use-samples is set")
+		config.ThreatDetection = nil
+	}
+
 	if config != nil {
 		safeOutputsConfigLog.Print("Successfully extracted safe-outputs configuration")
 	} else {
@@ -693,7 +793,7 @@ func (c *Compiler) extractSafeOutputsConfig(frontmatter map[string]any) *SafeOut
 	return config
 }
 
-// parseBaseSafeOutputConfig parses common fields (max, github-token, staged) from a config map.
+// parseBaseSafeOutputConfig parses common fields (max, github-token, github-app, staged) from a config map.
 // If defaultMax is provided (> 0), it will be set as the default value for config.Max
 // before parsing the max field from configMap. Supports both integer values and GitHub
 // Actions expression strings (e.g. "${{ inputs.max }}").
@@ -731,11 +831,248 @@ func (c *Compiler) parseBaseSafeOutputConfig(configMap map[string]any, config *B
 		}
 	}
 
-	// Parse staged flag (per-handler staged mode)
-	if staged, exists := configMap["staged"]; exists {
-		if stagedBool, ok := staged.(bool); ok {
-			safeOutputsConfigLog.Printf("Parsed staged flag: %t", stagedBool)
-			config.Staged = stagedBool
+	// Parse github-app (per-handler GitHub App credentials for token minting)
+	if app, exists := configMap["github-app"]; exists {
+		if appMap, ok := app.(map[string]any); ok {
+			safeOutputsConfigLog.Print("Parsed custom github-app from config")
+			config.GitHubApp = parseAppConfig(appMap)
 		}
 	}
+
+	// Parse staged flag (per-handler staged mode)
+	if err := preprocessBoolFieldAsString(configMap, "staged", safeOutputsConfigLog); err != nil {
+		safeOutputsConfigLog.Printf("Invalid staged value: %v", err)
+	} else if staged, exists := configMap["staged"]; exists {
+		if stagedStr, ok := staged.(string); ok && stagedStr != "" {
+			safeOutputsConfigLog.Printf("Parsed staged flag: %s", stagedStr)
+			value := TemplatableBool(stagedStr)
+			config.Staged = &value
+		}
+	}
+
+	// Parse samples list (hidden feature: deterministic replay samples for --use-samples).
+	// Accepts either a YAML list of objects, or a single object that is auto-wrapped
+	// into a one-element list. The JSON schema rejects scalar/string shapes so we
+	// don't need a defensive YAML-string branch here.
+	if samples, exists := configMap["samples"]; exists {
+		parsed := parseSamplesValue(samples)
+		if len(parsed) > 0 {
+			safeOutputsConfigLog.Printf("Parsed %d samples entries", len(parsed))
+			config.Samples = parsed
+		}
+	}
+}
+
+// parseSamplesValue normalizes a `samples` frontmatter value into a list of
+// objects. Accepted shapes:
+//   - YAML list of mappings: returned as-is
+//   - single YAML mapping: wrapped into a one-element list
+//
+// Any other shape returns an empty slice — schema validation rejects those
+// shapes upstream and we keep this parser strict to match.
+func parseSamplesValue(samples any) []map[string]any {
+	switch v := samples.(type) {
+	case []any:
+		out := make([]map[string]any, 0, len(v))
+		for _, item := range v {
+			if m, ok := item.(map[string]any); ok {
+				out = append(out, m)
+			} else if mStr, ok := item.(map[string]string); ok {
+				converted := make(map[string]any, len(mStr))
+				for k, s := range mStr {
+					converted[k] = s
+				}
+				out = append(out, converted)
+			}
+		}
+		return out
+	case map[string]any:
+		return []map[string]any{v}
+	default:
+		return nil
+	}
+}
+
+// SafeOutputStepConfig holds configuration for building a single safe output step
+// within the consolidated safe-outputs job
+type SafeOutputStepConfig struct {
+	StepName                   string            // Human-readable step name (e.g., "Create Issue")
+	StepID                     string            // Step ID for referencing outputs (e.g., "create_issue")
+	Script                     string            // JavaScript script to execute (for inline mode)
+	ScriptName                 string            // Name of the script in the registry (for file mode)
+	CustomEnvVars              []string          // Environment variables specific to this step
+	Condition                  ConditionNode     // Step-level condition (if clause)
+	Token                      string            // GitHub token for this step
+	UseCopilotRequestsToken    bool              // Whether to use Copilot requests token preference chain
+	UseCopilotCodingAgentToken bool              // Whether to use Copilot coding agent token preference chain
+	PreSteps                   []string          // Optional steps to run before the script step
+	PostSteps                  []string          // Optional steps to run after the script step
+	Outputs                    map[string]string // Outputs from this step
+	ContinueOnError            bool              // Whether to continue the job even if this step fails (continue-on-error: true)
+}
+
+func (c *Compiler) addHandlerManagerConfigEnvVar(steps *[]string, data *WorkflowData) {
+	if data.SafeOutputs == nil {
+		safeOutputsConfigLog.Print("No safe-outputs configuration, skipping handler manager config")
+		return
+	}
+
+	safeOutputsConfigLog.Print("Building handler manager configuration for safe-outputs")
+	// config holds both per-handler configs (keyed by handler name, e.g. "add_comment") and
+	// global runtime knobs (e.g. "mentions") that safe_output_handler_manager.cjs forwards to
+	// specific handlers at startup. Handler names are the reserved keys defined in handlerRegistry;
+	// non-handler keys ("mentions") are documented in safe_outputs_config_generation.go.
+	config := make(map[string]any)
+
+	// Collect engine-specific manifest files and path prefixes (AgentFileProvider interface).
+	// These are merged with the global runtime-derived lists so that engine-specific
+	// instruction files (e.g. CLAUDE.md, .claude/, AGENTS.md) are automatically protected.
+	extraManifestFiles, extraPathPrefixes := c.getEngineAgentFileInfo(data)
+	fullManifestFiles := getAllManifestFiles(extraManifestFiles...)
+	fullPathPrefixes := getProtectedPathPrefixes(extraPathPrefixes...)
+
+	// For workflow_call relay workflows, inject the resolved platform repo and ref into the
+	// dispatch_workflow handler config so dispatch targets the host repo, not the caller's.
+	safeOutputs := data.SafeOutputs
+	if hasWorkflowCallTrigger(data.On) && safeOutputs.DispatchWorkflow != nil {
+		if safeOutputs.DispatchWorkflow.TargetRepoSlug == "" {
+			safeOutputs = safeOutputsWithDispatchTargetRepo(safeOutputs, "${{ needs.activation.outputs.target_repo }}")
+			safeOutputsConfigLog.Print("Injecting target_repo into dispatch_workflow config for workflow_call relay")
+		}
+		if safeOutputs.DispatchWorkflow.TargetRef == "" {
+			safeOutputs = safeOutputsWithDispatchTargetRef(safeOutputs, "${{ needs.activation.outputs.target_ref }}")
+			safeOutputsConfigLog.Print("Injecting target_ref into dispatch_workflow config for workflow_call relay")
+		}
+	}
+
+	// Build configuration for each handler using the registry
+	for handlerName, builder := range handlerRegistry {
+		handlerConfig := builder(safeOutputs)
+		// Include handler if:
+		// 1. It returns a non-nil config (explicitly enabled, even if empty)
+		// 2. For auto-enabled handlers, include even with empty config
+		if handlerConfig != nil {
+			injectCurrentCheckoutPatchWorkspacePath(handlerName, handlerConfig, data)
+			injectCheckoutMapping(handlerName, handlerConfig, data)
+			// Augment protected-files protection with engine-specific files for handlers that use it.
+			if _, hasProtected := handlerConfig["protected_files"]; hasProtected {
+				// Extract per-handler exclusions set by the handler builder (sentinel key).
+				// These are compile-time overrides and must not be forwarded to the runtime.
+				excludeFiles := ParseStringArrayFromConfig(handlerConfig, "_protected_files_exclude", nil)
+				delete(handlerConfig, "_protected_files_exclude")
+
+				handlerConfig["protected_files"] = sliceutil.Exclude(fullManifestFiles, excludeFiles...)
+				filteredPrefixes := sliceutil.Exclude(fullPathPrefixes, excludeFiles...)
+				if len(filteredPrefixes) > 0 {
+					handlerConfig["protected_path_prefixes"] = filteredPrefixes
+				} else {
+					delete(handlerConfig, "protected_path_prefixes")
+				}
+				// Compute which top-level dot-folder prefixes are excluded so the runtime
+				// dot-folder check can skip them.
+				if dotFolderExcludes := getDotFolderExcludes(excludeFiles); len(dotFolderExcludes) > 0 {
+					handlerConfig["protected_dot_folder_excludes"] = dotFolderExcludes
+				}
+			}
+			safeOutputsConfigLog.Printf("Adding %s handler configuration", handlerName)
+			config[handlerName] = handlerConfig
+		}
+	}
+
+	// Include top-level mentions configuration so the handler manager can pass it to
+	// markdown-producing handlers that call sanitizeContent with allowed aliases.
+	if safeOutputs.Mentions != nil {
+		mentionsCfg := buildMentionsHandlerConfig(safeOutputs.Mentions)
+		if len(mentionsCfg) > 0 {
+			config["mentions"] = mentionsCfg
+		}
+	}
+
+	// Only add the env var if there are handlers to configure
+	if len(config) > 0 {
+		safeOutputsConfigLog.Printf("Marshaling handler config with %d handlers", len(config))
+		configJSON, err := json.Marshal(config)
+		if err != nil {
+			safeOutputsConfigLog.Printf("Failed to marshal handler config: %v", err)
+			return
+		}
+		// Escape the JSON for YAML (handle quotes and special chars)
+		configStr := string(configJSON)
+		*steps = append(*steps, fmt.Sprintf("          GH_AW_SAFE_OUTPUTS_HANDLER_CONFIG: %q\n", configStr))
+		safeOutputsConfigLog.Printf("Added handler config env var: size=%d bytes", len(configStr))
+	} else {
+		safeOutputsConfigLog.Print("No handlers configured, skipping config env var")
+	}
+}
+
+// buildMentionsHandlerConfig converts a MentionsConfig into the map format used by
+// GH_AW_SAFE_OUTPUTS_HANDLER_CONFIG so safe_output_handler_manager.cjs can pass
+// the top-level mentions policy through to mention-aware handlers.
+func buildMentionsHandlerConfig(m *MentionsConfig) map[string]any {
+	cfg := make(map[string]any)
+	if m.Enabled != nil {
+		cfg["enabled"] = *m.Enabled
+	}
+	if m.AllowedCollaborators != nil {
+		cfg["allowedCollaborators"] = *m.AllowedCollaborators
+	}
+	if m.AllowContext != nil {
+		cfg["allowContext"] = *m.AllowContext
+	}
+	if len(m.Allowed) > 0 {
+		cfg["allowed"] = m.Allowed
+	}
+	if len(m.AllowedTeams) > 0 {
+		cfg["allowedTeams"] = m.AllowedTeams
+	}
+	if m.Max != nil {
+		cfg["max"] = *m.Max
+	}
+	return cfg
+}
+
+// safeOutputsWithDispatchTargetRepo returns a shallow copy of cfg with the dispatch_workflow
+// TargetRepoSlug overridden to targetRepo. Only DispatchWorkflow is deep-copied; all other
+// pointer fields remain shared. This avoids mutating the original config.
+func safeOutputsWithDispatchTargetRepo(cfg *SafeOutputsConfig, targetRepo string) *SafeOutputsConfig {
+	dispatchCopy := *cfg.DispatchWorkflow
+	dispatchCopy.TargetRepoSlug = targetRepo
+	configCopy := *cfg
+	configCopy.DispatchWorkflow = &dispatchCopy
+	return &configCopy
+}
+
+// safeOutputsWithDispatchTargetRef returns a shallow copy of cfg with the dispatch_workflow
+// TargetRef overridden to targetRef. Only DispatchWorkflow is deep-copied; all other
+// pointer fields remain shared. This avoids mutating the original config.
+func safeOutputsWithDispatchTargetRef(cfg *SafeOutputsConfig, targetRef string) *SafeOutputsConfig {
+	dispatchCopy := *cfg.DispatchWorkflow
+	dispatchCopy.TargetRef = targetRef
+	configCopy := *cfg
+	configCopy.DispatchWorkflow = &dispatchCopy
+	return &configCopy
+}
+
+// getEngineAgentFileInfo returns the engine-specific manifest filenames and path prefixes
+// by type-asserting the active engine to AgentFileProvider.  Returns empty slices when
+// the engine is not set or does not implement the interface.
+func (c *Compiler) getEngineAgentFileInfo(data *WorkflowData) (manifestFiles []string, pathPrefixes []string) {
+	if data == nil || data.EngineConfig == nil {
+		return nil, nil
+	}
+	engine, err := c.engineRegistry.GetEngine(data.EngineConfig.ID)
+	if err != nil {
+		safeOutputsConfigLog.Printf("Engine lookup failed for %q: %v — skipping agent manifest file injection", data.EngineConfig.ID, err)
+		return nil, nil
+	}
+	if engine == nil {
+		return nil, nil
+	}
+	provider, ok := engine.(AgentFileProvider)
+	if !ok {
+		return nil, nil
+	}
+	safeOutputsConfigLog.Printf("Engine %s provides AgentFileProvider: files=%v, prefixes=%v",
+		data.EngineConfig.ID, provider.GetAgentManifestFiles(), provider.GetAgentManifestPathPrefixes())
+	return provider.GetAgentManifestFiles(), provider.GetAgentManifestPathPrefixes()
 }

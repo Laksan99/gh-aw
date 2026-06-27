@@ -2,31 +2,63 @@ package workflow
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strconv"
+	"strings"
 
 	"github.com/github/gh-aw/pkg/constants"
 	"github.com/github/gh-aw/pkg/logger"
+	"github.com/github/gh-aw/pkg/parser"
 	"github.com/github/gh-aw/pkg/stringutil"
 	"github.com/github/gh-aw/pkg/types"
 	"github.com/github/gh-aw/pkg/typeutil"
+	"github.com/github/gh-aw/pkg/workflow/compilerenv"
 )
 
 var engineLog = logger.New("workflow:engine")
+
+const WorkflowCallNetworkAllowedEnvVar = "GH_AW_WORKFLOW_CALL_NETWORK_ALLOWED"
+
+func injectWorkflowCallNetworkAllowedEnv(env map[string]string, workflowData *WorkflowData) {
+	if shouldUseWorkflowCallNetworkAllowedInput(workflowData) {
+		env[WorkflowCallNetworkAllowedEnvVar] = fmt.Sprintf("${{ inputs.%s }}", NetworkAllowedInputName)
+	}
+}
+
+func toEngineEnvValueString(value any) (string, bool) {
+	switch v := value.(type) {
+	case string:
+		return v, true
+	case float32:
+		return strconv.FormatFloat(float64(v), 'f', -1, 32), true
+	case float64:
+		return strconv.FormatFloat(v, 'f', -1, 64), true
+	case bool, int, int8, int16, int32, int64, uint, uint8, uint16, uint32, uint64:
+		return fmt.Sprintf("%v", v), true
+	default:
+		return "", false
+	}
+}
 
 // EngineConfig represents the parsed engine configuration
 type EngineConfig struct {
 	ID                 string
 	Version            string
 	Model              string
+	LLMProvider        string // Inference provider override for this engine (github|anthropic|openai)
+	PermissionMode     string
 	MaxTurns           string
+	MaxToolDenials     string // Maximum repeated tool denials before stopping inference (copilot SDK mode only)
 	MaxRuns            int    // Maximum number of LLM invocations per run (AWF apiProxy.maxRuns)
+	MaxTurnCacheMisses int    // Maximum number of consecutive cache misses per run (AWF apiProxy.maxCacheMisses)
 	MaxContinuations   int    // Maximum number of continuations for autopilot mode (copilot engine only; > 1 enables --autopilot)
-	MaxEffectiveTokens int64  // Maximum allowed effective tokens (ET) budget for AWF apiProxy firewall enforcement
+	MaxAICredits       int64  // Maximum allowed AI credits per run for AWF apiProxy firewall enforcement
 	Concurrency        string // Agent job-level concurrency configuration (YAML format)
 	UserAgent          string
 	Command            string // Custom executable path (when set, skip installation steps)
 	HarnessScript      string // Custom Node.js harness script filename (replaces engine default harness script when supported)
+	Driver             string // Custom driver script filename or command. For the copilot engine (engine.copilot-sdk-driver / engine.driver), supports .js/.cjs/.mjs (Node.js), .py (Python), .ts/.mts (TypeScript), .rb (Ruby), or a bare command name. For the pi engine (engine.driver), supports .js/.cjs/.mjs or a bare basename resolved from the setup-action directory.
 	Env                map[string]string
 	Auth               *EngineAuthConfig // Engine-level auth config (mapped to AWF_AUTH_* env vars for API proxy sidecar auth)
 	Config             string
@@ -34,13 +66,9 @@ type EngineConfig struct {
 	Agent              string // Agent identifier for copilot --agent flag (copilot engine only)
 	APITarget          string // Custom API endpoint hostname (e.g., "api.acme.ghe.com" or "api.enterprise.githubcopilot.com")
 	Bare               bool   // When true, disables automatic loading of context/instructions (copilot: --no-custom-instructions, claude: --bare, codex: --no-system-prompt, gemini: GEMINI_SYSTEM_MD=/dev/null)
-	// TokenWeights provides custom model cost data for effective token computation.
-	// When set, overrides or extends the built-in model_multipliers.json values.
+	// TokenWeights provides custom model cost data for AI Credits cost ratios.
+	// When set, overrides or extends built-in model cost defaults.
 	TokenWeights *types.TokenWeights
-
-	// EnableTokenSteering enables AWF apiProxy token-budget steering messages.
-	// Maps from frontmatter firewall.effective-token-steering.
-	EnableTokenSteering bool
 
 	// Inline definition fields (populated when engine.runtime is specified in frontmatter)
 	IsInlineDefinition bool   // true when the engine is defined inline via engine.runtime + optional engine.provider
@@ -62,17 +90,36 @@ type EngineConfig struct {
 	// Extensions is a list of engine-specific plugin names to install before launching the engine.
 	// Currently used by the Pi engine: each entry is passed to `pi install <extension>`.
 	Extensions []string
+
+	// CopilotSDK enables the GitHub Copilot SDK integration.
+	// When true the compiler enables a harness-managed Copilot CLI headless sidecar
+	// and sets COPILOT_SDK_URI on child processes so the SDK can connect to it.
+	CopilotSDK bool
+
+	// Cwd is a templatable string that overrides the working directory for the engine's
+	// spawned process. When set, it is passed as GH_AW_ENGINE_CWD to the execution
+	// environment. JS harness engines read this variable in preference to GITHUB_WORKSPACE;
+	// non-harness engines use it as the target of the shell-level cd prefix.
+	// Defaults to the repository workspace (GITHUB_WORKSPACE) when empty.
+	Cwd string
 }
 
 // EngineAuthConfig represents engine.auth frontmatter settings that map to
 // AWF_AUTH_* environment variables consumed by the AWF API proxy sidecar.
 type EngineAuthConfig struct {
-	Type          string
-	Audience      string
+	Type     string
+	Audience string
+	Provider string // "azure" or "anthropic"
+	// Azure WIF fields
 	AzureTenantID string
 	AzureClientID string
 	AzureScope    string
 	AzureCloud    string
+	// Anthropic WIF fields
+	AnthropicFederationRuleID string
+	AnthropicOrganizationID   string
+	AnthropicServiceAccountID string
+	AnthropicWorkspaceID      string
 }
 
 // NetworkPermissions represents network access permissions for workflow execution
@@ -106,7 +153,8 @@ type EngineAuthConfig struct {
 // Ecosystem identifiers in the Allowed list are expanded to their corresponding domain lists.
 // See GetAllowedDomains() for the list of supported ecosystem identifiers.
 type NetworkPermissions struct {
-	Allowed           []string        `yaml:"allowed,omitempty"`  // List of allowed domains or ecosystem identifiers (e.g., "defaults", "github", "python")
+	Allowed           []string        `yaml:"allowed,omitempty"` // List of allowed domains or ecosystem identifiers (e.g., "defaults", "github", "python")
+	AllowedInput      bool            `yaml:"allowed-input,omitempty"`
 	Blocked           []string        `yaml:"blocked,omitempty"`  // List of blocked domains (takes precedence over allowed)
 	Firewall          *FirewallConfig `yaml:"firewall,omitempty"` // AWF firewall configuration (see firewall.go)
 	ExplicitlyDefined bool            `yaml:"-"`                  // Internal flag: true if network field was explicitly set in frontmatter
@@ -118,12 +166,12 @@ type EngineNetworkConfig struct {
 	Network *NetworkPermissions
 }
 
-// GetMaxEffectiveTokens returns the configured engine ET budget, falling back to the default.
-func (e *EngineConfig) GetMaxEffectiveTokens() int64 {
-	if e == nil || e.MaxEffectiveTokens <= 0 {
-		return constants.DefaultMaxEffectiveTokens
+// GetMaxAICredits returns the configured engine AI credits budget, falling back to the default.
+func (e *EngineConfig) GetMaxAICredits() int64 {
+	if e == nil || e.MaxAICredits == 0 {
+		return constants.DefaultMaxAICredits
 	}
-	return e.MaxEffectiveTokens
+	return e.MaxAICredits
 }
 
 // GetMaxRuns returns the configured AWF max-runs value, falling back to the default.
@@ -134,65 +182,25 @@ func (e *EngineConfig) GetMaxRuns() int {
 	return e.MaxRuns
 }
 
-// parseMaxEffectiveTokensValue parses max-effective-tokens from either integer
-// or numeric-string frontmatter values.
-//
-// A return value of 0 is a sentinel that means "not configured" (missing or
-// invalid); explicit zero is not a valid user value because schema validation
-// enforces minimum 1 before this parser path runs.
-func parseMaxEffectiveTokensValue(raw any) int64 {
-	if val, ok := typeutil.ParseIntValue(raw); ok && val > 0 {
-		return int64(val)
+// GetMaxTurnCacheMisses returns the configured AWF max-turn-cache-misses value, falling back
+// to the enterprise override or built-in default.
+func (e *EngineConfig) GetMaxTurnCacheMisses() int {
+	if e == nil || e.MaxTurnCacheMisses <= 0 {
+		return compilerenv.ResolveDefaultMaxTurnCacheMisses(constants.DefaultMaxTurnCacheMisses)
 	}
-	if rawStr, ok := raw.(string); ok {
-		if parsed, err := strconv.ParseInt(rawStr, 10, 64); err == nil && parsed > 0 {
-			return parsed
-		}
-		engineLog.Printf("Ignoring invalid max-effective-tokens value: %q", rawStr)
-	}
-	return 0
-}
-
-// parseMaxRunsValue parses max-runs from either integer or numeric-string
-// frontmatter values.
-func parseMaxRunsValue(raw any) int {
-	if val, ok := typeutil.ParseIntValue(raw); ok && val > 0 {
-		return val
-	}
-	if rawStr, ok := raw.(string); ok {
-		if parsed, err := strconv.Atoi(rawStr); err == nil && parsed > 0 {
-			return parsed
-		}
-		engineLog.Printf("Ignoring invalid max-runs value: %q", rawStr)
-	}
-	return 0
-}
-
-// parseEffectiveTokenSteering extracts firewall.effective-token-steering from frontmatter.
-func parseEffectiveTokenSteering(frontmatter map[string]any) bool {
-	firewallRaw, ok := frontmatter["firewall"]
-	if !ok {
-		return false
-	}
-	firewallObj, ok := firewallRaw.(map[string]any)
-	if !ok {
-		return false
-	}
-
-	if raw, exists := firewallObj["effective-token-steering"]; exists {
-		if enabled, ok := raw.(bool); ok {
-			return enabled
-		}
-	}
-
-	return false
+	return e.MaxTurnCacheMisses
 }
 
 // ExtractEngineConfig extracts engine configuration from frontmatter, supporting both string and object formats
 func (c *Compiler) ExtractEngineConfig(frontmatter map[string]any) (string, *EngineConfig) {
-	topLevelMaxEffectiveTokens := parseMaxEffectiveTokensValue(frontmatter["max-effective-tokens"])
-	topLevelMaxRuns := parseMaxRunsValue(frontmatter["max-runs"])
-	effectiveTokenSteering := parseEffectiveTokenSteering(frontmatter)
+	topLevelMaxTurns := parseMaxTurnsValue(frontmatter["max-turns"])
+	topLevelMaxToolDenials := parseMaxToolDenialsValue(frontmatter["max-tool-denials"])
+	topLevelMaxAICredits := parseMaxAICreditsValue(frontmatter["max-ai-credits"])
+	topLevelMaxTurnCacheMisses := parseMaxTurnCacheMissesValue(frontmatter["max-turn-cache-misses"])
+	topLevelMaxRuns := parseMaxRunsValue(frontmatter["max-turns"])
+	if topLevelMaxRuns == 0 {
+		topLevelMaxRuns = parseMaxRunsValue(frontmatter["max-runs"])
+	}
 
 	if engine, exists := frontmatter["engine"]; exists {
 		engineLog.Print("Extracting engine configuration from frontmatter")
@@ -201,10 +209,12 @@ func (c *Compiler) ExtractEngineConfig(frontmatter map[string]any) (string, *Eng
 		if engineStr, ok := engine.(string); ok {
 			engineLog.Printf("Found engine in string format: %s", engineStr)
 			return engineStr, &EngineConfig{
-				ID:                  engineStr,
-				MaxRuns:             topLevelMaxRuns,
-				MaxEffectiveTokens:  topLevelMaxEffectiveTokens,
-				EnableTokenSteering: effectiveTokenSteering,
+				ID:                 engineStr,
+				MaxTurns:           topLevelMaxTurns,
+				MaxToolDenials:     topLevelMaxToolDenials,
+				MaxRuns:            topLevelMaxRuns,
+				MaxTurnCacheMisses: topLevelMaxTurnCacheMisses,
+				MaxAICredits:       topLevelMaxAICredits,
 			}
 		}
 
@@ -268,9 +278,21 @@ func (c *Compiler) ExtractEngineConfig(frontmatter map[string]any) (string, *Eng
 						engineLog.Printf("Extracted bare mode (inline): %v", config.Bare)
 					}
 				}
+				// Extract optional 'permission-mode' field (shared with non-inline path)
+				if permissionMode, hasPermissionMode := engineObj["permission-mode"]; hasPermissionMode {
+					if permissionModeStr, ok := permissionMode.(string); ok {
+						config.PermissionMode = permissionModeStr
+					}
+				}
+				if topLevelMaxTurns != "" {
+					config.MaxTurns = topLevelMaxTurns
+				}
+				if topLevelMaxToolDenials != "" {
+					config.MaxToolDenials = topLevelMaxToolDenials
+				}
 				config.MaxRuns = topLevelMaxRuns
-				config.MaxEffectiveTokens = topLevelMaxEffectiveTokens
-				config.EnableTokenSteering = effectiveTokenSteering
+				config.MaxTurnCacheMisses = topLevelMaxTurnCacheMisses
+				config.MaxAICredits = topLevelMaxAICredits
 
 				engineLog.Printf("Extracted inline engine definition: runtimeID=%s, providerID=%s", config.ID, config.InlineProviderID)
 				return config.ID, config
@@ -295,13 +317,32 @@ func (c *Compiler) ExtractEngineConfig(frontmatter map[string]any) (string, *Eng
 				}
 			}
 
-			// Extract optional 'max-turns' field
-			if maxTurns, hasMaxTurns := engineObj["max-turns"]; hasMaxTurns {
-				if val, ok := typeutil.ParseIntValue(maxTurns); ok {
-					config.MaxTurns = strconv.Itoa(val)
-				} else if maxTurnsStr, ok := maxTurns.(string); ok {
-					config.MaxTurns = maxTurnsStr
+			// Extract optional 'model-provider' field.
+			providerValue, hasProvider := engineObj["model-provider"]
+			if hasProvider {
+				if providerStr, ok := providerValue.(string); ok {
+					config.LLMProvider = strings.ToLower(strings.TrimSpace(providerStr))
 				}
+			}
+
+			// Extract optional 'permission-mode' field
+			if permissionMode, hasPermissionMode := engineObj["permission-mode"]; hasPermissionMode {
+				if permissionModeStr, ok := permissionMode.(string); ok {
+					config.PermissionMode = permissionModeStr
+				}
+			}
+
+			// Extract optional 'max-turns' field (deprecated alias for top-level max-turns).
+			// Use parseMaxTurnsValue for consistent validation: rejects negative values and
+			// arbitrary strings while preserving valid integers and GitHub Actions expressions.
+			if maxTurns, hasMaxTurns := engineObj["max-turns"]; hasMaxTurns {
+				config.MaxTurns = parseMaxTurnsValue(maxTurns)
+			}
+			if topLevelMaxTurns != "" {
+				config.MaxTurns = topLevelMaxTurns
+			}
+			if topLevelMaxToolDenials != "" {
+				config.MaxToolDenials = topLevelMaxToolDenials
 			}
 
 			// Extract optional 'max-continuations' field
@@ -369,12 +410,27 @@ func (c *Compiler) ExtractEngineConfig(frontmatter map[string]any) (string, *Eng
 				}
 			}
 
-			// Extract optional 'env' field (object/map of strings)
+			// Extract optional 'driver' / 'copilot-sdk-driver' field (string - validated separately).
+			// Both keys map to the shared Driver field. 'copilot-sdk-driver' is accepted for
+			// backward compatibility; 'driver' is the canonical name going forward.
+			if driver, hasDriver := engineObj["driver"]; hasDriver {
+				if driverStr, ok := driver.(string); ok {
+					config.Driver = driverStr
+					engineLog.Printf("Extracted engine.driver: %s", driverStr)
+				}
+			} else if sdkDriver, hasSDKDriver := engineObj["copilot-sdk-driver"]; hasSDKDriver {
+				if sdkDriverStr, ok := sdkDriver.(string); ok {
+					config.Driver = sdkDriverStr
+					engineLog.Printf("Extracted engine.copilot-sdk-driver (→ driver): %s", sdkDriverStr)
+				}
+			}
+
+			// Extract optional 'env' field (object/map of scalar values)
 			if env, hasEnv := engineObj["env"]; hasEnv {
 				if envMap, ok := env.(map[string]any); ok {
 					config.Env = make(map[string]string)
 					for key, value := range envMap {
-						if valueStr, ok := value.(string); ok {
+						if valueStr, ok := toEngineEnvValueString(value); ok {
 							config.Env[key] = valueStr
 						}
 					}
@@ -487,19 +543,45 @@ func (c *Compiler) ExtractEngineConfig(frontmatter map[string]any) (string, *Eng
 			}
 
 			// Return the ID as the engineSetting for backwards compatibility
+			if topLevelMaxTurns != "" {
+				config.MaxTurns = topLevelMaxTurns
+			}
 			config.MaxRuns = topLevelMaxRuns
-			config.MaxEffectiveTokens = topLevelMaxEffectiveTokens
-			config.EnableTokenSteering = effectiveTokenSteering
+			config.MaxTurnCacheMisses = topLevelMaxTurnCacheMisses
+			config.MaxAICredits = topLevelMaxAICredits
+
+			// Extract optional 'copilot-sdk' field (bool; copilot engine only)
+			if sdkVal, hasSDK := engineObj["copilot-sdk"]; hasSDK {
+				if sdkBool, ok := sdkVal.(bool); ok {
+					config.CopilotSDK = sdkBool
+					engineLog.Printf("Extracted copilot-sdk: %v", config.CopilotSDK)
+				}
+			}
+			if config.Driver != "" && config.ID == "copilot" && !config.CopilotSDK {
+				config.CopilotSDK = true
+				engineLog.Print("Enabled copilot-sdk because driver is configured for copilot engine")
+			}
+
+			// Extract optional 'cwd' field (templatable string for engine working directory)
+			if cwdVal, hasCwd := engineObj["cwd"]; hasCwd {
+				if cwdStr, ok := cwdVal.(string); ok && cwdStr != "" {
+					config.Cwd = cwdStr
+					engineLog.Printf("Extracted engine.cwd: %s", config.Cwd)
+				}
+			}
+
 			engineLog.Printf("Extracted engine configuration: ID=%s", config.ID)
 			return config.ID, config
 		}
 	}
 
-	if topLevelMaxEffectiveTokens > 0 || topLevelMaxRuns > 0 || effectiveTokenSteering {
+	if topLevelMaxTurns != "" || topLevelMaxToolDenials != "" || topLevelMaxAICredits != 0 || topLevelMaxRuns > 0 || topLevelMaxTurnCacheMisses > 0 {
 		return "", &EngineConfig{
-			MaxRuns:             topLevelMaxRuns,
-			MaxEffectiveTokens:  topLevelMaxEffectiveTokens,
-			EnableTokenSteering: effectiveTokenSteering,
+			MaxTurns:           topLevelMaxTurns,
+			MaxToolDenials:     topLevelMaxToolDenials,
+			MaxRuns:            topLevelMaxRuns,
+			MaxTurnCacheMisses: topLevelMaxTurnCacheMisses,
+			MaxAICredits:       topLevelMaxAICredits,
 		}
 	}
 
@@ -531,10 +613,23 @@ func (c *Compiler) getAgenticEngine(engineSetting string) (CodingAgentEngine, er
 	engine, err := c.engineRegistry.GetEngineByPrefix(engineSetting)
 	if err == nil {
 		engineLog.Printf("Found engine by prefix match: %s", engine.GetID())
-	} else {
-		engineLog.Printf("Failed to find engine for setting %s: %v", engineSetting, err)
+		return engine, nil
 	}
-	return engine, err
+
+	engineLog.Printf("Failed to find engine for setting %s: %v", engineSetting, err)
+
+	validEngines := c.engineRegistry.GetSupportedEngines()
+	suggestions := parser.FindClosestMatches(engineSetting, validEngines, 1)
+	enginesStr := strings.Join(validEngines, ", ")
+
+	errMsg := fmt.Sprintf("invalid engine: %s. Valid engines are: %s.\n\nExample:\nengine: copilot\n\nSee: %s",
+		engineSetting, enginesStr, constants.DocsEnginesURL)
+	if len(suggestions) > 0 {
+		errMsg = fmt.Sprintf("invalid engine: %s. Valid engines are: %s.\n\nDid you mean: %s?\n\nExample:\nengine: copilot\n\nSee: %s",
+			engineSetting, enginesStr, suggestions[0], constants.DocsEnginesURL)
+	}
+
+	return nil, errors.New(errMsg)
 }
 
 // extractEngineConfigFromJSON parses engine configuration from JSON string (from included files)
@@ -555,59 +650,6 @@ func (c *Compiler) extractEngineConfigFromJSON(engineJSON string) (*EngineConfig
 
 	_, config := c.ExtractEngineConfig(tempFrontmatter)
 	return config, nil
-}
-
-// parseAuthDefinition converts a raw auth config map (from engine.provider.auth) into
-// an AuthDefinition. It is backward-compatible: a map with only a "secret" key produces
-// an AuthDefinition with Strategy="" and Secret set (callers normalise Strategy to api-key).
-func parseAuthDefinition(authObj map[string]any) *AuthDefinition {
-	def := &AuthDefinition{}
-	if s, ok := authObj["strategy"].(string); ok {
-		def.Strategy = AuthStrategy(s)
-	}
-	if s, ok := authObj["secret"].(string); ok {
-		def.Secret = s
-	}
-	if s, ok := authObj["token-url"].(string); ok {
-		def.TokenURL = s
-	}
-	if s, ok := authObj["client-id"].(string); ok {
-		def.ClientIDRef = s
-	}
-	if s, ok := authObj["client-secret"].(string); ok {
-		def.ClientSecretRef = s
-	}
-	if s, ok := authObj["token-field"].(string); ok {
-		def.TokenField = s
-	}
-	if s, ok := authObj["header-name"].(string); ok {
-		def.HeaderName = s
-	}
-	return def
-}
-
-// parseEngineAuthConfig converts a raw engine.auth config map into EngineAuthConfig.
-func parseEngineAuthConfig(authObj map[string]any) *EngineAuthConfig {
-	auth := &EngineAuthConfig{}
-	if s, ok := authObj["type"].(string); ok {
-		auth.Type = s
-	}
-	if s, ok := authObj["audience"].(string); ok {
-		auth.Audience = s
-	}
-	if s, ok := authObj["azure-tenant-id"].(string); ok {
-		auth.AzureTenantID = s
-	}
-	if s, ok := authObj["azure-client-id"].(string); ok {
-		auth.AzureClientID = s
-	}
-	if s, ok := authObj["azure-scope"].(string); ok {
-		auth.AzureScope = s
-	}
-	if s, ok := authObj["azure-cloud"].(string); ok {
-		auth.AzureCloud = s
-	}
-	return auth
 }
 
 // applyEngineAuthEnv populates config.Env with AWF_AUTH_* environment variables
@@ -651,96 +693,29 @@ func applyEngineAuthEnv(config *EngineConfig) {
 			config.Env["AWF_AUTH_AZURE_CLOUD"] = config.Auth.AzureCloud
 		}
 	}
-}
-
-// parseRequestShape converts a raw request config map (from engine.provider.request) into
-// a RequestShape.
-func parseRequestShape(requestObj map[string]any) *RequestShape {
-	shape := &RequestShape{}
-	if s, ok := requestObj["path-template"].(string); ok {
-		shape.PathTemplate = s
-	}
-	if q, ok := requestObj["query"].(map[string]any); ok {
-		shape.Query = make(map[string]string, len(q))
-		for k, v := range q {
-			if vs, ok := v.(string); ok {
-				shape.Query[k] = vs
-			}
+	if config.Auth.Provider != "" {
+		if _, exists := config.Env["AWF_AUTH_PROVIDER"]; !exists {
+			config.Env["AWF_AUTH_PROVIDER"] = config.Auth.Provider
 		}
 	}
-	if b, ok := requestObj["body-inject"].(map[string]any); ok {
-		shape.BodyInject = make(map[string]string, len(b))
-		for k, v := range b {
-			if vs, ok := v.(string); ok {
-				shape.BodyInject[k] = vs
-			}
+	if config.Auth.AnthropicFederationRuleID != "" {
+		if _, exists := config.Env["AWF_AUTH_ANTHROPIC_FEDERATION_RULE_ID"]; !exists {
+			config.Env["AWF_AUTH_ANTHROPIC_FEDERATION_RULE_ID"] = config.Auth.AnthropicFederationRuleID
 		}
 	}
-	return shape
-}
-
-// parseEngineTokenWeights converts a raw token-weights config value (from engine.token-weights)
-// into a types.TokenWeights. Returns nil when the input is not a usable map or contains
-// no recognisable data. Multiplier values of unexpected numeric types (anything other than
-// float64, int, or uint64) are silently ignored — this matches the behaviour of the YAML
-// parser which produces float64 for JSON-number literals and integers for integer literals.
-func parseEngineTokenWeights(raw any) *types.TokenWeights {
-	obj, ok := raw.(map[string]any)
-	if !ok {
-		return nil
-	}
-
-	tw := &types.TokenWeights{}
-
-	// Parse multipliers: map of model name → float64
-	if multipliersRaw, ok := obj["multipliers"]; ok {
-		if multipliersMap, ok := multipliersRaw.(map[string]any); ok && len(multipliersMap) > 0 {
-			tw.Multipliers = make(map[string]float64, len(multipliersMap))
-			for model, val := range multipliersMap {
-				switch v := val.(type) {
-				case float64:
-					tw.Multipliers[model] = v
-				case int:
-					tw.Multipliers[model] = float64(v)
-				case uint64:
-					tw.Multipliers[model] = float64(v)
-				}
-			}
+	if config.Auth.AnthropicOrganizationID != "" {
+		if _, exists := config.Env["AWF_AUTH_ANTHROPIC_ORGANIZATION_ID"]; !exists {
+			config.Env["AWF_AUTH_ANTHROPIC_ORGANIZATION_ID"] = config.Auth.AnthropicOrganizationID
 		}
 	}
-
-	// Parse token-class-weights
-	if tcwRaw, ok := obj["token-class-weights"]; ok {
-		if tcwMap, ok := tcwRaw.(map[string]any); ok {
-			tcw := &types.TokenClassWeights{}
-			setFloat := func(dst *float64, key string) {
-				if v, ok := tcwMap[key]; ok {
-					switch f := v.(type) {
-					case float64:
-						*dst = f
-					case int:
-						*dst = float64(f)
-					case uint64:
-						*dst = float64(f)
-					}
-				}
-			}
-			setFloat(&tcw.Input, "input")
-			setFloat(&tcw.CachedInput, "cached-input")
-			setFloat(&tcw.Output, "output")
-			setFloat(&tcw.Reasoning, "reasoning")
-			setFloat(&tcw.CacheWrite, "cache-write")
-			// Only assign if at least one weight was set
-			if tcw.Input != 0 || tcw.CachedInput != 0 || tcw.Output != 0 ||
-				tcw.Reasoning != 0 || tcw.CacheWrite != 0 {
-				tw.TokenClassWeights = tcw
-			}
+	if config.Auth.AnthropicServiceAccountID != "" {
+		if _, exists := config.Env["AWF_AUTH_ANTHROPIC_SERVICE_ACCOUNT_ID"]; !exists {
+			config.Env["AWF_AUTH_ANTHROPIC_SERVICE_ACCOUNT_ID"] = config.Auth.AnthropicServiceAccountID
 		}
 	}
-
-	// Return nil when nothing useful was parsed
-	if len(tw.Multipliers) == 0 && tw.TokenClassWeights == nil {
-		return nil
+	if config.Auth.AnthropicWorkspaceID != "" {
+		if _, exists := config.Env["AWF_AUTH_ANTHROPIC_WORKSPACE_ID"]; !exists {
+			config.Env["AWF_AUTH_ANTHROPIC_WORKSPACE_ID"] = config.Auth.AnthropicWorkspaceID
+		}
 	}
-	return tw
 }

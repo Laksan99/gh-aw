@@ -3,6 +3,7 @@
 package cli
 
 import (
+	"context"
 	"errors"
 	"io"
 	"math"
@@ -100,6 +101,85 @@ func TestRunMonteCarloNilOnEmpty(t *testing.T) {
 	assert.Nil(t, runMonteCarlo([]int{100, 200}, 2, -1.0, rng), "negative lambda")
 }
 
+// TestRunMonteCarloNonFiniteLambda verifies that runMonteCarlo returns nil for
+// non-finite λ inputs (NaN and +Inf) without hanging or panicking.
+// Specification reference: R-MC-001 requires graceful handling of degenerate λ values.
+func TestRunMonteCarloNonFiniteLambda(t *testing.T) {
+	obs := []int{1000, 2000, 3000}
+
+	tests := []struct {
+		name   string
+		lambda float64
+	}{
+		{"NaN lambda", math.NaN()},
+		{"+Inf lambda", math.Inf(1)},
+		{"-Inf lambda", math.Inf(-1)},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			rng := deterministicRNG()
+			result := runMonteCarlo(obs, len(obs), tt.lambda, rng)
+			assert.Nil(t, result, "non-finite λ=%v should return nil (zero-projection fallback)", tt.lambda)
+		})
+	}
+}
+
+// TestRunMonteCarloZeroLambdaFallback verifies the zero-projection fallback behaviour
+// (R-MC-001): when λ = 0 (observedRunsPerPeriod = 0), runMonteCarlo MUST return nil
+// rather than producing a summary with zero projections, signalling to the caller that
+// there are no runs to project.
+func TestRunMonteCarloZeroLambdaFallback(t *testing.T) {
+	tests := []struct {
+		name                  string
+		etObs                 []int
+		successCount          int
+		observedRunsPerPeriod float64
+		wantNil               bool
+	}{
+		{
+			name:                  "zero observedRunsPerPeriod returns nil",
+			etObs:                 []int{1000, 2000, 3000},
+			successCount:          3,
+			observedRunsPerPeriod: 0.0,
+			wantNil:               true,
+		},
+		{
+			name:                  "negative observedRunsPerPeriod returns nil",
+			etObs:                 []int{1000, 2000, 3000},
+			successCount:          3,
+			observedRunsPerPeriod: -0.001,
+			wantNil:               true,
+		},
+		{
+			name:                  "empty observations returns nil regardless of lambda",
+			etObs:                 []int{},
+			successCount:          0,
+			observedRunsPerPeriod: 5.0,
+			wantNil:               true,
+		},
+		{
+			name:                  "positive lambda with observations returns non-nil",
+			etObs:                 []int{1000, 2000, 3000},
+			successCount:          3,
+			observedRunsPerPeriod: 1.0,
+			wantNil:               false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			rng := deterministicRNG()
+			result := runMonteCarlo(tt.etObs, tt.successCount, tt.observedRunsPerPeriod, rng)
+			if tt.wantNil {
+				assert.Nil(t, result, "expected nil for λ=%.4f with %d observations", tt.observedRunsPerPeriod, len(tt.etObs))
+			} else {
+				assert.NotNil(t, result, "expected non-nil for λ=%.4f with %d observations", tt.observedRunsPerPeriod, len(tt.etObs))
+			}
+		})
+	}
+}
+
 // TestRunMonteCarloBasicProperties checks that the Monte Carlo summary satisfies
 // statistical invariants (P10 ≤ P50 ≤ P90, mean ≥ 0, stddev ≥ 0).
 func TestRunMonteCarloBasicProperties(t *testing.T) {
@@ -114,21 +194,21 @@ func TestRunMonteCarloBasicProperties(t *testing.T) {
 	require.NotNil(t, mc)
 
 	assert.Equal(t, monteCarloIterations, mc.Iterations)
-	assert.GreaterOrEqual(t, mc.MeanProjectedEffectiveTokens, 0)
-	assert.GreaterOrEqual(t, mc.StdDevEffectiveTokens, 0.0)
-	assert.LessOrEqual(t, mc.P10ProjectedEffectiveTokens, mc.P50ProjectedEffectiveTokens, "ET P10 ≤ P50")
-	assert.LessOrEqual(t, mc.P50ProjectedEffectiveTokens, mc.P90ProjectedEffectiveTokens, "ET P50 ≤ P90")
+	assert.GreaterOrEqual(t, mc.MeanProjectedAIC, 0.0)
+	assert.GreaterOrEqual(t, mc.StdDevAIC, 0.0)
+	assert.LessOrEqual(t, mc.P10ProjectedAIC, mc.P50ProjectedAIC, "AIC P10 ≤ P50")
+	assert.LessOrEqual(t, mc.P50ProjectedAIC, mc.P90ProjectedAIC, "AIC P50 ≤ P90")
 }
 
-// TestRunMonteCarloZeroSuccessRate verifies that a 0% success rate produces zero ET.
+// TestRunMonteCarloZeroSuccessRate verifies that a 0% success rate produces zero AIC.
 func TestRunMonteCarloZeroSuccessRate(t *testing.T) {
 	rng := deterministicRNG()
-	etObs := []int{1000, 2000, 3000}
+	aicObs := []int{1000, 2000, 3000}
 	// successCount = 0 → successRate = 0/3 = 0.
-	mc := runMonteCarlo(etObs, 0, 5.0, rng)
+	mc := runMonteCarlo(aicObs, 0, 5.0, rng)
 	require.NotNil(t, mc)
-	assert.Equal(t, 0, mc.P50ProjectedEffectiveTokens, "zero success rate → zero ET")
-	assert.Equal(t, 0, mc.P90ProjectedEffectiveTokens, "zero success rate → zero ET P90")
+	assert.InDelta(t, 0.0, mc.P50ProjectedAIC, 1e-12, "zero success rate → zero AIC")
+	assert.InDelta(t, 0.0, mc.P90ProjectedAIC, 1e-12, "zero success rate → zero AIC P90")
 }
 
 // TestRunMonteCarloOrderOfMagnitude checks that the simulation mean is within
@@ -143,25 +223,25 @@ func TestRunMonteCarloOrderOfMagnitude(t *testing.T) {
 	require.NotNil(t, mc)
 
 	// Deterministic point estimate (ET).
-	var totalET int
-	for _, et := range etObs {
-		totalET += et
+	var totalAICMilli int
+	for _, aic := range etObs {
+		totalAICMilli += aic
 	}
-	avgET := totalET / len(etObs)
-	pointEstimate := int(math.Round(observedRunsPerPeriod * float64(avgET)))
+	avgAICMilli := totalAICMilli / len(etObs)
+	pointEstimate := math.Round(observedRunsPerPeriod * (float64(avgAICMilli) / 1000))
 
 	// Simulation mean should be within 20% of point estimate (with 100% success rate
 	// and Poisson lambda = 20, the spread should be small).
-	assert.InEpsilon(t, float64(pointEstimate), float64(mc.MeanProjectedEffectiveTokens), 0.20,
-		"simulation mean ET should be close to point estimate")
+	assert.InEpsilon(t, pointEstimate, mc.MeanProjectedAIC, 0.20,
+		"simulation mean AIC should be close to point estimate")
 
 	// P50 should also be within 20%.
-	assert.InEpsilon(t, float64(pointEstimate), float64(mc.P50ProjectedEffectiveTokens), 0.20,
-		"simulation P50 ET should be close to point estimate")
+	assert.InEpsilon(t, pointEstimate, mc.P50ProjectedAIC, 0.20,
+		"simulation P50 AIC should be close to point estimate")
 
 	// Confidence interval must bracket the mean.
-	assert.LessOrEqual(t, mc.P10ProjectedEffectiveTokens, mc.MeanProjectedEffectiveTokens)
-	assert.GreaterOrEqual(t, mc.P90ProjectedEffectiveTokens, mc.MeanProjectedEffectiveTokens)
+	assert.LessOrEqual(t, mc.P10ProjectedAIC, mc.MeanProjectedAIC)
+	assert.GreaterOrEqual(t, mc.P90ProjectedAIC, mc.MeanProjectedAIC)
 }
 
 // TestRunMonteCarloSortedOutputs verifies CI ordering holds across many random seeds.
@@ -171,8 +251,8 @@ func TestRunMonteCarloSortedOutputs(t *testing.T) {
 		rng := rand.New(rand.NewSource(int64(seed))) //nolint:gosec
 		mc := runMonteCarlo(etObs, len(etObs), 12.0, rng)
 		require.NotNil(t, mc)
-		assert.LessOrEqual(t, mc.P10ProjectedEffectiveTokens, mc.P50ProjectedEffectiveTokens)
-		assert.LessOrEqual(t, mc.P50ProjectedEffectiveTokens, mc.P90ProjectedEffectiveTokens)
+		assert.LessOrEqual(t, mc.P10ProjectedAIC, mc.P50ProjectedAIC)
+		assert.LessOrEqual(t, mc.P50ProjectedAIC, mc.P90ProjectedAIC)
 	}
 }
 
@@ -187,8 +267,8 @@ func TestRunMonteCarloDistributionShape(t *testing.T) {
 	mc := runMonteCarlo(etObs, len(etObs), 30.0, rng)
 	require.NotNil(t, mc)
 
-	assert.GreaterOrEqual(t, mc.MeanProjectedEffectiveTokens, mc.P10ProjectedEffectiveTokens, "mean ≥ P10")
-	assert.LessOrEqual(t, mc.MeanProjectedEffectiveTokens, mc.P90ProjectedEffectiveTokens, "mean ≤ P90")
+	assert.GreaterOrEqual(t, mc.MeanProjectedAIC, mc.P10ProjectedAIC, "mean ≥ P10")
+	assert.LessOrEqual(t, mc.MeanProjectedAIC, mc.P90ProjectedAIC, "mean ≤ P90")
 }
 
 // TestGammaSampleMeanVariance verifies that gammaSample produces the expected mean
@@ -241,17 +321,17 @@ func TestGammaSampleEdgeCases(t *testing.T) {
 func TestRunMonteCarloIsReliable(t *testing.T) {
 	rng := deterministicRNG()
 
-	// Below threshold: 3 observations < minObservationsForReliableForecast (5).
+	// Below threshold: 3 observations < minObservationsForReliableForecast (10).
 	smallObs := []int{1000, 1500, 1200}
 	mcSmall := runMonteCarlo(smallObs, len(smallObs), 4.0, rng)
 	require.NotNil(t, mcSmall)
-	assert.False(t, mcSmall.IsReliable, "fewer than 5 observations → IsReliable=false")
+	assert.False(t, mcSmall.IsReliable, "fewer than 10 observations → IsReliable=false")
 
 	// At threshold: exactly minObservationsForReliableForecast observations.
-	atThreshold := []int{1000, 1100, 1200, 1300, 1400}
+	atThreshold := []int{1000, 1100, 1200, 1300, 1400, 1500, 1600, 1700, 1800, 1900}
 	mcAt := runMonteCarlo(atThreshold, len(atThreshold), 4.0, rng)
 	require.NotNil(t, mcAt)
-	assert.True(t, mcAt.IsReliable, "exactly 5 observations → IsReliable=true")
+	assert.True(t, mcAt.IsReliable, "exactly 10 observations → IsReliable=true")
 
 	// Well above threshold.
 	largeObs := make([]int, 20)
@@ -287,8 +367,8 @@ func TestRunMonteCarloGammaPoissonWiderCI(t *testing.T) {
 	mcLarge := runMonteCarlo(largeObs, len(largeObs), lambda, rngLarge)
 	require.NotNil(t, mcLarge)
 
-	ciSmall := mcSmall.P90ProjectedEffectiveTokens - mcSmall.P10ProjectedEffectiveTokens
-	ciLarge := mcLarge.P90ProjectedEffectiveTokens - mcLarge.P10ProjectedEffectiveTokens
+	ciSmall := mcSmall.P90ProjectedAIC - mcSmall.P10ProjectedAIC
+	ciLarge := mcLarge.P90ProjectedAIC - mcLarge.P10ProjectedAIC
 
 	assert.Greater(t, ciSmall, ciLarge,
 		"small-sample CI (P90-P10=%d) should be wider than large-sample CI (%d)", ciSmall, ciLarge)
@@ -312,14 +392,14 @@ func TestRunMonteCarloFullEpisodePath(t *testing.T) {
 	mc := runMonteCarlo(etObs, successCount, 8.0, rng)
 	require.NotNil(t, mc)
 	assert.Equal(t, monteCarloIterations, mc.Iterations)
-	assert.Greater(t, mc.P90ProjectedEffectiveTokens, mc.P10ProjectedEffectiveTokens, "P90 > P10 for non-trivial inputs")
+	assert.Greater(t, mc.P90ProjectedAIC, mc.P10ProjectedAIC, "P90 > P10 for non-trivial inputs")
 
-	// ET percentiles should already be in ascending order.
-	ets := []int{mc.P10ProjectedEffectiveTokens, mc.P50ProjectedEffectiveTokens, mc.P90ProjectedEffectiveTokens}
-	sorted := make([]int, len(ets))
-	copy(sorted, ets)
-	sort.Ints(sorted)
-	assert.Equal(t, ets, sorted, "ET percentiles should already be in ascending order")
+	// AIC percentiles should already be in ascending order.
+	aics := []float64{mc.P10ProjectedAIC, mc.P50ProjectedAIC, mc.P90ProjectedAIC}
+	sorted := make([]float64, len(aics))
+	copy(sorted, aics)
+	sort.Float64s(sorted)
+	assert.Equal(t, aics, sorted, "AIC percentiles should already be in ascending order")
 }
 
 func TestResolveForecastWorkflowsFromRemote_RateLimitFallsBackToPartialResults(t *testing.T) {
@@ -336,10 +416,6 @@ func TestResolveForecastWorkflowsFromRemote_RateLimitFallsBackToPartialResults(t
 		attempts++
 		return nil, errors.New("API rate limit exceeded")
 	}
-	forecastRateLimitSleep = func(delay time.Duration) {
-		backoffs = append(backoffs, delay)
-	}
-
 	stderrReader, stderrWriter, err := os.Pipe()
 	require.NoError(t, err, "Should create stderr pipe")
 	originalStderr := os.Stderr
@@ -348,7 +424,12 @@ func TestResolveForecastWorkflowsFromRemote_RateLimitFallsBackToPartialResults(t
 		os.Stderr = originalStderr
 	})
 
-	names, err := resolveForecastWorkflowsFromRemote([]string{"ci-doctor", "daily-planner"}, "owner/repo", true)
+	forecastRateLimitSleep = func(_ context.Context, delay time.Duration) error {
+		backoffs = append(backoffs, delay)
+		return nil
+	}
+
+	names, err := resolveForecastWorkflowsFromRemote(context.Background(), []string{"ci-doctor", "daily-planner"}, "owner/repo", true)
 	require.NoError(t, err, "T-FC-030 should return caller-supplied partial results after rate-limit retries")
 	assert.Equal(t, []string{"ci-doctor", "daily-planner"}, names, "Should preserve caller-supplied workflow order")
 	assert.Equal(t, forecastRateLimitMaxAttempts, attempts, "Should retry discovery until the retry budget is exhausted")

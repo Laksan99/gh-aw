@@ -10,6 +10,8 @@ import (
 
 var nodejsLog = logger.New("workflow:nodejs")
 
+const npmDefaultCooldownDays = 3
+
 // GenerateNodeJsSetupStep creates a GitHub Actions step for setting up Node.js
 // Returns a step that installs Node.js using the default version from constants.DefaultNodeVersion
 // Caching is disabled by default to prevent cache poisoning vulnerabilities in release workflows
@@ -38,6 +40,8 @@ func installStepsContainNodeSetup(steps []GitHubActionStep) bool {
 
 // By default, --ignore-scripts is added to the install command to prevent pre/post install
 // scripts from executing (supply chain security). Pass runInstallScripts=true to allow scripts.
+// By default, a 3-day npm dependency cooldown is enabled via NPM_CONFIG_MIN_RELEASE_AGE.
+// Pass cooldownEnabled=false to disable it.
 // Parameters:
 //   - packageName: The npm package name (e.g., "@anthropic-ai/claude-code")
 //   - version: The package version to install
@@ -45,10 +49,11 @@ func installStepsContainNodeSetup(steps []GitHubActionStep) bool {
 //   - cacheKeyPrefix: The prefix for the cache key (unused, kept for API compatibility)
 //   - includeNodeSetup: If true, includes Node.js setup step before npm install
 //   - runInstallScripts: If true, allow pre/post install scripts (omits --ignore-scripts)
+//   - cooldownEnabled: If true, apply a default 3-day npm release-age cooldown
 //
 // Returns steps for installing the npm package (optionally with Node.js setup)
-func GenerateNpmInstallSteps(packageName, version, stepName, cacheKeyPrefix string, includeNodeSetup bool, runInstallScripts bool) []GitHubActionStep {
-	return GenerateNpmInstallStepsWithScope(packageName, version, stepName, cacheKeyPrefix, includeNodeSetup, true, runInstallScripts)
+func GenerateNpmInstallSteps(packageName, version, stepName, cacheKeyPrefix string, includeNodeSetup bool, runInstallScripts bool, cooldownEnabled bool) []GitHubActionStep {
+	return GenerateNpmInstallStepsWithScope(packageName, version, stepName, cacheKeyPrefix, includeNodeSetup, true, runInstallScripts, cooldownEnabled)
 }
 
 // BuildStandardNpmEngineInstallSteps creates standard npm installation steps for engines.
@@ -70,6 +75,30 @@ func BuildStandardNpmEngineInstallSteps(
 	cacheKeyPrefix string,
 	workflowData *WorkflowData,
 ) []GitHubActionStep {
+	cooldownEnabled := resolveRuntimeCooldown(workflowData, "node")
+	return buildStandardNpmEngineInstallSteps(packageName, defaultVersion, stepName, cacheKeyPrefix, workflowData, cooldownEnabled)
+}
+
+// BuildStandardNpmEngineInstallStepsNoCooldown creates standard npm installation
+// steps for engines while forcing the default npm release-age cooldown off.
+func BuildStandardNpmEngineInstallStepsNoCooldown(
+	packageName string,
+	defaultVersion string,
+	stepName string,
+	cacheKeyPrefix string,
+	workflowData *WorkflowData,
+) []GitHubActionStep {
+	return buildStandardNpmEngineInstallSteps(packageName, defaultVersion, stepName, cacheKeyPrefix, workflowData, false)
+}
+
+func buildStandardNpmEngineInstallSteps(
+	packageName string,
+	defaultVersion string,
+	stepName string,
+	cacheKeyPrefix string,
+	workflowData *WorkflowData,
+	cooldownEnabled bool,
+) []GitHubActionStep {
 	nodejsLog.Printf("Building npm engine install steps: package=%s, version=%s", packageName, defaultVersion)
 
 	// Use version from engine config if provided, otherwise default to pinned version
@@ -90,6 +119,7 @@ func BuildStandardNpmEngineInstallSteps(
 		cacheKeyPrefix,
 		true,  // Include Node.js setup
 		false, // Always disable scripts for engine CLI installs
+		cooldownEnabled,
 	)
 }
 
@@ -146,31 +176,27 @@ func BuildNpmEngineInstallStepsWithAWF(npmSteps []GitHubActionStep, workflowData
 // AWF_HOST_PATH and the entrypoint.sh script. This function only adds the generic
 // hostedtoolcache bin directories for npm packages.
 //
-// Both /opt/hostedtoolcache (GitHub-hosted runners) and /home/runner/work/_tool
-// (self-hosted GPU runners like aw-gpu-runner-T4, where RUNNER_TOOL_CACHE defaults
-// to /home/runner/work/_tool) are searched so node is found regardless of runner type.
+// RUNNER_TOOL_CACHE is required because the Actions runner populates it from the
+// runner tool_cache context. The generated command does not guess fallback paths.
 //
 // Returns:
 //   - string: A shell command that exports PATH with hostedtoolcache bin directories prepended
 func GetNpmBinPathSetup() string {
 	// Find all bin directories in hostedtoolcache (Node.js, Python, etc.)
 	// This finds paths like /opt/hostedtoolcache/node/22.13.0/x64/bin
-	// or /home/runner/work/_tool/node/24.0.0/x64/bin on self-hosted GPU runners.
-	//
-	// Both standard paths are searched; directories that do not exist are silently
-	// skipped by find (due to 2>/dev/null).
+	// or whatever path the runner exposes through RUNNER_TOOL_CACHE.
 	//
 	// After the find, re-prepend GOROOT/bin if set. The find returns directories
 	// alphabetically, so go/1.23.12 shadows go/1.25.0. Re-prepending GOROOT/bin
 	// ensures the Go version set by actions/setup-go takes precedence.
 	// AWF's entrypoint.sh exports GOROOT before the user command runs.
-	return `export PATH="$(find /opt/hostedtoolcache /home/runner/work/_tool -maxdepth 5 -type d -name bin 2>/dev/null | tr '\n' ':')$PATH"; [ -n "$GOROOT" ] && export PATH="$GOROOT/bin:$PATH" || true`
+	return `: "${RUNNER_TOOL_CACHE:?RUNNER_TOOL_CACHE must be set}"; GH_AW_TOOL_CACHE="$RUNNER_TOOL_CACHE"; export PATH="$(find "$GH_AW_TOOL_CACHE" -maxdepth 5 -type d -name bin 2>/dev/null | tr '\n' ':')$PATH"; [ -n "$GOROOT" ] && export PATH="$GOROOT/bin:$PATH" || true`
 }
 
 // GenerateNpmInstallStepsWithScope generates npm installation steps with control over global vs local installation.
 // By default, --ignore-scripts is added to the install command to prevent pre/post install
 // scripts from executing (supply chain security). Pass runInstallScripts=true to allow scripts.
-func GenerateNpmInstallStepsWithScope(packageName, version, stepName, cacheKeyPrefix string, includeNodeSetup bool, isGlobal bool, runInstallScripts bool) []GitHubActionStep {
+func GenerateNpmInstallStepsWithScope(packageName, version, stepName, cacheKeyPrefix string, includeNodeSetup bool, isGlobal bool, runInstallScripts bool, cooldownEnabled bool) []GitHubActionStep {
 	nodejsLog.Printf("Generating npm install steps: package=%s, version=%s, includeNodeSetup=%v, isGlobal=%v, runInstallScripts=%v", packageName, version, includeNodeSetup, isGlobal, runInstallScripts)
 
 	var steps []GitHubActionStep
@@ -208,14 +234,78 @@ func GenerateNpmInstallStepsWithScope(packageName, version, stepName, cacheKeyPr
 			"        env:",
 			"          ENGINE_VERSION: " + version,
 		}
+		if cooldownEnabled {
+			installStep = append(installStep, fmt.Sprintf("          NPM_CONFIG_MIN_RELEASE_AGE: '%d'", npmDefaultCooldownDays))
+		}
 	} else {
 		installCmd := fmt.Sprintf("npm install %s%s%s@%s", ignoreScriptsFlag, globalFlag, packageName, version)
 		installStep = GitHubActionStep{
 			"      - name: " + stepName,
 			"        run: " + installCmd,
 		}
+		if cooldownEnabled {
+			installStep = append(installStep,
+				"        env:",
+				fmt.Sprintf("          NPM_CONFIG_MIN_RELEASE_AGE: '%d'", npmDefaultCooldownDays),
+			)
+		}
 	}
 	steps = append(steps, installStep)
 
 	return steps
+}
+
+// resolveRuntimeCooldown returns whether runtime-associated dependency installs should apply
+// the default release-age cooldown. Defaults to true; runtimes.<id>.cooldown: false disables it.
+func resolveRuntimeCooldown(workflowData *WorkflowData, runtimeID string) bool {
+	if workflowData == nil {
+		return true
+	}
+
+	if workflowData.ParsedFrontmatter != nil && workflowData.ParsedFrontmatter.RuntimesTyped != nil {
+		var runtimeConfig *RuntimeConfig
+		switch runtimeID {
+		case "node":
+			runtimeConfig = workflowData.ParsedFrontmatter.RuntimesTyped.Node
+		case "python":
+			runtimeConfig = workflowData.ParsedFrontmatter.RuntimesTyped.Python
+		case "go":
+			runtimeConfig = workflowData.ParsedFrontmatter.RuntimesTyped.Go
+		case "uv":
+			runtimeConfig = workflowData.ParsedFrontmatter.RuntimesTyped.UV
+		case "bun":
+			runtimeConfig = workflowData.ParsedFrontmatter.RuntimesTyped.Bun
+		case "deno":
+			runtimeConfig = workflowData.ParsedFrontmatter.RuntimesTyped.Deno
+		case "dotnet":
+			runtimeConfig = workflowData.ParsedFrontmatter.RuntimesTyped.Dotnet
+		case "elixir":
+			runtimeConfig = workflowData.ParsedFrontmatter.RuntimesTyped.Elixir
+		case "gh-aw":
+			runtimeConfig = workflowData.ParsedFrontmatter.RuntimesTyped.GhAw
+		case "haskell":
+			runtimeConfig = workflowData.ParsedFrontmatter.RuntimesTyped.Haskell
+		case "java":
+			runtimeConfig = workflowData.ParsedFrontmatter.RuntimesTyped.Java
+		case "ruby":
+			runtimeConfig = workflowData.ParsedFrontmatter.RuntimesTyped.Ruby
+		}
+		if runtimeConfig != nil && runtimeConfig.Cooldown != nil {
+			return *runtimeConfig.Cooldown
+		}
+	}
+
+	runtimeAny, ok := workflowData.Runtimes[runtimeID]
+	if !ok {
+		return true
+	}
+	runtimeMap, ok := runtimeAny.(map[string]any)
+	if !ok {
+		return true
+	}
+	cooldown, ok := runtimeMap["cooldown"].(bool)
+	if !ok {
+		return true
+	}
+	return cooldown
 }

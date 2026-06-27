@@ -2,7 +2,7 @@ package workflow
 
 import (
 	"encoding/json"
-	"sort"
+	"slices"
 	"strings"
 	"time"
 
@@ -16,9 +16,10 @@ var metricsLog = logger.New("workflow:metrics")
 type ToolCallInfo struct {
 	Name          string        // Prettified tool name (e.g., "github::search_issues", "bash")
 	CallCount     int           // Number of times this tool was called
-	MaxInputSize  int           // Maximum input size in tokens for any call
-	MaxOutputSize int           // Maximum output size in tokens for any call
+	MaxInputSize  int           // Maximum input size for any call (engine-dependent units, often bytes/chars)
+	MaxOutputSize int           // Maximum output size for any call (engine-dependent units, often bytes/chars)
 	MaxDuration   time.Duration // Maximum execution duration for any call
+	OutputSample  string        // Preview of the largest tool response (first few lines, truncated)
 }
 
 // LogMetrics represents extracted metrics from log files
@@ -227,8 +228,15 @@ func FinalizeToolMetrics(opts FinalizeToolMetricsOptions) {
 	}
 
 	// Sort tool calls by name for consistent output
-	sort.Slice(opts.Metrics.ToolCalls, func(i, j int) bool {
-		return opts.Metrics.ToolCalls[i].Name < opts.Metrics.ToolCalls[j].Name
+	slices.SortFunc(opts.Metrics.ToolCalls, func(a, b ToolCallInfo) int {
+		switch {
+		case a.Name < b.Name:
+			return -1
+		case a.Name > b.Name:
+			return 1
+		default:
+			return 0
+		}
 	})
 
 	metricsLog.Printf("FinalizeToolMetrics: turns=%d, tokenUsage=%d, toolCalls=%d, sequences=%d",
@@ -255,8 +263,15 @@ func FinalizeToolCallsAndSequence(
 	}
 
 	// Sort tool calls by name for consistent output
-	sort.Slice(metrics.ToolCalls, func(i, j int) bool {
-		return metrics.ToolCalls[i].Name < metrics.ToolCalls[j].Name
+	slices.SortFunc(metrics.ToolCalls, func(a, b ToolCallInfo) int {
+		switch {
+		case a.Name < b.Name:
+			return -1
+		case a.Name > b.Name:
+			return 1
+		default:
+			return 0
+		}
 	})
 
 	metricsLog.Printf("FinalizeToolCallsAndSequence: toolCalls=%d, sequences=%d", len(metrics.ToolCalls), len(metrics.ToolSequences))

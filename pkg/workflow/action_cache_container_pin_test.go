@@ -115,6 +115,7 @@ func TestContainerPinMarshalSortedOutput(t *testing.T) {
 	cache := NewActionCache(tmpDir)
 	cache.Set("actions/checkout", "v5", "sha1")
 	cache.SetContainerPin("z-image:latest", "sha256:zzz", "z-image:latest@sha256:zzz")
+	cache.SetContainerPin("m-image:v2", "sha256:mmm", "m-image:v2@sha256:mmm")
 	cache.SetContainerPin("a-image:latest", "sha256:aaa", "a-image:latest@sha256:aaa")
 
 	require.NoError(t, cache.Save())
@@ -122,10 +123,29 @@ func TestContainerPinMarshalSortedOutput(t *testing.T) {
 	content, err := os.ReadFile(filepath.Join(tmpDir, ".github", "aw", CacheFileName))
 	require.NoError(t, err)
 
-	// Both container images should appear in the JSON.
 	contentStr := string(content)
-	assert.Contains(t, contentStr, `"a-image:latest"`, "a-image pin in output")
-	assert.Contains(t, contentStr, `"z-image:latest"`, "z-image pin in output")
+
+	// Verify that entries appear in alphabetical order by checking their positions
+	containers := []string{
+		"a-image:latest",
+		"m-image:v2",
+		"z-image:latest",
+	}
+
+	lastPos := -1
+	for _, container := range containers {
+		pos := indexOf(contentStr, `"`+container+`"`)
+		if pos == -1 {
+			t.Errorf("Container %s not found in cache file", container)
+			continue
+		}
+		if pos < lastPos {
+			t.Errorf("Container %s appears before previous container (not sorted)", container)
+		}
+		lastPos = pos
+	}
+
+	// Verify containers section is present
 	assert.Contains(t, contentStr, `"containers"`, "containers section present")
 
 	// Reload and verify round-trip.
@@ -134,7 +154,81 @@ func TestContainerPinMarshalSortedOutput(t *testing.T) {
 	pin, ok := cache2.GetContainerPin("a-image:latest")
 	require.True(t, ok)
 	assert.Equal(t, "sha256:aaa", pin.Digest)
+	pin, ok = cache2.GetContainerPin("m-image:v2")
+	require.True(t, ok)
+	assert.Equal(t, "sha256:mmm", pin.Digest)
 	pin, ok = cache2.GetContainerPin("z-image:latest")
 	require.True(t, ok)
 	assert.Equal(t, "sha256:zzz", pin.Digest)
+}
+
+// TestPruneStaleContainerPins verifies that PruneStaleContainerPins removes
+// entries not present in the known-image set and preserves entries that are.
+func TestPruneStaleContainerPins(t *testing.T) {
+	cache := NewActionCache(t.TempDir())
+
+	// Populate with three pins.
+	cache.SetContainerPin("ghcr.io/github/gh-aw-firewall/agent:0.27.0", "sha256:old", "ghcr.io/github/gh-aw-firewall/agent:0.27.0@sha256:old")
+	cache.SetContainerPin("ghcr.io/github/gh-aw-firewall/agent:0.27.2", "sha256:new", "ghcr.io/github/gh-aw-firewall/agent:0.27.2@sha256:new")
+	cache.SetContainerPin("node:lts-alpine", "sha256:node", "node:lts-alpine@sha256:node")
+
+	// Lock files now only reference the new AWF version and the node image.
+	knownImages := map[string]struct{}{
+		"ghcr.io/github/gh-aw-firewall/agent:0.27.2": {},
+		"node:lts-alpine": {},
+	}
+
+	pruned := cache.PruneStaleContainerPins(knownImages)
+	assert.Equal(t, 1, pruned, "exactly one stale pin should be pruned")
+
+	// Old version should be gone.
+	_, ok := cache.GetContainerPin("ghcr.io/github/gh-aw-firewall/agent:0.27.0")
+	assert.False(t, ok, "stale old-version pin should be removed")
+
+	// Current versions should still be present.
+	pin, ok := cache.GetContainerPin("ghcr.io/github/gh-aw-firewall/agent:0.27.2")
+	require.True(t, ok, "current pin should be kept")
+	assert.Equal(t, "sha256:new", pin.Digest)
+
+	pin, ok = cache.GetContainerPin("node:lts-alpine")
+	require.True(t, ok, "node pin should be kept")
+	assert.Equal(t, "sha256:node", pin.Digest)
+}
+
+// TestPruneStaleContainerPins_AllStale verifies that pruning with an empty known set
+// removes all container pins.
+func TestPruneStaleContainerPins_AllStale(t *testing.T) {
+	cache := NewActionCache(t.TempDir())
+	cache.SetContainerPin("image-a:v1", "sha256:aaa", "image-a:v1@sha256:aaa")
+	cache.SetContainerPin("image-b:v2", "sha256:bbb", "image-b:v2@sha256:bbb")
+
+	pruned := cache.PruneStaleContainerPins(map[string]struct{}{})
+	assert.Equal(t, 2, pruned, "all pins should be pruned when known set is empty")
+	assert.Empty(t, cache.ContainerPins, "ContainerPins map should be empty after full prune")
+}
+
+// TestPruneStaleContainerPins_NoneStale verifies that pruning with a set matching all
+// existing pins removes nothing.
+func TestPruneStaleContainerPins_NoneStale(t *testing.T) {
+	cache := NewActionCache(t.TempDir())
+	cache.SetContainerPin("node:lts-alpine", "sha256:abc", "node:lts-alpine@sha256:abc")
+
+	// Mark cache as clean to verify dirty flag is not set when nothing changes.
+	cache.dirty = false
+
+	pruned := cache.PruneStaleContainerPins(map[string]struct{}{"node:lts-alpine": {}})
+	assert.Equal(t, 0, pruned, "no pins should be pruned")
+	assert.False(t, cache.dirty, "dirty flag should not be set when nothing was pruned")
+}
+
+// TestPruneStaleContainerPins_NilMap verifies that pruning a cache with a nil
+// ContainerPins map returns 0 without panicking.
+func TestPruneStaleContainerPins_NilMap(t *testing.T) {
+	cache := NewActionCache(t.TempDir())
+	cache.ContainerPins = nil
+
+	assert.NotPanics(t, func() {
+		pruned := cache.PruneStaleContainerPins(map[string]struct{}{"any:image": {}})
+		assert.Equal(t, 0, pruned, "nil map should return 0 pruned")
+	})
 }

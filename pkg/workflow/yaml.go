@@ -95,6 +95,7 @@ import (
 	"sync"
 
 	"github.com/github/gh-aw/pkg/logger"
+	"github.com/github/gh-aw/pkg/sliceutil"
 	"github.com/goccy/go-yaml"
 )
 
@@ -110,6 +111,7 @@ var unquoteYAMLKeyCache sync.Map
 // The caller is responsible for repository-boundary validation (for example via
 // findWorkflowFile/isPathWithinDir) before passing workflowPath.
 func readWorkflowYAML(workflowPath string) (map[string]any, error) {
+	yamlLog.Printf("Reading workflow YAML: %s", workflowPath)
 	cleanPath := filepath.Clean(workflowPath)
 	absPath, err := filepath.Abs(cleanPath)
 	if err != nil {
@@ -118,14 +120,17 @@ func readWorkflowYAML(workflowPath string) (map[string]any, error) {
 
 	content, err := os.ReadFile(absPath) // #nosec G304 -- Caller provides trusted path, and path is normalized/absolute-resolved above
 	if err != nil {
+		yamlLog.Printf("Failed to read workflow file %s: %v", workflowPath, err)
 		return nil, fmt.Errorf("failed to read workflow file %s: %w", workflowPath, err)
 	}
 
 	var workflow map[string]any
 	if err := yaml.Unmarshal(content, &workflow); err != nil {
+		yamlLog.Printf("Failed to parse workflow file %s: %v", workflowPath, err)
 		return nil, fmt.Errorf("failed to parse workflow file %s: %w", workflowPath, err)
 	}
 
+	yamlLog.Printf("Read workflow YAML: %s (%d bytes, %d top-level keys)", workflowPath, len(content), len(workflow))
 	return workflow, nil
 }
 
@@ -166,7 +171,13 @@ func UnquoteYAMLKey(yamlStr string, key string) string {
 	// Use cached compiled regex to avoid recompiling on every call
 	var re *regexp.Regexp
 	if cached, ok := unquoteYAMLKeyCache.Load(key); ok {
-		re = cached.(*regexp.Regexp)
+		var typeOK bool
+		re, typeOK = cached.(*regexp.Regexp)
+		if !typeOK {
+			unquoteYAMLKeyCache.Delete(key)
+			re = regexp.MustCompile(pattern)
+			unquoteYAMLKeyCache.Store(key, re)
+		}
 	} else {
 		re = regexp.MustCompile(pattern)
 		unquoteYAMLKeyCache.Store(key, re)
@@ -174,6 +185,34 @@ func UnquoteYAMLKey(yamlStr string, key string) string {
 	// Use ReplaceAllString with capture group references for a single-pass replacement.
 	// ${1} = line start (^ or \n), ${2} = optional whitespace
 	return re.ReplaceAllString(yamlStr, "${1}${2}"+key+":")
+}
+
+// UnquoteYAMLTopLevelKey removes quotes from a YAML key only when it appears
+// at the very start of the YAML content.
+//
+// This intentionally leaves nested quoted keys unchanged.
+// Example:
+//
+//	"on":
+//	  push:
+//
+// becomes:
+//
+//	on:
+//	  push:
+//
+// but:
+//
+//	parent:
+//	  "on":
+//
+// remains unchanged.
+func UnquoteYAMLTopLevelKey(yamlStr string, key string) string {
+	quotedPrefix := `"` + key + `":`
+	if strings.HasPrefix(yamlStr, quotedPrefix) {
+		return key + ":" + yamlStr[len(quotedPrefix):]
+	}
+	return yamlStr
 }
 
 // MarshalWithFieldOrder marshals a map to YAML with fields in a specific order.
@@ -276,7 +315,7 @@ func OrderMapFields(data map[string]any, priorityFields []string) yaml.MapSlice 
 	// This ensures important fields like "name", "on", "jobs" appear first
 	for _, fieldName := range priorityFields {
 		if value, exists := data[fieldName]; exists {
-			orderedData = append(orderedData, yaml.MapItem{Key: fieldName, Value: value})
+			orderedData = append(orderedData, yaml.MapItem{Key: fieldName, Value: prepareNestedMapValueForYAML(fieldName, value)})
 		}
 	}
 
@@ -296,10 +335,80 @@ func OrderMapFields(data map[string]any, priorityFields []string) yaml.MapSlice 
 
 	// Phase 4: Add remaining fields to the ordered map
 	for _, key := range remainingKeys {
-		orderedData = append(orderedData, yaml.MapItem{Key: key, Value: data[key]})
+		orderedData = append(orderedData, yaml.MapItem{Key: key, Value: prepareNestedMapValueForYAML(key, data[key])})
 	}
 
 	return orderedData
+}
+
+func prepareNestedMapValueForYAML(fieldName string, value any) any {
+	switch v := value.(type) {
+	case map[string]any:
+		if fieldName == "with" || fieldName == "env" || fieldName == "secrets" {
+			return recursivelyOrderYAMLValue(v)
+		}
+		copied := make(map[string]any, len(v))
+		for key, childValue := range v {
+			copied[key] = prepareNestedMapValueForYAML(key, childValue)
+		}
+		return copied
+	case map[string]string:
+		if fieldName == "with" || fieldName == "env" || fieldName == "secrets" {
+			return recursivelyOrderYAMLValue(v)
+		}
+		return value
+	case []any:
+		copied := make([]any, len(v))
+		for i, childValue := range v {
+			copied[i] = prepareNestedMapValueForYAML("", childValue)
+		}
+		return copied
+	case yaml.MapSlice:
+		copied := make(yaml.MapSlice, 0, len(v))
+		for _, item := range v {
+			key, ok := item.Key.(string)
+			if !ok {
+				copied = append(copied, yaml.MapItem{Key: item.Key, Value: prepareNestedMapValueForYAML("", item.Value)})
+				continue
+			}
+			copied = append(copied, yaml.MapItem{Key: item.Key, Value: prepareNestedMapValueForYAML(key, item.Value)})
+		}
+		return copied
+	default:
+		return value
+	}
+}
+
+func recursivelyOrderYAMLValue(value any) any {
+	switch v := value.(type) {
+	case map[string]any:
+		orderedData := make(yaml.MapSlice, 0, len(v))
+		keys := sliceutil.SortedKeys(v)
+		for _, key := range keys {
+			orderedData = append(orderedData, yaml.MapItem{Key: key, Value: recursivelyOrderYAMLValue(v[key])})
+		}
+		return orderedData
+	case map[string]string:
+		orderedData := make(yaml.MapSlice, 0, len(v))
+		for _, key := range sliceutil.SortedKeys(v) {
+			orderedData = append(orderedData, yaml.MapItem{Key: key, Value: v[key]})
+		}
+		return orderedData
+	case []any:
+		copied := make([]any, len(v))
+		for i, childValue := range v {
+			copied[i] = recursivelyOrderYAMLValue(childValue)
+		}
+		return copied
+	case yaml.MapSlice:
+		copied := make(yaml.MapSlice, 0, len(v))
+		for _, item := range v {
+			copied = append(copied, yaml.MapItem{Key: item.Key, Value: recursivelyOrderYAMLValue(item.Value)})
+		}
+		return copied
+	default:
+		return value
+	}
 }
 
 // CleanYAMLNullValues removes " null" from YAML key-value pairs where the value is null.

@@ -1,9 +1,10 @@
 {
-  "get_me": "users",
+  "get_me": "context",
   "get_teams": "context",
   "get_team_members": "context",
 
   "get_repository": "repos",
+  "get_file_blame": "repos",
   "get_file_contents": "repos",
   "search_code": "repos",
   "list_commits": "repos",
@@ -36,19 +37,17 @@
   "create_pull_request": "pull_requests",
   "search_pull_requests": "pull_requests",
 
-  "list_workflows": "actions",
-  "list_workflow_runs": "actions",
-  "get_workflow_run": "actions",
-  "get_workflow_run_logs": "actions",
-  "download_workflow_run_artifact": "actions",
-  "get_workflow_run_usage": "actions",
-  "list_workflow_jobs": "actions",
+  "actions_get": "actions",
+  "actions_list": "actions",
+  "actions_run_trigger": "actions",
   "get_job_logs": "actions",
-  "list_workflow_run_artifacts": "actions",
 
   "list_code_scanning_alerts": "code_security",
   "get_code_scanning_alert": "code_security",
   "create_code_scanning_alert": "code_security",
+
+  "assign_copilot_to_issue": "copilot",
+  "request_copilot_review": "copilot",
 
   "list_dependabot_alerts": "dependabot",
   "get_dependabot_alert": "dependabot",
@@ -58,12 +57,13 @@
   "get_discussion": "discussions",
   "get_discussion_comments": "discussions",
   "create_discussion": "discussions",
+  "discussion_comment_write": "discussions",
 
   "create_gist": "gists",
   "list_gists": "gists",
 
   "get_label": "labels",
-  "list_label": "issues",
+  "list_label": "labels",
   "list_labels": "labels",
   "create_label": "labels",
 

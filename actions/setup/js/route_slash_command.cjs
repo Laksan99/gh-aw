@@ -1,10 +1,45 @@
 // @ts-check
 /// <reference types="@actions/github-script" />
+// @safe-outputs-exempt SEC-004 — event body text is read only for slash-command parsing; outbound /help comments are built from internal metadata.
 
 const { REACTION_MAP } = require("./add_reaction.cjs");
+const { createOrReuseStatusComment } = require("./add_workflow_run_comment.cjs");
+const nodePath = require("node:path");
+const { matchesCommandName, parseSlashCommand } = require("./slash_command_matcher.cjs");
 // Keep this aligned with the current default stable GitHub REST API version used by workflows.
 // Update when GitHub advances the recommended version to avoid sunset/deprecation warnings.
 const GITHUB_API_VERSION = "2022-11-28";
+
+/**
+ * Appends centralized command routing details to the current step summary.
+ * @param {string[]} existingCommands
+ * @param {string} selectedCommand
+ * @returns {Promise<void>}
+ */
+async function appendRoutingSummary(existingCommands, selectedCommand) {
+  const summary = core.summary;
+  if (!summary || typeof summary.addHeading !== "function" || typeof summary.addRaw !== "function" || typeof summary.write !== "function") {
+    return;
+  }
+
+  const normalizedCommands = existingCommands
+    .filter(command => typeof command === "string" && command.trim())
+    .map(command => `/${command.trim()}`)
+    .sort();
+
+  const selectedCommandText = selectedCommand ? `\`/${selectedCommand}\`` : "`<none>`";
+  const existingCommandsList = normalizedCommands.map(command => `- \`${command}\``).join("\n");
+
+  try {
+    summary.addHeading("Agentic Commands Router", 3).addRaw(`- Selected command: ${selectedCommandText}`, true).addEOL().addRaw(`- Configured commands: ${normalizedCommands.length}`, true).addEOL();
+    if (existingCommandsList) {
+      summary.addEOL().addRaw(`<details><summary>Configured commands</summary>\n\n${existingCommandsList}\n\n</details>`, true).addEOL();
+    }
+    await summary.write({ overwrite: false });
+  } catch (error) {
+    core.warning(`Failed to write centralized routing details to step summary: ${String(error)}`);
+  }
+}
 
 function eventIdentifier() {
   if (context.eventName !== "issue_comment") {
@@ -19,24 +54,81 @@ function resolveBodyText() {
     pull_request: context.payload?.pull_request?.body ?? "",
     issue_comment: context.payload?.comment?.body ?? "",
     pull_request_review_comment: context.payload?.comment?.body ?? "",
+    pull_request_review: context.payload?.review?.body ?? "",
     discussion: context.payload?.discussion?.body ?? "",
     discussion_comment: context.payload?.comment?.body ?? "",
   };
   return bodyByEvent[context.eventName] ?? "";
 }
 
-function resolveDispatchRef() {
+function isPRClosedAtStart() {
+  const pullRequestState = context.payload?.pull_request?.state;
+  if (pullRequestState === "closed") {
+    return true;
+  }
+  const issueState = context.payload?.issue?.state;
+  if (context.payload?.issue?.pull_request && issueState === "closed") {
+    return true;
+  }
+  return false;
+}
+
+function normalizeDispatchRef(ref) {
+  if (!ref) {
+    return "";
+  }
+  return ref.startsWith("refs/") ? ref : `refs/heads/${ref}`;
+}
+
+async function resolveIssueBackedPRHeadRef() {
+  const isIssueBackedPullRequest = context.payload?.issue?.pull_request;
+  const pullNumber = context.payload?.issue?.number;
+  if (!isIssueBackedPullRequest || !pullNumber) {
+    return "";
+  }
+
+  try {
+    const response = await github.rest.pulls.get({
+      owner: context.repo.owner,
+      repo: context.repo.repo,
+      pull_number: pullNumber,
+      headers: {
+        "X-GitHub-Api-Version": GITHUB_API_VERSION,
+      },
+    });
+    const headRef = response?.data?.head?.ref;
+    if (!headRef) {
+      return "";
+    }
+    return normalizeDispatchRef(headRef);
+  } catch (error) {
+    core.warning(`Failed to resolve PR head ref for #${pullNumber}: ${String(error)}`);
+    return "";
+  }
+}
+
+async function resolveDispatchRef() {
   if (process.env.GITHUB_HEAD_REF) {
-    return `refs/heads/${process.env.GITHUB_HEAD_REF}`;
+    return normalizeDispatchRef(process.env.GITHUB_HEAD_REF);
+  }
+
+  const payloadHeadRef = context.payload?.pull_request?.head?.ref;
+  if (payloadHeadRef) {
+    return normalizeDispatchRef(payloadHeadRef);
+  }
+
+  const issuePullRequestHeadRef = await resolveIssueBackedPRHeadRef();
+  if (issuePullRequestHeadRef) {
+    return issuePullRequestHeadRef;
   }
 
   const fallbackRef = process.env.GITHUB_REF || context.ref;
   if (fallbackRef) {
-    return fallbackRef;
+    return normalizeDispatchRef(fallbackRef);
   }
 
   const defaultBranch = context.payload?.repository?.default_branch || "main";
-  return `refs/heads/${defaultBranch}`;
+  return normalizeDispatchRef(defaultBranch);
 }
 
 function normalizeReaction(reaction) {
@@ -48,6 +140,10 @@ function normalizeReaction(reaction) {
     return "";
   }
   return trimmed;
+}
+
+function maintainsStatusComment(route) {
+  return route?.status_comment === true;
 }
 
 /**
@@ -179,12 +275,32 @@ async function addImmediateReaction(reaction) {
   }
 }
 
+async function addImmediateStatusComment() {
+  try {
+    const comment = await createOrReuseStatusComment({
+      ...context,
+      nonFatalStatusCommentErrors: true,
+    });
+    if (!comment?.id) {
+      return null;
+    }
+    return {
+      status_comment_id: String(comment.id),
+      ...(comment.url ? { status_comment_url: comment.url } : {}),
+      ...(comment.repo?.owner && comment.repo?.repo ? { status_comment_repo: `${comment.repo.owner}/${comment.repo.repo}` } : {}),
+    };
+  } catch (error) {
+    core.warning(`Immediate status comment failed: ${String(error)}`);
+    return null;
+  }
+}
+
 /**
  * Dispatches a workflow with the API version header required by GitHub REST.
  * @param {string} workflowId
  * @param {string} ref
  * @param {Record<string, string>} inputs
- * @returns {Promise<void>}
+ * @returns {Promise<boolean>}
  */
 async function dispatchWorkflow(workflowId, ref, inputs) {
   try {
@@ -194,15 +310,241 @@ async function dispatchWorkflow(workflowId, ref, inputs) {
       workflow_id: workflowId,
       ref,
       inputs,
-      request: {
+      headers: {
+        "X-GitHub-Api-Version": GITHUB_API_VERSION,
+      },
+    });
+    return true;
+  } catch (error) {
+    if (isDisabledWorkflowDispatchError(error)) {
+      core.info(`Skipping workflow '${workflowId}' because it is disabled.`);
+      return false;
+    }
+    throw new Error(`Failed to dispatch workflow '${workflowId}' on ref '${ref}': ${String(error)}`);
+  }
+}
+
+function isBuiltinHelpEnabled() {
+  const raw = (process.env.GH_AW_HELP_COMMAND_ENABLED || "").trim().toLowerCase();
+  if (!raw || raw === "true") {
+    return true;
+  }
+  if (raw === "false") {
+    return false;
+  }
+  core.warning(`Invalid value for GH_AW_HELP_COMMAND_ENABLED (expected 'true' or 'false', got '${raw}'). Using default: enabled.`);
+  return true;
+}
+
+function parseHelpCommandsMetadata() {
+  const raw = process.env.GH_AW_HELP_COMMANDS || "[]";
+  try {
+    const parsed = JSON.parse(raw);
+    if (!Array.isArray(parsed)) {
+      return [];
+    }
+    return parsed
+      .flatMap(item => {
+        const command = typeof item?.command === "string" ? item.command.trim() : "";
+        if (!command) {
+          return [];
+        }
+        const description = typeof item?.description === "string" ? item.description.trim() : "";
+        return [
+          {
+            command,
+            description,
+            centralized: Boolean(item?.centralized),
+            decentralized: Boolean(item?.decentralized),
+            label: Boolean(item?.label),
+            source_file: typeof item?.source_file === "string" ? item.source_file.trim() : "",
+          },
+        ];
+      })
+      .sort((left, right) => left.command.localeCompare(right.command));
+  } catch (error) {
+    core.warning(`Failed to parse GH_AW_HELP_COMMANDS metadata: ${String(error)}`);
+    return [];
+  }
+}
+
+/**
+ * Regex matching bare GitHub @mentions outside inline code spans.
+ * Captures the preceding non-word character (p1) and the username (p2).
+ */
+const GITHUB_MENTION_RE = /(^|[^\w`])@([A-Za-z0-9](?:[A-Za-z0-9_-]{0,37}[A-Za-z0-9])?)/g;
+
+/**
+ * Neutralizes bare @mentions in a description string so they do not trigger
+ * GitHub notifications. Wraps matched mentions in backticks.
+ * @param {string} description
+ * @returns {string}
+ */
+function neutralizeDescriptionMentions(description) {
+  return description.replace(GITHUB_MENTION_RE, (_, p1, p2) => `${p1}\`@${p2}\``);
+}
+
+function buildCommandBulletLine(entry) {
+  const desc = entry.description ? neutralizeDescriptionMentions(entry.description) : "";
+  const suffix = desc ? ` — ${desc}` : "";
+  const commandText = `\`/${entry.command}\``;
+  if (entry.source_file) {
+    const owner = context.repo.owner;
+    const repo = context.repo.repo;
+    const githubServer = process.env.GITHUB_SERVER_URL || "https://github.com";
+    const sourceUrl = `${githubServer}/${owner}/${repo}/blob/HEAD/.github/workflows/${entry.source_file}.md`;
+    return `- [${commandText}](${sourceUrl})${suffix}`;
+  }
+  return `- ${commandText}${suffix}`;
+}
+
+function buildLabelBulletLine(entry) {
+  const desc = entry.description ? neutralizeDescriptionMentions(entry.description) : "";
+  const suffix = desc ? ` — ${desc}` : "";
+  return `- \`${entry.command}\`${suffix}`;
+}
+
+function buildHelpCommentBody(helpCommands) {
+  // Commands that are centralized should appear only in the centralized section even if
+  // they are also registered as decentralized (e.g. two workflows for the same command).
+  const centralized = helpCommands.filter(entry => entry.centralized);
+  const centralizedNames = new Set(centralized.map(entry => entry.command));
+  const decentralized = helpCommands.filter(entry => entry.decentralized && !centralizedNames.has(entry.command));
+  const labels = helpCommands.filter(entry => entry.label);
+
+  const lines = ["### Agentic Workflow Commands", "", "**Centralized slash commands**"];
+  if (centralized.length === 0) {
+    lines.push("- _None_");
+  } else {
+    for (const entry of centralized) {
+      lines.push(buildCommandBulletLine(entry));
+    }
+  }
+
+  lines.push("", "**Non-centralized slash commands**");
+  if (decentralized.length === 0) {
+    lines.push("- _None_");
+  } else {
+    for (const entry of decentralized) {
+      lines.push(buildCommandBulletLine(entry));
+    }
+  }
+
+  lines.push("", "**Label commands**");
+  if (labels.length === 0) {
+    lines.push("- _None_");
+  } else {
+    for (const entry of labels) {
+      lines.push(buildLabelBulletLine(entry));
+    }
+  }
+
+  const docsUrl = (process.env.GH_AW_SLASH_COMMAND_DOCS_URL || "").trim();
+  if (docsUrl) {
+    lines.push("", `Learn more: [Slash command documentation](${docsUrl})`);
+  }
+  return lines.join("\n");
+}
+
+async function postBuiltinHelpComment(commentBody) {
+  const owner = context.repo.owner;
+  const repo = context.repo.repo;
+
+  try {
+    const issueNumber = context.payload?.issue?.number ?? context.payload?.pull_request?.number;
+    if (issueNumber) {
+      await github.rest.issues.createComment({
+        owner,
+        repo,
+        issue_number: issueNumber,
+        body: commentBody,
         headers: {
           "X-GitHub-Api-Version": GITHUB_API_VERSION,
         },
-      },
-    });
+      });
+      return true;
+    }
+
+    if (context.eventName === "discussion" || context.eventName === "discussion_comment") {
+      const discussionID = context.payload?.discussion?.node_id;
+      if (!discussionID) {
+        core.warning("Unable to post builtin /help response: discussion node_id missing.");
+        return false;
+      }
+      await github.graphql(
+        `
+          mutation($discussionId: ID!, $body: String!) {
+            addDiscussionComment(input: { discussionId: $discussionId, body: $body }) {
+              comment { id }
+            }
+          }`,
+        { discussionId: discussionID, body: commentBody }
+      );
+      return true;
+    }
+
+    core.warning(`Unable to post builtin /help response for event '${context.eventName}'.`);
+    return false;
   } catch (error) {
-    throw new Error(`Failed to dispatch workflow '${workflowId}' on ref '${ref}': ${String(error)}`);
+    core.warning(`Failed to post builtin /help comment: ${String(error)}`);
+    return false;
   }
+}
+
+function toWorkflowDispatchID(route) {
+  if (!route?.workflow || typeof route.workflow !== "string" || !route.workflow.trim()) {
+    return "";
+  }
+  // Routing config may provide either bare workflow name ("archie") or full lock filename ("archie.lock.yml").
+  const baseName = nodePath.posix.basename(route.workflow.trim());
+  if (!baseName) {
+    return "";
+  }
+  return baseName.endsWith(".lock.yml") ? baseName : `${baseName}.lock.yml`;
+}
+
+function isDisabledWorkflowDispatchError(error) {
+  const status = error?.status ?? error?.response?.status;
+  const message = [error?.message, error?.response?.data?.message]
+    .filter(value => typeof value === "string" && value.trim())
+    .join(" ")
+    .toLowerCase();
+
+  if (status !== 422 || !message) {
+    return false;
+  }
+
+  return message.includes("workflow is disabled") || message.includes("workflow was disabled") || message.includes("disabled workflow");
+}
+
+/**
+ * @param {Record<string, Array<{workflow?: unknown, events?: unknown, ai_reaction?: unknown, status_comment?: unknown}>>} slashRouteMap
+ * @param {string} actualCommand
+ * @returns {Array<{workflow?: unknown, events?: unknown, ai_reaction?: unknown, status_comment?: unknown}>}
+ */
+function resolveMatchingSlashRoutes(slashRouteMap, actualCommand) {
+  /** @type {Array<{workflow?: unknown, events?: unknown, ai_reaction?: unknown, status_comment?: unknown}>} */
+  const matchedRoutes = [];
+  const seen = new Set();
+
+  for (const [configuredCommand, configuredRoutes] of Object.entries(slashRouteMap)) {
+    if (!matchesCommandName(configuredCommand, actualCommand) || !Array.isArray(configuredRoutes)) {
+      continue;
+    }
+
+    for (const route of configuredRoutes) {
+      // Keep the de-duplication key explicit so routes that differ only by
+      // status-comment behavior remain distinct dispatch targets.
+      const key = JSON.stringify([route?.workflow ?? "", route?.ai_reaction ?? "", route?.status_comment === true, Array.isArray(route?.events) ? route.events : []]);
+      if (seen.has(key)) {
+        continue;
+      }
+      seen.add(key);
+      matchedRoutes.push(route);
+    }
+  }
+
+  return matchedRoutes;
 }
 
 async function main() {
@@ -213,10 +555,17 @@ async function main() {
   const labelRouteMap = JSON.parse(process.env.GH_AW_LABEL_ROUTING || "{}");
   core.info(`Configured centralized slash commands: ${Object.keys(slashRouteMap).length}.`);
   core.info(`Configured decentralized label commands: ${Object.keys(labelRouteMap).length}.`);
+  const text = resolveBodyText();
+  const selectedCommand = parseSlashCommand(text);
+  await appendRoutingSummary(Object.keys(slashRouteMap), selectedCommand);
 
   const identifier = eventIdentifier();
   const { buildAwContext } = require("./aw_context.cjs");
-  const ref = resolveDispatchRef();
+  const ref = await resolveDispatchRef();
+  if (isPRClosedAtStart()) {
+    core.info("Pull request is closed at workflow start; skipping centralized routing.");
+    return;
+  }
 
   if (context.payload?.action === "labeled") {
     const labelName = context.payload?.label?.name ?? "";
@@ -238,34 +587,52 @@ async function main() {
       await addImmediateReaction(immediateReaction);
     }
     for (const route of routes) {
+      const workflowID = toWorkflowDispatchID(route);
+      if (!workflowID) {
+        core.warning("Skipping label route with missing workflow identifier.");
+        continue;
+      }
       const routeReaction = normalizeReaction(route?.ai_reaction);
       const awContext = {
         ...buildAwContext(),
         command_name: "",
         ...(routeReaction ? { desired_ai_reaction: routeReaction } : {}),
       };
-      core.info(`Dispatching workflow '${route.workflow}.lock.yml' for label '${labelName}'.`);
-      await dispatchWorkflow(`${route.workflow}.lock.yml`, ref, {
+      core.info(`Dispatching workflow '${workflowID}' for label '${labelName}'.`);
+      const dispatched = await dispatchWorkflow(workflowID, ref, {
         aw_context: JSON.stringify(awContext),
       });
-      core.info(`Dispatched '${route.workflow}' for label '${labelName}'`);
+      if (dispatched) {
+        core.info(`Dispatched '${workflowID}' for label '${labelName}'`);
+      }
     }
     core.info(`Completed decentralized label routing for '${labelName}'.`);
     return;
   }
 
-  const text = resolveBodyText();
   core.info(`Resolved payload text length: ${String(text).length}.`);
-  const firstWord = String(text).trim().split(/\s+/)[0] ?? "";
-  core.info(`First token in payload: '${firstWord || "<empty>"}'.`);
-  if (!firstWord.startsWith("/")) {
+  core.info(`First token in payload: '${selectedCommand ? `/${selectedCommand}` : "<empty>"}'.`);
+  if (!selectedCommand) {
     core.info("No slash command found at start of payload text; skipping dispatch.");
     return;
   }
 
-  const commandName = firstWord.slice(1);
+  const commandName = selectedCommand;
+  if (commandName === "help") {
+    if (isBuiltinHelpEnabled()) {
+      await addImmediateReaction("eyes");
+      const posted = await postBuiltinHelpComment(buildHelpCommentBody(parseHelpCommandsMetadata()));
+      if (posted) {
+        core.info("Posted builtin /help command response.");
+      }
+      return;
+    }
+    // Builtin /help is disabled — fall through so custom /help workflows still dispatch.
+    core.info("Builtin /help command is disabled by aw.json (help_command=false); routing normally.");
+  }
+
   core.info(`Resolved command '/${commandName}' for event identifier '${identifier}'.`);
-  const configuredRoutes = slashRouteMap[commandName] ?? [];
+  const configuredRoutes = resolveMatchingSlashRoutes(slashRouteMap, commandName);
   core.info(`Configured routes for '/${commandName}': ${configuredRoutes.length}.`);
   const routes = configuredRoutes.filter(route => Array.isArray(route.events) && route.events.includes(identifier));
   if (routes.length === 0) {
@@ -278,22 +645,35 @@ async function main() {
     core.info(`Adding immediate '${immediateReaction}' reaction for '/${commandName}'.`);
     await addImmediateReaction(immediateReaction);
   }
+  let statusCommentContext = null;
+  if (routes.some(maintainsStatusComment)) {
+    core.info(`Adding immediate status comment for '/${commandName}'.`);
+    statusCommentContext = await addImmediateStatusComment();
+  }
 
   core.info(`Dispatch ref resolved to '${ref}'.`);
   for (const route of routes) {
+    const workflowID = toWorkflowDispatchID(route);
+    if (!workflowID) {
+      core.warning("Skipping slash route with missing workflow identifier.");
+      continue;
+    }
     const routeReaction = normalizeReaction(route?.ai_reaction);
     const awContext = {
       ...buildAwContext(),
       command_name: commandName,
       ...(routeReaction ? { desired_ai_reaction: routeReaction } : {}),
+      ...(maintainsStatusComment(route) && statusCommentContext ? statusCommentContext : {}),
     };
-    core.info(`Dispatching workflow '${route.workflow}.lock.yml' for '/${commandName}'.`);
-    await dispatchWorkflow(`${route.workflow}.lock.yml`, ref, {
+    core.info(`Dispatching workflow '${workflowID}' for '/${commandName}'.`);
+    const dispatched = await dispatchWorkflow(workflowID, ref, {
       aw_context: JSON.stringify(awContext),
     });
-    core.info(`Dispatched '${route.workflow}' for '/${commandName}'`);
+    if (dispatched) {
+      core.info(`Dispatched '${workflowID}' for '/${commandName}'`);
+    }
   }
   core.info(`Completed centralized routing for '/${commandName}'.`);
 }
 
-module.exports = { main, eventIdentifier, resolveBodyText, resolveDispatchRef, GITHUB_API_VERSION };
+module.exports = { main, parseSlashCommand, eventIdentifier, resolveBodyText, resolveDispatchRef, GITHUB_API_VERSION };

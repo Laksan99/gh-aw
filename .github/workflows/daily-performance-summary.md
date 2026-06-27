@@ -1,4 +1,6 @@
 ---
+private: true
+emoji: "⚡"
 description: Daily project performance summary (90-day window) with trend charts using mcp-scripts
 on:
   schedule: daily
@@ -9,7 +11,9 @@ permissions:
   issues: read
   pull-requests: read
   discussions: read
-engine: copilot
+engine:
+  id: copilot
+  copilot-sdk: true
 strict: true
 tracker-id: daily-performance-summary
 tools:
@@ -21,6 +25,8 @@ safe-outputs:
   upload-asset:
     max: 3
     allowed-exts: [.png, .jpg, .jpeg, .svg]
+  close-discussion:
+    required-title-prefix: "[daily performance] "
 timeout-minutes: 30
 imports:
   - uses: shared/daily-audit-charts.md
@@ -29,7 +35,9 @@ imports:
   - shared/github-queries-mcp-script.md
 
 
-  - shared/observability-otlp.md
+  - shared/otlp.md
+features:
+  gh-aw-detection: true
 ---
 
 {{#runtime-import? .github/shared-instructions.md}}

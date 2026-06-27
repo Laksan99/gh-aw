@@ -1,4 +1,5 @@
 ---
+emoji: "📊"
 name: Copilot Session Insights
 description: Analyzes GitHub Copilot coding agent sessions to provide detailed insights on usage patterns, success rates, and performance metrics
 on:
@@ -7,6 +8,7 @@ on:
     - cron: daily
   workflow_dispatch:
 
+max-daily-ai-credits: 10000
 permissions:
   contents: read
   actions: read
@@ -22,6 +24,9 @@ network:
     - github
     - python
 
+sandbox:
+  agent:
+    sudo: false
 tools:
   cli-proxy: true
   github:
@@ -29,8 +34,8 @@ tools:
     toolsets: [default]
   bash:
     - "jq *"
-    - "find /tmp -type f"
-    - "cat /tmp/*"
+    - "find /tmp/gh-aw/agent -type f"
+    - "cat /tmp/gh-aw/agent/*"
     - "mkdir -p *"
     - "find * -maxdepth 1"
     - "date *"
@@ -50,10 +55,10 @@ imports:
   - shared/session-analysis-charts.md
   - shared/session-analysis-strategies.md
 
-  - shared/observability-otlp.md
+  - shared/otlp.md
 timeout-minutes: 45
-
-
+features:
+  gh-aw-detection: true
 ---
 # Copilot coding agent Session Analysis
 
@@ -76,7 +81,7 @@ Create a comprehensive report and publish it as a GitHub Discussion for team rev
 - **Repository**: ${{ github.repository }}
 - **Analysis Period**: Most recent ~50 agent sessions
 - **Cache Memory**: `/tmp/gh-aw/cache-memory/`
-- **Pre-fetched Data**: Available at `/tmp/gh-aw/session-data/`
+- **Pre-fetched Data**: Available at `/tmp/gh-aw/agent/session-data/`
 - **Conversation Logs**: Now available with agent's internal monologue and reasoning
 
 ## Task Overview
@@ -84,8 +89,8 @@ Create a comprehensive report and publish it as a GitHub Discussion for team rev
 ### Phase 0: Setup and Prerequisites
 
 **Pre-fetched Data Available**: Session data has been fetched by the `copilot-session-data-fetch` shared module:
-- `/tmp/gh-aw/session-data/sessions-list.json` - List of sessions with metadata
-- `/tmp/gh-aw/session-data/logs/` - **Conversation transcript files** (new!)
+- `/tmp/gh-aw/agent/session-data/sessions-list.json` - List of sessions with metadata
+- `/tmp/gh-aw/agent/session-data/logs/` - **Conversation transcript files** (new!)
   - `{session_number}-conversation.txt` - Agent's internal monologue, reasoning, and tool usage
   - `{session_number}/` - GitHub Actions logs (fallback only)
 
@@ -104,7 +109,7 @@ Create a comprehensive report and publish it as a GitHub Discussion for team rev
 
 ### Phase 1: Session Analysis
 
-For each downloaded session in `/tmp/gh-aw/session-data/`:
+For each downloaded session in `/tmp/gh-aw/agent/session-data/`:
 
 1. **Load Conversation Logs**: Read the agent's conversation transcript from `{session_number}-conversation.txt` files. These contain:
    - Agent's internal reasoning and planning
@@ -149,7 +154,7 @@ gh api "repos/$GITHUB_REPOSITORY/pulls?state=open&per_page=100" \
   --paginate \
   --jq '.[] | {number, title, head_branch: .head.ref, created_at, updated_at, assignees: [.assignees[].login], requested_reviewers: [.requested_reviewers[].login]}' \
   | jq -s '.' \
-  > /tmp/gh-aw/session-data/open-prs.json
+  > /tmp/gh-aw/agent/session-data/open-prs.json
 
 # Fetch in-progress workflow runs from the last 6 hours (paginated)
 SIX_HOURS_AGO=$(date -d '6 hours ago' '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null || date -v-6H '+%Y-%m-%dT%H:%M:%SZ')
@@ -157,10 +162,10 @@ gh api "repos/$GITHUB_REPOSITORY/actions/runs?status=in_progress&per_page=100" \
   --paginate \
   --jq ".workflow_runs[] | select(.created_at >= \"${SIX_HOURS_AGO}\") | {run_id: .id, branch: .head_branch, workflow_name: .name, created_at, status}" \
   | jq -s '.' \
-  > /tmp/gh-aw/session-data/active-runs.json
+  > /tmp/gh-aw/agent/session-data/active-runs.json
 
-echo "Fetched $(jq 'length' /tmp/gh-aw/session-data/open-prs.json) open PRs"
-echo "Fetched $(jq 'length' /tmp/gh-aw/session-data/active-runs.json) in-progress runs"
+echo "Fetched $(jq 'length' /tmp/gh-aw/agent/session-data/open-prs.json) open PRs"
+echo "Fetched $(jq 'length' /tmp/gh-aw/agent/session-data/active-runs.json) in-progress runs"
 ```
 
 **Orphan Detection Logic**:
@@ -177,8 +182,8 @@ ONE_HOUR_AGO=$(date -d '1 hour ago' '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null || date -v
 # 3. Filter: gate_count >= 5, no copilot agent assigned, created_at < two_hours_ago
 # 4. Classify severity and emit escalation records
 jq -n \
-  --slurpfile prs /tmp/gh-aw/session-data/open-prs.json \
-  --slurpfile runs /tmp/gh-aw/session-data/active-runs.json \
+  --slurpfile prs /tmp/gh-aw/agent/session-data/open-prs.json \
+  --slurpfile runs /tmp/gh-aw/agent/session-data/active-runs.json \
   --arg two_hours_ago "$TWO_HOURS_AGO" \
   --arg one_hour_ago "$ONE_HOUR_AGO" '
   # Build a map of branch -> gate_count from in-progress runs
@@ -220,10 +225,10 @@ jq -n \
                            else "priority agent assignment" end)
     }
   ) | sort_by(-.gate_count)
-' > /tmp/gh-aw/session-data/orphan-escalations.json
+' > /tmp/gh-aw/agent/session-data/orphan-escalations.json
 
-echo "Escalation candidates found: $(jq 'length' /tmp/gh-aw/session-data/orphan-escalations.json)"
-jq '.' /tmp/gh-aw/session-data/orphan-escalations.json
+echo "Escalation candidates found: $(jq 'length' /tmp/gh-aw/agent/session-data/orphan-escalations.json)"
+jq '.' /tmp/gh-aw/agent/session-data/orphan-escalations.json
 ```
 
 Use this data to populate the **Orphaned Branch Escalation Alerts** section in the report.
@@ -263,12 +268,18 @@ Generate a human-readable Markdown report and create a discussion.
 Daily Copilot Agent Session Analysis — [YYYY-MM-DD]
 ```
 
+### Report Formatting
+
+- Use h3 (`###`) or lower for all headers in the discussion body. Never use h1 (`#`) or h2 (`##`) — these are reserved for the discussion title.
+- Wrap long sections in `<details><summary><b>Section Name</b></summary>` tags to improve readability and reduce scrolling.
+- Keep Executive Summary, Key Metrics, and Recommendations always visible; collapse verbose per-session data in `<details>` blocks.
+
 **Discussion Template**:
 
 ```markdown
-# 🤖 Copilot Agent Session Analysis — [DATE]
+### 🤖 Copilot Agent Session Analysis — [DATE]
 
-## Executive Summary
+#### Executive Summary
 
 - **Sessions Analyzed**: [NUMBER]
 - **Analysis Period**: [DATE RANGE]
@@ -276,7 +287,7 @@ Daily Copilot Agent Session Analysis — [YYYY-MM-DD]
 - **Average Duration**: [TIME]
 - **Experimental Strategy**: [STRATEGY NAME] (if applicable)
 
-## Key Metrics
+#### Key Metrics
 
 | Metric | Value | Trend |
 |--------|-------|-------|
@@ -287,7 +298,7 @@ Daily Copilot Agent Session Analysis — [YYYY-MM-DD]
 | Loop Detection Rate | [N] ([%]) | [↑↓→] |
 | Context Issues | [N] ([%]) | [↑↓→] |
 
-## Success Factors ✅
+#### Success Factors ✅
 
 Patterns associated with successful task completion:
 
@@ -301,7 +312,7 @@ Patterns associated with successful task completion:
 
 [Include 3-5 key success patterns]
 
-## Failure Signals ⚠️
+#### Failure Signals ⚠️
 
 Common indicators of inefficiency or failure:
 
@@ -315,9 +326,12 @@ Common indicators of inefficiency or failure:
 
 [Include 3-5 key failure patterns]
 
-## Prompt Quality Analysis 📝
+#### Prompt Quality Analysis 📝
 
-### High-Quality Prompt Characteristics
+<details>
+<summary><b>Per-Prompt Breakdown</b></summary>
+
+##### High-Quality Prompt Characteristics
 
 - [Characteristic 1]: Found in [%] of successful sessions
 - [Characteristic 2]: Found in [%] of successful sessions
@@ -328,7 +342,7 @@ Common indicators of inefficiency or failure:
 [Example of an effective task description]
 ```
 
-### Low-Quality Prompt Characteristics
+##### Low-Quality Prompt Characteristics
 
 - [Characteristic 1]: Found in [%] of failed sessions
 - [Characteristic 2]: Found in [%] of failed sessions
@@ -338,17 +352,22 @@ Common indicators of inefficiency or failure:
 [Example of an ineffective task description]
 ```
 
-## Orphaned Branch Escalation Alerts 🚨
+</details>
+
+#### Orphaned Branch Escalation Alerts 🚨
 
 > Branches with ≥5 simultaneous gate firings and no Copilot agent assigned for >2 hours.
 
-### Summary
+##### Summary
 
 - **Orphaned Branches Today**: [N] out of [TOTAL] active branches ([%])
 - **Historical Baseline**: ~40% orphaned rate
 - **Status**: [NORMAL / ⚠️ ELEVATED] (flag if today's rate > 50%)
 
-### Escalation Candidates
+<details>
+<summary><b>Escalation Candidate Details</b></summary>
+
+##### Escalation Candidates
 
 | Branch | PR | Gate Count | Wait Time | Severity | Recommended Action |
 |--------|-----|------------|-----------|----------|--------------------|
@@ -356,29 +375,36 @@ Common indicators of inefficiency or failure:
 
 _(If no escalation candidates: "✅ No orphaned branches exceed the escalation threshold today.")_
 
-### CI Waste Estimate
+##### CI Waste Estimate
 
 - **Orphaned gate-hours today**: [N] gate × [Xh] ≈ [N] CI-minutes wasted
 - **Recoverable capacity**: Assigning agents to critical/high branches could recover ~[%] of orphaned CI capacity
 
-## Notable Observations
+</details>
 
-### Loop Detection
+#### Notable Observations
+
+<details>
+<summary><b>Loop Detection and Session Diagnostics</b></summary>
+
+##### Loop Detection
 - **Sessions with loops**: [N] ([%])
 - **Average loop count**: [NUMBER]
 - **Common loop patterns**: [Description]
 
-### Tool Usage
+##### Tool Usage
 - **Most used tools**: [List]
 - **Tool success rates**: [Statistics]
 - **Missing tools**: [List of requested but unavailable tools]
 
-### Context Issues
+##### Context Issues
 - **Sessions with confusion**: [N] ([%])
 - **Common confusion points**: [List]
 - **Clarification requests**: [N]
 
-## Experimental Analysis
+</details>
+
+#### Experimental Analysis
 
 **This run included experimental strategy**: [STRATEGY NAME]
 
@@ -394,9 +420,9 @@ _(If no escalation candidates: "✅ No orphaned branches exceed the escalation t
 
 [If not experimental, include note: "Standard analysis only - no experimental strategy this run"]
 
-## Actionable Recommendations
+#### Actionable Recommendations
 
-### For Users Writing Task Descriptions
+##### For Users Writing Task Descriptions
 
 1. **[Recommendation 1]**: [Specific guidance]
    - Example: [Before/After example]
@@ -407,7 +433,7 @@ _(If no escalation candidates: "✅ No orphaned branches exceed the escalation t
 3. **[Recommendation 3]**: [Specific guidance]
    - Example: [Before/After example]
 
-### For System Improvements
+##### For System Improvements
 
 1. **[Improvement Area]**: [Description]
    - Potential impact: [High/Medium/Low]
@@ -415,13 +441,16 @@ _(If no escalation candidates: "✅ No orphaned branches exceed the escalation t
 2. **[Improvement Area]**: [Description]
    - Potential impact: [High/Medium/Low]
 
-### For Tool Development
+##### For Tool Development
 
 1. **[Missing Tool/Capability]**: [Description]
    - Frequency of need: [NUMBER] sessions
    - Use case: [Description]
 
-## Trends Over Time
+<details>
+<summary><b>Historical Trends and Statistical Summary</b></summary>
+
+#### Trends Over Time
 
 [Compare with historical data from cache memory if available]
 
@@ -429,7 +458,7 @@ _(If no escalation candidates: "✅ No orphaned branches exceed the escalation t
 - **Average duration trend**: [Description]
 - **Quality improvement**: [Description]
 
-## Statistical Summary
+#### Statistical Summary
 
 ```
 Total Sessions Analyzed:     [N]
@@ -452,7 +481,9 @@ Medium-Quality Prompts:    [N] ([%])
 Low-Quality Prompts:       [N] ([%])
 ```
 
-## Next Steps
+</details>
+
+#### Next Steps
 
 - [ ] Review recommendations with team
 - [ ] Implement high-priority prompt improvements
@@ -481,13 +512,13 @@ _Workflow: ${{ github.workflow }}_
 **Accessing Logs**:
 ```bash
 # List available conversation logs
-find /tmp/gh-aw/session-data/logs -type f -name "*-conversation.txt"
+find /tmp/gh-aw/agent/session-data/logs -type f -name "*-conversation.txt"
 
 # Read a specific conversation log
-cat /tmp/gh-aw/session-data/logs/123-conversation.txt
+cat /tmp/gh-aw/agent/session-data/logs/123-conversation.txt
 
 # Count conversation logs
-find /tmp/gh-aw/session-data/logs -type f -name "*-conversation.txt" | wc -l
+find /tmp/gh-aw/agent/session-data/logs -type f -name "*-conversation.txt" | wc -l
 ```
 
 **What to Look For in Conversation Logs**:

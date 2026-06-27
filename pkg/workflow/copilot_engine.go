@@ -40,7 +40,7 @@ func NewCopilotEngine() *CopilotEngine {
 			experimental: false,
 			capabilities: EngineCapabilities{
 				ToolsAllowlist:   true,
-				MaxTurns:         false, // Copilot CLI does not support max-turns feature yet
+				MaxTurns:         true,  // AWF max-turns is supported for Copilot runs
 				MaxContinuations: true,  // Copilot CLI supports --autopilot with --max-autopilot-continues
 				WebSearch:        false, // Copilot CLI does not have built-in web-search support
 				BareMode:         true,  // Copilot CLI supports --no-custom-instructions
@@ -61,24 +61,27 @@ func (e *CopilotEngine) GetModelEnvVarName() string {
 	return constants.CopilotCLIModelEnvVar
 }
 
+// ResolveLLMProvider returns the effective provider for Copilot inference.
+// Default is github, overridable via engine.model-provider.
+func (e *CopilotEngine) ResolveLLMProvider(workflowData *WorkflowData) string {
+	return resolveEngineLLMProvider(workflowData, LLMProviderGitHub)
+}
+
 // GetRequiredSecretNames returns the list of secrets required by the Copilot engine.
 // This includes COPILOT_GITHUB_TOKEN and optionally MCP_GATEWAY_API_KEY.
 // It also includes COPILOT_PROVIDER_* env var keys that may carry secrets when BYOK mode
 // is configured — allowing them to pass through strict-mode validation and the secret filter.
 func (e *CopilotEngine) GetRequiredSecretNames(workflowData *WorkflowData) []string {
 	copilotLog.Print("Collecting required secrets for Copilot engine")
-	secrets := []string{
-		"COPILOT_GITHUB_TOKEN",
-		// BYOK provider variables that may carry secrets in engine.env.
-		// Listed unconditionally: checking for their presence in the current workflow's
-		// EngineConfig.Env would add complexity without security benefit, since these
-		// keys only carry secrets when the workflow author explicitly sets them.
-		// Listing them here allows strict-mode validation to recognise them as engine
-		// credentials and lets FilterEnvForSecrets pass their values through to the step.
+	provider := e.ResolveLLMProvider(workflowData)
+	secrets := append([]string{}, llmProviderSecretNames(provider)...)
+	// Always include the BYOK provider keys so that secrets assigned to them via engine.env
+	// pass through the strict-mode validator and FilterEnvForSecrets.
+	secrets = append(secrets,
 		constants.CopilotProviderBaseURL,
 		constants.CopilotProviderAPIKey,
 		constants.CopilotProviderBearerToken,
-	}
+	)
 
 	// Add MCP gateway API key if MCP servers are present (gateway is always started with MCP servers)
 	if HasMCPServers(workflowData) {
@@ -116,6 +119,19 @@ func (e *CopilotEngine) GetRequiredSecretNames(workflowData *WorkflowData) []str
 	return secrets
 }
 
+// GetSupportedEnvVarKeys returns the engine.env variable names that the Copilot engine
+// supports as defined in the AWF specification. These cover the primary auth token and
+// all BYOK provider variables that may carry secret values.
+func (e *CopilotEngine) GetSupportedEnvVarKeys() []string {
+	return []string{
+		constants.CopilotGitHubToken,
+		constants.CopilotProviderBaseURL,
+		constants.CopilotProviderAPIKey,
+		constants.CopilotProviderBearerToken,
+		constants.CopilotProviderWireAPI,
+	}
+}
+
 // GetInstallationSteps is implemented in copilot_engine_installation.go
 
 func (e *CopilotEngine) GetDeclaredOutputFiles() []string {
@@ -137,7 +153,7 @@ func (e *CopilotEngine) GetAgentManifestFiles() []string {
 // The .github/ directory contains copilot-instructions.md, path-specific instruction
 // files, and copilot-setup-steps.yml — any of which can alter agent behaviour.
 func (e *CopilotEngine) GetAgentManifestPathPrefixes() []string {
-	return []string{".github/"}
+	return []string{constants.GithubDir}
 }
 
 // GetHarnessScriptName returns the filename of the JavaScript harness script that wraps

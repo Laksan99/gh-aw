@@ -1,5 +1,7 @@
 # styles Package
 
+> Centralized Dracula-inspired terminal color palette, adaptive color variables, border definitions, and pre-configured lipgloss styles for consistent CLI output.
+
 The `styles` package provides centralized color constants, adaptive color variables, border definitions, and pre-configured `lipgloss` styles for consistent terminal output across the codebase.
 
 ## Overview
@@ -14,7 +16,7 @@ The `styles` package exports the following:
 |----------|---------|
 | Adaptive colors | `ColorError`, `ColorWarning`, `ColorSuccess`, `ColorInfo`, `ColorPurple`, `ColorYellow`, `ColorComment`, `ColorForeground`, `ColorBackground`, `ColorBorder`, `ColorTableAltRow` |
 | Border styles | `RoundedBorder`, `NormalBorder`, `ThickBorder` |
-| Pre-configured `lipgloss.Style` | `Error`, `Warning`, `Success`, `Info`, `FilePath`, `LineNumber`, `Command`, `Progress`, `Prompt`, `Count`, `Verbose`, `Header`, `TableHeader`, `TableCell`, `TableTitle`, `TableBorder`, `ErrorBox`, `ServerName`, `ServerType`, `TreeEnumerator`, `TreeNode` |
+| Pre-configured `lipgloss.Style` | `Error`, `Warning`, `Success`, `Info`, `FilePath`, `LineNumber`, `Command`, `Progress`, `Prompt`, `Count`, `Verbose`, `Header`, `TableHeader`, `TableCell`, `TableTitle`, `TableBorder`, `ErrorBox`, `ServerName`, `ServerType`, `TreeEnumerator`, `TreeNode`, `ScheduleCalendarEmpty`, `ScheduleCalendarLow`, `ScheduleCalendarMedium`, `ScheduleCalendarHigh`, `ScheduleCalendarCritical` |
 | Huh theme | `HuhTheme` — `huh.ThemeFunc` for Dracula-inspired interactive forms |
 
 ## Adaptive Color Variables
@@ -76,6 +78,11 @@ These `lipgloss.Style` values are ready to use directly:
 | `Header` | Success/green, bold, bottom margin | Section headers |
 | `TreeEnumerator` | Border color | Tree branch characters |
 | `TreeNode` | Foreground | Tree node text |
+| `ScheduleCalendarEmpty` | Comment/muted | Heatmap: zero-trigger slots |
+| `ScheduleCalendarLow` | Info/cyan | Heatmap: low-intensity slots |
+| `ScheduleCalendarMedium` | Success/green | Heatmap: medium-intensity slots |
+| `ScheduleCalendarHigh` | Warning/orange | Heatmap: high-intensity slots |
+| `ScheduleCalendarCritical` | Error/red, bold | Heatmap: critical-intensity slots |
 
 ## Usage Examples
 
@@ -104,12 +111,35 @@ import "github.com/github/gh-aw/pkg/styles"
 form := huh.NewForm(...).WithTheme(styles.HuhTheme)
 ```
 
-## Design Notes
+## Wasm Build Variants
+
+Under the `js || wasm` build constraint, `theme_wasm.go` replaces all `lipgloss` types with lightweight no-op stubs that return text unchanged (no ANSI escape codes emitted):
+
+| Type | Implements | Behavior |
+|------|-----------|---------|
+| `WasmStyle` | `.Render(...string) string` | Returns input text concatenated, unchanged |
+| `WasmColor` | `color.Color` via `.RGBA()` | Returns transparent black `(0,0,0,0)` |
+| `WasmBorder` | — | No-op placeholder |
+
+All adaptive color variables, border variables, and style variables are re-declared as `WasmColor{}`, `WasmBorder{}`, or `WasmStyle{}` values in the Wasm build.
+
+## Dependencies
+
+**External**:
+- `charm.land/lipgloss/v2` — terminal style rendering (non-Wasm builds)
+- `charm.land/lipgloss/v2/compat` — adaptive color support (`compat.AdaptiveColor`)
+- `charm.land/huh/v2` — form library themed by `HuhTheme` (non-Wasm builds)
+
+## Design Decisions
 
 - Colors are defined with both light and dark hex constants (`hexColor*Light`, `hexColor*Dark`) so tests can assert exact color values without depending on the `lipgloss` type system.
 - The package uses `charm.land/lipgloss/v2` and `charm.land/lipgloss/v2/compat` for adaptive color support.
 - For visual examples and detailed usage guidelines, see `scratchpad/styles-guide.md`.
 - All `*` styles export pre-configured `lipgloss.Style` values (not functions), so they can be used with method chaining: `styles.Error.Copy().Underline(true)`.
+
+## Thread Safety
+
+All exported variables are package-level `lipgloss.Style` values initialized at program startup. They are safe to read concurrently. Creating derived styles via method chaining (e.g., `styles.Error.Copy().Underline(true)`) MUST be done per call site — `lipgloss.Style` values SHOULD NOT be mutated after initialization.
 
 ---
 

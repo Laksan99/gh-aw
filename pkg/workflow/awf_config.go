@@ -25,7 +25,7 @@
 //	      "openai":    { "host": "api.openai.com" },
 //	      "anthropic": { "host": "api.anthropic.com" },
 //	      "copilot":   { "host": "api.githubcopilot.com" },
-//	      "gemini":    { "host": "generativelanguage.googleapis.com" }
+//	      "antigravity":    { "host": "generativelanguage.googleapis.com" }
 //	    },
 //	    "models": {
 //	      "sonnet": ["mygateway/*sonnet*"],
@@ -34,6 +34,15 @@
 //	  },
 //	  "container": {
 //	    "imageTag": "0.25.29,squid=sha256:..."
+//	  },
+//	  "chroot": {
+//	    "binariesSourcePath": "/tmp/gh-aw",
+//	    "identity": {
+//	      "user": "runner",
+//	      "uid": 1001,
+//	      "gid": 1001,
+//	      "home": "/tmp/gh-aw/home"
+//	    }
 //	  }
 //	}
 //
@@ -56,10 +65,12 @@ import (
 	"strings"
 	"sync"
 
+	"github.com/santhosh-tekuri/jsonschema/v6"
+
 	"github.com/github/gh-aw/pkg/constants"
 	"github.com/github/gh-aw/pkg/jsonutil"
 	"github.com/github/gh-aw/pkg/logger"
-	"github.com/santhosh-tekuri/jsonschema/v6"
+	"github.com/github/gh-aw/pkg/setutil"
 )
 
 //go:embed schemas/awf-config.schema.json
@@ -111,10 +122,35 @@ func validateAWFConfigJSON(configJSON string) error {
 	if err := json.Unmarshal([]byte(configJSON), &doc); err != nil {
 		return fmt.Errorf("failed to parse AWF config JSON: %w", err)
 	}
+	normalizeTemplatableModelFallbackEnabled(doc)
 	if err := schema.Validate(doc); err != nil {
 		return fmt.Errorf("AWF config schema validation failed: %w", err)
 	}
 	return nil
+}
+
+// normalizeTemplatableModelFallbackEnabled adjusts a generated AWF config document
+// for compile-time schema validation by coercing modelFallback.enabled GitHub Actions
+// expressions to a boolean placeholder. GitHub Actions resolves these expressions at
+// runtime before AWF consumes the config.
+func normalizeTemplatableModelFallbackEnabled(doc any) {
+	root, ok := doc.(map[string]any)
+	if !ok {
+		return
+	}
+	apiProxy, ok := root["apiProxy"].(map[string]any)
+	if !ok {
+		return
+	}
+	modelFallback, ok := apiProxy["modelFallback"].(map[string]any)
+	if !ok {
+		return
+	}
+	enabled, ok := modelFallback["enabled"].(string)
+	if !ok || !isExpression(enabled) {
+		return
+	}
+	modelFallback["enabled"] = true
 }
 
 // AWFConfigFile represents the AWF configuration file schema.
@@ -126,11 +162,18 @@ type AWFConfigFile struct {
 	// Network contains network egress control configuration.
 	Network *AWFNetworkConfig `json:"network,omitempty"`
 
+	// Platform contains GitHub deployment metadata used by AWF auth handling.
+	Platform *AWFPlatformConfig `json:"platform,omitempty"`
+
 	// APIProxy contains API proxy (LLM gateway) configuration.
 	APIProxy *AWFAPIProxyConfig `json:"apiProxy,omitempty"`
 
 	// Container contains container execution configuration.
 	Container *AWFContainerConfig `json:"container,omitempty"`
+
+	// Chroot contains chroot execution overrides for split-filesystem ARC/DinD runners.
+	// This field is not populated at compile time; it is injected at runtime when DinD topology is detected.
+	Chroot *AWFChrootConfig `json:"chroot,omitempty"`
 }
 
 // AWFNetworkConfig is the "network" section of the AWF config file.
@@ -144,6 +187,20 @@ type AWFNetworkConfig struct {
 	// BlockDomains is the list of explicitly blocked egress domains.
 	// Maps to: --block-domains <comma-separated>
 	BlockDomains []string `json:"blockDomains,omitempty"`
+
+	// Isolation enables topology-based egress isolation mode.
+	// Maps to: --network-isolation
+	Isolation bool `json:"isolation,omitempty"`
+
+	// TopologyAttach lists container names AWF should attach to awf-net.
+	// Maps to: --topology-attach <name> (repeatable)
+	TopologyAttach []string `json:"topologyAttach,omitempty"`
+}
+
+// AWFPlatformConfig is the "platform" section of the AWF config file.
+type AWFPlatformConfig struct {
+	// Type is the GitHub deployment type consumed by AWF for auth behavior.
+	Type string `json:"type,omitempty"`
 }
 
 // AWFAPIProxyConfig is the "apiProxy" section of the AWF config file.
@@ -159,14 +216,24 @@ type AWFAPIProxyConfig struct {
 	// MaxRuns is the maximum number of LLM invocations allowed for a run.
 	MaxRuns int `json:"maxRuns,omitempty"`
 
-	// MaxEffectiveTokens is the explicit ET budget enforced by the API proxy.
-	MaxEffectiveTokens int64 `json:"maxEffectiveTokens,omitempty"`
+	// MaxTurnCacheMisses is the maximum number of consecutive cache misses allowed for a run.
+	MaxTurnCacheMisses int `json:"maxCacheMisses,omitempty"`
+
+	// MaxAICredits is the explicit per-run AI credits budget enforced by the API proxy.
+	MaxAICredits int64 `json:"maxAiCredits,omitempty"`
+
+	// ModelFallback configures the model fallback policy for unresolved model selections.
+	// When nil, the AWF default (enabled=true, strategy=middle_power) is used.
+	// Set enabled=false to prevent AWF from silently rewriting deployment names, which
+	// is needed for BYOK Azure OpenAI deployments where rewriting causes HTTP 404.
+	ModelFallback *AWFModelFallbackConfig `json:"modelFallback,omitempty"`
 
 	// ModelMultipliers configures per-model ET accounting multipliers in AWF.
 	ModelMultipliers map[string]float64 `json:"modelMultipliers,omitempty"`
 
 	// Targets holds per-provider API target overrides.
 	// Supported keys: "openai", "anthropic", "copilot", "gemini"
+	// The "gemini" target is also used for Antigravity engine routing.
 	Targets map[string]*AWFAPITargetConfig `json:"targets,omitempty"`
 
 	// Models contains model alias and fallback policy definitions.
@@ -177,11 +244,28 @@ type AWFAPIProxyConfig struct {
 	Models map[string][]string `json:"models,omitempty"`
 }
 
+// AWFModelFallbackConfig is the "apiProxy.modelFallback" section of the AWF config file.
+// It controls whether model fallback is enabled for unresolved model selections.
+type AWFModelFallbackConfig struct {
+	// Enabled controls whether middle-power fallback is applied when model resolution fails.
+	// It accepts literal booleans and GitHub Actions expressions. A nil value omits the field,
+	// letting AWF use its default.
+	Enabled *TemplatableBool `json:"enabled,omitempty"`
+}
+
 // AWFAPITargetConfig is a single API proxy target entry.
 // Maps to: --<provider>-api-target <host>
 type AWFAPITargetConfig struct {
 	// Host is the hostname (and optional port) of the API endpoint.
-	Host string `json:"host"`
+	Host string `json:"host,omitempty"`
+
+	// AuthHeader is the custom authentication header name sent with API requests.
+	// When set, the raw API key is sent as "<authHeader>: <key>" instead of the
+	// provider default (e.g. "Authorization: ******" for OpenAI, or
+	// "x-api-key: <key>" for Anthropic). This supports gateways like Azure OpenAI
+	// that require "api-key: <rawkey>" in place of the standard provider scheme.
+	// Maps to: --openai-api-auth-header / --anthropic-api-auth-header
+	AuthHeader string `json:"authHeader,omitempty"`
 }
 
 // AWFContainerConfig is the "container" section of the AWF config file.
@@ -191,6 +275,39 @@ type AWFContainerConfig struct {
 	// Format: "<tag>" or "<tag>,squid=sha256:...,agent=sha256:..."
 	// Maps to: --image-tag <value>
 	ImageTag string `json:"imageTag,omitempty"`
+}
+
+// AWFChrootConfig is the "chroot" section of the AWF config file.
+// It configures chroot execution overrides for split-filesystem ARC/DinD runners.
+// These fields let AWF handle binary staging and identity resolution natively,
+// eliminating the need for bootstrap actions on ARC/DinD topologies.
+type AWFChrootConfig struct {
+	// BinariesSourcePath is the runner-side directory to overlay at /usr/local/bin
+	// inside chroot mode for split-filesystem ARC/DinD runners.
+	BinariesSourcePath string `json:"binariesSourcePath,omitempty"`
+
+	// Identity configures identity values applied after chroot pivot to override
+	// HOME/USER/LOGNAME defaults inside chroot mode.
+	Identity *AWFChrootIdentityConfig `json:"identity,omitempty"`
+}
+
+// AWFChrootIdentityConfig is the "chroot.identity" section of the AWF config file.
+// It provides identity values applied after chroot pivot to override HOME/USER
+// defaults inside chroot mode.
+type AWFChrootIdentityConfig struct {
+	// User is the USER/LOGNAME string to export inside chroot mode.
+	User string `json:"user,omitempty"`
+
+	// UID is the UID hint used for chroot identity synthesis and user switching.
+	// Must be >= 1 (root is not supported).
+	UID int `json:"uid,omitempty"`
+
+	// GID is the GID hint used for chroot identity synthesis and user switching.
+	// Must be >= 1.
+	GID int `json:"gid,omitempty"`
+
+	// Home is the home directory path to export inside chroot mode.
+	Home string `json:"home,omitempty"`
 }
 
 // buildAWFConfigSchemaURL returns the release-pinned JSON schema URL for the AWF config file.
@@ -252,29 +369,73 @@ func BuildAWFConfigJSON(config AWFCommandConfig) (string, error) {
 		}
 	}
 
-	// ── API proxy section ─────────────────────────────────────────────────────
-	maxEffectiveTokens := constants.DefaultMaxEffectiveTokens
-	maxRuns := constants.DefaultMaxRuns
-	if config.WorkflowData != nil && config.WorkflowData.EngineConfig != nil {
-		maxEffectiveTokens = config.WorkflowData.EngineConfig.GetMaxEffectiveTokens()
-		maxRuns = config.WorkflowData.EngineConfig.GetMaxRuns()
+	if isAWFNetworkIsolationEnabled(config.WorkflowData) {
+		if awfConfig.Network == nil {
+			awfConfig.Network = &AWFNetworkConfig{}
+		}
+		awfConfig.Network.Isolation = true
+		awfConfig.Network.TopologyAttach = buildAWFTopologyAttachList(config.WorkflowData)
+		awfConfigLog.Printf("Network section: isolation enabled with %d topology attachments", len(awfConfig.Network.TopologyAttach))
 	}
 
-	enableTokenSteering := extractEffectiveTokenSteering(config.WorkflowData)
+	if platformType := extractPlatformType(config.WorkflowData); platformType != "" {
+		awfConfig.Platform = &AWFPlatformConfig{Type: platformType}
+		awfConfigLog.Printf("Platform section: type=%s", platformType)
+	}
+
+	// ── API proxy section ─────────────────────────────────────────────────────
+	// maxAICredits is taken from frontmatter/imports only; when unset (0) the
+	// runtime value is resolved from vars.GH_AW_DEFAULT_MAX_AI_CREDITS via a
+	// GitHub Actions expression injected directly into the JSON string in
+	// BuildAWFCommand (see injectMaxAICreditsExpression in awf_helpers.go).
+	maxAICredits := int64(0)
+	maxRuns := constants.DefaultMaxRuns
+	// GetMaxTurnCacheMisses handles nil receiver and env-var fallback, so pre-init
+	// via the nil receiver avoids a redundant os.Getenv when EngineConfig is set.
+	maxTurnCacheMisses := (*EngineConfig)(nil).GetMaxTurnCacheMisses()
+	if config.WorkflowData != nil && config.WorkflowData.EngineConfig != nil {
+		if config.WorkflowData.EngineConfig.MaxAICredits != 0 {
+			maxAICredits = config.WorkflowData.EngineConfig.MaxAICredits
+		}
+		maxRuns = config.WorkflowData.EngineConfig.GetMaxRuns()
+		maxTurnCacheMisses = config.WorkflowData.EngineConfig.GetMaxTurnCacheMisses()
+	}
+
+	// Token steering is enabled by default. Setting max-ai-credits to a negative
+	// value (-1) omits that budget from the AWF config and disables token steering.
+	// When maxAICredits is 0 (runtime default), token steering stays enabled here.
+	enableTokenSteering := maxAICredits >= 0
+	if maxAICredits < 0 {
+		// Negative signals "disabled" — omit the budget from the AWF config.
+		maxAICredits = 0
+	}
+
 	apiProxy := &AWFAPIProxyConfig{
 		Enabled:             true,
 		MaxRuns:             maxRuns,
-		MaxEffectiveTokens:  maxEffectiveTokens,
+		MaxTurnCacheMisses:  maxTurnCacheMisses,
+		MaxAICredits:        maxAICredits,
 		EnableTokenSteering: enableTokenSteering && awfSupportsTokenSteering(firewallConfig),
 	}
 
-	if enableTokenSteering && !awfSupportsTokenSteering(firewallConfig) {
+	if !enableTokenSteering {
+		awfConfigLog.Printf("Skipping apiProxy.enableTokenSteering: max-ai-credits is negative (disabled)")
+	} else if !awfSupportsTokenSteering(firewallConfig) {
 		awfConfigLog.Printf("Skipping apiProxy.enableTokenSteering: AWF version %q requires at least %s", getAWFImageTag(firewallConfig), constants.AWFTokenSteeringMinVersion)
 	}
 
 	if modelMultipliers := extractModelMultipliers(config.WorkflowData); len(modelMultipliers) > 0 {
 		apiProxy.ModelMultipliers = modelMultipliers
 		awfConfigLog.Printf("API proxy: %d model multipliers configured", len(apiProxy.ModelMultipliers))
+	}
+
+	if mf := extractModelFallback(config.WorkflowData); mf != nil {
+		apiProxy.ModelFallback = mf
+		enabledDisplay := "<unset>"
+		if mf.Enabled != nil {
+			enabledDisplay = mf.Enabled.String()
+		}
+		awfConfigLog.Printf("API proxy: modelFallback configured: enabled=%s", enabledDisplay)
 	}
 
 	targets := map[string]*AWFAPITargetConfig{}
@@ -287,13 +448,38 @@ func BuildAWFConfigJSON(config AWFCommandConfig) (string, error) {
 		targets["anthropic"] = &AWFAPITargetConfig{Host: anthropicTarget}
 		awfConfigLog.Printf("API proxy: custom anthropic target=%s", anthropicTarget)
 	}
+
+	// Apply authHeader overrides from sandbox.agent.targets frontmatter.
+	// These are independent of the host/env-var settings: authHeader can be set
+	// even when no custom host is configured.
+	for _, provider := range []string{"openai", "anthropic"} {
+		authHeader := extractAPITargetAuthHeader(config.WorkflowData, provider)
+		if authHeader == "" {
+			continue
+		}
+		if existing, ok := targets[provider]; ok {
+			existing.AuthHeader = authHeader
+		} else {
+			targets[provider] = &AWFAPITargetConfig{AuthHeader: authHeader}
+		}
+		awfConfigLog.Printf("API proxy: custom %s authHeader=%s", provider, authHeader)
+	}
 	if copilotTarget := GetCopilotAPITarget(config.WorkflowData); copilotTarget != "" {
 		targets["copilot"] = &AWFAPITargetConfig{Host: copilotTarget}
 		awfConfigLog.Printf("API proxy: custom copilot target=%s", copilotTarget)
 	}
-	if geminiTarget := GetGeminiAPITarget(config.WorkflowData, config.EngineName); geminiTarget != "" {
-		targets["gemini"] = &AWFAPITargetConfig{Host: geminiTarget}
+	if antigravityTarget := GetAntigravityAPITarget(config.WorkflowData, config.EngineName); antigravityTarget != "" {
+		// Route the Antigravity-resolved API target through the "gemini" provider key
+		// to match AWF's supported target providers.
+		geminiTarget := GetGeminiAPITarget(config.WorkflowData, config.EngineName)
+		if geminiTarget != "" && geminiTarget != antigravityTarget {
+			awfConfigLog.Printf("API proxy: overriding gemini target %s with antigravity target %s; configure only one of GEMINI_API_BASE_URL or ANTIGRAVITY_API_BASE_URL to avoid ambiguity", geminiTarget, antigravityTarget)
+		}
+		awfConfigLog.Printf("API proxy: mapped antigravity target to gemini provider target=%s", antigravityTarget)
+		targets["gemini"] = &AWFAPITargetConfig{Host: antigravityTarget}
+	} else if geminiTarget := GetGeminiAPITarget(config.WorkflowData, config.EngineName); geminiTarget != "" {
 		awfConfigLog.Printf("API proxy: custom gemini target=%s", geminiTarget)
+		targets["gemini"] = &AWFAPITargetConfig{Host: geminiTarget}
 	}
 
 	if len(targets) > 0 {
@@ -325,11 +511,25 @@ func BuildAWFConfigJSON(config AWFCommandConfig) (string, error) {
 
 	awfConfigLog.Printf("AWF config JSON generated: %d bytes", len(jsonStr))
 
-	if err := validateAWFConfigJSON(jsonStr); err != nil {
-		return "", fmt.Errorf("generated AWF config failed schema validation: %w", err)
+	if config.WorkflowData != nil && config.WorkflowData.ValidateAWFConfig {
+		if err := validateAWFConfigJSON(jsonStr); err != nil {
+			return "", fmt.Errorf("generated AWF config failed schema validation: %w", err)
+		}
 	}
 
 	return jsonStr, nil
+}
+
+// buildAWFTopologyAttachList returns container names that AWF should attach to
+// the internal awf-net network when network isolation mode is enabled.
+// The list always includes the MCP gateway and conditionally includes the
+// host-started CLI proxy sidecar when gh-proxy mode is active.
+func buildAWFTopologyAttachList(workflowData *WorkflowData) []string {
+	targets := []string{"awmg-mcpg"}
+	if isCliProxyNeeded(workflowData) {
+		targets = append(targets, "awmg-cli-proxy")
+	}
+	return targets
 }
 
 // splitDomainList splits a comma-separated domain string into a deduplicated
@@ -337,11 +537,13 @@ func BuildAWFConfigJSON(config AWFCommandConfig) (string, error) {
 // non-duplicate entries; this keeps the allow-list deterministic.
 func splitDomainList(domains string) []string {
 	var result []string
-	seen := make(map[string]bool)
+	seen := make(map[string]struct {
+	})
 	for d := range strings.SplitSeq(domains, ",") {
 		d = strings.TrimSpace(d)
-		if d != "" && !seen[d] {
-			seen[d] = true
+		if d != "" && !setutil.Contains(seen, d) {
+			seen[d] = struct {
+			}{}
 			result = append(result, d)
 		}
 	}
@@ -358,8 +560,38 @@ func extractModelMultipliers(workflowData *WorkflowData) map[string]float64 {
 	return workflowData.EngineConfig.TokenWeights.Multipliers
 }
 
-func extractEffectiveTokenSteering(workflowData *WorkflowData) bool {
-	return workflowData != nil &&
-		workflowData.EngineConfig != nil &&
-		workflowData.EngineConfig.EnableTokenSteering
+// extractPlatformType returns sandbox.agent.platform only for enabled AWF sandbox
+// agents, or an empty string to let AWF fall back to its default platform logic.
+func extractPlatformType(workflowData *WorkflowData) string {
+	if workflowData == nil || workflowData.SandboxConfig == nil || workflowData.SandboxConfig.Agent == nil {
+		return ""
+	}
+	if workflowData.SandboxConfig.Agent.Disabled {
+		return ""
+	}
+	if !isSupportedSandboxType(getAgentType(workflowData.SandboxConfig.Agent)) {
+		return ""
+	}
+	return workflowData.SandboxConfig.Agent.Platform
+}
+
+// extractModelFallback returns an AWFModelFallbackConfig if the workflow has configured
+// sandbox.agent.model-fallback, or nil if the field is absent (letting AWF use its default).
+func extractModelFallback(workflowData *WorkflowData) *AWFModelFallbackConfig {
+	if workflowData == nil {
+		return nil
+	}
+	if workflowData.SandboxConfig == nil {
+		return nil
+	}
+	if workflowData.SandboxConfig.Agent == nil {
+		return nil
+	}
+	mf := workflowData.SandboxConfig.Agent.ModelFallback
+	if mf == nil {
+		return nil
+	}
+	return &AWFModelFallbackConfig{
+		Enabled: mf,
+	}
 }

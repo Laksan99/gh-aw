@@ -1,4 +1,5 @@
 ---
+emoji: "📰"
 description: Generates a daily news digest of repository activity including issues, PRs, discussions, and workflow runs
 on:
   schedule:
@@ -13,9 +14,11 @@ permissions:
   discussions: read
   actions: read
 
+  copilot-requests: write
 tracker-id: daily-news-weekday
 engine:
-  id: copilot
+  id: pi
+  model: copilot/gpt-5.4
   bare: true
 
 timeout-minutes: 30  # Reduced from 45 since pre-fetching data is faster
@@ -43,7 +46,7 @@ runs-on: aw-gpu-runner-T4
 
 runtimes:
   node:
-    version: "24"
+    version: "22"
 
 network:
   allowed:
@@ -52,7 +55,9 @@ network:
     - node
 
 sandbox:
-  agent: awf  # Firewall enabled (migrated from network.firewall)
+  agent:
+    id: awf
+    sudo: false
 safe-outputs:
   upload-artifact:
     max-uploads: 3
@@ -66,6 +71,8 @@ safe-outputs:
 
 tools:
   cli-proxy: true
+  github:
+    mode: gh-proxy
   edit:
   bash:
     - "*"
@@ -87,7 +94,7 @@ steps:
       set -e
       
       # Create directories
-      mkdir -p /tmp/gh-aw/daily-news-data
+      mkdir -p /tmp/gh-aw/agent/daily-news-data
       mkdir -p /tmp/gh-aw/repo-memory/default/daily-news-data
       
       # Check if cached data exists and is recent (< 24 hours old)
@@ -110,7 +117,7 @@ steps:
       # Use cached data if valid
       if [ "$CACHE_VALID" = true ]; then
         echo "📦 Using cached data from previous run"
-        cp -r /tmp/gh-aw/repo-memory/default/daily-news-data/* /tmp/gh-aw/daily-news-data/
+        cp -r /tmp/gh-aw/repo-memory/default/daily-news-data/* /tmp/gh-aw/agent/daily-news-data/
         echo "✅ Cached data restored to working directory"
         echo "cache_valid=true" >> "$GITHUB_OUTPUT"
       else
@@ -160,7 +167,7 @@ steps:
             }
           }
         }
-      " -f owner="${GITHUB_REPOSITORY_OWNER}" -f repo="${GITHUB_REPOSITORY#*/}" > /tmp/gh-aw/daily-news-data/issues.json
+      " -f owner="${GITHUB_REPOSITORY_OWNER}" -f repo="${GITHUB_REPOSITORY#*/}" > /tmp/gh-aw/agent/daily-news-data/issues.json
       echo "✅ Issues data fetched"
 
   - name: Fetch pull requests
@@ -213,7 +220,7 @@ steps:
             }
           }
         }
-      " -f owner="${GITHUB_REPOSITORY_OWNER}" -f repo="${GITHUB_REPOSITORY#*/}" > /tmp/gh-aw/daily-news-data/pull_requests.json
+      " -f owner="${GITHUB_REPOSITORY_OWNER}" -f repo="${GITHUB_REPOSITORY#*/}" > /tmp/gh-aw/agent/daily-news-data/pull_requests.json
       echo "✅ Pull requests data fetched"
 
   - name: Fetch commits
@@ -227,7 +234,7 @@ steps:
       gh api "repos/${GITHUB_REPOSITORY}/commits" \
         --paginate \
         --jq '[.[] | {sha, author: .commit.author, message: .commit.message, date: .commit.author.date, html_url}]' \
-        > /tmp/gh-aw/daily-news-data/commits.json
+        > /tmp/gh-aw/agent/daily-news-data/commits.json
       echo "✅ Commits data fetched"
 
   - name: Fetch releases
@@ -240,7 +247,7 @@ steps:
       echo "Fetching releases..."
       gh api "repos/${GITHUB_REPOSITORY}/releases" \
         --jq '[.[] | {tag_name, name, created_at, published_at, html_url, body}]' \
-        > /tmp/gh-aw/daily-news-data/releases.json
+        > /tmp/gh-aw/agent/daily-news-data/releases.json
       echo "✅ Releases data fetched"
 
   - name: Fetch discussions
@@ -268,7 +275,7 @@ steps:
             }
           }
         }
-      " -f owner="${GITHUB_REPOSITORY_OWNER}" -f repo="${GITHUB_REPOSITORY#*/}" > /tmp/gh-aw/daily-news-data/discussions.json
+      " -f owner="${GITHUB_REPOSITORY_OWNER}" -f repo="${GITHUB_REPOSITORY#*/}" > /tmp/gh-aw/agent/daily-news-data/discussions.json
       echo "✅ Discussions data fetched"
 
   - name: Check for changesets
@@ -280,13 +287,13 @@ steps:
       set -e
       echo "Checking for changesets..."
       if [ -d ".changeset" ]; then
-        find .changeset -name "*.md" -type f ! -name "README.md" > /tmp/gh-aw/daily-news-data/changesets.txt
+        find .changeset -name "*.md" -type f ! -name "README.md" > /tmp/gh-aw/agent/daily-news-data/changesets.txt
       else
-        echo "No changeset directory" > /tmp/gh-aw/daily-news-data/changesets.txt
+        echo "No changeset directory" > /tmp/gh-aw/agent/daily-news-data/changesets.txt
       fi
       echo "✅ Changeset check complete"
 
-  - name: Cache downloaded data
+  - name: Save downloaded data to cache
     if: steps.check-cache.outputs.cache_valid != 'true'
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -294,7 +301,7 @@ steps:
     run: |
       set -e
       echo "💾 Caching data for future runs..."
-      cp -r /tmp/gh-aw/daily-news-data/* /tmp/gh-aw/repo-memory/default/daily-news-data/
+      cp -r /tmp/gh-aw/agent/daily-news-data/* /tmp/gh-aw/repo-memory/default/daily-news-data/
       date +%s > "/tmp/gh-aw/repo-memory/default/daily-news-data/.timestamp"
       echo "✅ Data caching complete"
 
@@ -303,13 +310,14 @@ steps:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
     run: |
-      find /tmp/gh-aw/daily-news-data/ -maxdepth 1 -ls
+      find /tmp/gh-aw/agent/daily-news-data/ -maxdepth 1 -ls
 
 imports:
   - uses: shared/repo-memory-standard.md
     with:
       branch-name: "memory/daily-news"
       description: "Historical news digest data"
+  - shared/mcp/headroom.md
   - shared/mcp/tavily.md
   - ../skills/jqschema/SKILL.md
   - uses: shared/daily-audit-base.md
@@ -317,10 +325,9 @@ imports:
       title-prefix: "[daily-news] "
       expires: 3d
   - shared/trends.md
-  - shared/observability-otlp.md
+  - shared/otlp.md
 features:
-  copilot-requests: true
-
+  gh-aw-detection: true
 ---
 
 {{#runtime-import? .github/shared-instructions.md}}
@@ -333,7 +340,7 @@ Write an upbeat, friendly, motivating summary of recent activity in the repo.
 
 ## 📁 Pre-Downloaded Data Available
 
-**IMPORTANT**: All GitHub data has been pre-downloaded to `/tmp/gh-aw/daily-news-data/` to avoid excessive MCP calls. Use these files instead of making GitHub API calls:
+**IMPORTANT**: All GitHub data has been pre-downloaded to `/tmp/gh-aw/agent/daily-news-data/` to avoid excessive MCP calls. Use these files instead of making GitHub API calls:
 
 - **`issues.json`** - Open and recently closed issues (last 100 of each)
 - **`pull_requests.json`** - Open, merged, and closed pull requests
@@ -358,11 +365,11 @@ Write an upbeat, friendly, motivating summary of recent activity in the repo.
 - Cache processed trend data for faster chart generation
 - Store analysis results that can inform future reports
 
-{{#if experiments.prompt_style == "concise"}}
+{{#if experiments.prompt_style == 'concise'}}
 ## 📊 Trend Charts Requirement
 
 Generate exactly **2 trend charts** (issues/PRs activity and commit activity) using data from
-`/tmp/gh-aw/daily-news-data/`. Use Python (pandas + matplotlib/seaborn) to process the JSON
+`/tmp/gh-aw/agent/daily-news-data/`. Use Python (pandas + matplotlib/seaborn) to process the JSON
 files, produce PNGs at 300 DPI, upload them via `upload asset`, and embed them in the
 discussion under a `### 📈 Trend Analysis` section with a 2-3 sentence interpretation each.
 {{else}}
@@ -370,13 +377,13 @@ discussion under a `### 📈 Trend Analysis` section with a 2-3 sentence interpr
 
 **IMPORTANT**: Generate exactly 2 trend charts that showcase key metrics of the project. These charts should visualize trends over time to give the team insights into project health and activity patterns.
 
-Use the pre-downloaded data from `/tmp/gh-aw/daily-news-data/` to generate all statistics and charts.
+Use the pre-downloaded data from `/tmp/gh-aw/agent/daily-news-data/` to generate all statistics and charts.
 
 ### Chart Generation Process
 
 **Phase 1: Data Collection**
 
-**Use the pre-downloaded data files** from `/tmp/gh-aw/daily-news-data/`:
+**Use the pre-downloaded data files** from `/tmp/gh-aw/agent/daily-news-data/`:
 
 1. **Issues Activity Data**: Load from `issues.json`
    - Parse `openIssues.nodes` and `closedIssues.nodes`
@@ -403,7 +410,7 @@ Use the pre-downloaded data from `/tmp/gh-aw/daily-news-data/` to generate all s
 **Phase 2: Data Preparation**
 
 1. Create a Python script at `/tmp/gh-aw/python/process_data.py` that:
-   - Reads the JSON files from `/tmp/gh-aw/daily-news-data/`
+   - Reads the JSON files from `/tmp/gh-aw/agent/daily-news-data/`
    - Processes timestamps and aggregates by date
    - Generates CSV files in `/tmp/gh-aw/python/data/`:
      - `issues_prs_activity.csv` - Daily counts of issues and PRs
@@ -500,14 +507,14 @@ If insufficient data is available (less than 7 days):
 
 ---
 
-{{#if experiments.prompt_style == "concise"}}
-Read from the pre-downloaded files in `/tmp/gh-aw/daily-news-data/` (`issues.json`,
+{{#if experiments.prompt_style == 'concise'}}
+Read from the pre-downloaded files in `/tmp/gh-aw/agent/daily-news-data/` (`issues.json`,
 `pull_requests.json`, `commits.json`, `discussions.json`, `releases.json`, `changesets.txt`).
 Write an upbeat, emoji-accented digest covering: top issues and PRs, notable commits,
 community engagement, productivity suggestions, and a closing haiku.
 Create a GitHub discussion titled "Daily Status - <today's date>".
 {{else}}
-**Data Sources** - Use the pre-downloaded files in `/tmp/gh-aw/daily-news-data/`:
+**Data Sources** - Use the pre-downloaded files in `/tmp/gh-aw/agent/daily-news-data/`:
 - Include some or all of the following from the JSON files:
   * Recent issues activity (from `issues.json`)
   * Recent pull requests (from `pull_requests.json`)
@@ -532,10 +539,20 @@ Create a GitHub discussion titled "Daily Status - <today's date>".
 
 - In a note at the end of the report, include a log of:
   * All web search queries you used (if any)
-  * All files you read from `/tmp/gh-aw/daily-news-data/`
+  * All files you read from `/tmp/gh-aw/agent/daily-news-data/`
   * Summary statistics: number of issues/PRs/commits/discussions analyzed
   * Date range of data analyzed
   * Any data limitations encountered
+
+Use h3 (`###`) or lower for all headers in the discussion. Never use h1 (`#`) or h2 (`##`) inside discussion bodies — these are reserved for the discussion title.
+
+Wrap long sections in `<details><summary><b>Section Name</b></summary>` tags to improve readability and reduce scrolling.
+
+Suggested structure:
+- Brief summary (always visible)
+- Key metrics or highlights (always visible)
+- Detailed analysis (in `<details>` tags)
+- Recommendations (always visible)
 
 Create a new GitHub discussion with a title containing today's date (e.g., "Daily Status - 2024-10-10") containing a markdown report with your findings. Use links where appropriate.
 

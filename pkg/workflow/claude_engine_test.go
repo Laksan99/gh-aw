@@ -64,6 +64,9 @@ func TestClaudeEngine(t *testing.T) {
 	if strings.Contains(installStep, "--ignore-scripts") {
 		t.Errorf("Expected no --ignore-scripts flag for Claude Code (requires post-install scripts), got: %s", installStep)
 	}
+	if strings.Contains(installStep, "NPM_CONFIG_MIN_RELEASE_AGE") {
+		t.Errorf("Expected no npm release-age cooldown env for Claude install, got: %s", installStep)
+	}
 
 	// Test execution steps
 	workflowData := &WorkflowData{
@@ -134,7 +137,7 @@ func TestClaudeEngine(t *testing.T) {
 	}
 
 	// When no tools/MCP servers are configured, --mcp-config flag should NOT be present
-	if strings.Contains(stepContent, `--mcp-config '${RUNNER_TEMP}/gh-aw/mcp-config/mcp-servers.json'`) {
+	if strings.Contains(stepContent, `--mcp-config "${RUNNER_TEMP}/gh-aw/mcp-config/mcp-servers.json"`) {
 		t.Errorf("Did not expect MCP config in CLI args (no MCP servers): %s", stepContent)
 	}
 
@@ -169,6 +172,27 @@ func TestClaudeEngineWithOutput(t *testing.T) {
 	if !strings.Contains(stepContent, "GH_AW_SAFE_OUTPUTS: ${{ steps.set-runtime-paths.outputs.GH_AW_SAFE_OUTPUTS }}") {
 		t.Errorf("Expected GH_AW_SAFE_OUTPUTS in env section when hasOutput=true in step content:\n%s", stepContent)
 	}
+}
+
+func TestClaudeEngineLLMProviderGitHubUsesCopilotCredentials(t *testing.T) {
+	engine := NewClaudeEngine()
+	workflowData := &WorkflowData{
+		Name: "test-workflow",
+		EngineConfig: &EngineConfig{
+			LLMProvider: "github",
+		},
+		NetworkPermissions: &NetworkPermissions{
+			Firewall: &FirewallConfig{Enabled: true},
+		},
+	}
+
+	steps := engine.GetExecutionSteps(workflowData, "test-log")
+	require.Len(t, steps, 1)
+	stepContent := strings.Join([]string(steps[0]), "\n")
+
+	assert.Contains(t, stepContent, "GH_AW_LLM_PROVIDER: github")
+	assert.Contains(t, stepContent, "ANTHROPIC_API_KEY: ${{ secrets.COPILOT_GITHUB_TOKEN }}")
+	assert.Contains(t, stepContent, fmt.Sprintf("ANTHROPIC_BASE_URL: http://host.docker.internal:%d", constants.CopilotLLMGatewayPort))
 }
 
 func TestClaudeEngineAllowsMountedMCPCLICommandsInRestrictedBash(t *testing.T) {
@@ -208,6 +232,7 @@ func TestClaudeEnginePermissionMode(t *testing.T) {
 	tests := []struct {
 		name            string
 		tools           map[string]any
+		engineConfig    *EngineConfig
 		expectedMode    string
 		notExpectedMode string
 	}{
@@ -226,36 +251,89 @@ func TestClaudeEnginePermissionMode(t *testing.T) {
 			notExpectedMode: "bypassPermissions",
 		},
 		{
-			name: "bash wildcard * — bypassPermissions",
+			name: "bash wildcard * no longer forces bypassPermissions",
 			tools: map[string]any{
 				"bash": []any{"*"},
 			},
-			expectedMode:    "bypassPermissions",
-			notExpectedMode: "acceptEdits",
+			expectedMode:    "acceptEdits",
+			notExpectedMode: "bypassPermissions",
 		},
 		{
-			name: "bash colon-wildcard :* — bypassPermissions",
+			name: "bash colon-wildcard :* no longer forces bypassPermissions",
 			tools: map[string]any{
 				"bash": []any{":*"},
 			},
-			expectedMode:    "bypassPermissions",
-			notExpectedMode: "acceptEdits",
+			expectedMode:    "acceptEdits",
+			notExpectedMode: "bypassPermissions",
 		},
 		{
-			name: "bash nil value (unrestricted) — bypassPermissions",
+			name: "bash true no longer forces bypassPermissions",
+			tools: map[string]any{
+				"bash": true,
+			},
+			expectedMode:    "acceptEdits",
+			notExpectedMode: "bypassPermissions",
+		},
+		{
+			name: "bash nil no longer forces bypassPermissions",
 			tools: map[string]any{
 				"bash": nil,
 			},
-			expectedMode:    "bypassPermissions",
+			expectedMode:    "acceptEdits",
+			notExpectedMode: "bypassPermissions",
+		},
+		{
+			name: "edit false defaults to auto permission mode",
+			tools: map[string]any{
+				"edit": false,
+			},
+			expectedMode:    "auto",
 			notExpectedMode: "acceptEdits",
+		},
+		{
+			name: "engine.permission-mode overrides tools.edit=false default",
+			tools: map[string]any{
+				"edit": false,
+			},
+			engineConfig: &EngineConfig{
+				PermissionMode: "acceptEdits",
+			},
+			expectedMode:    "acceptEdits",
+			notExpectedMode: "auto",
+		},
+		{
+			name: "legacy engine.args permission-mode override still works with one emitted flag",
+			engineConfig: &EngineConfig{
+				Args: []string{"--permission-mode", "auto"},
+			},
+			expectedMode:    "auto",
+			notExpectedMode: "acceptEdits",
+		},
+		{
+			name: "legacy engine.args permission-mode=value override still works with one emitted flag",
+			engineConfig: &EngineConfig{
+				Args: []string{"--permission-mode=auto"},
+			},
+			expectedMode:    "auto",
+			notExpectedMode: "acceptEdits",
+		},
+		{
+			name: "engine.permission-mode overrides legacy engine.args permission-mode",
+			engineConfig: &EngineConfig{
+				PermissionMode: "plan",
+				Args:           []string{"--permission-mode", "auto"},
+			},
+			expectedMode:    "plan",
+			notExpectedMode: "auto",
 		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			workflowData := &WorkflowData{
-				Name:  "test-workflow",
-				Tools: tt.tools,
+				Name:         "test-workflow",
+				Tools:        tt.tools,
+				EngineConfig: tt.engineConfig,
 			}
 			steps := engine.GetExecutionSteps(workflowData, "test-log")
 			require.Len(t, steps, 1, "Expected one execution step")
@@ -264,6 +342,111 @@ func TestClaudeEnginePermissionMode(t *testing.T) {
 				"Expected --permission-mode %s", tt.expectedMode)
 			assert.NotContains(t, stepContent, "--permission-mode "+tt.notExpectedMode,
 				"Did not expect --permission-mode %s", tt.notExpectedMode)
+			assert.Equal(t, 1, strings.Count(stepContent, "--permission-mode"),
+				"Expected exactly one --permission-mode flag in CLI args")
+		})
+	}
+}
+
+func TestIsEditToolExplicitlyDisabled(t *testing.T) {
+	tests := []struct {
+		name     string
+		tools    map[string]any
+		expected bool
+	}{
+		{
+			name:     "nil tools",
+			tools:    nil,
+			expected: false,
+		},
+		{
+			name: "edit missing",
+			tools: map[string]any{
+				"bash": []any{"echo"},
+			},
+			expected: false,
+		},
+		{
+			name: "edit false",
+			tools: map[string]any{
+				"edit": false,
+			},
+			expected: true,
+		},
+		{
+			name: "edit true",
+			tools: map[string]any{
+				"edit": true,
+			},
+			expected: false,
+		},
+		{
+			name: "edit null",
+			tools: map[string]any{
+				"edit": nil,
+			},
+			expected: false,
+		},
+		{
+			name: "edit as string",
+			tools: map[string]any{
+				"edit": "false",
+			},
+			expected: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.expected, isEditToolExplicitlyDisabled(tt.tools))
+		})
+	}
+}
+
+func TestStripClaudePermissionModeArgs(t *testing.T) {
+	tests := []struct {
+		name               string
+		inputArgs          []string
+		expectedArgs       []string
+		expectedPermission string
+	}{
+		{
+			name:               "no permission mode args",
+			inputArgs:          []string{"--foo", "bar"},
+			expectedArgs:       []string{"--foo", "bar"},
+			expectedPermission: "",
+		},
+		{
+			name:               "split permission mode arg",
+			inputArgs:          []string{"--permission-mode", "auto", "--foo"},
+			expectedArgs:       []string{"--foo"},
+			expectedPermission: "auto",
+		},
+		{
+			name:               "equals permission mode arg",
+			inputArgs:          []string{"--foo", "--permission-mode=plan"},
+			expectedArgs:       []string{"--foo"},
+			expectedPermission: "plan",
+		},
+		{
+			name:               "multiple permission mode args use last value",
+			inputArgs:          []string{"--permission-mode", "auto", "--permission-mode=acceptEdits", "--foo"},
+			expectedArgs:       []string{"--foo"},
+			expectedPermission: "acceptEdits",
+		},
+		{
+			name:               "dangling permission mode flag is removed",
+			inputArgs:          []string{"--foo", "--permission-mode"},
+			expectedArgs:       []string{"--foo"},
+			expectedPermission: "",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			args, permissionMode := stripClaudePermissionModeArgs(tt.inputArgs)
+			assert.Equal(t, tt.expectedArgs, args)
+			assert.Equal(t, tt.expectedPermission, permissionMode)
 		})
 	}
 }
@@ -453,7 +636,7 @@ func TestClaudeEngineWithMCPServers(t *testing.T) {
 	stepContent := strings.Join([]string(executionStep), "\n")
 
 	// When MCP servers are configured, --mcp-config flag SHOULD be present
-	if !strings.Contains(stepContent, `--mcp-config '${RUNNER_TEMP}/gh-aw/mcp-config/mcp-servers.json'`) {
+	if !strings.Contains(stepContent, `--mcp-config "${RUNNER_TEMP}/gh-aw/mcp-config/mcp-servers.json"`) {
 		t.Errorf("Expected --mcp-config in CLI args when MCP servers are configured: %s", stepContent)
 	}
 
@@ -487,7 +670,7 @@ func TestClaudeEngineWithSafeOutputs(t *testing.T) {
 	stepContent := strings.Join([]string(executionStep), "\n")
 
 	// When safe-outputs is configured, --mcp-config flag SHOULD be present
-	if !strings.Contains(stepContent, `--mcp-config '${RUNNER_TEMP}/gh-aw/mcp-config/mcp-servers.json'`) {
+	if !strings.Contains(stepContent, `--mcp-config "${RUNNER_TEMP}/gh-aw/mcp-config/mcp-servers.json"`) {
 		t.Errorf("Expected --mcp-config in CLI args when safe-outputs are configured: %s", stepContent)
 	}
 
@@ -768,5 +951,74 @@ func TestClaudeEngineWithExpressionVersion(t *testing.T) {
 	// Should NOT embed expression directly in shell command
 	if strings.Contains(installStep, "@anthropic-ai/claude-code@"+expressionVersion) {
 		t.Errorf("Expression should NOT be embedded directly in npm install command, got:\n%s", installStep)
+	}
+}
+
+func TestIsAnthropicWIF(t *testing.T) {
+	tests := []struct {
+		name         string
+		workflowData *WorkflowData
+		want         bool
+	}{
+		{
+			name:         "nil workflowData returns false",
+			workflowData: nil,
+			want:         false,
+		},
+		{
+			name:         "nil EngineConfig returns false",
+			workflowData: &WorkflowData{},
+			want:         false,
+		},
+		{
+			name: "nil Auth returns false",
+			workflowData: &WorkflowData{
+				EngineConfig: &EngineConfig{},
+			},
+			want: false,
+		},
+		{
+			name: "github-oidc without provider returns false",
+			workflowData: &WorkflowData{
+				EngineConfig: &EngineConfig{
+					Auth: &EngineAuthConfig{Type: "github-oidc"},
+				},
+			},
+			want: false,
+		},
+		{
+			name: "github-oidc with azure provider returns false",
+			workflowData: &WorkflowData{
+				EngineConfig: &EngineConfig{
+					Auth: &EngineAuthConfig{Type: "github-oidc", Provider: "azure"},
+				},
+			},
+			want: false,
+		},
+		{
+			name: "static type with anthropic provider returns false",
+			workflowData: &WorkflowData{
+				EngineConfig: &EngineConfig{
+					Auth: &EngineAuthConfig{Type: "static", Provider: "anthropic"},
+				},
+			},
+			want: false,
+		},
+		{
+			name: "github-oidc with anthropic provider returns true",
+			workflowData: &WorkflowData{
+				EngineConfig: &EngineConfig{
+					Auth: &EngineAuthConfig{Type: "github-oidc", Provider: "anthropic"},
+				},
+			},
+			want: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := isAnthropicWIF(tt.workflowData)
+			assert.Equal(t, tt.want, got)
+		})
 	}
 }

@@ -18,8 +18,16 @@ This command creates a temporary private repository in your GitHub account, inst
 workflow(s) from their source repositories, and runs them in "trial mode" to capture safe outputs without
 making actual changes to the "simulated" host repository.
 
-Examples:
-  ` + string(constants.CLIExtensionPrefix) + ` trial githubnext/agentics/weekly-research                         # Run a single workflow in a temporary trial repository
+Repository modes:
+- Default mode (no flags): Creates a temporary trial repository and simulates execution as if running against the current repository (github.repository context points to current repo)
+- --logical-repo REPO: Simulates execution against a specified repository (github.repository context points to REPO while actually running in a temporary trial repository)
+- --host-repo REPO: Uses the specified repository as the host for trial execution instead of creating a temporary one
+- --clone-repo REPO: Clones the specified repository's contents into the trial repository before execution (useful for testing against actual repository state)
+
+All workflows must support workflow_dispatch trigger to be used in trial mode.
+The host repository will be created as private and kept by default unless --delete-host-repo-after is specified.
+Trial results are saved both locally (in trials/ directory) and in the host repository for future reference.`,
+		Example: `  ` + string(constants.CLIExtensionPrefix) + ` trial githubnext/agentics/weekly-research                         # Run a single workflow in a temporary trial repository
   ` + string(constants.CLIExtensionPrefix) + ` trial githubnext/agentics/daily-plan githubnext/agentics/weekly-research # Compare multiple workflows
   ` + string(constants.CLIExtensionPrefix) + ` trial githubnext/agentics/daily-plan myorg/myrepo/custom-workflow # Run workflows from different repositories
   ` + string(constants.CLIExtensionPrefix) + ` trial githubnext/agentics/my-workflow --host-repo myorg/myrepo    # Use an existing host repository
@@ -33,19 +41,10 @@ Examples:
   ` + string(constants.CLIExtensionPrefix) + ` trial githubnext/agentics/my-workflow --host-repo .               # Use the current repository as the host
   ` + string(constants.CLIExtensionPrefix) + ` trial ./local-workflow.md --clone-repo upstream/repo --repeat 2   # Run a local workflow against cloned contents
   ` + string(constants.CLIExtensionPrefix) + ` trial githubnext/agentics/my-workflow --trigger-context https://github.com/owner/repo/issues/123 # Provide issue context for issue-triggered workflows
-
-Repository modes:
-- Default mode (no flags): Creates a temporary trial repository and simulates execution as if running against the current repository (github.repository context points to current repo)
-- --logical-repo REPO: Simulates execution against a specified repository (github.repository context points to REPO while actually running in a temporary trial repository)
-- --host-repo REPO: Uses the specified repository as the host for trial execution instead of creating a temporary one
-- --clone-repo REPO: Clones the specified repository's contents into the trial repository before execution (useful for testing against actual repository state)
-
-All workflows must support workflow_dispatch trigger to be used in trial mode.
-The host repository will be created as private and kept by default unless --delete-host-repo-after is specified.
-Trial results are saved both locally (in trials/ directory) and in the host repository for future reference.`,
+`,
 		Args: func(cmd *cobra.Command, args []string) error {
 			if len(args) < 1 {
-				return fmt.Errorf("missing workflow specification\n\nUsage:\n  %s <workflow-spec>...\n\nExamples:\n  %[1]s githubnext/agentics/daily-plan             Trial a workflow from a repository\n  %[1]s ./local-workflow.md                         Trial a local workflow\n\nRun '%[1]s --help' for more information", cmd.CommandPath())
+				return fmt.Errorf("missing workflow specification\n\nUsage:\n  %s <workflow-spec>...\n\nExample:\n  %[1]s githubnext/agentics/daily-plan             Trial a workflow from a repository\n  %[1]s ./local-workflow.md                         Trial a local workflow\n\nRun '%[1]s --help' for more information", cmd.CommandPath())
 			}
 			return nil
 		},
@@ -55,7 +54,6 @@ Trial results are saved both locally (in trials/ directory) and in the host repo
 			logicalRepoSpec, _ := cmd.Flags().GetString("logical-repo")
 			cloneRepoSpec, _ := cmd.Flags().GetString("clone-repo")
 			hostRepoSpec, _ := cmd.Flags().GetString("host-repo")
-			repoSpec, _ := cmd.Flags().GetString("repo")
 			deleteHostRepo, _ := cmd.Flags().GetBool("delete-host-repo-after")
 			forceDeleteHostRepo, _ := cmd.Flags().GetBool("force-delete-host-repo-before")
 			yes, _ := cmd.Flags().GetBool("yes")
@@ -68,7 +66,9 @@ Trial results are saved both locally (in trials/ directory) and in the host repo
 			engineOverride, _ := cmd.Flags().GetString("engine")
 			appendText, _ := cmd.Flags().GetString("append")
 			verbose, _ := cmd.Root().PersistentFlags().GetBool("verbose")
-			disableSecurityScanner, _ := cmd.Flags().GetBool("disable-security-scanner")
+			disableSecurityScanner, _ := cmd.Flags().GetBool("no-security-scanner")
+			disableSecurityScannerLegacy, _ := cmd.Flags().GetBool("disable-security-scanner")
+			disableSecurityScanner = disableSecurityScanner || disableSecurityScannerLegacy
 
 			if err := validateEngine(engineOverride); err != nil {
 				trialLog.Printf("Engine validation failed: engine=%s, err=%v", engineOverride, err)
@@ -78,11 +78,6 @@ Trial results are saved both locally (in trials/ directory) and in the host repo
 				trialLog.Printf("Trial options: dry_run=%v, repeat=%d, timeout_min=%d, auto_merge_prs=%v, logical_repo=%q, clone_repo=%q, host_repo=%q",
 					dryRun, repeatCount, timeout, autoMergePRs, logicalRepoSpec, cloneRepoSpec, hostRepoSpec)
 			}
-			// If --repo was used instead of --host-repo, use its value
-			if repoSpec != "" {
-				hostRepoSpec = repoSpec
-			}
-
 			opts := TrialOptions{
 				Repos: TrialRepoContext{
 					LogicalRepo: logicalRepoSpec,
@@ -116,21 +111,20 @@ Trial results are saved both locally (in trials/ directory) and in the host repo
 	cmd.Flags().String("clone-repo", "", "Clone the contents of the specified repository into the host repository before execution (useful for testing against actual repository state)")
 
 	cmd.Flags().String("host-repo", "", "Custom host repository slug (defaults to '<username>/gh-aw-trial'). Use '.' for current repository")
-	cmd.Flags().String("repo", "", "Alias for --host-repo: the repository where workflows are installed and run (note: different semantics from --repo in other commands)")
-	_ = cmd.Flags().MarkHidden("repo") // Hide alias to avoid semantic confusion with --repo in other commands
 	cmd.Flags().Bool("delete-host-repo-after", false, "Delete the host repository after completion (kept by default)")
 	cmd.Flags().Bool("force-delete-host-repo-before", false, "Force delete the host repository before creation if it already exists")
 	cmd.Flags().BoolP("yes", "y", false, "Skip confirmation prompts")
-	cmd.Flags().Bool("dry-run", false, "Show what would be done without making any changes")
-	cmd.Flags().Int("timeout", 30, "Execution timeout in minutes")
+	cmd.Flags().Bool("dry-run", false, "Preview trial execution without applying any changes")
+	cmd.Flags().Int("timeout", 30, "Execution timeout in minutes (set to 0 to disable timeout)")
 	cmd.Flags().String("trigger-context", "", "Trigger context URL (e.g., GitHub issue URL) for issue-triggered workflows")
 	cmd.Flags().Int("repeat", 0, "Number of additional times to run after the initial execution (e.g., --repeat 3 runs 4 times total)")
 	cmd.Flags().Bool("auto-merge-prs", false, "Auto-merge any pull requests created during trial execution")
 	addEngineFlag(cmd)
 	addJSONFlag(cmd)
 	cmd.Flags().String("append", "", "Append extra content to the end of agentic workflow on installation")
+	cmd.Flags().Bool("no-security-scanner", false, "Disable security scanning of workflow markdown content")
 	cmd.Flags().Bool("disable-security-scanner", false, "Disable security scanning of workflow markdown content")
-	cmd.MarkFlagsMutuallyExclusive("host-repo", "repo")
+	_ = cmd.Flags().MarkHidden("disable-security-scanner")
 	cmd.MarkFlagsMutuallyExclusive("logical-repo", "clone-repo")
 
 	return cmd

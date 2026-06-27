@@ -67,8 +67,13 @@ func GenerateJobConcurrencyConfig(workflowData *WorkflowData) string {
 		return ""
 	}
 
-	// Build the default concurrency configuration
+	// Build the default concurrency configuration.
+	// For workflow_call workers, github.workflow resolves to the caller workflow
+	// name, so use the compile-time workflow ID to avoid cross-worker collisions.
 	groupValue := fmt.Sprintf("gh-aw-%s-${{ github.workflow }}", engineID)
+	if hasWorkflowCallTrigger(workflowData.On) && workflowData.WorkflowID != "" {
+		groupValue = fmt.Sprintf("gh-aw-%s-%s", engineID, workflowData.WorkflowID)
+	}
 	// If the user specified a job-discriminator, append it so that concurrent
 	// runs with different inputs (fan-out pattern) do not share the same group.
 	if workflowData.ConcurrencyJobDiscriminator != "" {
@@ -76,6 +81,9 @@ func GenerateJobConcurrencyConfig(workflowData *WorkflowData) string {
 		groupValue = fmt.Sprintf("%s-%s", groupValue, workflowData.ConcurrencyJobDiscriminator)
 	}
 	concurrencyConfig := fmt.Sprintf("concurrency:\n  group: \"%s\"", groupValue)
+	if isGroupConcurrencyQueueEnabled(workflowData) {
+		concurrencyConfig += "\n  queue: max"
+	}
 
 	return concurrencyConfig
 }
@@ -167,7 +175,7 @@ func isSlashCommandWorkflow(on string) bool {
 // inserted between the primary identifiers and the tail, providing a stable per-item
 // key for manual workflow_dispatch runs triggered via the label trigger shorthand.
 func entityConcurrencyKey(primaryParts []string, tailParts []string, hasItemNumber bool) string {
-	parts := make([]string, 0, len(primaryParts)+len(tailParts)+1)
+	parts := make([]string, 0, safeAllocationCapacity(len(primaryParts), len(tailParts), 1))
 	parts = append(parts, primaryParts...)
 	if hasItemNumber {
 		parts = append(parts, "inputs.item_number")
@@ -182,7 +190,7 @@ func entityConcurrencyKey(primaryParts []string, tailParts []string, hasItemNumb
 // When contains(github.actor, '[bot]') is true, the expression short-circuits to
 // github.run_id so that bot-triggered runs never share a group with human runs.
 func botIsolatedConcurrencyKey(primaryParts []string, tailParts []string, hasItemNumber bool) string {
-	parts := make([]string, 0, len(primaryParts)+len(tailParts)+2)
+	parts := make([]string, 0, safeAllocationCapacity(len(primaryParts), len(tailParts), 2))
 	// Prepend the bot-actor isolation check: bot runs always get a unique key
 	parts = append(parts, "contains(github.actor, '[bot]') && github.run_id")
 	parts = append(parts, primaryParts...)

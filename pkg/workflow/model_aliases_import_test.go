@@ -15,39 +15,31 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// TestModelAliasesFromImportedWorkflow verifies that model aliases defined in an imported
-// (shared) workflow file are included in the compiled AWF config, and that the main
-// workflow file's aliases take precedence.
+// TestModelAliasesFromImportedWorkflow verifies that a workflow can import a shared workflow
+// and that compilation succeeds. Model aliases via the `models` frontmatter field have been
+// removed; aliases now come only from the builtin alias map.
 func TestModelAliasesFromImportedWorkflow(t *testing.T) {
 	tempDir := testutil.TempDir(t, "models-import-test-*")
 
-	// Shared workflow defines a custom alias and a non-conflicting vendor alias.
+	// Shared workflow with no model alias declarations.
 	sharedWorkflowPath := filepath.Join(tempDir, "shared-models.md")
 	sharedWorkflowContent := `---
-models:
-  shared-alias:
-    - shared/model-v1
-  sonnet:
-    - import/sonnet-override
+description: Shared Models
 ---
 
 # Shared Models
 `
 	require.NoError(t, os.WriteFile(sharedWorkflowPath, []byte(sharedWorkflowContent), 0644))
 
-	// Main workflow imports the shared file and overrides one alias.
+	// Main workflow imports the shared file.
 	mainWorkflowPath := filepath.Join(tempDir, "main-workflow.md")
 	mainWorkflowContent := `---
 on: issues
 permissions:
   contents: read
   issues: read
+strict: false
 engine: copilot
-models:
-  main-alias:
-    - main/model-v1
-  shared-alias:
-    - main/override-shared
 imports:
   - shared-models.md
 ---
@@ -65,10 +57,6 @@ imports:
 
 	lockYAML := string(lockFileContent)
 
-	// Verify the generated lock file compiles successfully. Since models are not yet
-	// emitted to awf-config.json (pending AWF firewall support), we verify that the
-	// compilation itself succeeds and produces a valid lock file without checking for
-	// model alias names in the lock YAML (they don't appear in the JSON config yet).
 	assert.NotEmpty(t, lockYAML, "lock file should be non-empty after successful compilation")
 }
 
@@ -103,7 +91,7 @@ func TestModelAliasesImportMergeOrder(t *testing.T) {
 
 		// Builtins are still present.
 		assert.NotEmpty(t, merged["sonnet"], "builtin sonnet should still be present")
-		assert.NotEmpty(t, merged["auto"], "builtin auto should still be present")
+		assert.NotEmpty(t, merged["agent"], "builtin agent should still be present")
 	})
 }
 
@@ -151,5 +139,5 @@ func TestModelAliasesAWFConfigJSON(t *testing.T) {
 
 	// Other builtins preserved.
 	assert.NotEmpty(t, mappings["sonnet"], "builtin sonnet should still be in ModelMappings")
-	assert.NotEmpty(t, mappings["auto"], "builtin auto should still be in ModelMappings")
+	assert.NotEmpty(t, mappings["agent"], "builtin agent should still be in ModelMappings")
 }

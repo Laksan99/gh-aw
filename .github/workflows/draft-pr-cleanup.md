@@ -1,4 +1,6 @@
 ---
+private: true
+emoji: "🧹"
 name: Draft PR Cleanup
 description: Automated cleanup policy for stale draft pull requests to reduce clutter and improve triage efficiency
 on:
@@ -8,10 +10,13 @@ permissions:
   contents: read
   pull-requests: read
   # Note: PR write operations handled via safe-outputs
-engine: copilot
+  copilot-requests: write
+engine:
+  id: copilot
+  copilot-sdk: true
 strict: true
 imports:
-  - shared/observability-otlp.md
+  - shared/otlp.md
 tools:
   cli-proxy: true
   github:
@@ -32,9 +37,6 @@ safe-outputs:
     run-success: "✅ Draft PR cleanup complete! [{workflow_name}]({run_url}) has reviewed and processed stale drafts."
     run-failure: "❌ Draft PR cleanup failed! [{workflow_name}]({run_url}) {status}. Some draft PRs may not be processed."
 timeout-minutes: 20
-features:
-  copilot-requests: true
-
 ---
 
 # Draft PR Cleanup Agent 🧹
@@ -206,7 +208,7 @@ Create a summary of actions taken:
 *Draft PR Cleanup workflow run: ${{ github.run_id }}*
 ```
 
-## Important Guidelines
+### Important Guidelines
 
 ### Fair and Transparent
 - Calculate inactivity objectively based on measurable activity
@@ -232,7 +234,7 @@ Create a summary of actions taken:
 - **PR with `stale-draft` but recent activity**: Remove `stale-draft` label if activity < 10 days
 - **Bot-created PRs**: Apply same rules, but consider if bot is still active
 
-## Success Metrics
+### Success Metrics
 
 Effectiveness measured by:
 - **Draft PR rate**: Reduce from 9.6% to <5% over time

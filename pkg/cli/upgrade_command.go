@@ -19,14 +19,15 @@ var upgradeLog = logger.New("cli:upgrade_command")
 
 // UpgradeConfig contains configuration for the upgrade command
 type UpgradeConfig struct {
-	Verbose     bool
-	WorkflowDir string
-	NoFix       bool
-	NoCompile   bool
-	CreatePR    bool
-	NoActions   bool
-	Audit       bool
-	JSON        bool
+	Verbose            bool
+	WorkflowDir        string
+	NoFix              bool
+	NoCompile          bool
+	CreatePR           bool
+	NoActions          bool
+	Audit              bool
+	JSON               bool
+	DisabledCodemodIDs []string
 }
 
 // NewUpgradeCommand creates the upgrade command
@@ -55,18 +56,22 @@ Use --audit to check dependency health without performing upgrades. This include
 
 The --audit flag skips the normal upgrade process.
 
-This command always upgrades all Markdown files in .github/workflows.
-
-Examples:
-  ` + string(constants.CLIExtensionPrefix) + ` upgrade                    # Upgrade all workflows
+This command always upgrades all Markdown files in .github/workflows.`,
+		Example: `  ` + string(constants.CLIExtensionPrefix) + ` upgrade                    # Upgrade all workflows
   ` + string(constants.CLIExtensionPrefix) + ` upgrade --no-fix          # Update agent files only (skip codemods, actions, and compilation)
   ` + string(constants.CLIExtensionPrefix) + ` upgrade --no-actions      # Skip updating GitHub Actions versions
   ` + string(constants.CLIExtensionPrefix) + ` upgrade --no-compile      # Skip recompiling workflows (do not modify lock files)
   ` + string(constants.CLIExtensionPrefix) + ` upgrade --create-pull-request  # Upgrade and open a pull request
   ` + string(constants.CLIExtensionPrefix) + ` upgrade --dir custom/workflows  # Upgrade workflows in custom directory
+  ` + string(constants.CLIExtensionPrefix) + ` upgrade --org my-org       # Preview upgrade pull requests across an organization
+  ` + string(constants.CLIExtensionPrefix) + ` upgrade --org my-org --repos '*-service'  # Limit org mode to matching repositories
+  ` + string(constants.CLIExtensionPrefix) + ` upgrade --org my-org --create-pull-request  # Open upgrade pull requests in org repositories
+  ` + string(constants.CLIExtensionPrefix) + ` upgrade --org my-org --create-pull-request --yes  # Auto-accept per-repo confirmations for PR creation (required in CI)
+  ` + string(constants.CLIExtensionPrefix) + ` upgrade --org my-org --create-issue  # Open issues in org repos with agentic workflows
+  ` + string(constants.CLIExtensionPrefix) + ` upgrade --org my-org --create-issue --yes  # Auto-accept per-repo confirmations (required in CI)
   ` + string(constants.CLIExtensionPrefix) + ` upgrade --audit           # Check dependency health without upgrading
   ` + string(constants.CLIExtensionPrefix) + ` upgrade --audit --json    # Output audit results in JSON format
-  ` + string(constants.CLIExtensionPrefix) + ` upgrade --pre-releases    # Include prerelease versions when self-upgrading the extension`,
+  ` + string(constants.CLIExtensionPrefix) + ` upgrade --pre-releases    # Include prerelease versions when self-upgrading the extension (stable releases are the default)`,
 		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			verbose, _ := cmd.Flags().GetBool("verbose")
@@ -75,17 +80,52 @@ Examples:
 			createPRFlag, _ := cmd.Flags().GetBool("create-pull-request")
 			prFlagAlias, _ := cmd.Flags().GetBool("pr")
 			createPR := createPRFlag || prFlagAlias
+			createIssue, _ := cmd.Flags().GetBool("create-issue")
+			yes, _ := cmd.Flags().GetBool("yes")
 			noActions, _ := cmd.Flags().GetBool("no-actions")
 			noCompile, _ := cmd.Flags().GetBool("no-compile")
 			auditFlag, _ := cmd.Flags().GetBool("audit")
 			jsonOutput, _ := cmd.Flags().GetBool("json")
+			disabledCodemods, _ := cmd.Flags().GetStringSlice("disable-codemod")
 			skipExtensionUpgrade, _ := cmd.Flags().GetBool("skip-extension-upgrade")
 			approveUpgrade, _ := cmd.Flags().GetBool("approve")
 			preReleases, _ := cmd.Flags().GetBool("pre-releases")
+			targetOrg, _ := cmd.Flags().GetString("org")
+			repoGlobs, _ := cmd.Flags().GetStringSlice("repos")
+
+			if len(repoGlobs) > 0 && targetOrg == "" {
+				return errors.New("--repos requires --org to be specified")
+			}
+
+			if createIssue && targetOrg == "" {
+				return errors.New("--create-issue requires --org to be specified")
+			}
+
+			if createPR && createIssue {
+				return errors.New("cannot specify both --create-pull-request and --create-issue")
+			}
 
 			// Handle audit mode
 			if auditFlag {
 				return runDependencyAudit(cmd.Context(), verbose, jsonOutput)
+			}
+
+			opts := upgradeOptions{
+				ctx:                  cmd.Context(),
+				verbose:              verbose,
+				workflowDir:          dir,
+				noFix:                noFix,
+				noCompile:            noCompile,
+				noActions:            noActions,
+				disabledCodemodIDs:   disabledCodemods,
+				skipExtensionUpgrade: skipExtensionUpgrade,
+				approve:              approveUpgrade,
+				preReleases:          preReleases,
+				yes:                  yes,
+			}
+
+			if targetOrg != "" {
+				return runUpgradeForOrg(cmd.Context(), targetOrg, repoGlobs, opts, createPR, createIssue, verbose)
 			}
 
 			if createPR {
@@ -94,7 +134,7 @@ Examples:
 				}
 			}
 
-			if err := runUpgradeCommand(cmd.Context(), verbose, dir, noFix, noCompile, noActions, skipExtensionUpgrade, approveUpgrade, preReleases); err != nil {
+			if err := runUpgradeCommand(opts); err != nil {
 				return err
 			}
 
@@ -113,14 +153,19 @@ Examples:
 	cmd.Flags().Bool("no-fix", false, "Skip codemods, action version updates, and workflow compilation (only update agent files)")
 	cmd.Flags().Bool("no-actions", false, "Skip updating GitHub Actions versions (ignored when --no-fix is set)")
 	cmd.Flags().Bool("no-compile", false, "Skip recompiling workflows (do not modify lock files; ignored when --no-fix is set)")
+	cmd.Flags().StringSlice("disable-codemod", nil, "Disable specific codemod IDs during the fix step (repeatable)")
 	cmd.Flags().Bool("create-pull-request", false, "Create a pull request with the upgrade changes")
 	cmd.Flags().Bool("pr", false, "Alias for --create-pull-request")
 	_ = cmd.Flags().MarkHidden("pr") // Hide the short alias from help output
+	cmd.Flags().Bool("create-issue", false, "Open a GitHub issue in each org repository with agentic workflows (requires --org)")
+	cmd.Flags().BoolP("yes", "y", false, "Auto-accept org-mode create confirmations (required in CI)")
 	cmd.Flags().Bool("audit", false, "Check dependency health without performing upgrades")
-	cmd.Flags().Bool("pre-releases", false, "Include pre-release versions when checking for extension upgrades")
+	cmd.Flags().Bool("pre-releases", false, "Include pre-release versions when checking for extension upgrades; pre-releases are installed by exact tag")
 	cmd.Flags().Bool("approve", false, "Approve all safe update changes. When strict mode is active (the default), the compiler emits warnings for new restricted secrets or unapproved action additions/removals not present in the existing gh-aw-manifest. Use this flag to approve and skip safe update enforcement")
 	cmd.Flags().Bool("skip-extension-upgrade", false, "Skip automatic extension upgrade (used internally to prevent recursion after upgrade)")
 	_ = cmd.Flags().MarkHidden("skip-extension-upgrade")
+	cmd.Flags().String("org", "", "Preview or create upgrade pull requests across an organization")
+	cmd.Flags().StringSlice("repos", nil, "Limit --org mode to repositories matching one or more glob patterns")
 	addJSONFlag(cmd)
 
 	// Register completions
@@ -148,19 +193,34 @@ func runDependencyAudit(ctx context.Context, verbose bool, jsonOutput bool) erro
 	return nil
 }
 
+// upgradeOptions holds parameters for runUpgradeCommand.
+type upgradeOptions struct {
+	ctx                  context.Context
+	verbose              bool
+	workflowDir          string
+	noFix                bool
+	noCompile            bool
+	noActions            bool
+	disabledCodemodIDs   []string
+	skipExtensionUpgrade bool
+	approve              bool
+	preReleases          bool
+	yes                  bool
+}
+
 // runUpgradeCommand executes the upgrade process
-func runUpgradeCommand(ctx context.Context, verbose bool, workflowDir string, noFix bool, noCompile bool, noActions bool, skipExtensionUpgrade bool, approve bool, preReleases bool) error {
-	upgradeLog.Printf("Running upgrade command: verbose=%v, workflowDir=%s, noFix=%v, noCompile=%v, noActions=%v, skipExtensionUpgrade=%v",
-		verbose, workflowDir, noFix, noCompile, noActions, skipExtensionUpgrade)
+func runUpgradeCommand(opts upgradeOptions) error {
+	upgradeLog.Printf("Running upgrade command: verbose=%v, workflowDir=%s, noFix=%v, noCompile=%v, noActions=%v, disabledCodemodIDs=%v, skipExtensionUpgrade=%v",
+		opts.verbose, opts.workflowDir, opts.noFix, opts.noCompile, opts.noActions, opts.disabledCodemodIDs, opts.skipExtensionUpgrade)
 
 	// Step 0b: Ensure gh-aw extension is on the latest version.
 	// If the extension was just upgraded, re-launch the freshly-installed binary
 	// with the same flags so that all subsequent steps (e.g. lock-file compilation)
 	// use the correct new version string.  The hidden --skip-extension-upgrade flag
 	// prevents the re-launched process from entering this branch again.
-	if !skipExtensionUpgrade {
+	if !opts.skipExtensionUpgrade {
 		fmt.Fprintln(os.Stderr, console.FormatInfoMessage("Checking gh-aw extension version..."))
-		upgraded, installPath, err := upgradeExtensionIfOutdated(verbose, preReleases)
+		upgraded, installPath, err := upgradeExtensionIfOutdated(opts.verbose, opts.preReleases)
 		if err != nil {
 			upgradeLog.Printf("Extension upgrade failed: %v", err)
 			return err
@@ -174,34 +234,35 @@ func runUpgradeCommand(ctx context.Context, verbose bool, workflowDir string, no
 				return err
 			}
 			// The child process completed all upgrade steps (including any PR creation).
-			// Exit the parent so we do not repeat those steps.
-			os.Exit(0)
+			// Signal the entry-point to exit cleanly without repeating those steps.
+			return &ExitCodeError{Code: 0}
 		}
 	}
 
-	// Step 1: Update dispatcher agent file (like init command)
-	fmt.Fprintln(os.Stderr, console.FormatInfoMessage("Updating agent file..."))
-	upgradeLog.Print("Updating agent file")
+	// Step 1: Update dispatcher skill and related Copilot artifacts (like init command)
+	fmt.Fprintln(os.Stderr, console.FormatInfoMessage("Updating dispatcher skill..."))
+	upgradeLog.Print("Updating dispatcher skill")
 
-	if err := updateAgentFiles(verbose); err != nil {
-		upgradeLog.Printf("Failed to update agent file: %v", err)
-		return fmt.Errorf("failed to update agent file: %w", err)
+	if err := updateCopilotArtifacts(opts.ctx, opts.verbose); err != nil {
+		upgradeLog.Printf("Failed to update dispatcher skill: %v", err)
+		return fmt.Errorf("failed to update dispatcher skill: %w", err)
 	}
 
-	if verbose {
-		fmt.Fprintln(os.Stderr, console.FormatSuccessMessage("✓ Updated agent file"))
+	if opts.verbose {
+		fmt.Fprintln(os.Stderr, console.FormatSuccessMessage("✓ Updated dispatcher skill"))
 	}
 
 	// Step 2: Apply codemods to all workflows (unless --no-fix is specified)
-	if !noFix {
+	if !opts.noFix {
 		fmt.Fprintln(os.Stderr, console.FormatInfoMessage("Applying codemods to all workflows..."))
 		upgradeLog.Print("Applying codemods to all workflows")
 
 		fixConfig := FixConfig{
-			WorkflowIDs: nil, // nil means all workflows
-			Write:       true,
-			Verbose:     verbose,
-			WorkflowDir: workflowDir,
+			WorkflowIDs:        nil, // nil means all workflows
+			Write:              true,
+			Verbose:            opts.verbose,
+			WorkflowDir:        opts.workflowDir,
+			DisabledCodemodIDs: opts.disabledCodemodIDs,
 		}
 
 		if err := RunFix(fixConfig); err != nil {
@@ -211,79 +272,77 @@ func runUpgradeCommand(ctx context.Context, verbose bool, workflowDir string, no
 		}
 	} else {
 		upgradeLog.Print("Skipping codemods (--no-fix specified)")
-		if verbose {
+		if opts.verbose {
 			fmt.Fprintln(os.Stderr, console.FormatInfoMessage("Skipping codemods (--no-fix specified)"))
 		}
 	}
 
 	// Step 3: Update GitHub Actions versions (unless --no-fix or --no-actions is specified)
-	if !noFix && !noActions {
+	if !opts.noFix && !opts.noActions {
 		fmt.Fprintln(os.Stderr, console.FormatInfoMessage("Updating GitHub Actions versions..."))
 		upgradeLog.Print("Updating GitHub Actions versions")
 
-		if err := UpdateActions(ctx, false, verbose, false, 0); err != nil {
+		if err := UpdateActions(opts.ctx, false, opts.verbose, false, 0); err != nil {
 			upgradeLog.Printf("Failed to update actions: %v", err)
 			// Don't fail the upgrade if action updates fail - this is non-critical
 			fmt.Fprintln(os.Stderr, console.FormatWarningMessage(fmt.Sprintf("Warning: Failed to update actions: %v", err)))
-		} else if verbose {
-			fmt.Fprintln(os.Stderr, console.FormatSuccessMessage("✓ Updated GitHub Actions versions"))
+		} else {
+			if opts.verbose {
+				fmt.Fprintln(os.Stderr, console.FormatSuccessMessage("✓ Updated GitHub Actions versions"))
+			}
+
+			// Only update "uses:" references in source .md files when actions-lock.json
+			// was successfully updated, so both files stay in sync. Compilation is
+			// deferred to Step 4.
+			upgradeLog.Print("Updating action references in workflow .md files")
+			if err := UpdateActionsInWorkflowFiles(opts.ctx, opts.workflowDir, "", opts.verbose, false, true, 0); err != nil {
+				msg := fmt.Sprintf("Failed to update action references in workflow files: %v", err)
+				upgradeLog.Print(msg)
+				// Non-critical: warn but don't fail the upgrade
+				fmt.Fprintln(os.Stderr, console.FormatWarningMessage("Warning: "+msg))
+			}
 		}
 	} else {
-		if noFix {
+		if opts.noFix {
 			upgradeLog.Print("Skipping action updates (--no-fix specified)")
-			if verbose {
+			if opts.verbose {
 				fmt.Fprintln(os.Stderr, console.FormatInfoMessage("Skipping action updates (--no-fix specified)"))
 			}
-		} else if noActions {
+		} else if opts.noActions {
 			upgradeLog.Print("Skipping action updates (--no-actions specified)")
-			if verbose {
+			if opts.verbose {
 				fmt.Fprintln(os.Stderr, console.FormatInfoMessage("Skipping action updates (--no-actions specified)"))
 			}
 		}
 	}
 
-	// Step 3b: Update container image digest pins (unless --no-fix or --no-actions is specified)
-	// Container pins are stored alongside action pins in .github/aw/actions-lock.json.
-	// Running this before compilation means the next compile step will embed the
-	// pinned @sha256: references in the generated lock files.
-	if !noFix && !noActions {
-		upgradeLog.Print("Updating container image digest pins")
-		if err := UpdateContainerPins(ctx, workflowDir, verbose); err != nil {
-			upgradeLog.Printf("Failed to update container pins: %v", err)
-			// Non-critical — Docker may not be available in all environments.
-			fmt.Fprintln(os.Stderr, console.FormatWarningMessage(fmt.Sprintf("Warning: Failed to update container pins: %v", err)))
-		} else if verbose {
-			fmt.Fprintln(os.Stderr, console.FormatSuccessMessage("✓ Updated container image pins"))
-		}
-	}
-
 	// Step 4: Compile all workflows (unless --no-fix or --no-compile is specified)
-	if !noFix && !noCompile {
+	if !opts.noFix && !opts.noCompile {
 		fmt.Fprintln(os.Stderr, console.FormatInfoMessage("Compiling all workflows..."))
 		upgradeLog.Print("Compiling all workflows")
 
 		// Create and configure compiler
 		compiler := createAndConfigureCompiler(CompileConfig{
-			Verbose:     verbose,
-			WorkflowDir: workflowDir,
-			Approve:     approve,
+			Verbose:     opts.verbose,
+			WorkflowDir: opts.workflowDir,
+			Approve:     opts.approve,
 		})
 
 		// Determine workflow directory
-		workflowsDir := workflowDir
+		workflowsDir := opts.workflowDir
 		if workflowsDir == "" {
-			workflowsDir = ".github/workflows"
+			workflowsDir = constants.GetWorkflowDir()
 		}
 
 		// Compile all workflow files
-		stats, compileErr := compileAllWorkflowFiles(compiler, workflowsDir, verbose)
+		stats, compileErr := compileAllWorkflowFiles(opts.ctx, compiler, workflowsDir, opts.verbose)
 		if compileErr != nil {
 			upgradeLog.Printf("Failed to compile workflows: %v", compileErr)
 			// Don't fail the upgrade if compilation fails - this is non-critical
 			fmt.Fprintln(os.Stderr, console.FormatWarningMessage(fmt.Sprintf("Warning: Failed to compile workflows: %v", compileErr)))
 		} else if stats != nil {
 			// Print compilation summary
-			if verbose {
+			if opts.verbose {
 				fmt.Fprintln(os.Stderr, console.FormatSuccessMessage(fmt.Sprintf("✓ Compiled %d workflow(s)", stats.Total-stats.Errors)))
 			}
 			if stats.Errors > 0 {
@@ -291,15 +350,41 @@ func runUpgradeCommand(ctx context.Context, verbose bool, workflowDir string, no
 			}
 		}
 	} else {
-		if noFix {
+		if opts.noFix {
 			upgradeLog.Print("Skipping compilation (--no-fix specified)")
-			if verbose {
+			if opts.verbose {
 				fmt.Fprintln(os.Stderr, console.FormatInfoMessage("Skipping compilation (--no-fix specified)"))
 			}
-		} else if noCompile {
+		} else if opts.noCompile {
 			upgradeLog.Print("Skipping compilation (--no-compile specified)")
-			if verbose {
+			if opts.verbose {
 				fmt.Fprintln(os.Stderr, console.FormatInfoMessage("Skipping compilation (--no-compile specified)"))
+			}
+		}
+	}
+
+	// Step 4b: Update container image digest pins (unless --no-fix or --no-actions is specified)
+	// Container pins are stored alongside action pins in .github/aw/actions-lock.json.
+	// This runs AFTER compilation so that the compiled lock files already reflect the
+	// current AWF version; stale pins from superseded versions are pruned and new
+	// versions are resolved in a single pass.  When --no-compile is set, the existing
+	// lock files are used as-is — pins are still pruned and refreshed against whatever
+	// lock files are currently on disk.
+	if !opts.noFix && !opts.noActions {
+		upgradeLog.Print("Updating container image digest pins")
+		newPins, err := UpdateContainerPins(opts.ctx, opts.workflowDir, opts.verbose)
+		if err != nil {
+			upgradeLog.Printf("Failed to update container pins: %v", err)
+			// Non-critical — Docker may not be available in all environments.
+			fmt.Fprintln(os.Stderr, console.FormatWarningMessage(fmt.Sprintf("Warning: Failed to update container pins: %v", err)))
+		} else if opts.verbose {
+			fmt.Fprintln(os.Stderr, console.FormatSuccessMessage("✓ Updated container image pins"))
+		}
+		if newPins && !opts.noCompile {
+			upgradeLog.Print("Recompiling workflows to embed new container digest pins")
+			fmt.Fprintln(os.Stderr, console.FormatInfoMessage("Recompiling workflows to embed container digest pins..."))
+			if recompileErr := recompileAllWorkflows(opts.ctx, opts.workflowDir, "", opts.verbose); recompileErr != nil {
+				fmt.Fprintln(os.Stderr, console.FormatWarningMessage(fmt.Sprintf("Warning: Failed to recompile after container pin update: %v", recompileErr)))
 			}
 		}
 	}
@@ -311,17 +396,25 @@ func runUpgradeCommand(ctx context.Context, verbose bool, workflowDir string, no
 	return nil
 }
 
-// updateAgentFiles updates the dispatcher agent file to the latest template
-func updateAgentFiles(verbose bool) error {
-	// Update dispatcher agent
+// updateCopilotArtifacts updates the dispatcher skill and related Copilot setup artifacts.
+func updateCopilotArtifacts(ctx context.Context, verbose bool) error {
+	// Update dispatcher skill
 	if err := ensureAgenticWorkflowsDispatcher(verbose, false); err != nil {
-		upgradeLog.Printf("Failed to update dispatcher agent: %v", err)
-		return fmt.Errorf("failed to update dispatcher agent: %w", err)
+		upgradeLog.Printf("Failed to update dispatcher skill: %v", err)
+		return fmt.Errorf("failed to update dispatcher skill: %w", err)
+	}
+	if err := ensureAgenticWorkflowsAgent(verbose); err != nil {
+		upgradeLog.Printf("Failed to update Agentic Workflows custom agent: %v", err)
+		return fmt.Errorf("failed to update Agentic Workflows custom agent: %w", err)
+	}
+	if err := deleteLegacyAgentFiles(verbose); err != nil {
+		upgradeLog.Printf("Failed to delete legacy agent files: %v", err)
+		fmt.Fprintln(os.Stderr, console.FormatWarningMessage(fmt.Sprintf("Warning: Failed to delete legacy agent files: %v", err)))
 	}
 
 	// Upgrade copilot-setup-steps.yml version
 	actionMode := workflow.DetectActionMode(GetVersion())
-	if err := upgradeCopilotSetupSteps(verbose, actionMode, GetVersion()); err != nil {
+	if err := upgradeCopilotSetupSteps(ctx, verbose, actionMode, GetVersion()); err != nil {
 		upgradeLog.Printf("Failed to upgrade copilot-setup-steps.yml: %v", err)
 		// Don't fail the upgrade if copilot-setup-steps upgrade fails - this is non-critical
 		fmt.Fprintln(os.Stderr, console.FormatWarningMessage(fmt.Sprintf("Warning: Failed to upgrade copilot-setup-steps.yml: %v", err)))
@@ -372,8 +465,8 @@ func relaunchWithSameArgs(extraFlag string, exeOverride string) error {
 	if err := cmd.Run(); err != nil {
 		var exitErr *exec.ExitError
 		if errors.As(err, &exitErr) {
-			// Preserve the child's exit code so the caller sees the real failure.
-			os.Exit(exitErr.ExitCode())
+			// Preserve the child's exit code so the entry-point can propagate it.
+			return &ExitCodeError{Code: exitErr.ExitCode()}
 		}
 		return err
 	}

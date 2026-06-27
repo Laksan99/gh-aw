@@ -25,6 +25,22 @@ function hasFrontMatter(content) {
 }
 
 /**
+ * Returns true when runtime-import frontmatter should be preserved for agent/skill files.
+ * Agent/skill frontmatter can carry execution metadata (for example model selection)
+ * that must not be stripped before the engine reads the imported definition.
+ *
+ * @param {string} filepath - Resolved runtime import path (relative form).
+ * @returns {boolean}
+ */
+function shouldPreserveFrontMatter(filepath) {
+  const normalized = String(filepath || "").replace(/\\/g, "/");
+  const segments = normalized.split("/").filter(Boolean);
+  // resolveRuntimeImportFilePath() strips ".github/" prefixes, so files imported from
+  // ".github/agents/*" arrive here as "agents/*".
+  return segments[0] === "agents" || segments[0] === "skills" || (segments[0] === ".agents" && (segments[1] === "agents" || segments[1] === "skills"));
+}
+
+/**
  * Removes XML comments from content
  * @param {string} content - The content to process
  * @returns {string} - Content with XML comments removed
@@ -203,6 +219,7 @@ function isSafeExpression(expr) {
     /^github\.aw\.inputs\.[a-zA-Z0-9_-]+$/,
     /^inputs\.[a-zA-Z0-9_-]+$/,
     /^env\.[a-zA-Z0-9_-]+$/,
+    /^experiments\.[a-zA-Z0-9_-]+$/,
   ];
 
   for (const pattern of dynamicPatterns) {
@@ -562,7 +579,7 @@ function processExpressions(content, source) {
           "Safe expressions include:\n" +
           "  - github.actor, github.repository, github.run_id, etc.\n" +
           "  - github.event.issue.number, github.event.pull_request.number, etc.\n" +
-          "  - needs.*, steps.*, env.*, inputs.*\n\n" +
+          "  - needs.*, steps.*, env.*, inputs.*, experiments.*\n\n" +
           "See documentation for the complete list of allowed expressions."
       );
     }
@@ -611,7 +628,7 @@ function processExpressions(content, source) {
       "Safe expressions include:\n" +
       "  - github.actor, github.repository, github.run_id, etc.\n" +
       "  - github.event.issue.number, github.event.pull_request.number, etc.\n" +
-      "  - needs.*, steps.*, env.*, inputs.*\n\n" +
+      "  - needs.*, steps.*, env.*, inputs.*, experiments.*\n\n" +
       "See documentation for the complete list of allowed expressions.";
     throw new Error(errorMsg);
   }
@@ -899,22 +916,16 @@ function generatePlaceholderName(expr) {
 }
 
 /**
- * Reads and processes a file or URL for runtime import
- * @param {string} filepathOrUrl - The path to the file (relative to GITHUB_WORKSPACE) or URL to import
- * @param {boolean} optional - Whether the import is optional (true for {{#runtime-import? filepath}})
+ * Resolves a runtime-import file path to its normalized absolute path.
+ * @param {string} filepathOrUrl - File path (not URL)
  * @param {string} workspaceDir - The GITHUB_WORKSPACE directory path
- * @param {number} [startLine] - Optional start line (1-indexed, inclusive)
- * @param {number} [endLine] - Optional end line (1-indexed, inclusive)
- * @returns {Promise<string>} - The processed file or URL content, or empty string if optional and file not found
- * @throws {Error} - If file/URL is not found and import is not optional, or if GitHub Actions macros are detected
+ * @returns {{filepath: string, normalizedPath: string}}
  */
-async function processRuntimeImport(filepathOrUrl, optional, workspaceDir, startLine, endLine) {
-  // Check if this is a URL
+function resolveRuntimeImportFilePath(filepathOrUrl, workspaceDir) {
   if (/^https?:\/\//i.test(filepathOrUrl)) {
-    return await processUrlImport(filepathOrUrl, optional, startLine, endLine);
+    throw new Error(`${ERR_VALIDATION}: Expected file path for runtime import, received URL: ${filepathOrUrl}`);
   }
 
-  // Otherwise, process as a file
   let filepath = filepathOrUrl;
   let isAgentsPath = false;
 
@@ -993,6 +1004,28 @@ async function processRuntimeImport(filepathOrUrl, optional, workspaceDir, start
     }
   }
 
+  return { filepath, normalizedPath };
+}
+
+/**
+ * Reads and processes a file or URL for runtime import
+ * @param {string} filepathOrUrl - The path to the file (relative to GITHUB_WORKSPACE) or URL to import
+ * @param {boolean} optional - Whether the import is optional (true for {{#runtime-import? filepath}})
+ * @param {string} workspaceDir - The GITHUB_WORKSPACE directory path
+ * @param {number} [startLine] - Optional start line (1-indexed, inclusive)
+ * @param {number} [endLine] - Optional end line (1-indexed, inclusive)
+ * @returns {Promise<string>} - The processed file or URL content, or empty string if optional and file not found
+ * @throws {Error} - If file/URL is not found and import is not optional, or if GitHub Actions macros are detected
+ */
+async function processRuntimeImport(filepathOrUrl, optional, workspaceDir, startLine, endLine) {
+  // Check if this is a URL
+  if (/^https?:\/\//i.test(filepathOrUrl)) {
+    return await processUrlImport(filepathOrUrl, optional, startLine, endLine);
+  }
+
+  // Otherwise, process as a file
+  const { filepath, normalizedPath } = resolveRuntimeImportFilePath(filepathOrUrl, workspaceDir);
+
   // Check if file exists
   if (!fs.existsSync(normalizedPath)) {
     if (optional) {
@@ -1030,29 +1063,33 @@ async function processRuntimeImport(filepathOrUrl, optional, workspaceDir, start
 
   // Check for front matter and warn
   if (hasFrontMatter(content)) {
-    core.debug(`File ${filepath} contains front matter which will be ignored in runtime import`);
-    // Remove front matter (everything between first --- and second ---)
-    const lines = content.split("\n");
-    let inFrontMatter = false;
-    let frontMatterCount = 0;
-    const processedLines = [];
+    if (shouldPreserveFrontMatter(filepath)) {
+      core.debug(`File ${filepath} contains front matter which will be preserved for agent runtime import`);
+    } else {
+      core.debug(`File ${filepath} contains front matter which will be ignored in runtime import`);
+      // Remove front matter (everything between first --- and second ---)
+      const lines = content.split("\n");
+      let inFrontMatter = false;
+      let frontMatterCount = 0;
+      const processedLines = [];
 
-    for (const line of lines) {
-      if (line.trim() === "---" || line.trim() === "---\r") {
-        frontMatterCount++;
-        if (frontMatterCount === 1) {
-          inFrontMatter = true;
-          continue;
-        } else if (frontMatterCount === 2) {
-          inFrontMatter = false;
-          continue;
+      for (const line of lines) {
+        if (line.trim() === "---" || line.trim() === "---\r") {
+          frontMatterCount++;
+          if (frontMatterCount === 1) {
+            inFrontMatter = true;
+            continue;
+          } else if (frontMatterCount === 2) {
+            inFrontMatter = false;
+            continue;
+          }
+        }
+        if (!inFrontMatter && frontMatterCount >= 2) {
+          processedLines.push(line);
         }
       }
-      if (!inFrontMatter && frontMatterCount >= 2) {
-        processedLines.push(line);
-      }
+      content = processedLines.join("\n");
     }
-    content = processedLines.join("\n");
   }
 
   // Remove XML comments
@@ -1075,6 +1112,26 @@ async function processRuntimeImport(filepathOrUrl, optional, workspaceDir, start
   }
 
   return content;
+}
+
+/**
+ * Resolves an import path/URL to a canonical key for deduplication checks.
+ * @param {string} filepathOrUrl
+ * @param {string} workspaceDir
+ * @param {number} [startLine]
+ * @param {number} [endLine]
+ * @returns {string}
+ */
+function resolveRuntimeImportKey(filepathOrUrl, workspaceDir, startLine, endLine) {
+  const rangeSuffix = startLine !== undefined && endLine !== undefined ? `:${startLine}-${endLine}` : "";
+
+  if (/^https?:\/\//i.test(filepathOrUrl)) {
+    return `${filepathOrUrl}${rangeSuffix}`;
+  }
+
+  const { normalizedPath } = resolveRuntimeImportFilePath(filepathOrUrl, workspaceDir);
+
+  return `${normalizedPath}${rangeSuffix}`;
 }
 
 /**
@@ -1101,9 +1158,10 @@ async function processRuntimeImport(filepathOrUrl, optional, workspaceDir, start
  * @param {Array<string>} [importStack] - Stack of currently importing files (for circular dependency detection)
  * @param {ImportTreeNode[]|null} [parentTreeChildren] - Array to push import tree nodes into, or null to skip tree building
  * @param {Map<string, string>} [rawImportCache] - Cache of raw (pre-expansion) file contents, used to set rawContent on cached tree nodes
+ * @param {Set<string>} [resolvedInParent] - Canonical import keys already resolved in parent/sibling context; skipped during recursion
  * @returns {Promise<string>} - Content with runtime-import macros replaced by file/URL contents
  */
-async function processRuntimeImports(content, workspaceDir, importedFiles = new Set(), importCache = new Map(), importStack = [], parentTreeChildren = null, rawImportCache = new Map()) {
+async function processRuntimeImports(content, workspaceDir, importedFiles = new Set(), importCache = new Map(), importStack = [], parentTreeChildren = null, rawImportCache = new Map(), resolvedInParent = new Set()) {
   // Normalize body-level {{#import}} directives to {{#runtime-import}} equivalents.
   // {{#import}} is deprecated — use {{#runtime-import}} or the 'imports:' frontmatter field instead.
   // Both colon and no-colon syntax are supported for backward compatibility:
@@ -1175,8 +1233,28 @@ async function processRuntimeImports(content, workspaceDir, importedFiles = new 
   }
 
   // Process all imports sequentially (to handle async URLs)
+  const resolvedInThisCall = new Set();
   for (const matchData of matches) {
     const { fullMatch, filepathOrUrl, optional, startLine, endLine, filepathWithRange } = matchData;
+    let importKey;
+    try {
+      importKey = resolveRuntimeImportKey(filepathOrUrl, workspaceDir, startLine, endLine);
+    } catch (error) {
+      const errorMessage = getErrorMessage(error);
+      throw new Error(`${ERR_API}: Failed to process runtime import for ${filepathWithRange}: ${errorMessage}`);
+    }
+
+    // Skip imports already resolved in the parent/sibling context.
+    // This avoids duplicate expansion when the workflow file self-imports and
+    // recursively encounters imports that were already expanded in the outer pass.
+    if (resolvedInParent.has(importKey)) {
+      // Intentionally replace with empty string (instead of cached content):
+      // this branch exists specifically to prevent duplicate prompt blocks when
+      // recursively traversing a self-imported workflow body.
+      processedContent = processedContent.replace(fullMatch, "");
+      core.info(`Skipping already resolved import for ${filepathWithRange}`);
+      continue;
+    }
 
     // Check if this file is already in the import cache
     if (importCache.has(filepathWithRange)) {
@@ -1243,7 +1321,8 @@ async function processRuntimeImports(content, workspaceDir, importedFiles = new 
       // any {{#import}} directives before processing them.
       if (importedContent && /\{\{#(?:runtime-import|import)/.test(importedContent)) {
         core.info(`Recursively processing imports in ${filepathWithRange}`);
-        importedContent = await processRuntimeImports(importedContent, workspaceDir, importedFiles, importCache, [...importStack], parentTreeChildren !== null ? treeNodeChildren : null, rawImportCache);
+        const inheritedResolved = new Set([...resolvedInParent, ...resolvedInThisCall]);
+        importedContent = await processRuntimeImports(importedContent, workspaceDir, importedFiles, importCache, [...importStack], parentTreeChildren !== null ? treeNodeChildren : null, rawImportCache, inheritedResolved);
       }
 
       // Cache the fully processed content and the raw pre-expansion content
@@ -1253,6 +1332,7 @@ async function processRuntimeImports(content, workspaceDir, importedFiles = new 
 
       // Replace the macro with the imported content
       processedContent = processedContent.replace(fullMatch, () => importedContent);
+      resolvedInThisCall.add(importKey);
     } catch (error) {
       const errorMessage = getErrorMessage(error);
       throw new Error(`${ERR_API}: Failed to process runtime import for ${filepathWithRange}: ${errorMessage}`);

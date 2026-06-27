@@ -1,4 +1,6 @@
 ---
+private: true
+emoji: "📊"
 description: Generates high-quality data visualizations and trend charts using Python scientific computing libraries
 on:
   workflow_dispatch:
@@ -7,14 +9,16 @@ permissions:
   actions: read
   issues: read
   pull-requests: read
-engine: copilot
+engine:
+  id: copilot
+  copilot-sdk: true
 tools:
   cli-proxy: true
   agentic-workflows:
   edit:
 imports:
   - shared/charts-with-trending.md
-  - shared/observability-otlp.md
+  - shared/otlp.md
 safe-outputs:
   upload-artifact:
     max-uploads: 3
@@ -27,6 +31,9 @@ safe-outputs:
 timeout-minutes: 15
 
 
+sandbox:
+  agent:
+    sudo: false
 ---
 
 # Python Data Visualization Generator

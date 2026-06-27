@@ -201,6 +201,37 @@ func TestAddRepoParameterIfNeededSpecificTargetRepoNoAllowedRepos(t *testing.T) 
 	assert.False(t, hasRepo, "repo parameter should NOT be added when target-repo is specific and no allowed-repos")
 }
 
+func TestAddRepoParameterIfNeededClosePullRequestWithAllowedRepos(t *testing.T) {
+	tool := map[string]any{
+		"name": "close_pull_request",
+		"inputSchema": map[string]any{
+			"type": "object",
+			"properties": map[string]any{
+				"body": map[string]any{"type": "string"},
+			},
+		},
+	}
+
+	safeOutputs := &SafeOutputsConfig{
+		ClosePullRequests: &ClosePullRequestsConfig{
+			SafeOutputTargetConfig: SafeOutputTargetConfig{
+				TargetRepoSlug: "org/default-repo",
+				AllowedRepos:   []string{"org/other-repo"},
+			},
+		},
+	}
+
+	addRepoParameterIfNeeded(tool, "close_pull_request", safeOutputs)
+
+	inputSchema := tool["inputSchema"].(map[string]any)
+	properties := inputSchema["properties"].(map[string]any)
+
+	repoProp, ok := properties["repo"].(map[string]any)
+	require.True(t, ok, "repo property should be added")
+	assert.Equal(t, "string", repoProp["type"], "repo type should be string")
+	assert.Contains(t, repoProp["description"].(string), "org/default-repo", "description should include default repo")
+}
+
 func TestParseUpdateIssuesConfigWithWildcardTargetRepo(t *testing.T) {
 	compiler := &Compiler{}
 	outputMap := map[string]any{
@@ -295,3 +326,88 @@ func TestGenerateDispatchWorkflowToolRequiredSorted(t *testing.T) {
 
 // TestGenerateFilteredToolsJSONWithStandardOutputs tests that standard safe outputs produce
 // the expected tools in the filtered output (regression test for the completeness check).
+
+// TestComputeRequiredFieldRemovalsCloseDiscussion verifies that allow-body: false for
+// close-discussion produces a required field removal for the body field.
+func TestComputeRequiredFieldRemovalsCloseDiscussion(t *testing.T) {
+	f := false
+	removals := computeRequiredFieldRemovals(&SafeOutputsConfig{
+		CloseDiscussions: &CloseDiscussionsConfig{
+			AllowBody: &f,
+		},
+	})
+
+	require.Contains(t, removals, "close_discussion", "expected close_discussion key")
+	assert.Equal(t, []string{"body"}, removals["close_discussion"])
+	assert.NotContains(t, removals, "close_issue", "close_issue should not be affected")
+}
+
+// TestComputeRequiredFieldRemovalsCloseIssue verifies that allow-body: false for
+// close-issue produces a required field removal for the body field.
+func TestComputeRequiredFieldRemovalsCloseIssue(t *testing.T) {
+	f := false
+	removals := computeRequiredFieldRemovals(&SafeOutputsConfig{
+		CloseIssues: &CloseIssuesConfig{
+			AllowBody: &f,
+		},
+	})
+
+	require.Contains(t, removals, "close_issue", "expected close_issue key")
+	assert.Equal(t, []string{"body"}, removals["close_issue"])
+	assert.NotContains(t, removals, "close_discussion", "close_discussion should not be affected")
+}
+
+// TestComputeRequiredFieldRemovalsAllowBodyTrue verifies that allow-body: true
+// does NOT produce any required field removals.
+func TestComputeRequiredFieldRemovalsAllowBodyTrue(t *testing.T) {
+	tr := true
+	removals := computeRequiredFieldRemovals(&SafeOutputsConfig{
+		CloseDiscussions: &CloseDiscussionsConfig{
+			AllowBody: &tr,
+		},
+		CloseIssues: &CloseIssuesConfig{
+			AllowBody: &tr,
+		},
+	})
+
+	assert.Empty(t, removals, "no removals expected when allow-body is true")
+}
+
+// TestComputeRequiredFieldRemovalsNilConfig verifies that a nil config returns empty removals.
+func TestComputeRequiredFieldRemovalsNilConfig(t *testing.T) {
+	removals := computeRequiredFieldRemovals(nil)
+	assert.Empty(t, removals)
+}
+
+// TestComputeRequiredFieldRemovals_BothFalse verifies that allow-body: false on both tools
+// produces removals for both.
+func TestComputeRequiredFieldRemovals_BothFalse(t *testing.T) {
+	f := false
+	removals := computeRequiredFieldRemovals(&SafeOutputsConfig{
+		CloseDiscussions: &CloseDiscussionsConfig{AllowBody: &f},
+		CloseIssues:      &CloseIssuesConfig{AllowBody: &f},
+	})
+
+	assert.Equal(t, []string{"body"}, removals["close_discussion"])
+	assert.Equal(t, []string{"body"}, removals["close_issue"])
+}
+
+func TestComputeRequiredFieldAdditionsRequireTemporaryID(t *testing.T) {
+	additions := computeRequiredFieldAdditions(&SafeOutputsConfig{
+		CreateIssues:       &CreateIssuesConfig{RequireTemporaryID: true},
+		CreatePullRequests: &CreatePullRequestsConfig{RequireTemporaryID: true},
+	})
+
+	require.Contains(t, additions, "create_issue")
+	require.Contains(t, additions, "create_pull_request")
+	assert.Equal(t, []string{"temporary_id"}, additions["create_issue"])
+	assert.Equal(t, []string{"temporary_id"}, additions["create_pull_request"])
+}
+
+func TestComputeRequiredFieldAdditionsDisabledByDefault(t *testing.T) {
+	additions := computeRequiredFieldAdditions(&SafeOutputsConfig{
+		CreateIssues:       &CreateIssuesConfig{},
+		CreatePullRequests: &CreatePullRequestsConfig{},
+	})
+	assert.Empty(t, additions)
+}

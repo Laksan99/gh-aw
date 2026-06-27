@@ -6,6 +6,62 @@ const { validateTargetRepo, parseAllowedRepos, getDefaultTargetRepo } = require(
 const fs = require("fs");
 
 /**
+ * Check whether a schema enforces strict object keys.
+ * @param {any} inputSchema - Tool input schema
+ * @returns {boolean} True when additional properties are disallowed
+ */
+function isStrictSchema(inputSchema) {
+  if (!inputSchema || typeof inputSchema !== "object") {
+    return false;
+  }
+  if (inputSchema.additionalProperties !== false) {
+    return false;
+  }
+  const { properties } = inputSchema;
+  return !!properties && typeof properties === "object" && !Array.isArray(properties);
+}
+
+/**
+ * Strip unknown keys from tool arguments when schema is strict.
+ * @param {any} args - Tool call arguments
+ * @param {any} inputSchema - Tool input schema
+ * @param {(keys: string[]) => void} [onUnknownKeysStripped] - Optional callback for stripped keys
+ * @returns {any} Sanitized args
+ */
+function sanitizeArgsBySchema(args, inputSchema, onUnknownKeysStripped) {
+  if (!args || typeof args !== "object" || Array.isArray(args)) {
+    return args;
+  }
+  if (!isStrictSchema(inputSchema)) {
+    return args;
+  }
+
+  const allowedKeys = new Set(Object.keys(inputSchema.properties));
+  const sanitizedArgs = {};
+  const strippedKeys = [];
+  for (const [key, value] of Object.entries(args)) {
+    if (allowedKeys.has(key)) {
+      sanitizedArgs[key] = value;
+    } else {
+      strippedKeys.push(key);
+    }
+  }
+  if (strippedKeys.length > 0 && typeof onUnknownKeysStripped === "function") {
+    onUnknownKeysStripped(strippedKeys);
+  }
+  return sanitizedArgs;
+}
+
+/**
+ * Check whether workflow metadata name is a non-empty string after trimming.
+ * @param {any} workflowName
+ * @returns {boolean}
+ */
+function hasValidWorkflowMetadataName(workflowName) {
+  return typeof workflowName === "string" && workflowName.trim().length > 0;
+}
+
+/**
  * Load tools from tools.json file
  * @param {Object} server - The MCP server instance for logging
  * @returns {Array} Array of tool definitions
@@ -68,10 +124,12 @@ function loadTools(server) {
  * Attach handlers to tools
  * @param {Array} tools - Array of tool definitions
  * @param {Object} handlers - Object containing handler functions
+ * @param {{ debug?: Function }} [logger] - Optional logger
  * @returns {Array} Tools with handlers attached
  */
-function attachHandlers(tools, handlers) {
+function attachHandlers(tools, handlers, logger) {
   const handlerMap = {
+    create_issue: handlers.createIssueHandler,
     create_pull_request: handlers.createPullRequestHandler,
     push_to_pull_request_branch: handlers.pushToPullRequestBranchHandler,
     push_repo_memory: handlers.pushRepoMemoryHandler,
@@ -79,18 +137,24 @@ function attachHandlers(tools, handlers) {
     upload_artifact: handlers.uploadArtifactHandler,
     create_project: handlers.createProjectHandler,
     add_comment: handlers.addCommentHandler,
+    create_pull_request_review_comment: handlers.createPullRequestReviewCommentHandler,
+    submit_pull_request_review: handlers.submitPullRequestReviewHandler,
+    update_issue: handlers.updateIssueHandler,
+    update_pull_request: handlers.updatePullRequestHandler,
   };
 
   tools.forEach(tool => {
     const handler = handlerMap[tool.name];
     if (handler) {
       tool.handler = handler;
+    } else if (typeof handlers.defaultHandler === "function") {
+      tool.handler = handlers.defaultHandler(tool.name);
     }
 
     // Check if this is a dispatch_workflow tool (dynamic tool with workflow metadata)
-    if (tool._workflow_name) {
+    if (hasValidWorkflowMetadataName(tool._workflow_name)) {
       // Create a custom handler that wraps args in inputs and adds workflow_name
-      const workflowName = tool._workflow_name;
+      const workflowName = tool._workflow_name.trim();
       tool.handler = args => {
         // Wrap args in inputs property to match dispatch_workflow schema
         return handlers.defaultHandler("dispatch_workflow")({
@@ -112,9 +176,9 @@ function attachHandlers(tools, handlers) {
     }
 
     // Check if this is a call_workflow tool (dynamic tool with call workflow metadata)
-    if (tool._call_workflow_name) {
+    if (hasValidWorkflowMetadataName(tool._call_workflow_name)) {
       // Create a custom handler that wraps args in inputs and adds workflow_name
-      const workflowName = tool._call_workflow_name;
+      const workflowName = tool._call_workflow_name.trim();
       tool.handler = args => {
         // Wrap args in inputs property to match call_workflow schema
         return handlers.defaultHandler("call_workflow")({
@@ -122,6 +186,16 @@ function attachHandlers(tools, handlers) {
           workflow_name: workflowName,
         });
       };
+    }
+
+    if (typeof tool.handler === "function" && isStrictSchema(tool.inputSchema)) {
+      const originalHandler = tool.handler;
+      tool.handler = args =>
+        originalHandler(
+          sanitizeArgsBySchema(args, tool.inputSchema, strippedKeys => {
+            logger?.debug?.(`Stripped unknown keys for strict schema tool '${tool.name}': ${JSON.stringify(strippedKeys)}`);
+          })
+        );
     }
   });
 
@@ -137,12 +211,31 @@ function attachHandlers(tools, handlers) {
  * @param {Function} normalizeTool - Function to normalize tool names
  */
 function registerPredefinedTools(server, tools, config, registerTool, normalizeTool) {
+  const toolSafetyWarnings = {
+    add_comment: " This tool records a real comment intent. Do not use it for placeholder comments, auth checks, or probing. Call it only when the final comment body is ready; otherwise use noop or report_incomplete.",
+    create_issue: " This tool records a real issue intent. Do not use it for placeholder titles/bodies, auth checks, or probing. Call it only when the final issue title/body are ready; otherwise use noop or report_incomplete.",
+    create_pull_request: " This tool records a real pull request intent. Do not use it for tests, auth checks, or probing. Call it once only when the final PR title/body/branch are ready; otherwise use noop or report_incomplete.",
+    push_to_pull_request_branch:
+      " This tool records a real PR branch update intent. Do not use it for probe branches, placeholder commit messages, auth checks, or probing. Call it only when the final branch update is ready; otherwise use noop or report_incomplete.",
+  };
+
   tools.forEach(tool => {
     // Check if this is a regular tool matching a config key
     if (Object.keys(config).find(configKey => normalizeTool(configKey) === tool.name)) {
       let toolToRegister = tool;
+      const safetyWarning = toolSafetyWarnings[tool.name];
+      const isCreatePullRequestTool = tool.name === "create_pull_request" && config.create_pull_request;
       // Enrich create_pull_request tool description when target-repo is configured
-      if (tool.name === "create_pull_request" && config.create_pull_request) {
+      if (safetyWarning || isCreatePullRequestTool) {
+        toolToRegister = JSON.parse(JSON.stringify(tool));
+        if (tool.handler) {
+          toolToRegister.handler = tool.handler;
+        }
+        if (safetyWarning) {
+          toolToRegister.description += safetyWarning;
+        }
+      }
+      if (isCreatePullRequestTool) {
         const targetRepo = config.create_pull_request["target-repo"];
         if (targetRepo) {
           // Validate the configured target-repo against the allowed-repos list
@@ -154,7 +247,6 @@ function registerPredefinedTools(server, tools, config, registerTool, normalizeT
               server.debug(`WARNING: SEC-005: ${validation.error}`);
             }
           }
-          toolToRegister = JSON.parse(JSON.stringify(tool));
           toolToRegister.description += ` Note: This workflow is configured to create pull requests in '${targetRepo}'. You do not need to specify the repo parameter.`;
           if (toolToRegister.inputSchema && toolToRegister.inputSchema.properties && toolToRegister.inputSchema.properties.repo) {
             toolToRegister.inputSchema.properties.repo.description += ` Configured default: '${targetRepo}'.`;
@@ -167,7 +259,7 @@ function registerPredefinedTools(server, tools, config, registerTool, normalizeT
 
     // Check if this is a dispatch_workflow tool (has _workflow_name metadata)
     // These tools are dynamically generated with workflow-specific names
-    if (tool._workflow_name) {
+    if (hasValidWorkflowMetadataName(tool._workflow_name)) {
       server.debug(`Found dispatch_workflow tool: ${tool.name} (_workflow_name: ${tool._workflow_name})`);
       if (config.dispatch_workflow) {
         server.debug(`  dispatch_workflow config exists, registering tool`);
@@ -199,7 +291,7 @@ function registerPredefinedTools(server, tools, config, registerTool, normalizeT
 
     // Check if this is a call_workflow tool (has _call_workflow_name metadata)
     // These tools are dynamically generated with workflow-specific names
-    if (tool._call_workflow_name) {
+    if (hasValidWorkflowMetadataName(tool._call_workflow_name)) {
       server.debug(`Found call_workflow tool: ${tool.name} (_call_workflow_name: ${tool._call_workflow_name})`);
       if (config.call_workflow) {
         server.debug(`  call_workflow config exists, registering tool`);

@@ -54,6 +54,12 @@ const KEEPALIVE_PING_INTERVAL_MS = 10000;
 /** Starting JSON-RPC ID for keepalive ping requests */
 const KEEPALIVE_PING_ID_START = 1000;
 
+/** Preferred max lines for generated CLI help output */
+const TOP_HELP_MAX_LINES = 20;
+const TOOL_HELP_MAX_LINES = 30;
+const TOOL_DESC_MAX_LEN = 90;
+const COMPACT_NAME_LINE_TARGET_WIDTH = 110;
+
 // ---------------------------------------------------------------------------
 // Audit logging
 // ---------------------------------------------------------------------------
@@ -89,6 +95,48 @@ function auditLog(serverName, entry) {
     const core = global.core;
     core.warning(`Failed to write audit log for ${serverName}: ${err instanceof Error ? err.message : String(err)}`);
   }
+}
+
+// ---------------------------------------------------------------------------
+// I/O helpers
+// ---------------------------------------------------------------------------
+
+/**
+ * Write data to process.stdout and return a Promise that resolves only after
+ * the data has been fully flushed to the OS.
+ *
+ * When stdout is a pipe and the payload exceeds the OS pipe buffer (~64 KiB on
+ * Linux), `process.stdout.write()` returns `false` — the first chunk is written
+ * to the OS immediately but the remainder is queued in Node.js's internal
+ * buffer.  Any synchronous write to process.stderr that follows (e.g. a
+ * `core.info` call) will reach the OS *before* the buffered stdout tail is
+ * flushed, which corrupts the output when the caller captures both streams
+ * together (e.g. `2>&1`).
+ *
+ * Awaiting the `drain` event ensures stdout is fully drained before any
+ * subsequent diagnostic logging.
+ *
+ * @param {string} data
+ * @returns {Promise<void>}
+ */
+function writeStdoutAndFlush(data) {
+  return new Promise((resolve, reject) => {
+    const flushed = process.stdout.write(data);
+    if (flushed) {
+      resolve();
+    } else {
+      const onDrain = () => {
+        process.stdout.removeListener("error", onError);
+        resolve();
+      };
+      const onError = err => {
+        process.stdout.removeListener("drain", onDrain);
+        reject(err);
+      };
+      process.stdout.once("drain", onDrain);
+      process.stdout.once("error", onError);
+    }
+  });
 }
 
 // ---------------------------------------------------------------------------
@@ -433,13 +481,16 @@ function parseBridgeArgs(argv) {
 }
 
 /**
- * Check whether stdin should be read and parsed as a JSON payload for tool arguments.
- * Returns true when the '.' sentinel is the only argument, or when no arguments are
- * provided and stdin is not connected to a terminal (i.e. data is being piped).
+ * Check whether stdin should be read for tool arguments.
+ * Returns true when:
+ * - The '.' sentinel is the only argument (JSON payload mode — full args from stdin), or
+ * - No arguments are provided and stdin is not connected to a terminal (piped JSON payload), or
+ * - Any '--key .' or '--key=.' pair is present (per-field stdin mode — raw text for that field).
  *
- * This enables agents to pipe complex multi-argument payloads as a single JSON object:
+ * This enables agents to pipe content in multiple ways:
  *   printf '{"issue_number":42,"body":"hello"}' | safeoutputs add_comment .
  *   printf '{"issue_number":42,"body":"hello"}' | safeoutputs add_comment
+ *   printf 'Long issue body...' | safeoutputs create_issue --title "Bug" --body .
  *
  * @param {string[]} args - User arguments after the tool name
  * @returns {boolean}
@@ -447,6 +498,15 @@ function parseBridgeArgs(argv) {
 function hasStdinJsonPayload(args) {
   if (args.length === 1 && args[0] === ".") return true;
   if (args.length === 0 && !process.stdin.isTTY) return true;
+  // Per-field stdin marker: --key . (space-separated) or --key=. (equals-separated)
+  for (let i = 0; i < args.length; i++) {
+    if (args[i].startsWith("--")) {
+      const raw = args[i].slice(2);
+      const eqIdx = raw.indexOf("=");
+      if (eqIdx >= 0 && raw.slice(eqIdx + 1) === ".") return true;
+      if (eqIdx < 0 && i + 1 < args.length && args[i + 1] === ".") return true;
+    }
+  }
   return false;
 }
 
@@ -503,10 +563,16 @@ function readStdinSync() {
  * complex multi-argument payloads without shell quoting issues:
  *   printf '{"issue_number":42,"body":"hello"}' | safeoutputs add_comment .
  *
+ * When `stdinContent` is provided and non-empty, any '--key .' or '--key=.'
+ * pair substitutes that field's value with the raw stdin text (per-field
+ * stdin mode). This enables agents to pipe large text into a single field:
+ *   printf 'Long issue body...' | safeoutputs create_issue --title "Bug" --body .
+ * When stdin is empty, the '.' is passed through as a literal value.
+ *
  * @param {string[]} args - User arguments after the tool name
  * @param {Record<string, {type?: string|string[]}>} [schemaProperties] - Tool input schema properties
- * @param {string | null} [stdinContent] - Pre-read stdin content; used only when args is empty
- *   or `['.']` (JSON payload mode). Ignored for all other argument forms.
+ * @param {string | null} [stdinContent] - Pre-read stdin content; used in JSON payload mode
+ *   (args empty or `['.']`) and per-field stdin mode (`--key .`).
  * @returns {{args: Record<string, unknown>, json: boolean}}
  */
 function parseToolArgs(args, schemaProperties = {}, stdinContent = null) {
@@ -515,14 +581,15 @@ function parseToolArgs(args, schemaProperties = {}, stdinContent = null) {
   let jsonOutput = false;
   const hasSchemaProperties = Object.keys(schemaProperties).length > 0;
   const { normalizedSchemaKeyMap, ambiguousNormalizedSchemaKeys } = buildNormalizedSchemaKeyMap(schemaProperties);
+  // Trimmed stdin content used in both JSON payload mode and per-field stdin mode.
+  const trimmedStdin = stdinContent !== null ? stdinContent.trim() : null;
 
   // JSON payload mode: when args is empty or ['.'] and stdinContent is available,
   // parse stdin as a JSON object and use its properties directly as tool arguments.
-  if (stdinContent !== null && (args.length === 0 || (args.length === 1 && args[0] === "."))) {
-    const trimmed = stdinContent.trim();
-    if (trimmed) {
+  if (trimmedStdin !== null && (args.length === 0 || (args.length === 1 && args[0] === "."))) {
+    if (trimmedStdin) {
       try {
-        const parsed = JSON.parse(trimmed);
+        const parsed = JSON.parse(trimmedStdin);
         if (parsed !== null && typeof parsed === "object" && !Array.isArray(parsed)) {
           for (const [key, value] of Object.entries(parsed)) {
             const canonicalKey = resolveSchemaPropertyKey(key, schemaProperties, normalizedSchemaKeyMap, ambiguousNormalizedSchemaKeys);
@@ -548,14 +615,22 @@ function parseToolArgs(args, schemaProperties = {}, stdinContent = null) {
         } else {
           const canonicalKey = resolveSchemaPropertyKey(key, schemaProperties, normalizedSchemaKeyMap, ambiguousNormalizedSchemaKeys);
           const rawValue = raw.slice(eqIdx + 1);
-          result[canonicalKey] = coerceToolArgValue(canonicalKey, rawValue, schemaProperties[canonicalKey], result[canonicalKey], !hasSchemaProperties);
+          if (rawValue === "." && trimmedStdin) {
+            result[canonicalKey] = trimmedStdin;
+          } else {
+            result[canonicalKey] = coerceToolArgValue(canonicalKey, rawValue, schemaProperties[canonicalKey], result[canonicalKey], !hasSchemaProperties);
+          }
         }
       } else if (raw === "json") {
         jsonOutput = true;
       } else if (i + 1 < args.length && !args[i + 1].startsWith("--")) {
         const canonicalKey = resolveSchemaPropertyKey(raw, schemaProperties, normalizedSchemaKeyMap, ambiguousNormalizedSchemaKeys);
         const rawValue = args[i + 1];
-        result[canonicalKey] = coerceToolArgValue(canonicalKey, rawValue, schemaProperties[canonicalKey], result[canonicalKey], !hasSchemaProperties);
+        if (rawValue === "." && trimmedStdin) {
+          result[canonicalKey] = trimmedStdin;
+        } else {
+          result[canonicalKey] = coerceToolArgValue(canonicalKey, rawValue, schemaProperties[canonicalKey], result[canonicalKey], !hasSchemaProperties);
+        }
         i++;
       } else {
         const canonicalKey = resolveSchemaPropertyKey(raw, schemaProperties, normalizedSchemaKeyMap, ambiguousNormalizedSchemaKeys);
@@ -763,20 +838,18 @@ function loadTools(toolsFile) {
  * @param {Array<{name: string, description?: string}>} tools - Tool list
  */
 function showHelp(serverName, tools) {
-  const lines = [`Usage: ${serverName} <command> [options]`, ""];
-  lines.push("Available commands:");
+  const lines = [`Usage: ${serverName} <command> [--param value ...]`, `Tip: ${serverName} <command> --help`, "", `Commands (${tools.length}):`];
   if (tools.length > 0) {
-    // Calculate column width for aligned output
-    const maxNameLen = Math.max(...tools.map(t => t.name.length));
-    for (const tool of tools) {
-      const padded = tool.name.padEnd(maxNameLen + 2);
-      lines.push(`  ${padded}${tool.description || "No description"}`);
-    }
+    const maxCommandLines = Math.max(1, TOP_HELP_MAX_LINES - lines.length);
+    lines.push(
+      ...formatCompactNameLines(
+        tools.map(tool => tool.name),
+        maxCommandLines
+      )
+    );
   } else {
     lines.push("  (tool list unavailable)");
   }
-  lines.push("");
-  lines.push(`Run '${serverName} <command> --help' for more information on a command.`);
   process.stdout.write(lines.join("\n") + "\n");
 }
 
@@ -796,40 +869,97 @@ function showToolHelp(serverName, toolName, tools) {
     return;
   }
 
-  const lines = [`Command: ${toolName}`, `Description: ${tool.description || "No description"}`];
+  const lines = [
+    `Command: ${toolName}`,
+    `Description: ${summarizeHelpText(tool.description || "No description", TOOL_DESC_MAX_LEN)}`,
+    `Usage: ${serverName} ${toolName} [--param value ...]`,
+    `JSON mode: printf '{"param":"value",...}' | ${serverName} ${toolName} .`,
+  ];
 
   const props = tool.inputSchema?.properties;
   const required = new Set(tool.inputSchema?.required || []);
   if (props && Object.keys(props).length > 0) {
     lines.push("");
-    lines.push("Options:");
-    const maxKeyLen = Math.max(...Object.keys(props).map(k => k.length));
-    for (const [key, val] of Object.entries(props)) {
-      const flagPad = `--${key}`.padEnd(maxKeyLen + 4);
-      const parts = [getTypeStr(val.type)];
-      if (required.has(key)) parts.push("(required)");
-      if (val.description) parts.push(val.description);
-      lines.push(`  ${flagPad}${parts.join(" ")}`);
+    lines.push(`Options (${Object.keys(props).length}):`);
+    const optionEntries = Object.entries(props);
+    const hasRequiredOptions = required.size > 0;
+    const maxOptionLines = Math.max(1, TOOL_HELP_MAX_LINES - lines.length - (hasRequiredOptions ? 1 : 0));
+    lines.push(
+      ...formatCompactNameLines(
+        optionEntries.map(([key]) => `--${key}${required.has(key) ? "*" : ""}`),
+        maxOptionLines
+      )
+    );
+    if (hasRequiredOptions) {
+      lines.push("Required options are marked with *.");
     }
-
-    lines.push("");
-    lines.push(`Usage: ${serverName} ${toolName} [--param value ...]`);
-    lines.push(`  or:  printf '{"param":"value",...}' | ${serverName} ${toolName} .`);
   }
 
   process.stdout.write(lines.join("\n") + "\n");
 }
 
 /**
- * Format a JSON schema type value as a short bracketed string.
+ * Collapse whitespace and trim long help text for compact output.
  *
- * @param {string|string[]|undefined} type
+ * @param {string} value
+ * @param {number} maxLen
  * @returns {string}
  */
-function getTypeStr(type) {
-  if (!type) return "(string)";
-  const types = Array.isArray(type) ? type.filter(t => t !== "null") : [type];
-  return `(${types.length > 0 ? types.join("|") : "null"})`;
+function summarizeHelpText(value, maxLen) {
+  const normalized = String(value || "")
+    .replace(/\s+/g, " ")
+    .trim();
+  if (!Number.isFinite(maxLen) || maxLen <= 0) {
+    return normalized;
+  }
+  if (normalized.length <= maxLen) {
+    return normalized;
+  }
+  return `${normalized.slice(0, maxLen - 1)}…`;
+}
+
+/**
+ * Render names as comma-separated compact lines and keep all names visible.
+ * Width is a soft target; the final line may exceed it to avoid dropping names.
+ *
+ * @param {string[]} names
+ * @param {number} maxLines - Preferred line budget; non-positive/invalid values force one compact line
+ * @returns {string[]}
+ */
+function formatCompactNameLines(names, maxLines) {
+  if (!Array.isArray(names) || names.length === 0) {
+    // Callers spread the result into help lines, so empty input should contribute no lines.
+    return [];
+  }
+  if (!Number.isFinite(maxLines) || maxLines <= 0) {
+    return [`  ${names.join(", ")}`];
+  }
+  const lines = [];
+  let current = "  ";
+  for (const name of names) {
+    const token = current.trim() ? `, ${name}` : name;
+    // A single very long name may still exceed the width target; we keep it intact.
+    const shouldStartNewLine = current.length + token.length > COMPACT_NAME_LINE_TARGET_WIDTH;
+    if (shouldStartNewLine) {
+      lines.push(current);
+      current = `  ${name}`;
+      continue;
+    }
+    current += token;
+  }
+  if (current.trim()) {
+    lines.push(current);
+  }
+  if (lines.length > maxLines) {
+    // Keep maxLines - 1 full lines and collapse the remaining names into the final allowed line.
+    const compactTail = lines
+      .slice(maxLines - 1)
+      // Trim per-line indentation before rebuilding a single indented tail line.
+      .map(line => line.trim())
+      .join(", ");
+    return [...lines.slice(0, maxLines - 1), `  ${compactTail}`];
+  }
+  return lines;
 }
 
 // ---------------------------------------------------------------------------
@@ -953,8 +1083,9 @@ function isResultMessage(message) {
  *
  * @param {unknown} responseBody - Parsed JSON-RPC response body
  * @param {string} serverName - Server name (for logging)
+ * @returns {Promise<void>}
  */
-function formatResponse(responseBody, serverName) {
+async function formatResponse(responseBody, serverName) {
   const core = global.core;
   const messages = extractJSONRPCMessages(responseBody);
   renderProgressMessages(messages);
@@ -997,7 +1128,7 @@ function formatResponse(responseBody, serverName) {
         auditLog(serverName, { event: "tool_error", error: output });
         process.exitCode = 1;
       } else {
-        process.stdout.write(output + "\n");
+        await writeStdoutAndFlush(output + "\n");
         core.info(`[${serverName}] Tool output: ${output.length} chars`);
       }
       return;
@@ -1010,14 +1141,14 @@ function formatResponse(responseBody, serverName) {
       auditLog(serverName, { event: "tool_error", error: resultStr });
       process.exitCode = 1;
     } else {
-      process.stdout.write(resultStr + "\n");
+      await writeStdoutAndFlush(resultStr + "\n");
     }
     return;
   }
 
   // Fallback: print raw response
   const rawStr = typeof resp === "string" ? resp : JSON.stringify(resp);
-  process.stdout.write(rawStr + "\n");
+  await writeStdoutAndFlush(rawStr + "\n");
 }
 
 // ---------------------------------------------------------------------------
@@ -1088,15 +1219,25 @@ async function main() {
     stopKeepalive = startMcpKeepalivePings(serverUrl, apiKey, sessionId, serverName);
     const resp = await mcpToolsCall(serverUrl, apiKey, sessionId, toolName, toolArgs, serverName);
 
+    // Stop keepalive BEFORE writing any output.  When stdout is a pipe and the
+    // response payload exceeds the OS pipe buffer (~64 KiB on Linux),
+    // process.stdout.write() buffers the overflow and flushes it later via the
+    // event loop.  If the keepalive timer fires in that window its core.info()
+    // call writes to stderr; callers that capture both streams (e.g. 2>&1) see
+    // the [info] line interleaved inside the JSON, corrupting it.  Stopping the
+    // timer here ensures no further log lines reach stderr during the write.
+    stopKeepalive?.();
+    stopKeepalive = null;
+
     const totalMs = Date.now() - callStartMs;
     core.info(`[${serverName}] Tool call complete: total=${totalMs}ms`);
     auditLog(serverName, { event: "call_complete", tool: toolName, totalElapsedMs: totalMs });
 
     if (jsonOutput) {
       // --json: print the raw JSON-RPC response body
-      process.stdout.write(JSON.stringify(resp.body, null, 2) + "\n");
+      await writeStdoutAndFlush(JSON.stringify(resp.body, null, 2) + "\n");
     } else {
-      formatResponse(resp.body, serverName);
+      await formatResponse(resp.body, serverName);
     }
   } catch (err) {
     const totalMs = Date.now() - callStartMs;
@@ -1130,6 +1271,9 @@ module.exports = {
   extractJSONRPCMessages,
   renderProgressMessages,
   formatResponse,
+  writeStdoutAndFlush,
+  showHelp,
+  showToolHelp,
   hasStdinJsonPayload,
   readStdinSync,
   main,

@@ -150,7 +150,7 @@ Implementations are evaluated at three compliance levels:
 
 ### 3.1 Multi-Layered Architecture
 
-The security architecture employs six independent security layers that provide defense-in-depth:
+The security architecture employs seven independent security layers that provide defense-in-depth:
 
 ```text
 ┌─────────────────────────────────────────────────────┐
@@ -913,6 +913,16 @@ Compilation-time security checks validate workflow definitions before generating
 - Replacement field or pattern
 - Migration instructions
 
+### 10.8 Compile-Time vs Runtime Validation Tradeoffs
+
+The security model uses both compile-time and runtime validation because each layer covers different failure modes:
+
+1. Compile-time checks provide deterministic early rejection for static misconfiguration (schema, expressions, permissions, network declarations, and action pinning) before execution cost is incurred.
+2. Runtime checks provide enforcement against context-dependent threats that cannot be fully proven statically (actor identity, repository origin, token materialization, network path activation, and runtime output integrity).
+3. Controls that can be reliably expressed statically SHOULD be enforced at compile time first to reduce runtime attack surface and operational variance.
+4. Controls that depend on event payloads, credentials, or mutable platform state MUST be enforced at runtime even when a compile-time approximation exists.
+5. Security-critical controls MAY be enforced in both phases when defense-in-depth materially reduces bypass risk.
+
 ---
 
 ## 11. Runtime Security Enforcement
@@ -1022,6 +1032,19 @@ concurrency:
 - Cancellation could leave inconsistent state
 - Sequential queueing is preferred over cancellation
 
+### 11.9 Runtime Enforcement Operations Sequence
+
+A conforming implementation MUST execute runtime controls in this order:
+
+1. **Concurrency gate setup**: Apply `concurrency` grouping and cancellation policy before executing job logic (RS-16 through RS-22).
+2. **Freshness gate**: Validate source-vs-compiled timestamps and fail fast on stale lock files (RS-01 through RS-03).
+3. **Repository trust gate**: Validate repository identity and fork constraints for the active trigger (RS-04 and RS-05).
+4. **Actor authorization gate**: Validate role membership and required privileges before any mutation-capable step (RS-06 through RS-08).
+5. **Credential gate**: Validate token shape and expression-only sourcing before token use (RS-09 through RS-11).
+6. **Network boundary gate**: Activate sandbox/proxy/iptables controls before running agent or MCP execution paths (RS-12 and RS-13).
+7. **Output integrity gate**: Validate agent output schema and required fields before dispatching safe outputs (RS-14 and RS-15).
+8. **Termination and audit**: Fail closed on any gate violation and emit a deterministic security failure reason for auditability.
+
 ---
 
 ## 12. Compliance Testing
@@ -1103,6 +1126,8 @@ A conforming implementation MUST provide a compliance test suite covering all MU
 - **T-CS-004**: Verify network configuration validation
 - **T-CS-005**: Verify action pinning enforcement
 - **T-CS-006**: Verify deprecated feature rejection
+- **T-SG07-001**: Verify fail-secure behavior on schema validation error — when `gh-aw compile` processes a workflow containing a schema validation error (e.g., an unrecognized top-level key, a field with a value that violates the JSON Schema type or enum constraint), compilation **MUST** fail with a non-zero exit code and a diagnostic message identifying the invalid field and the violated schema constraint. The output lock file **MUST NOT** be written or updated when compilation fails due to a schema validation error. **Assertion**: `gh-aw compile` exits non-zero; no `.lock.yml` file is created or modified; stderr contains the schema violation description. **Expected result**: compilation failure; no output artifact produced.
+- **T-SG07-002**: Verify fail-secure behavior on MUST-level requirement violation — when `gh-aw compile` processes a workflow that violates a MUST-level security requirement (e.g., declaring `permissions: contents: write` without a `safe-outputs` configuration, triggering CTR-001), compilation **MUST** fail with a non-zero exit code and a diagnostic message identifying the violated requirement by its rule identifier (e.g., `CTR-001`) and providing actionable remediation guidance. The output lock file **MUST NOT** be written or updated when compilation fails due to a MUST-level requirement violation. **Assertion**: `gh-aw compile` exits non-zero; no `.lock.yml` file is created or modified; stderr contains the rule identifier and remediation guidance. **Expected result**: compilation failure; no output artifact produced.
 
 #### 12.2.8 Runtime Security Tests
 
@@ -1118,6 +1143,14 @@ A conforming implementation MUST provide a compliance test suite covering all MU
 - **T-RS-010**: Verify cancel-in-progress behavior
 - **T-RS-011**: Verify dynamic group identifier generation
 
+#### 12.2.9 Companion GitHub MCP Access-Control Tests
+
+GitHub-tool-specific runtime access-control behaviors are tracked in the companion specifications `scratchpad/github-mcp-access-control-specification.md` and `scratchpad/guard-policies-specification.md`.
+
+- **T-GH-047 to T-GH-060** cover blocked-user enforcement, label-based promotion, minimum-integrity ordering, and related guard-policy runtime decisions for GitHub MCP integrations.
+- These companion test IDs are defined in `scratchpad/github-mcp-access-control-specification.md` Section 11.1.8 (Blocked-User Tests) and Section 11.1.9 (Integrity Level Tests).
+- Dedicated `trusted-users` runtime-enforcement test IDs are not yet mirrored in this top-level suite; maintainers SHOULD consult the companion GitHub MCP access-control specification and implementation tests until they are promoted here.
+
 ### 12.3 Compliance Checklist
 
 | Requirement | Test ID | Level | Status |
@@ -1126,6 +1159,7 @@ A conforming implementation MUST provide a compliance test suite covering all MU
 | Output Isolation | T-OI-001 to T-OI-007 | 1 | Required |
 | Permission Management | T-PM-001 to T-PM-007 | 1 | Required |
 | Compilation-Time Checks | T-CS-001 to T-CS-006 | 1 | Required |
+| Fail-Secure (SG-07) | T-SG07-001, T-SG07-002 | 1 | Required |
 | Network Isolation | T-NI-001 to T-NI-009 | 2 | Required |
 | Sandbox Isolation | T-SI-001 to T-SI-007 | 2 | Required |
 | Runtime Enforcement | T-RS-001 to T-RS-011 | 2 | Required |
@@ -1382,7 +1416,7 @@ Success!
 
 **Explanation**: Terminal color codes (`\x1b[...m`) removed to prevent terminal injection.
 
-#### Example 6: Comprehensive Sanitization
+#### Example 6: Combined Threat Sanitization
 
 **Input** (markdown with multiple threats):
 ```markdown
@@ -1841,6 +1875,10 @@ roles: [admin, maintainer]  # Restrict to trusted roles
 
 - **[GHA-SECURITY]** "Security hardening for GitHub Actions." GitHub Documentation. https://docs.github.com/en/actions/security-guides/security-hardening-for-github-actions
 
+- **[GHAW-GUARD-POLICIES]** "Guard Policies Integration Specification." GitHub Agentic Workflows, version 0.1.0 draft. https://github.com/github/gh-aw/blob/main/scratchpad/guard-policies-specification.md
+
+- **[GHAW-GITHUB-ACCESS]** "GitHub MCP Server Access Control Specification." GitHub Agentic Workflows, version 1.1.0 draft. https://github.com/github/gh-aw/blob/main/scratchpad/github-mcp-access-control-specification.md
+
 ### Informative References
 
 - **[MCP-SPEC]** "Model Context Protocol Specification." Anthropic. https://modelcontextprotocol.io/specification
@@ -1869,7 +1907,7 @@ roles: [admin, maintainer]  # Restrict to trusted roles
 **Status**: Candidate Recommendation
 
 **Initial Release**:
-- Formalized security architecture with six independent layers
+- Formalized security architecture with seven independent layers
 - Defined three conformance classes (Basic, Standard, Complete)
 - Specified input sanitization requirements and procedures
 - Specified output isolation patterns and guarantees
@@ -1880,7 +1918,7 @@ roles: [admin, maintainer]  # Restrict to trusted roles
 - Specified compilation-time security checks
 - Specified runtime security enforcement
 - Defined compliance testing requirements and test categories
-- Included comprehensive appendices with examples and best practices
+- Included appendices with examples and best practices
 
 **Key Design Decisions**:
 - Defense-in-depth approach with independent, composable layers
@@ -1897,4 +1935,27 @@ roles: [admin, maintainer]  # Restrict to trusted roles
 ---
 
 *Copyright © 2026 GitHub, Inc. All rights reserved.*
+
+---
+
+## Sync Notes
+
+This section cross-references the normative compliance validation document and defines the revalidation cadence for this specification.
+
+### Validation Document
+
+The compliance validation pass for this specification is documented in:
+
+- **`specs/security-architecture-spec-validation.md`** — records the results of the most recent full validation pass against each MUST/SHALL requirement, including test IDs, pass/fail status, and any open findings. All conforming implementations **SHOULD** consult this document to understand the current validation state before making security architecture changes.
+
+### Revalidation Trigger
+
+A full revalidation pass **MUST** be triggered and the results in `specs/security-architecture-spec-validation.md` **MUST** be updated whenever:
+
+1. This specification is incremented to a new minor version (e.g., `1.0.x` → `1.1.0` or higher).
+2. A new MUST-level requirement is added or an existing MUST-level requirement is modified or removed in any section.
+3. A security incident or CVE is attributed to a control defined in this specification.
+4. The reference implementation (GitHub Agentic Workflows) ships a change that affects a control described in Sections 4–11.
+
+The revalidation cadence **SHOULD** also include a review of `specs/security-architecture-spec-validation.md` on every minor version bump, even in the absence of the above triggers, to ensure the validation summary table remains current.
 *This specification is provided under the MIT License.*

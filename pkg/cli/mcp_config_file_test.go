@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"reflect"
 	"testing"
 
 	"github.com/github/gh-aw/pkg/testutil"
@@ -31,16 +32,30 @@ func TestEnsureMCPConfig(t *testing.T) {
 				if !exists {
 					t.Error("Expected github-agentic-workflows server to exist")
 				}
+				if server.Type != "local" {
+					t.Errorf("Expected type 'local', got %q", server.Type)
+				}
 				if server.Command != "gh" {
 					t.Errorf("Expected command 'gh', got %q", server.Command)
 				}
 				if len(server.Args) != 2 || server.Args[0] != "aw" || server.Args[1] != "mcp-server" {
 					t.Errorf("Expected args ['aw', 'mcp-server'], got %v", server.Args)
 				}
+				expectedTools := []string{"compile", "audit", "logs", "inspect", "status", "audit-diff"}
+				if len(server.Tools) != len(expectedTools) {
+					t.Errorf("Expected %d tools, got %d (%v)", len(expectedTools), len(server.Tools), server.Tools)
+				} else {
+					for i, tool := range expectedTools {
+						if server.Tools[i] != tool {
+							t.Errorf("Expected tools %v, got %v", expectedTools, server.Tools)
+							break
+						}
+					}
+				}
 			},
 		},
 		{
-			name: "renders instructions for existing config without gh-aw server",
+			name: "adds gh-aw server to existing config without gh-aw server",
 			existingConfig: &MCPConfig{
 				MCPServers: map[string]VSCodeMCPServer{
 					"other-server": {
@@ -52,16 +67,18 @@ func TestEnsureMCPConfig(t *testing.T) {
 			verbose: true,
 			wantErr: false,
 			validateContent: func(t *testing.T, config *MCPConfig) {
-				// File should NOT be modified - should remain with only 1 server
-				if len(config.MCPServers) != 1 {
-					t.Errorf("Expected 1 server (file should not be modified), got %d", len(config.MCPServers))
+				if len(config.MCPServers) != 2 {
+					t.Errorf("Expected 2 servers, got %d", len(config.MCPServers))
 				}
 				if _, exists := config.MCPServers["other-server"]; !exists {
 					t.Error("Expected existing other-server to be preserved")
 				}
-				// gh-aw server should NOT be added (instructions rendered instead)
-				if _, exists := config.MCPServers["github-agentic-workflows"]; exists {
-					t.Error("Expected github-agentic-workflows server to NOT be added (instructions should be rendered)")
+				server, exists := config.MCPServers["github-agentic-workflows"]
+				if !exists {
+					t.Fatal("Expected github-agentic-workflows server to be added")
+				}
+				if server.Type != "local" {
+					t.Errorf("Expected type 'local', got %q", server.Type)
 				}
 			},
 		},
@@ -70,8 +87,10 @@ func TestEnsureMCPConfig(t *testing.T) {
 			existingConfig: &MCPConfig{
 				MCPServers: map[string]VSCodeMCPServer{
 					"github-agentic-workflows": {
+						Type:    "local",
 						Command: "gh",
 						Args:    []string{"aw", "mcp-server"},
+						Tools:   []string{"compile", "audit", "logs", "inspect", "status", "audit-diff"},
 					},
 				},
 			},
@@ -84,25 +103,64 @@ func TestEnsureMCPConfig(t *testing.T) {
 			},
 		},
 		{
-			name: "renders instructions for existing config with different settings",
+			name: "updates existing config with missing required fields",
 			existingConfig: &MCPConfig{
 				MCPServers: map[string]VSCodeMCPServer{
 					"github-agentic-workflows": {
 						Command: "old-command",
 						Args:    []string{"old-arg"},
+						CWD:     "${workspaceFolder}",
 					},
 				},
 			},
 			verbose: false,
 			wantErr: false,
 			validateContent: func(t *testing.T, config *MCPConfig) {
-				// File should NOT be modified - old settings should remain
 				server := config.MCPServers["github-agentic-workflows"]
-				if server.Command != "old-command" {
-					t.Errorf("Expected command to remain 'old-command' (file should not be modified), got %q", server.Command)
+				if server.Type != "local" {
+					t.Errorf("Expected type 'local', got %q", server.Type)
 				}
-				if len(server.Args) != 1 || server.Args[0] != "old-arg" {
-					t.Errorf("Expected args to remain ['old-arg'] (file should not be modified), got %v", server.Args)
+				if server.Command != "gh" {
+					t.Errorf("Expected command 'gh', got %q", server.Command)
+				}
+				expectedArgs := []string{"aw", "mcp-server"}
+				if !reflect.DeepEqual(server.Args, expectedArgs) {
+					t.Errorf("Expected args %v, got %v", expectedArgs, server.Args)
+				}
+				expectedTools := []string{"compile", "audit", "logs", "inspect", "status", "audit-diff"}
+				if len(server.Tools) != len(expectedTools) {
+					t.Errorf("Expected tools %v, got %v", expectedTools, server.Tools)
+				}
+				if server.CWD != "${workspaceFolder}" {
+					t.Errorf("Expected cwd to be preserved, got %q", server.CWD)
+				}
+			},
+		},
+		{
+			name: "updates legacy servers config in place",
+			existingConfig: &MCPConfig{
+				Servers: map[string]VSCodeMCPServer{
+					"github-agentic-workflows": {
+						Command: "gh",
+						Args:    []string{"aw", "mcp-server"},
+					},
+				},
+			},
+			verbose: false,
+			wantErr: false,
+			validateContent: func(t *testing.T, config *MCPConfig) {
+				if config.MCPServers != nil {
+					t.Error("Expected mcpServers to remain nil for legacy-only config")
+				}
+				server, exists := config.Servers["github-agentic-workflows"]
+				if !exists {
+					t.Fatal("Expected github-agentic-workflows server in legacy servers map")
+				}
+				if server.Type != "local" {
+					t.Errorf("Expected type 'local', got %q", server.Type)
+				}
+				if len(server.Tools) != 6 {
+					t.Errorf("Expected 6 tools, got %d", len(server.Tools))
 				}
 			},
 		},
@@ -278,8 +336,10 @@ func TestMCPConfigJSONMarshaling(t *testing.T) {
 	config := MCPConfig{
 		MCPServers: map[string]VSCodeMCPServer{
 			"github-agentic-workflows": {
+				Type:    "local",
 				Command: "gh",
 				Args:    []string{"aw", "mcp-server"},
+				Tools:   []string{"compile", "audit", "logs", "inspect", "status", "audit-diff"},
 			},
 		},
 	}
@@ -312,6 +372,14 @@ func TestMCPConfigJSONMarshaling(t *testing.T) {
 
 	if len(server.Args) != 2 {
 		t.Errorf("Expected 2 args, got %d", len(server.Args))
+	}
+
+	if server.Type != "local" {
+		t.Errorf("Expected type 'local', got %q", server.Type)
+	}
+
+	if len(server.Tools) != 6 {
+		t.Errorf("Expected 6 tools, got %d", len(server.Tools))
 	}
 }
 

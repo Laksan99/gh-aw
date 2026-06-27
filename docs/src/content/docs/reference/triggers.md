@@ -22,12 +22,14 @@ GitHub Agentic Workflows supports all standard GitHub Actions triggers plus addi
 Run workflows manually from the GitHub UI, API, or via `gh aw run`/`gh aw trial`. [Full syntax reference](https://docs.github.com/en/actions/using-workflows/workflow-syntax-for-github-actions#on).
 
 **Basic trigger:**
+
 ```yaml wrap
 on:
   workflow_dispatch:
 ```
 
 **With input parameters:**
+
 ```yaml wrap
 on:
   workflow_dispatch:
@@ -54,63 +56,29 @@ on:
 
 #### Accessing Inputs in Markdown
 
-Use `${{ github.event.inputs.INPUT_NAME }}` expressions to access workflow_dispatch inputs in your markdown content:
+Access inputs in your markdown content with `${{ github.event.inputs.INPUT_NAME }}`:
 
-```aw wrap
----
-on:
-  workflow_dispatch:
-    inputs:
-      topic:
-        description: 'Research topic'
-        required: true
-        type: string
-permissions:
-  contents: read
-safe-outputs:
-  create-discussion:
----
-
-# Research Assistant
-
+```markdown
 Research the following topic: "${{ github.event.inputs.topic }}"
-
-Provide a comprehensive summary with key findings and recommendations.
 ```
 
-**Supported input types:**
-- `string` - Free-form text input
-- `boolean` - True/false checkbox
-- `choice` - Dropdown selection with predefined options
-- `environment` - Dropdown selection of GitHub environments configured in the repository
+**Supported input types:** `string` (free-form text), `boolean` (checkbox), `choice` (dropdown with predefined options), and `environment` (dropdown populated from repository Settings → Environments).
 
-The `environment` input type automatically populates a dropdown with environments configured in repository Settings → Environments. It returns the environment name as a string and supports a `default` value. Unlike the `manual-approval:` field, using an `environment` input does not enforce environment protection rules—it only provides the environment name as a string value for use in your workflow logic.
+The `environment` input returns the environment name as a string and supports a `default` value. Unlike `manual-approval:`, it does not enforce environment protection rules — it only provides the environment name for use in your workflow logic.
 
 ### Scheduled Triggers (`schedule:`)
 
 Run workflows on a recurring schedule using human-friendly expressions or [cron syntax](https://docs.github.com/en/actions/using-workflows/events-that-trigger-workflows#schedule).
 
-**Fuzzy Scheduling (Recommended):**
+**Fuzzy Scheduling:**
 
-Use fuzzy schedules to automatically scatter execution times and avoid load spikes:
-
-```yaml wrap
-on:
-  schedule: daily  # Compiler assigns a unique scattered time per workflow
-```
-
-Use the `around` constraint for a preferred time with flexibility:
+Fuzzy schedules scatter execution times to avoid load spikes. Use `around <time>` for a preferred time with ±1 hour flexibility, or `between <a> and <b>` to scatter within a window (such as business hours):
 
 ```yaml wrap
 on:
-  schedule: daily around 14:00  # Scatters within ±1 hour (13:00-15:00)
-```
-
-For workflows that should only run during specific hours (like business hours), use the `between` constraint:
-
-```yaml wrap
-on:
-  schedule: daily between 9:00 and 17:00  # Scatters within 9am-5pm range
+  schedule: daily                              # Compiler picks a scattered time
+  # schedule: daily around 14:00               # ±1 hour around 2pm
+  # schedule: daily between 9:00 and 17:00     # Scatters within 9am-5pm
 ```
 
 The compiler assigns each workflow a unique, deterministic execution time based on the file path, ensuring load distribution and consistency across recompiles. UTC offsets are supported on any time expression (e.g., `daily between 9am and 5pm utc-5`).
@@ -166,40 +134,13 @@ on:
     lock-for-agent: true
 ```
 
-When enabled, the issue is locked at workflow start and unlocked after completion (or before safe-output processing). The unlock step uses `always()` to ensure cleanup even on failure. Useful for workflows that make multiple sequential updates to an issue or need to prevent race conditions.
-
-**Requirements:**
-- Requires `issues: write` permission (automatically added to activation and conclusion jobs)
-- Pull requests are silently skipped (they cannot be locked via the issues API)
-- Already-locked issues are skipped without error
-
-**Example workflow:**
-```aw wrap
----
-on:
-  issues:
-    types: [opened]
-    lock-for-agent: true
-permissions:
-  contents: read
-safe-outputs:
-  add-comment:
-    max: 3
----
-
-# Issue Processor with Locking
-
-Process the issue and make multiple updates without interference
-from concurrent modifications.
-
-Context: "${{ steps.sanitized.outputs.text }}"
-```
+The issue is locked at workflow start and unlocked after completion (or before safe-output processing); the unlock step uses `always()` so cleanup runs even on failure. Useful for workflows that make multiple sequential updates or need to prevent race conditions.
 
 ### Pull Request Triggers (`pull_request:`)
 
 Trigger on pull request events. [Full event reference](https://docs.github.com/en/actions/using-workflows/events-that-trigger-workflows#pull_request).
 
-**Code availability:** When triggered by a pull request event, the coding agent has access to both the PR branch and the default branch.
+When triggered by a pull request event, the coding agent has access to both the PR branch and the default branch.
 
 ```yaml wrap
 on:
@@ -220,17 +161,13 @@ on:
     forks: ["trusted-org/*"]  # Allow forks from trusted-org
 ```
 
-**Available patterns:**
-- `["*"]` - Allow all forks (use with caution)
-- `["owner/*"]` - Allow forks from specific organization or user
-- `["owner/repo"]` - Allow specific repository
-- Omit `forks` field - Default behavior (same-repository PRs only)
-
-The compiler uses repository ID comparison for reliable fork detection that is not affected by repository renames.
+Use `["owner/repo"]` for a specific repository, `["owner/*"]` for an entire org/user, or `["*"]` to allow all forks (use with caution). Omit `forks:` for the default behavior (same-repository PRs only). The compiler uses repository ID comparison so fork detection is unaffected by repository renames.
 
 ### Comment Triggers
 
-**Note:** `issue_comment` events also fire for comments on pull requests (GitHub models PR comments as issue comments). When a comment is on a pull request, the coding agent has access to both the PR branch and the default branch.
+The triggers `issue_comment:`, `pull_request_review_comment:`, and `discussion_comment:` activate workflows when comments are created or edited.
+
+Note that `issue_comment` events also fire for comments on pull requests (GitHub models PR comments as issue comments). When a comment is on a pull request, the coding agent has access to both the PR branch and the default branch.
 
 ```yaml wrap
 on:
@@ -272,12 +209,17 @@ on:
       - develop
 ```
 
-Workflows with `workflow_run` triggers include automatic security protections:
+You can also combine `workflow_run` with top-level authorization filters such as `bots:` or `roles:`:
 
-- **Repository/fork validation:** The compiler injects repository ID and fork checks, rejecting cross-repository or fork-triggered runs.
-- **Branch restrictions required:** Include `branches` to limit triggering branches; without them the compiler warns (or errors in strict mode).
+```yaml wrap
+on:
+  workflow_run:
+    workflows: ["CI"]
+    types: [completed]
+  bots: ["dependabot[bot]"]
+```
 
-See the [Security Architecture](/gh-aw/introduction/architecture/) for details.
+Workflows with `workflow_run` triggers include automatic security protections: `workflows` must list at least one non-empty entry (empty or missing values are rejected at compile time, since GitHub silently disables such triggers); the compiler injects repository ID and fork checks to reject cross-repository or fork-triggered runs; and `branches` is recommended to limit triggering branches (the compiler warns when omitted, or errors in strict mode). See the [Security Architecture](/gh-aw/introduction/architecture/) for details.
 
 #### Conclusion Filtering (`conclusion:`)
 
@@ -304,27 +246,16 @@ on:
 
 #### State Filtering (`state:`)
 
-Use `state:` to restrict the trigger to specific deployment states. The compiler compiles this into a guarded `if:` condition so the workflow only runs for the matching states. Other combined triggers (such as `workflow_dispatch`) are not blocked by the guard.
+Use `state:` to restrict the trigger to specific deployment states (single value or list). The compiler emits a guarded `if:` condition so other combined triggers (such as `workflow_dispatch`) pass through unaffected.
 
 ```yaml wrap
 on:
   deployment_status:
-    state: failure            # Single state
-```
-
-```yaml wrap
-on:
-  deployment_status:
-    state: [error, failure]   # Multiple states
+    state: [error, failure]   # Or a single value: state: failure
   workflow_dispatch:           # Safely combined — guard ensures dispatch passes through
 ```
 
 Valid `state` values: `error`, `failure`, `pending`, `success`, `inactive`, `in_progress`, `queued`, `waiting`.
-
-> [!NOTE]
-> The `state` field compiles into a GitHub Actions `if:` condition: `github.event_name != 'deployment_status' || (github.event.deployment_status.state == 'failure')`. This means the workflow still runs when triggered by other events in the same `on:` block.
-
-#### Required Permissions
 
 Workflows triggered by `deployment_status` need `deployments: read` to access the event payload:
 
@@ -333,56 +264,6 @@ permissions:
   contents: read
   deployments: read
 ```
-
-#### Natural Language Shorthands
-
-```yaml wrap
-on: "deployment failed"             # deployment_status with state == 'failure'
-on: "deployment error"              # deployment_status with state == 'error'
-on: "deployment failed or error"    # deployment_status with state == 'failure' or 'error'
-```
-
-These shorthands also include `workflow_dispatch` automatically.
-
-#### Deployment Incident Monitor Example
-
-```aw wrap
----
-on:
-  deployment_status:
-    state: [error, failure]
-  workflow_dispatch:
-permissions:
-  contents: read
-  actions: read
-  deployments: read
-tools:
-  github:
-    toolsets: [repos, actions]
-safe-outputs:
-  create-issue:
-    expires: 7d
-    title-prefix: "[Incident] "
-    labels: [incident, deployment-failure]
-    close-older-issues: true
-    skip-if-match: 'is:issue is:open label:incident label:deployment-failure'
-  noop:
----
-
-# Deployment Incident Monitor
-
-A deployment to ${{ github.event.deployment.environment }} has failed with state: ${{ github.event.deployment_status.state }}.
-
-Investigate the root cause:
-1. Check the deployment workflow logs for the failing step
-2. Review recent commits to the deployed branch for potential causes
-3. Check if this environment has had recent failures (look for existing incident issues)
-
-If a new incident is found, create an issue summarizing the failure, the likely root cause, and the recommended next step.
-If an incident issue for this deployment already exists, call noop.
-```
-
-See the [Natural Language Shorthands](#other-shorthands) section for additional shorthand formats.
 
 ### Repository Dispatch Trigger (`repository_dispatch:`)
 
@@ -415,29 +296,9 @@ Content-Type: application/json
 
 Reference `client_payload` fields in your workflow markdown using standard GitHub Actions expressions:
 
-```yaml wrap
-on:
-  repository_dispatch:
-    types: [jira-issue-created]
-```
-
 ```markdown
 Issue ${{ github.event.client_payload.issue_key }}: ${{ github.event.client_payload.summary }}
 ```
-
-#### Natural Language Shorthand
-
-```yaml wrap
-on: api dispatch jira-issue-created   # repository_dispatch with custom event type
-```
-
-See [Other Shorthands](#other-shorthands) for the full list of dispatch shorthands.
-
-#### Triggering from Jira
-
-In **Project → Automation**, create a rule with trigger **Issue created** and action **Send web request** pointing at the dispatch endpoint above. Pass Jira smart values as `client_payload` fields (e.g., `{{issue.key}}`).
-
-See the FAQ entry [Can I trigger an agentic workflow from an external system like Jira?](/gh-aw/reference/faq/#can-i-trigger-an-agentic-workflow-from-an-external-system-like-jira) for a complete walkthrough.
 
 ### Command Triggers (`slash_command:`)
 
@@ -486,7 +347,11 @@ The `remove_label` field (boolean, default `true`) controls whether the label is
 
 `label_command` can be combined with `slash_command:` — the workflow activates when either condition is met. See [LabelOps](/gh-aw/patterns/label-ops/) for patterns and examples.
 
-### Label Filtering (`names:`)
+## Trigger Filtering
+
+Triggers can be filtered by label names, and more. These filters compile into guarded `if:` conditions that ensure the workflow only runs when the specified criteria are met, while allowing other events to pass through unaffected.
+
+### Filtering with Labels (`names:`)
 
 Filter issue and pull request triggers by label names using the `names:` field. Unlike `label_command`, the label stays on the item after the workflow runs.
 
@@ -506,6 +371,118 @@ on: pull_request labeled needs-review, ready-to-merge
 ```
 
 All shorthand formats compile to standard GitHub Actions syntax and automatically include the `workflow_dispatch` trigger. Supported for `issue`, `pull_request`, and `discussion` events. See [LabelOps workflows](/gh-aw/patterns/label-ops/) for automation examples.
+
+### Filtering with Simple Conditions (`:if`)
+
+For conditions that can be expressed directly with GitHub Actions context, use `if:` without a custom job:
+
+```yaml wrap
+---
+on:
+  pull_request:
+    types: [opened, synchronize]
+
+if: github.event.pull_request.draft == false
+---
+```
+
+### Filtering with Search Queries (`skip-if-match:`, `skip-if-no-match:`)
+
+For conditions based on GitHub search results, use [`skip-if-match:`](#skip-if-match-condition-skip-if-match) or [`skip-if-no-match:`](#skip-if-no-match-condition-skip-if-no-match) in the `on:` section. These accept standard [GitHub search query syntax](https://docs.github.com/en/search-github/searching-on-github/searching-issues-and-pull-requests) and produce the same skipped-not-failed behavior.
+
+### Filtering by Repository Access Roles (`on.roles:`, `on.skip-roles:`)
+
+Controls who can trigger agentic workflows using an **exact-match allowlist** — each role is matched literally against the actor's repository role with no privilege hierarchy. Defaults to `[admin, maintainer, write]`. Use `skip-roles:` to exempt team members from checks that should only apply to external contributors.
+
+```yaml wrap
+on:
+  issues:
+    types: [opened]
+  roles: [admin, maintainer, write]   # Default; use `all` to allow any user (⚠️ caution)
+  # skip-roles: [admin, maintainer, write]
+```
+
+:::caution[Exact match, not a minimum threshold]
+`roles` is an allowlist, not a privilege threshold. Setting `roles: [write]` will **reject** actors with `admin` or `maintainer` roles because `admin !== write`. To accept all typical contributors, list every role explicitly, e.g. `[admin, maintainer, write]`.
+:::
+
+Available roles: `admin`, `maintainer`/`maintain`, `write`, `triage`, `read`, `all`. Workflows with unsafe triggers (`push`, `issues`, `pull_request`) automatically enforce permission checks. Failed checks cancel the workflow with a warning.
+
+### Filtering by Bot (`on.bots:`, `on.skip-bots:`)
+
+Configure which GitHub bot accounts can trigger workflows — useful for allowing specific automation bots while maintaining security controls. Use `skip-bots:` for the inverse:
+
+```yaml wrap
+on:
+  issues:
+    types: [opened]
+  bots: ["dependabot[bot]", "renovate[bot]", "agentic-workflows-dev[bot]"]
+  # skip-bots: [github-actions, copilot, dependabot]
+```
+
+The `[bot]` suffix is optional — `github-actions` matches `github-actions[bot]` automatically.
+
+### Filtering by Author Associations (`on.skip-author-associations`)
+
+You can skip workflow execution when a specific event is triggered by an author with a matching event payload `author_association` field (for example `github.event.comment.author_association`, `github.event.issue.author_association`, or `github.event.pull_request.author_association`).
+
+```yaml wrap
+on:
+  issue_comment:
+    types: [created]
+  pull_request_review_comment:
+    types: [created]
+  skip-author-associations:
+    issue_comment: contributor
+    pull_request_review_comment: [first_time_contributor, none]
+```
+
+### Filtering by Custom Steps (`on.steps:`)
+
+Inject deterministic filtering steps directly into the pre-activation job — see [Pre-Activation Steps](#pre-activation-steps-onsteps) for full syntax and examples. This is the recommended approach for lightweight filtering since it saves one workflow job versus the multi-job pattern below.
+
+### Filtering by Custom Jobs (`jobs:`)
+
+For complex custom trigger filtering you can use a separate `jobs:` entry when filtering requires heavy tooling (checkout, compiled tools, multiple runners):
+
+```yaml wrap title=".github/workflows/smart-responder.md"
+---
+on:
+  issues:
+    types: [opened]
+
+safe-outputs:
+  add-comment:
+
+jobs:
+  filter:
+    runs-on: ubuntu-latest
+    outputs:
+      should-run: ${{ steps.check.outputs.result }}
+    steps:
+      - id: check
+        env:
+          LABELS: ${{ toJSON(github.event.issue.labels.*.name) }}
+        run: |
+          if echo "$LABELS" | grep -q '"bug"'; then
+            echo "result=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "result=false" >> "$GITHUB_OUTPUT"
+          fi
+
+if: needs.filter.outputs.should-run == 'true'
+---
+
+# Bug Issue Responder
+
+Triage bug report: "${{ github.event.issue.title }}" and add-comment with a summary of the next steps.
+```
+
+The compiler automatically adds the filter job as a dependency of the activation job, so when the condition is false the workflow run is **skipped** (not failed), keeping the Actions tab clean.
+
+## Additional Trigger Options
+
+Trigger support additional options for reactions, status comments, authentication tokens, and more. These options are configured in the same `on:` block as the trigger and apply to all triggers defined within that block.
 
 ### Reactions (`reaction:`)
 
@@ -534,9 +511,7 @@ on:
   status-comment: true
 ```
 
-When `status-comment: true`, the activation job posts a comment when the workflow starts and updates it when the run completes. Setting `reaction:` alone does not create status comments — they are independent settings.
-
-For `slash_command` and `label_command` triggers, both `reaction: eyes` and `status-comment: true` are enabled by default. Disable either explicitly:
+When `status-comment: true`, the activation job posts a comment on workflow start and updates it on completion. `reaction:` and `status-comment:` are independent settings. For `slash_command` and `label_command`, both default to enabled (with `reaction: eyes`); disable either explicitly:
 
 ```yaml wrap
 on:
@@ -545,11 +520,7 @@ on:
   status-comment: false    # disable the status comment
 ```
 
-For all other trigger types, `status-comment` must be explicitly set to `true` to enable it. To suppress status comments, omit `status-comment:` or set it to `false`.
-
-#### Selective target control (object form)
-
-Use an object to enable status comments while selectively disabling specific targets. The object form implies status comments are enabled; each field defaults to `true`:
+For all other triggers, `status-comment` must be explicitly set to `true`. Use an object to selectively disable specific targets (each field defaults to `true`):
 
 ```yaml wrap
 on:
@@ -571,14 +542,9 @@ on:
 | `pull-requests` | boolean | `true` | Enable status comments for `pull_request` and `pull_request_review_comment` events |
 | `discussions` | boolean | `true` | Enable status comments for `discussion` and `discussion_comment` events |
 
-> [!NOTE]
-> Setting all three fields to `false` is a compilation error. If no targets are enabled, use `status-comment: false` instead.
-
 ### Activation Token (`on.github-token:`, `on.github-app:`)
 
-Configure a custom GitHub token or GitHub App for the activation job **and all skip-if search checks**. The activation job posts the initial reaction (and status comment if `status-comment: true`) on the triggering item, and skip-if checks use the same token to query the GitHub Search API. By default all of these operations use the workflow's `GITHUB_TOKEN`.
-
-Use `github-token:` to supply a PAT or custom token:
+Configure a custom GitHub token or GitHub App for the activation job **and all skip-if search checks** — reaction, status comment, and search steps share the same token (default: workflow's `GITHUB_TOKEN`). Use `github-token:` for a PAT or `github-app:` to mint a short-lived installation token:
 
 ```yaml wrap
 on:
@@ -587,8 +553,6 @@ on:
   reaction: "eyes"
   github-token: ${{ secrets.MY_TOKEN }}
 ```
-
-Use `github-app:` to mint a short-lived installation token instead:
 
 ```yaml wrap
 on:
@@ -600,9 +564,9 @@ on:
     private-key: ${{ secrets.APP_KEY }}
 ```
 
-The `github-app` object accepts the same fields as the GitHub App configuration used elsewhere in the framework (`app-id`, `private-key`, and optionally `owner` and `repositories`). The token is minted once in the pre-activation job and is shared across the reaction step, the status comment step (if `status-comment: true`), and any skip-if search steps.
+The `github-app` object accepts `client-id`, `private-key`, and optionally `owner` and `repositories` — the same fields used elsewhere in the framework (`app-id` is a deprecated alias for `client-id`). The token is minted once in the pre-activation job.
 
-Both `github-token` and `github-app` can be defined in a **shared agentic workflow** and will be automatically inherited by any workflow that imports it (first-wins strategy). This means a central CentralRepoOps shared workflow can define the app config once and all importing workflows benefit automatically:
+Both fields can be defined in a **shared agentic workflow** and are inherited by importers (first-wins). A `CentralRepoOps` shared workflow can define the app config once and all importers benefit:
 
 ```yaml wrap
 # shared-ops.md - define app config once
@@ -667,11 +631,9 @@ on: weekly on monday
     max: 3  # Skip if 3 or more PRs match
 ```
 
-A pre-activation check runs the search query against the current repository. If matches reach or exceed the threshold (default `max: 1`), the workflow is skipped. The query is automatically scoped to the current repository and supports all standard GitHub search qualifiers (`is:`, `label:`, `in:title`, `author:`, etc.).
+A pre-activation check runs the query against the current repository. If matches reach or exceed the threshold (default `max: 1`), the workflow is skipped. All standard GitHub search qualifiers are supported (`is:`, `label:`, `in:title`, `author:`, etc.).
 
-#### Cross-Repo and Org-Wide Queries
-
-By default the query is scoped to the current repository. Use `scope: none` to disable this and search across an entire org. For cross-repo or org-wide searches that require elevated permissions, configure `github-token` or `github-app` at the top-level `on:` section — the same token is shared across all skip-if checks and the activation job:
+Use `scope: none` to remove the automatic repo qualifier and search org-wide. For cross-repo or org-wide searches that need elevated permissions, configure `github-token` or `github-app` at the top-level `on:` section — the same token is shared across all skip-if checks and the activation job:
 
 ```yaml wrap
 on:
@@ -689,7 +651,7 @@ on:
 |-------|----------|-------------|
 | `scope: none` | inside `skip-if-match` | Disables the automatic `repo:owner/repo` qualifier |
 | `github-token` | top-level `on:` | Custom PAT or token for all skip-if searches (e.g. `${{ secrets.CROSS_ORG_TOKEN }}`) |
-| `github-app` | top-level `on:` | Mints a short-lived installation token shared across all skip-if steps; requires `app-id` and `private-key` |
+| `github-app` | top-level `on:` | Mints a short-lived installation token shared across all skip-if steps; requires `client-id` and `private-key` |
 
 `github-token` and `github-app` are mutually exclusive. String shorthand always uses the default `GITHUB_TOKEN` scoped to the current repository.
 
@@ -710,21 +672,7 @@ on:
     min: 3  # Only run if 3 or more issues match
 ```
 
-A pre-activation check runs the search query against the current repository. If matches are below the threshold (default `min: 1`), the workflow is skipped. Can be combined with `skip-if-match` for complex conditions.
-
-The same `scope: none` field available on `skip-if-match` works identically here. Authentication (`github-token` / `github-app`) is configured at the top-level `on:` section and is shared across all skip-if checks — a single mint step is emitted for both:
-
-```yaml wrap
-on:
-  schedule: every 15 minutes
-  skip-if-no-match:
-    query: "org:myorg label:agent-fix -label:ops:agentic is:issue is:open"
-    scope: none
-  github-app:
-    client-id: ${{ secrets.WORKFLOW_APP_ID }}
-    private-key: ${{ secrets.WORKFLOW_APP_PRIVATE_KEY }}
-    owner: myorg
-```
+If matches are below the threshold (default `min: 1`), the workflow is skipped. Can be combined with `skip-if-match` for complex conditions. `scope: none`, `github-token`, and `github-app` work identically to [`skip-if-match`](#skip-if-match-condition-skip-if-match) above — a single mint step is shared when both are present.
 
 ### Pre-Activation Steps (`on.steps:`)
 
@@ -747,24 +695,9 @@ if: needs.pre_activation.outputs.label_check_result == 'success'
 
 Each step with an `id` automatically gets an output `<id>_result` wired to `${{ steps.<id>.outcome }}` (values: `success`, `failure`, `cancelled`, `skipped`). This lets you gate the workflow on whether the step **succeeded or failed** via its exit code.
 
-To pass an explicit value rather than relying on exit codes, set a step output and re-expose it via `jobs.pre-activation.outputs`:
+To pass an explicit value rather than relying on exit codes, set a step output (e.g., `echo "has_bug_label=true" >> "$GITHUB_OUTPUT"`) and re-expose it via `jobs.pre-activation.outputs`:
 
 ```yaml wrap
-on:
-  issues:
-    types: [opened]
-  steps:
-    - name: Check issue label
-      id: label_check
-      env:
-        LABELS: ${{ toJSON(github.event.issue.labels.*.name) }}
-      run: |
-        if echo "$LABELS" | grep -q '"bug"'; then
-          echo "has_bug_label=true" >> "$GITHUB_OUTPUT"
-        else
-          echo "has_bug_label=false" >> "$GITHUB_OUTPUT"
-        fi
-
 jobs:
   pre-activation:
     outputs:
@@ -773,7 +706,7 @@ jobs:
 if: needs.pre_activation.outputs.has_bug_label == 'true'
 ```
 
-Explicit outputs defined in `jobs.pre-activation.outputs` take precedence over auto-wired `<id>_result` outputs on key collision.
+Explicit outputs in `jobs.pre-activation.outputs` take precedence over auto-wired `<id>_result` outputs on key collision.
 
 ### Pre-Activation and Activation Dependencies (`on.needs:`)
 
@@ -837,7 +770,7 @@ Supported permission scopes: `actions`, `checks`, `contents`, `deployments`, `di
 
 Instead of writing full YAML trigger configurations, you can use natural-language shorthand strings with `on:`. The compiler expands these into standard GitHub Actions trigger syntax and automatically includes `workflow_dispatch` so the workflow can also be run manually.
 
-For label-based shorthands (`on: issue labeled bug`, `on: pull_request labeled needs-review`), see [Label Filtering](#label-filtering-names) above. For the label-command pattern, see [Label Command Trigger](#label-command-trigger-label_command) above.
+For label-based shorthands (`on: issue labeled bug`, `on: pull_request labeled needs-review`), see [Label Filtering](#filtering-with-labels-names) above. For the label-command pattern, see [Label Command Trigger](#label-command-trigger-label_command) above.
 
 ### Push and Pull Request
 
@@ -851,24 +784,6 @@ on: pull_request opened affecting docs/**  # Activity type + path filter
 ```
 
 `pull` is an alias for `pull_request`. Valid activity types: `opened`, `edited`, `closed`, `reopened`, `synchronize`, `assigned`, `unassigned`, `labeled`, `unlabeled`, `review_requested`, `merged`.
-
-#### Glob Pattern Validation
-
-The compiler validates glob patterns in `branches`, `branches-ignore`, `tags`, `tags-ignore`, and `paths`/`paths-ignore` filter fields at compile time for `push`, `pull_request`, `pull_request_target`, and `workflow_run` triggers. Invalid patterns produce a compilation error:
-
-```yaml wrap
-on:
-  push:
-    paths:
-      - ./src/**/*.go   # error: invalid glob pattern "./src/**/*.go" in on.push.paths
-    branches:
-      - main branch     # error: invalid glob pattern "main branch" in on.push.branches
-```
-
-Common invalid patterns:
-- **`./`-prefixed paths** — use `src/**` not `./src/**`
-- **Spaces in ref patterns** — branch/tag names cannot contain spaces
-- **Unclosed brackets** — e.g. `feat[` without a closing `]`
 
 ### Issues and Discussions
 
@@ -904,5 +819,6 @@ on: "deployment failed or error"    # deployment_status with state == 'failure' 
 - [Schedule Syntax](/gh-aw/reference/schedule-syntax/) - Complete schedule format reference
 - [Command Triggers](/gh-aw/reference/command-triggers/) - Special @mention triggers and context text
 - [Frontmatter](/gh-aw/reference/frontmatter/) - Complete frontmatter configuration
+- [DeterministicOps](/gh-aw/patterns/deterministic-ops/) - Combining deterministic steps with AI reasoning
 - [LabelOps](/gh-aw/patterns/label-ops/) - Label-based automation workflows
 - [Workflow Structure](/gh-aw/reference/workflow-structure/) - Directory layout and organization

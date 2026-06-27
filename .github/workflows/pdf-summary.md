@@ -1,4 +1,6 @@
 ---
+private: true
+emoji: "📄"
 description: pdf summarizer
 on:
   # Command trigger - responds to /summarize mentions
@@ -12,7 +14,7 @@ on:
     inputs:
       url:
         description: 'URL(s) to resource(s) to analyze (comma-separated for multiple URLs)'
-        required: true
+        required: false
         type: string
       query:
         description: 'Query or question to answer about the resource(s)'
@@ -26,13 +28,15 @@ permissions:
   pull-requests: read
   discussions: read
 
-engine: copilot
+engine:
+  id: copilot
+  copilot-sdk: true
 
 imports:
   - shared/mcp/markitdown.md
   - shared/reporting.md
 
-  - shared/observability-otlp.md
+  - shared/otlp.md
 tools:
   cli-proxy: true
   cache-memory: true
@@ -44,7 +48,7 @@ safe-outputs:
     expires: 1d
     max: 1
   messages:
-    footer: "> 📄 *Summary compiled by [{workflow_name}]({run_url})*{effective_tokens_suffix}{history_link}"
+    footer: "> 📄 *Summary compiled by [{workflow_name}]({run_url})*{ai_credits_suffix}{history_link}"
     run-started: "📖 Page by page! [{workflow_name}]({run_url}) is reading through this {event_type}..."
     run-success: "📚 TL;DR ready! [{workflow_name}]({run_url}) has distilled the essence. Knowledge condensed! ✨"
     run-failure: "📖 Reading interrupted! [{workflow_name}]({run_url}) {status}. The document remains unsummarized..."

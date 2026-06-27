@@ -3,12 +3,18 @@ import { describe, it, expect, beforeEach, vi } from "vitest";
 // Mock core global
 const mockCore = {
   info: vi.fn(),
+  warning: vi.fn(),
 };
 global.core = mockCore;
 
 describe("ephemerals", () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    delete process.env.GH_AW_DEFAULT_UTC;
+    delete process.env.GH_AW_PROJECT_UTC;
+    delete process.env.GITHUB_WORKSPACE;
+    delete process.env.RUNNER_WORKSPACE;
+    delete process.env.GITHUB_REPOSITORY;
   });
 
   describe("formatExpirationDate", () => {
@@ -19,6 +25,17 @@ describe("ephemerals", () => {
       expect(result).toMatch(/Jan 25, 2026/);
       // Note: formatExpirationDate returns format like "Jan 25, 2026, 3:54 PM"
       // UTC is added by createExpirationLine, not by formatExpirationDate itself
+    });
+
+    it("should use configured default timezone when present", async () => {
+      process.env.GH_AW_DEFAULT_UTC = "-08:00";
+      const { formatExpirationDate } = await import("./ephemerals.cjs");
+      const date = new Date("2026-01-25T15:54:08.894Z");
+
+      const result = formatExpirationDate(date);
+
+      expect(result).toContain("Jan 25, 2026");
+      expect(result).toContain("UTC-08:00");
     });
   });
 
@@ -34,12 +51,36 @@ describe("ephemerals", () => {
       expect(result).toContain("UTC");
     });
 
+    it("should use compiled project timezone ahead of the default timezone", async () => {
+      process.env.GH_AW_PROJECT_UTC = "-08:00";
+      process.env.GH_AW_DEFAULT_UTC = "+00:00";
+
+      const { createExpirationLine } = await import("./ephemerals.cjs");
+      const date = new Date("2026-01-25T15:54:08.894Z");
+      const result = createExpirationLine(date);
+
+      expect(result).toContain("UTC-08:00");
+      expect(result).not.toContain("UTC+00:00");
+      expect(result).not.toMatch(/\sUTC$/);
+    });
+
     it("should include ISO format in XML comment", async () => {
       const { createExpirationLine } = await import("./ephemerals.cjs");
       const date = new Date("2026-01-25T15:54:08.894Z");
       const result = createExpirationLine(date);
 
       expect(result).toMatch(/<!-- gh-aw-expires: \d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z -->/);
+    });
+
+    it("should use compiled project timezone when present", async () => {
+      process.env.GH_AW_PROJECT_UTC = "+02:00";
+
+      const { createExpirationLine } = await import("./ephemerals.cjs");
+      const date = new Date("2026-01-25T15:54:08.894Z");
+      const result = createExpirationLine(date);
+
+      expect(result).toContain("UTC+02:00");
+      expect(result).not.toMatch(/\sUTC$/);
     });
   });
 
@@ -125,6 +166,20 @@ describe("ephemerals", () => {
 
       expect(result).toBeInstanceOf(Date);
       // Should use ISO date from HTML comment, not the human-readable date
+      expect(result?.toISOString()).toBe("2026-01-25T15:54:08.894Z");
+    });
+
+    it("should parse a generated expiration line when project utc is configured", async () => {
+      process.env.GH_AW_PROJECT_UTC = "-08:00";
+
+      const { createExpirationLine, extractExpirationDate } = await import("./ephemerals.cjs");
+      const date = new Date("2026-01-25T15:54:08.894Z");
+      const body = `> ${createExpirationLine(date)}`;
+
+      const result = extractExpirationDate(body);
+
+      expect(body).toContain("UTC-08:00");
+      expect(result).toBeInstanceOf(Date);
       expect(result?.toISOString()).toBe("2026-01-25T15:54:08.894Z");
     });
   });

@@ -3,20 +3,18 @@ package workflow
 import (
 	"fmt"
 	"path/filepath"
-	"regexp"
 	"sort"
 	"strings"
 
+	"github.com/github/gh-aw/pkg/setutil"
 	"github.com/github/gh-aw/pkg/stringutil"
 
 	"github.com/github/gh-aw/pkg/constants"
 	"github.com/github/gh-aw/pkg/logger"
 	"github.com/github/gh-aw/pkg/sliceutil"
-	"github.com/goccy/go-yaml"
 )
 
 var compilerJobsLog = logger.New("workflow:compiler_jobs")
-var exactSetupStepIDPattern = regexp.MustCompile(`(?m)^\s*id:\s*setup\s*$`)
 
 // This file contains job building functions extracted from compiler.go
 // These functions are responsible for constructing the various jobs that make up
@@ -470,28 +468,27 @@ func (c *Compiler) ensureConclusionIsLastJob() error {
 	}
 
 	// Build a set of already-listed needs for O(1) lookup
-	currentNeeds := make(map[string]bool, len(conclusionJob.Needs))
+	currentNeeds := make(map[string]struct {
+	}, len(conclusionJob.Needs))
 	for _, need := range conclusionJob.Needs {
-		currentNeeds[need] = true
+		currentNeeds[need] = struct {
+		}{}
 	}
 
 	// Jobs that must never appear in conclusion's needs
-	exclude := map[string]bool{
-		"conclusion":                           true,
-		string(constants.PreActivationJobName): true,
-		"pre-activation":                       true,
+	exclude := map[string]struct {
+	}{
+		"conclusion":                           {},
+		string(constants.PreActivationJobName): {},
+		"pre-activation":                       {},
 	}
 
 	// Iterate over all jobs in alphabetical order for deterministic output
 	allJobs := c.jobManager.GetAllJobs()
-	jobNames := make([]string, 0, len(allJobs))
-	for name := range allJobs {
-		jobNames = append(jobNames, name)
-	}
-	sort.Strings(jobNames)
+	jobNames := sliceutil.SortedKeys(allJobs)
 
 	for _, jobName := range jobNames {
-		if exclude[jobName] || currentNeeds[jobName] {
+		if setutil.Contains(exclude, jobName) || setutil.Contains(currentNeeds, jobName) {
 			continue
 		}
 		conclusionJob.Needs = append(conclusionJob.Needs, jobName)
@@ -510,491 +507,6 @@ func (c *Compiler) extractJobsFromFrontmatter(frontmatter map[string]any) map[st
 	return ExtractMapField(frontmatter, "jobs")
 }
 
-// buildCustomJobs creates custom jobs defined in the frontmatter jobs section
-func (c *Compiler) buildCustomJobs(data *WorkflowData, activationJobCreated bool) error {
-	compilerJobsLog.Printf("Building %d custom jobs", len(data.Jobs))
-
-	// Pre-compute jobs referenced in the markdown body with no explicit needs.
-	// These run before activation (not after), so we must not auto-add activation to them.
-	promptReferencedJobsSlice := c.getCustomJobsReferencedInPromptWithNoActivationDep(data)
-	promptReferencedJobs := make(map[string]bool, len(promptReferencedJobsSlice))
-	for _, j := range promptReferencedJobsSlice {
-		promptReferencedJobs[j] = true
-	}
-	onNeedsJobs := make(map[string]bool, len(data.OnNeeds))
-	for _, j := range data.OnNeeds {
-		onNeedsJobs[j] = true
-	}
-
-	for jobName, jobConfig := range data.Jobs {
-		// Skip jobs.pre-activation (or pre_activation) as it's handled specially in buildPreActivationJob
-		if jobName == string(constants.PreActivationJobName) || jobName == "pre-activation" {
-			compilerJobsLog.Printf("Skipping jobs.%s (handled in buildPreActivationJob)", jobName)
-			continue
-		}
-
-		// Built-in jobs are already created before buildCustomJobs; treat jobs.<builtin>
-		// entries as customization-only and do not create duplicate jobs.
-		if _, exists := c.jobManager.GetJob(jobName); exists {
-			compilerJobsLog.Printf("Skipping jobs.%s (built-in job already exists)", jobName)
-			continue
-		}
-
-		if configMap, ok := jobConfig.(map[string]any); ok {
-			job := &Job{
-				Name: jobName,
-			}
-
-			// Extract job dependencies
-			hasExplicitNeeds := false
-			if needs, hasNeeds := configMap["needs"]; hasNeeds {
-				hasExplicitNeeds = true
-				if needsList, ok := needs.([]any); ok {
-					for _, need := range needsList {
-						if needStr, ok := need.(string); ok {
-							job.Needs = append(job.Needs, needStr)
-						}
-					}
-				} else if needStr, ok := needs.(string); ok {
-					// Single dependency as string
-					job.Needs = append(job.Needs, needStr)
-				}
-			}
-
-			// If no explicit needs and activation job exists, automatically add activation as dependency
-			// This ensures custom jobs wait for workflow validation before executing.
-			// Exception: jobs whose outputs are referenced in the markdown body run before activation
-			// (so the activation job can include their outputs in the prompt).
-			isReferencedInMarkdown := promptReferencedJobs[jobName]
-			isOnNeedsDependency := onNeedsJobs[jobName]
-			if !hasExplicitNeeds && activationJobCreated && !isReferencedInMarkdown && !isOnNeedsDependency {
-				job.Needs = append(job.Needs, string(constants.ActivationJobName))
-				compilerJobsLog.Printf("Added automatic dependency: custom job '%s' now depends on '%s'", jobName, string(constants.ActivationJobName))
-			} else if !hasExplicitNeeds && isReferencedInMarkdown {
-				compilerJobsLog.Printf("Custom job '%s' referenced in markdown body runs before activation (no auto-added dependency)", jobName)
-			} else if !hasExplicitNeeds && isOnNeedsDependency {
-				compilerJobsLog.Printf("Custom job '%s' listed in on.needs runs before activation (no auto-added dependency)", jobName)
-			}
-
-			// Extract other job properties
-			if runsOn, hasRunsOn := configMap["runs-on"]; hasRunsOn {
-				if runsOnStr, ok := runsOn.(string); ok {
-					job.RunsOn = "runs-on: " + runsOnStr
-				} else {
-					// Array or object form: marshal the value and build indented YAML snippet
-					yamlBytes, err := yaml.Marshal(runsOn)
-					if err != nil {
-						return fmt.Errorf("failed to convert runs-on to YAML for job '%s': %w", jobName, err)
-					}
-					lines := strings.Split(strings.TrimSpace(string(yamlBytes)), "\n")
-					var b strings.Builder
-					b.WriteString("runs-on:\n")
-					for _, line := range lines {
-						b.WriteString("      " + line + "\n")
-					}
-					job.RunsOn = strings.TrimSuffix(b.String(), "\n")
-				}
-			}
-
-			if ifCond, hasIf := configMap["if"]; hasIf {
-				if ifStr, ok := ifCond.(string); ok {
-					job.If = c.extractExpressionFromIfString(ifStr)
-				}
-			}
-
-			// Extract permissions
-			if permissions, hasPermissions := configMap["permissions"]; hasPermissions {
-				if permsMap, ok := permissions.(map[string]any); ok {
-					// Use goccy/go-yaml to marshal permissions
-					yamlBytes, err := yaml.Marshal(permsMap)
-					if err != nil {
-						return fmt.Errorf("failed to convert permissions to YAML for job '%s': %w", jobName, err)
-					}
-					// Indent the YAML properly for job-level permissions
-					permsYAML := string(yamlBytes)
-					lines := strings.Split(strings.TrimSpace(permsYAML), "\n")
-					var formattedPerms strings.Builder
-					formattedPerms.WriteString("permissions:\n")
-					for _, line := range lines {
-						formattedPerms.WriteString("      " + line + "\n")
-					}
-					job.Permissions = formattedPerms.String()
-				}
-			}
-
-			// Extract strategy for custom jobs
-			if strategy, hasStrategy := configMap["strategy"]; hasStrategy {
-				if strategyMap, ok := strategy.(map[string]any); ok {
-					// Use goccy/go-yaml to marshal strategy
-					yamlBytes, err := yaml.Marshal(strategyMap)
-					if err != nil {
-						return fmt.Errorf("failed to convert strategy to YAML for job '%s': %w", jobName, err)
-					}
-					// Indent the YAML properly for job-level strategy
-					strategyYAML := string(yamlBytes)
-					lines := strings.Split(strings.TrimSpace(strategyYAML), "\n")
-					var formattedStrategy strings.Builder
-					formattedStrategy.WriteString("strategy:\n")
-					for _, line := range lines {
-						formattedStrategy.WriteString("      " + line + "\n")
-					}
-					job.Strategy = formattedStrategy.String()
-				}
-			}
-
-			// Extract name (display name) for custom jobs
-			if name, hasName := configMap["name"]; hasName {
-				if nameStr, ok := name.(string); ok {
-					job.DisplayName = nameStr
-				}
-			}
-
-			// Extract timeout-minutes for custom jobs
-			if timeout, hasTimeout := configMap["timeout-minutes"]; hasTimeout {
-				switch v := timeout.(type) {
-				case int:
-					job.TimeoutMinutes = v
-				case uint64:
-					if v <= uint64(^uint(0)>>1) {
-						job.TimeoutMinutes = int(v)
-					}
-				case float64:
-					job.TimeoutMinutes = int(v)
-				}
-			}
-
-			// Extract concurrency for custom jobs
-			if concurrency, hasConcurrency := configMap["concurrency"]; hasConcurrency {
-				switch v := concurrency.(type) {
-				case string:
-					job.Concurrency = "concurrency: " + v
-				case map[string]any:
-					// Default cancel-in-progress to false for non-agent jobs if not explicitly set.
-					// This prevents accidental cancellation of queued runs when multiple agents
-					// are running the same workflow concurrently.
-					if _, hasCancelInProgress := v["cancel-in-progress"]; !hasCancelInProgress {
-						v["cancel-in-progress"] = false
-					}
-					yamlBytes, err := yaml.Marshal(v)
-					if err != nil {
-						return fmt.Errorf("failed to convert concurrency to YAML for job '%s': %w", jobName, err)
-					}
-					lines := strings.Split(strings.TrimSpace(string(yamlBytes)), "\n")
-					var formattedConcurrency strings.Builder
-					formattedConcurrency.WriteString("concurrency:\n")
-					for _, line := range lines {
-						formattedConcurrency.WriteString("      " + line + "\n")
-					}
-					job.Concurrency = formattedConcurrency.String()
-				}
-			}
-
-			// Extract env for custom jobs
-			if env, hasEnv := configMap["env"]; hasEnv {
-				if envMap, ok := env.(map[string]any); ok {
-					job.Env = make(map[string]string)
-					for key, val := range envMap {
-						if valStr, ok := val.(string); ok {
-							job.Env[key] = valStr
-						} else if val != nil {
-							// Arrays and maps are serialized as JSON so that shell consumers
-							// (e.g. jq --argjson) receive valid JSON.
-							job.Env[key] = marshalEnvValue(val)
-						}
-					}
-				}
-			}
-
-			// Extract container for custom jobs
-			if container, hasContainer := configMap["container"]; hasContainer {
-				switch v := container.(type) {
-				case string:
-					job.Container = "container: " + v
-				case map[string]any:
-					yamlBytes, err := yaml.Marshal(v)
-					if err != nil {
-						return fmt.Errorf("failed to convert container to YAML for job '%s': %w", jobName, err)
-					}
-					lines := strings.Split(strings.TrimSpace(string(yamlBytes)), "\n")
-					var formattedContainer strings.Builder
-					formattedContainer.WriteString("container:\n")
-					for _, line := range lines {
-						formattedContainer.WriteString("      " + line + "\n")
-					}
-					job.Container = formattedContainer.String()
-				}
-			}
-
-			// Extract services for custom jobs
-			if services, hasServices := configMap["services"]; hasServices {
-				if servicesMap, ok := services.(map[string]any); ok {
-					yamlBytes, err := yaml.Marshal(servicesMap)
-					if err != nil {
-						return fmt.Errorf("failed to convert services to YAML for job '%s': %w", jobName, err)
-					}
-					lines := strings.Split(strings.TrimSpace(string(yamlBytes)), "\n")
-					var formattedServices strings.Builder
-					formattedServices.WriteString("services:\n")
-					for _, line := range lines {
-						formattedServices.WriteString("      " + line + "\n")
-					}
-					job.Services = formattedServices.String()
-				}
-			}
-
-			// Extract continue-on-error for custom jobs
-			if continueOnError, hasCOE := configMap["continue-on-error"]; hasCOE {
-				if coeVal, ok := continueOnError.(bool); ok {
-					job.ContinueOnError = &coeVal
-				}
-			}
-
-			// Extract environment for custom jobs
-			if environment, hasEnvironment := configMap["environment"]; hasEnvironment {
-				switch v := environment.(type) {
-				case string:
-					job.Environment = "environment: " + v
-				case map[string]any:
-					yamlBytes, err := yaml.Marshal(v)
-					if err != nil {
-						return fmt.Errorf("failed to convert environment to YAML for job '%s': %w", jobName, err)
-					}
-					lines := strings.Split(strings.TrimSpace(string(yamlBytes)), "\n")
-					var formattedEnvironment strings.Builder
-					formattedEnvironment.WriteString("environment:\n")
-					for _, line := range lines {
-						formattedEnvironment.WriteString("      " + line + "\n")
-					}
-					job.Environment = strings.TrimSuffix(formattedEnvironment.String(), "\n")
-				}
-			}
-
-			// Extract outputs for custom jobs
-			if outputs, hasOutputs := configMap["outputs"]; hasOutputs {
-				if outputsMap, ok := outputs.(map[string]any); ok {
-					job.Outputs = make(map[string]string)
-					for key, val := range outputsMap {
-						if valStr, ok := val.(string); ok {
-							job.Outputs[key] = valStr
-						} else {
-							compilerJobsLog.Printf("Warning: output '%s' in job '%s' has non-string value (type: %T), ignoring", key, jobName, val)
-						}
-					}
-				}
-			}
-
-			// Check if this is a reusable workflow call
-			if uses, hasUses := configMap["uses"]; hasUses {
-				if usesStr, ok := uses.(string); ok {
-					compilerJobsLog.Printf("Custom job '%s' is a reusable workflow call: %s", jobName, usesStr)
-					job.Uses = usesStr
-
-					// Extract with parameters for reusable workflow
-					if with, hasWith := configMap["with"]; hasWith {
-						if withMap, ok := with.(map[string]any); ok {
-							job.With = withMap
-						}
-					}
-
-					// Extract secrets for reusable workflow
-					if secrets, hasSecrets := configMap["secrets"]; hasSecrets {
-						switch sv := secrets.(type) {
-						case string:
-							if sv == "inherit" {
-								job.SecretsInherit = true
-							}
-						case map[string]any:
-							job.Secrets = make(map[string]string)
-							for key, val := range sv {
-								if valStr, ok := val.(string); ok {
-									// Validate that the secret value is a proper GitHub Actions expression
-									// Note: We don't pass the key to validateSecretsExpression to prevent
-									// CodeQL from detecting sensitive data flow to error messages/logs
-									if err := validateSecretsExpression(valStr); err != nil {
-										return err
-									}
-									job.Secrets[key] = valStr
-								}
-							}
-						}
-					}
-				}
-			} else {
-				// Add basic steps if specified (only for non-reusable workflow jobs).
-				// `pre-steps` are inserted after setup-injected steps and before the
-				// regular `steps` list (including any checkout step it may contain).
-				var preSteps []string
-				var regularSteps []string
-				_, hasPreStepsField := configMap["pre-steps"]
-				_, hasStepsField := configMap["steps"]
-				if hasPreStepsField {
-					var err error
-					preSteps, err = c.extractPinnedJobSteps("pre-steps", jobName, configMap, data)
-					if err != nil {
-						return fmt.Errorf("failed to process pre-steps for job '%s': %w", jobName, err)
-					}
-				}
-				if hasStepsField {
-					var err error
-					regularSteps, err = c.extractPinnedJobSteps("steps", jobName, configMap, data)
-					if err != nil {
-						return fmt.Errorf("failed to process steps for job '%s': %w", jobName, err)
-					}
-				}
-
-				if hasPreStepsField || hasStepsField {
-					// Prepend GH_HOST configuration step for GHES/GHEC compatibility.
-					// Custom frontmatter jobs run as independent GitHub Actions jobs that
-					// don't inherit GITHUB_ENV from the agent job, so the gh CLI won't
-					// know which host to target without this step.
-					job.Steps = append(job.Steps, generateGHESHostConfigurationStep())
-					job.Steps = append(job.Steps, preSteps...)
-					job.Steps = append(job.Steps, regularSteps...)
-				}
-			}
-
-			if err := c.jobManager.AddJob(job); err != nil {
-				return fmt.Errorf("failed to add custom job '%s': %w", jobName, err)
-			}
-			compilerJobsLog.Printf("Successfully added custom job '%s' with %d needs dependencies", jobName, len(job.Needs))
-		}
-	}
-
-	compilerJobsLog.Print("Completed building all custom jobs")
-	return nil
-}
-
-func (c *Compiler) applyBuiltinJobPreSteps(data *WorkflowData) error {
-	if data == nil || data.Jobs == nil {
-		return nil
-	}
-
-	for jobName, jobConfig := range data.Jobs {
-		targetJobName := jobName
-		if jobName == "pre-activation" {
-			targetJobName = string(constants.PreActivationJobName)
-		}
-
-		job, exists := c.jobManager.GetJob(targetJobName)
-		if !exists {
-			continue
-		}
-
-		configMap, ok := jobConfig.(map[string]any)
-		if !ok {
-			return fmt.Errorf("jobs.%s must be an object, got %T", jobName, jobConfig)
-		}
-		if _, hasPreSteps := configMap["pre-steps"]; !hasPreSteps {
-			continue
-		}
-
-		preSteps, err := c.extractPinnedJobSteps("pre-steps", jobName, configMap, data)
-		if err != nil {
-			return fmt.Errorf("failed to process pre-steps for built-in job '%s': %w", jobName, err)
-		}
-		if len(preSteps) == 0 {
-			continue
-		}
-
-		job.Steps = insertPreStepsAfterSetupBeforeCheckout(job.Steps, preSteps)
-		compilerJobsLog.Printf("Inserted %d pre-steps into built-in job '%s'", len(preSteps), targetJobName)
-	}
-
-	return nil
-}
-
-func insertPreStepsAfterSetupBeforeCheckout(steps []string, preSteps []string) []string {
-	if len(preSteps) == 0 {
-		return steps
-	}
-
-	firstCheckoutIdx := -1
-	lastSetupIdx := -1
-	for i, step := range steps {
-		if firstCheckoutIdx == -1 && strings.Contains(step, "uses: actions/checkout@") {
-			firstCheckoutIdx = i
-			// Walk backward to the checkout step's list-item boundary ("- ").
-			// If no boundary is found, keep the current index so insertion still
-			// occurs before the checkout uses-line.
-			for j := i; j >= 0; j-- {
-				trimmed := strings.TrimLeft(steps[j], " ")
-				if strings.HasPrefix(trimmed, "- ") {
-					firstCheckoutIdx = j
-					break
-				}
-			}
-		}
-		if exactSetupStepIDPattern.MatchString(step) {
-			lastSetupIdx = i
-		}
-	}
-
-	insertIdx := len(steps)
-	if lastSetupIdx >= 0 {
-		// Setup step may be emitted as multiple []string entries (one line per entry).
-		// Insert after the full setup step by finding the next step boundary.
-		// A step boundary is identified by the YAML list-item prefix ("- ") after
-		// indentation trimming, which marks the beginning of the next step block.
-		// If no boundary is found (e.g. setup is the final step), insertIdx stays len(steps)
-		// and pre-steps are appended by the slice insertion logic below.
-		for i := lastSetupIdx + 1; i < len(steps); i++ {
-			trimmed := strings.TrimLeft(steps[i], " ")
-			if strings.HasPrefix(trimmed, "- ") {
-				insertIdx = i
-				break
-			}
-		}
-		if insertIdx == len(steps) {
-			compilerJobsLog.Print("No step boundary found after setup step; appending pre-steps at end")
-		}
-	} else if firstCheckoutIdx >= 0 {
-		insertIdx = firstCheckoutIdx
-	}
-	if insertIdx > len(steps) {
-		insertIdx = len(steps)
-	}
-
-	result := make([]string, 0, len(steps)+len(preSteps))
-	result = append(result, steps[:insertIdx]...)
-	result = append(result, preSteps...)
-	result = append(result, steps[insertIdx:]...)
-	return result
-}
-
-func (c *Compiler) extractPinnedJobSteps(fieldName string, jobName string, configMap map[string]any, data *WorkflowData) ([]string, error) {
-	raw, hasField := configMap[fieldName]
-	if !hasField {
-		return nil, nil
-	}
-
-	stepsList, ok := raw.([]any)
-	if !ok {
-		return nil, fmt.Errorf("%s for job '%s' must be an array of step objects", fieldName, jobName)
-	}
-
-	pinnedSteps := make([]string, 0, len(stepsList))
-	for i, step := range stepsList {
-		stepMap, ok := step.(map[string]any)
-		if !ok {
-			return nil, fmt.Errorf("%s for job '%s' contains invalid step at index %d: expected object", fieldName, jobName, i)
-		}
-
-		typedStep, err := MapToStep(stepMap)
-		if err != nil {
-			return nil, fmt.Errorf("failed to convert %s to typed step for job '%s': %w", fieldName, jobName, err)
-		}
-
-		pinnedStep := applyActionPinToTypedStep(typedStep, data)
-		stepYAML, err := ConvertStepToYAML(pinnedStep.ToMap())
-		if err != nil {
-			return nil, fmt.Errorf("failed to convert %s to YAML for job '%s': %w", fieldName, jobName, err)
-		}
-		pinnedSteps = append(pinnedSteps, stepYAML)
-	}
-
-	return pinnedSteps, nil
-}
-
 // shouldAddCheckoutStep returns true if the workflow requires a checkout step.
 // The repository checkout is needed in the agent job to access workflow files,
 // custom agent files, and other repository content.
@@ -1007,17 +519,17 @@ func (c *Compiler) extractPinnedJobSteps(fieldName string, jobName string, confi
 func (c *Compiler) shouldAddCheckoutStep(data *WorkflowData) bool {
 	// If checkout was explicitly disabled via checkout: false, skip it
 	if data.CheckoutDisabled {
-		log.Print("Skipping checkout step: checkout disabled via checkout: false")
+		workflowLog.Print("Skipping checkout step: checkout disabled via checkout: false")
 		return false
 	}
 
 	// If custom steps already contain checkout, don't add another one
 	if data.CustomSteps != "" && ContainsCheckout(data.CustomSteps) {
-		log.Print("Skipping checkout step: custom steps already contain checkout")
+		workflowLog.Print("Skipping checkout step: custom steps already contain checkout")
 		return false
 	}
 
 	// Always add checkout to ensure agent has repository access
-	log.Print("Adding checkout step: agent job requires repository access")
+	workflowLog.Print("Adding checkout step: agent job requires repository access")
 	return true
 }

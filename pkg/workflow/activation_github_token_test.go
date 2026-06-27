@@ -148,6 +148,30 @@ func TestActivationGitHubApp(t *testing.T) {
 		assert.Contains(t, stepsStr, "github-token: ${{ steps.activation-app-token.outputs.token }}", "Add-comment step should use app token")
 	})
 
+	t.Run("missing_key_ignore_adds_guard_and_fallback_token", func(t *testing.T) {
+		statusComment := true
+		workflowData := &WorkflowData{
+			Name:          "Test Workflow",
+			AIReaction:    "eyes",
+			StatusComment: &statusComment,
+			ActivationGitHubApp: &GitHubAppConfig{
+				AppID:           "${{ secrets.GH_AW_APP_ID }}",
+				PrivateKey:      "${{ secrets.GH_AW_APP_PRIVATE_KEY }}",
+				IgnoreIfMissing: true,
+			},
+		}
+
+		job, err := compiler.buildActivationJob(workflowData, false, "", "test.lock.yml")
+		require.NoError(t, err, "buildActivationJob should succeed")
+		require.NotNil(t, job)
+
+		stepsStr := strings.Join(job.Steps, "")
+		assert.Contains(t, stepsStr, "if: ${{ secrets.GH_AW_APP_ID != '' && secrets.GH_AW_APP_PRIVATE_KEY != '' }}")
+		assert.NotContains(t, stepsStr, "GH_AW_APP_CLIENT_ID:")
+		assert.NotContains(t, stepsStr, "GH_AW_APP_PRIVATE_KEY:")
+		assert.Contains(t, stepsStr, "github-token: ${{ steps.activation-app-token.outputs.token || secrets.GITHUB_TOKEN }}")
+	})
+
 	t.Run("app_token_minted_once_for_both_reaction_and_comment", func(t *testing.T) {
 		statusComment := true
 		workflowData := &WorkflowData{
@@ -172,8 +196,8 @@ func TestActivationGitHubApp(t *testing.T) {
 		// Both steps should use the same app token
 		assert.Contains(t, stepsStr, "id: react", "Reaction step should be present")
 		assert.Contains(t, stepsStr, "id: add-comment", "Add-comment step should be present")
-		// Both reaction and comment steps should use the same app token, and the hash check step too
-		assert.Equal(t, 3, strings.Count(stepsStr, "github-token: ${{ steps.activation-app-token.outputs.token }}"), "Reaction, comment, and hash check steps should all use app token")
+		// Reaction, comment, hash check, and daily guardrail steps should all use the same app token
+		assert.Equal(t, 4, strings.Count(stepsStr, "github-token: ${{ steps.activation-app-token.outputs.token }}"), "Reaction, comment, hash check, and daily guardrail steps should all use app token")
 	})
 	t.Run("app_token_minted_for_hash_check_even_without_reaction_or_comment", func(t *testing.T) {
 		// Regression test: when ActivationGitHubApp is set but no reaction/comment/label step
@@ -202,6 +226,86 @@ func TestActivationGitHubApp(t *testing.T) {
 		assert.Contains(t, stepsStr, "github-token: ${{ steps.activation-app-token.outputs.token }}",
 			"Hash check step should use the minted app token")
 	})
+}
+
+func TestActivationJobNeedsAppToken(t *testing.T) {
+	newCtx := func(app *GitHubAppConfig) *activationJobBuildContext {
+		return &activationJobBuildContext{data: &WorkflowData{
+			ActivationGitHubApp: app,
+			RawFrontmatter:      map[string]any{maxDailyAICreditsField: -1},
+		}}
+	}
+	app := &GitHubAppConfig{AppID: "1", PrivateKey: "key"}
+
+	tests := []struct {
+		name   string
+		ctx    *activationJobBuildContext
+		config func(*activationJobBuildContext)
+		want   bool
+	}{
+		{
+			name: "no app configured",
+			ctx:  newCtx(nil),
+			config: func(ctx *activationJobBuildContext) {
+				ctx.hasReaction = true
+			},
+			want: false,
+		},
+		{
+			name: "reaction triggers app token",
+			ctx:  newCtx(app),
+			config: func(ctx *activationJobBuildContext) {
+				ctx.hasReaction = true
+			},
+			want: true,
+		},
+		{
+			name: "status comment triggers app token",
+			ctx:  newCtx(app),
+			config: func(ctx *activationJobBuildContext) {
+				ctx.hasStatusComment = true
+			},
+			want: true,
+		},
+		{
+			name: "remove label triggers app token",
+			ctx:  newCtx(app),
+			config: func(ctx *activationJobBuildContext) {
+				ctx.shouldRemoveLabel = true
+			},
+			want: true,
+		},
+		{
+			name: "access requirement triggers app token",
+			ctx:  newCtx(app),
+			config: func(ctx *activationJobBuildContext) {
+				ctx.needsAppTokenForAccess = true
+			},
+			want: true,
+		},
+		{
+			name: "no triggers with app",
+			ctx:  newCtx(app),
+			config: func(_ *activationJobBuildContext) {
+			},
+			want: false,
+		},
+		{
+			name: "daily guardrail triggers app token",
+			ctx:  newCtx(app),
+			config: func(ctx *activationJobBuildContext) {
+				ctx.data.RawFrontmatter = nil
+			},
+			want: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			tt.config(tt.ctx)
+			assert.Equal(t, tt.want, activationJobNeedsAppToken(tt.ctx))
+		})
+	}
 }
 
 func TestActivationGitHubTokenExtraction(t *testing.T) {

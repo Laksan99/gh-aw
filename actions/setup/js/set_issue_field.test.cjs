@@ -99,6 +99,33 @@ describe("set_issue_field (Handler Factory Architecture)", () => {
     expect(typeof result).toBe("function");
   });
 
+  it("should resolve issue number from temporary_id when create_issue precedes set_issue_field in same batch", async () => {
+    const message = {
+      type: "set_issue_field",
+      issue_number: "#aw_smoke_issue",
+      field_name: "Customer Impact",
+      value: "High",
+    };
+
+    const resolvedTemporaryIds = {
+      aw_smoke_issue: { repo: "test-owner/test-repo", number: 42 },
+    };
+
+    const result = await handler(message, resolvedTemporaryIds);
+
+    expect(result.success).toBe(true);
+    expect(result.issue_number).toBe(42);
+    expect(result.field_name).toBe("Customer Impact");
+    expect(result.field_node_id).toBe(textFieldId);
+    expect(mockGraphql).toHaveBeenCalledWith(
+      expect.stringContaining("setIssueFieldValue"),
+      expect.objectContaining({
+        issueId: issueNodeId,
+        issueFields: [expect.objectContaining({ fieldId: textFieldId, textValue: "High" })],
+      })
+    );
+  });
+
   it("should set issue text field successfully", async () => {
     const message = {
       type: "set_issue_field",
@@ -272,5 +299,159 @@ describe("set_issue_field (Handler Factory Architecture)", () => {
     expect(result.error).toContain("No issue fields were discovered");
     expect(mockCore.warning).toHaveBeenCalledWith(expect.stringContaining("No issue fields were discovered"));
     expect(mockCore.error).not.toHaveBeenCalled();
+  });
+
+  it("fetchIssueFields query uses only concrete issue field type fragments", async () => {
+    let capturedQuery = "";
+    mockGraphql.mockImplementation(query => {
+      if (query.includes("repository(owner")) {
+        capturedQuery = query;
+        return Promise.resolve(mockIssueFieldsQuery);
+      }
+      if (query.includes("setIssueFieldValue")) {
+        return Promise.resolve({ setIssueFieldValue: { issue: { id: issueNodeId } } });
+      }
+      return Promise.resolve({});
+    });
+
+    const { main } = require("./set_issue_field.cjs");
+    const h = await main({ max: 5 });
+    await h({ type: "set_issue_field", issue_number: 42, field_name: "Customer Impact", value: "High" }, {});
+
+    // The query must not select id or name directly on the union — only inside concrete fragments
+    // Bare "id" or "name" would appear on their own line; inside a fragment they appear as "{ id name }"
+    expect(capturedQuery).not.toMatch(/^\s+id\s*$/m);
+    expect(capturedQuery).not.toMatch(/^\s+name\s*$/m);
+    // The query must not include the non-existent IssueField type fragment
+    expect(capturedQuery).not.toMatch(/\.\.\.\s+on\s+IssueField\s*\{/);
+    // The query must include at least the concrete IssueFieldText fragment
+    expect(capturedQuery).toContain("... on IssueFieldText");
+    // The query must include the IssueFieldSingleSelect fragment with options
+    expect(capturedQuery).toContain("... on IssueFieldSingleSelect");
+    expect(capturedQuery).toContain("options");
+  });
+
+  it("fetchIssueFields query does not include a User.issueFields selection", async () => {
+    let capturedQuery = "";
+    mockGraphql.mockImplementation(query => {
+      if (query.includes("repository(owner")) {
+        capturedQuery = query;
+        return Promise.resolve(mockIssueFieldsQuery);
+      }
+      if (query.includes("setIssueFieldValue")) {
+        return Promise.resolve({ setIssueFieldValue: { issue: { id: issueNodeId } } });
+      }
+      return Promise.resolve({});
+    });
+
+    const { main } = require("./set_issue_field.cjs");
+    const h = await main({ max: 5 });
+    await h({ type: "set_issue_field", issue_number: 42, field_name: "Customer Impact", value: "High" }, {});
+
+    expect(capturedQuery).not.toContain("... on User");
+  });
+
+  it("fetchIssueFields filters out nodes missing id or name (null entries and unknown types)", async () => {
+    mockGraphql.mockImplementation(query => {
+      if (query.includes("issueFields")) {
+        return Promise.resolve({
+          repository: {
+            issueFields: {
+              nodes: [
+                null,
+                { __typename: "IssueFieldText", id: textFieldId, name: "Customer Impact" },
+                { __typename: "IssueFieldUnknown" }, // missing id and name
+                { __typename: "IssueFieldUnknown", id: "IF_x" }, // missing name
+                { __typename: "IssueFieldUnknown", name: "Orphan" }, // missing id
+              ],
+            },
+            owner: { __typename: "Organization", issueFields: { nodes: [] } },
+          },
+        });
+      }
+      if (query.includes("setIssueFieldValue")) {
+        return Promise.resolve({ setIssueFieldValue: { issue: { id: issueNodeId } } });
+      }
+      return Promise.resolve({});
+    });
+
+    const { main } = require("./set_issue_field.cjs");
+    const h = await main({ max: 5 });
+    // Only the IssueFieldText node (with valid id+name) should survive filtering
+    const result = await h({ type: "set_issue_field", issue_number: 42, field_name: "Customer Impact", value: "High" }, {});
+    expect(result.success).toBe(true);
+    expect(result.field_node_id).toBe(textFieldId);
+  });
+
+  it("GraphQL discovery errors propagate as actionable errors, not as 'No issue fields were discovered'", async () => {
+    const graphqlError = new Error("Selections can't be made directly on unions (see selections on IssueFields)");
+    mockGraphql.mockImplementation(query => {
+      if (query.includes("repository(owner")) {
+        return Promise.reject(graphqlError);
+      }
+      if (query.includes("setIssueFieldValue")) {
+        return Promise.resolve({ setIssueFieldValue: { issue: { id: issueNodeId } } });
+      }
+      return Promise.resolve({});
+    });
+
+    const { main } = require("./set_issue_field.cjs");
+    const errorHandler = await main({ max: 5 });
+
+    const result = await errorHandler({
+      type: "set_issue_field",
+      issue_number: 42,
+      field_name: "Priority",
+      value: "High",
+    });
+
+    expect(result.success).toBe(false);
+    // Must NOT be silently treated as "no fields discovered"
+    expect(result.skipped).not.toBe(true);
+    expect(result.error).not.toContain("No issue fields were discovered");
+    // Must surface the actual error
+    expect(result.error).toContain("Selections can't be made directly on unions");
+    expect(mockCore.warning).not.toHaveBeenCalledWith(expect.stringContaining("No issue fields were discovered"));
+  });
+
+  it("should include issue intent metadata when runtime feature is enabled", async () => {
+    process.env.GH_AW_RUNTIME_FEATURES = "issue_intents";
+
+    try {
+      const { main } = require("./set_issue_field.cjs");
+      const featureHandler = await main({ max: 5 });
+
+      const result = await featureHandler(
+        {
+          type: "set_issue_field",
+          issue_number: 42,
+          field_name: "Customer Impact",
+          value: "High",
+          rationale: "Customer-reported with SLA breach risk",
+          confidence: "high",
+          suggest: true,
+        },
+        {}
+      );
+
+      expect(result.success).toBe(true);
+      expect(mockGraphql).toHaveBeenCalledWith(
+        expect.stringContaining("setIssueFieldValue"),
+        expect.objectContaining({
+          issueFields: [
+            expect.objectContaining({
+              fieldId: textFieldId,
+              textValue: "High",
+              rationale: "Customer-reported with SLA breach risk",
+              confidence: "HIGH",
+              suggest: true,
+            }),
+          ],
+          headers: { "GraphQL-Features": "update_issue_suggestions" },
+        })
+      );
+    } finally {
+      delete process.env.GH_AW_RUNTIME_FEATURES;
+    }
   });
 });

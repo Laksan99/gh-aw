@@ -1,4 +1,6 @@
 ---
+private: true
+emoji: "🦅"
 name: Dev Hawk
 description: Monitors development workflow activities and provides real-time alerts and insights on pull requests and CI status
 on:
@@ -14,7 +16,10 @@ permissions:
   contents: read
   actions: read
   pull-requests: read
-engine: copilot
+  copilot-requests: write
+engine:
+  id: copilot
+  copilot-sdk: true
 tools:
   bash:
     - "gh agent-task create *"
@@ -23,7 +28,7 @@ safe-outputs:
     max: 1
     target: "*"
   messages:
-    footer: "> 🦅 *Observed from above by [{workflow_name}]({run_url})*{effective_tokens_suffix}{history_link}"
+    footer: "> 🦅 *Observed from above by [{workflow_name}]({run_url})*{ai_credits_suffix}{history_link}"
     run-started: "🦅 Dev Hawk circles the sky! [{workflow_name}]({run_url}) is monitoring this {event_type} from above..."
     run-success: "🦅 Hawk eyes report! [{workflow_name}]({run_url}) has completed reconnaissance. Intel delivered! 🎯"
     run-failure: "🦅 Hawk down! [{workflow_name}]({run_url}) {status}. The skies grow quiet..."
@@ -34,10 +39,7 @@ imports:
     with:
       toolsets: [pull_requests, actions, repos]
   - shared/reporting.md
-  - shared/observability-otlp.md
-features:
-  copilot-requests: true
-
+  - shared/otlp.md
 ---
 
 # Dev Hawk - Development Workflow Monitor

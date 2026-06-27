@@ -53,7 +53,14 @@ func (c *Compiler) buildSafeOutputJob(data *WorkflowData, config SafeOutputJobCo
 	safeOutputsJobsLog.Printf("Building safe output job: %s (actionMode=%s)", config.JobName, c.actionMode)
 	var steps []string
 
-	// Add GitHub App token minting step if app is configured
+	// Add pre-steps if provided (e.g., checkout, git config for create-pull-request)
+	if len(config.PreSteps) > 0 {
+		safeOutputsJobsLog.Printf("Adding %d pre-steps to job", len(config.PreSteps))
+		steps = append(steps, config.PreSteps...)
+	}
+
+	// Add GitHub App token minting step if app is configured.
+	// This must run after setup/pre-steps so dynamic credentials can be prepared first.
 	if data.SafeOutputs != nil && data.SafeOutputs.GitHubApp != nil {
 		safeOutputsJobsLog.Print("Adding GitHub App token minting step with auto-computed permissions")
 		// For workflow_call relay workflows, scope the token to the platform repo name only
@@ -63,13 +70,12 @@ func (c *Compiler) buildSafeOutputJob(data *WorkflowData, config SafeOutputJobCo
 		if hasWorkflowCallTrigger(data.On) {
 			appTokenFallbackRepo = "${{ needs.activation.outputs.target_repo_name }}"
 		}
-		steps = append(steps, c.buildGitHubAppTokenMintStep(data.SafeOutputs.GitHubApp, config.Permissions, appTokenFallbackRepo)...)
-	}
-
-	// Add pre-steps if provided (e.g., checkout, git config for create-pull-request)
-	if len(config.PreSteps) > 0 {
-		safeOutputsJobsLog.Printf("Adding %d pre-steps to job", len(config.PreSteps))
-		steps = append(steps, config.PreSteps...)
+		steps = append(steps, c.buildGitHubAppTokenMintStepForRepository(
+			data.SafeOutputs.GitHubApp,
+			config.Permissions,
+			appTokenFallbackRepo,
+			inferSingleCheckoutRepositoryForGitHubAppOwner(data),
+		)...)
 	}
 
 	// Build the step based on action mode
@@ -114,12 +120,6 @@ func (c *Compiler) buildSafeOutputJob(data *WorkflowData, config SafeOutputJobCo
 	// Add post-steps if provided (e.g., assignees, reviewers)
 	if len(config.PostSteps) > 0 {
 		steps = append(steps, config.PostSteps...)
-	}
-
-	// Add GitHub App token invalidation step if app is configured
-	if data.SafeOutputs != nil && data.SafeOutputs.GitHubApp != nil {
-		safeOutputsJobsLog.Print("Adding GitHub App token invalidation step")
-		steps = append(steps, c.buildGitHubAppTokenInvalidationStep()...)
 	}
 
 	// Determine job condition

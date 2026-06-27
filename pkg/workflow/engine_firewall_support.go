@@ -101,7 +101,7 @@ func generateSquidLogsUploadStep(workflowName string) GitHubActionStep {
 	sanitizedName := strings.ToLower(SanitizeWorkflowName(workflowName))
 	artifactName := "firewall-logs-" + sanitizedName
 	// Firewall logs are now at a known location in the sandbox folder structure
-	firewallLogsDir := "/tmp/gh-aw/sandbox/firewall/logs/"
+	firewallLogsDir := constants.AWFProxyLogsDir + "/"
 
 	stepLines := []string{
 		"      - name: Upload Firewall Logs",
@@ -118,7 +118,7 @@ func generateSquidLogsUploadStep(workflowName string) GitHubActionStep {
 }
 
 // generateFirewallLogParsingStep creates a GitHub Actions step to parse firewall logs and create step summary.
-func generateFirewallLogParsingStep(workflowName string) GitHubActionStep {
+func generateFirewallLogParsingStep(workflowName string, workflowData *WorkflowData) GitHubActionStep {
 	// Firewall logs are at a known location in the sandbox folder structure
 	firewallLogsDir := constants.AWFProxyLogsDir
 	firewallDir := path.Dir(firewallLogsDir)
@@ -130,16 +130,26 @@ func generateFirewallLogParsingStep(workflowName string) GitHubActionStep {
 		"        env:",
 		"          AWF_LOGS_DIR: " + firewallLogsDir,
 		"        run: |",
-		"          # Fix permissions on firewall logs/audit dirs so they can be uploaded as artifacts",
-		"          # AWF runs with sudo, creating files owned by root",
-		fmt.Sprintf("          sudo chmod -R a+rX %s 2>/dev/null || true", firewallDir),
+	}
+
+	// When sudo is false (network isolation mode), AWF runs rootless so firewall files
+	// are not owned by root — skip the sudo chmod permission-fix step.
+	if !isAWFNetworkIsolationEnabled(workflowData) {
+		stepLines = append(stepLines,
+			"          # Fix permissions on firewall logs/audit dirs so they can be uploaded as artifacts",
+			"          # AWF runs with sudo, creating files owned by root",
+			fmt.Sprintf("          sudo chmod -R a+rX %s 2>/dev/null || true", firewallDir),
+		)
+	}
+
+	stepLines = append(stepLines,
 		"          # Only run awf logs summary if awf command exists (it may not be installed if workflow failed before install step)",
 		"          if command -v awf &> /dev/null; then",
 		"            awf logs summary | tee -a \"$GITHUB_STEP_SUMMARY\"",
 		"          else",
 		"            echo 'AWF binary not installed, skipping firewall log summary'",
 		"          fi",
-	}
+	)
 
 	return GitHubActionStep(stepLines)
 }
@@ -147,21 +157,21 @@ func generateFirewallLogParsingStep(workflowName string) GitHubActionStep {
 // defaultGetSquidLogsSteps returns the steps for uploading and parsing Squid logs after
 // secret redaction. It is shared across engines (Claude, Codex, Copilot) whose
 // GetSquidLogsSteps implementations are otherwise identical save for the logger used.
-func defaultGetSquidLogsSteps(workflowData *WorkflowData, log *logger.Logger) []GitHubActionStep {
+func defaultGetSquidLogsSteps(workflowData *WorkflowData, debugLog *logger.Logger) []GitHubActionStep {
 	var steps []GitHubActionStep
 
 	// Only add upload and parsing steps if firewall is enabled
 	if isFirewallEnabled(workflowData) {
-		log.Printf("Adding Squid logs upload and parsing steps for workflow: %s", workflowData.Name)
+		debugLog.Printf("Adding Squid logs upload and parsing steps for workflow: %s", workflowData.Name)
 
 		squidLogsUpload := generateSquidLogsUploadStep(workflowData.Name)
 		steps = append(steps, squidLogsUpload)
 
 		// Add firewall log parsing step to create step summary
-		firewallLogParsing := generateFirewallLogParsingStep(workflowData.Name)
+		firewallLogParsing := generateFirewallLogParsingStep(workflowData.Name, workflowData)
 		steps = append(steps, firewallLogParsing)
 	} else {
-		log.Print("Firewall disabled, skipping Squid logs upload")
+		debugLog.Print("Firewall disabled, skipping Squid logs upload")
 	}
 
 	return steps

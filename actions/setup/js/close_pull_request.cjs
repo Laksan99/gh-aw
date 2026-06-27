@@ -4,6 +4,7 @@
 const { createAuthenticatedGitHubClient } = require("./handler_auth.cjs");
 const { ERR_NOT_FOUND } = require("./error_codes.cjs");
 const { createCloseEntityHandler, checkLabelFilter, buildCommentBody, PULL_REQUEST_CONFIG } = require("./close_entity_helpers.cjs");
+const { resolveTargetRepoConfig, resolveAndValidateRepo } = require("./repo_helpers.cjs");
 
 /**
  * @typedef {import('./types/handler-factory').HandlerFactoryFunction} HandlerFactoryFunction
@@ -77,9 +78,16 @@ async function closePullRequest(github, owner, repo, prNumber) {
 async function main(config = {}) {
   const requiredLabels = config.required_labels || [];
   const requiredTitlePrefix = config.required_title_prefix || "";
+  const { defaultTargetRepo, allowedRepos } = resolveTargetRepoConfig(config);
   const githubClient = await createAuthenticatedGitHubClient(config);
+  const configuredTargetRepo = config["target-repo"] || "";
 
   core.info(`Close pull request configuration: max=${config.max || 10}`);
+  core.info(`Configured target repo: ${configuredTargetRepo || "(unset)"}`);
+  core.info(`Default target repo: ${defaultTargetRepo}`);
+  if (allowedRepos.size > 0) {
+    core.info(`Allowed repos: ${Array.from(allowedRepos).join(", ")}`);
+  }
   if (requiredLabels.length > 0) {
     core.info(`Required labels: ${requiredLabels.join(", ")}`);
   }
@@ -92,6 +100,13 @@ async function main(config = {}) {
     PULL_REQUEST_CONFIG,
     {
       resolveTarget(item) {
+        // Resolve and validate target repository
+        const repoResult = resolveAndValidateRepo(item, defaultTargetRepo, allowedRepos, "pull request");
+        if (!repoResult.success) {
+          return { success: false, error: repoResult.error };
+        }
+        const { repo: entityRepo, repoParts } = repoResult;
+
         let prNumber;
         if (item.pull_request_number !== undefined) {
           prNumber = parseInt(String(item.pull_request_number), 10);
@@ -105,7 +120,7 @@ async function main(config = {}) {
           }
           prNumber = contextPR;
         }
-        return { success: true, entityNumber: prNumber, owner: context.repo.owner, repo: context.repo.repo };
+        return { success: true, entityNumber: prNumber, owner: repoParts.owner, repo: repoParts.repo, entityRepo };
       },
 
       getDetails: getPullRequestDetails,
@@ -130,7 +145,7 @@ async function main(config = {}) {
       addComment: addPullRequestComment,
 
       closeEntity(github, owner, repo, prNumber) {
-        core.info(`Closing PR #${prNumber}`);
+        core.info(`Closing PR #${prNumber} in ${owner}/${repo}`);
         return closePullRequest(github, owner, repo, prNumber);
       },
 

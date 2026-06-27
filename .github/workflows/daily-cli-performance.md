@@ -1,4 +1,6 @@
 ---
+private: true
+emoji: "⚡"
 description: Daily CLI Performance - Runs benchmarks, tracks performance trends, and reports regressions
 on:
   schedule: daily
@@ -8,7 +10,7 @@ on:
   steps:
     - name: Detect recent compilation-related changes
       id: changes
-      uses: actions/github-script@v9
+      uses: actions/github-script@v9.0.0
       with:
         script: |
           const { owner, repo } = context.repo;
@@ -26,12 +28,16 @@ on:
           }
           core.info(`has_changes=${hasChanges}`);
           core.setOutput('has_changes', hasChanges ? 'true' : 'false');
+max-daily-ai-credits: 10000
 permissions:
   contents: read
   issues: read
   pull-requests: read
+  copilot-requests: write
 tracker-id: daily-cli-performance
-engine: copilot
+engine:
+  id: copilot
+  copilot-sdk: true
 tools:
   cli-proxy: true
   repo-memory:
@@ -61,17 +67,17 @@ imports:
       title-prefix: "[daily-cli-performance] "
       expires: 3d
   - shared/go-make.md
-  - shared/observability-otlp.md
-features:
-  copilot-requests: true
+  - shared/otlp.md
 if: needs.pre_activation.outputs.has_changes == 'true' || github.event_name == 'workflow_dispatch'
 jobs:
   pre-activation:
     outputs:
       has_changes: ${{ steps.changes.outputs.has_changes }}
-
-firewall:
-  effective-token-steering: true
+features:
+  gh-aw-detection: true
+sandbox:
+  agent:
+    sudo: false
 ---
 
 {{#runtime-import? .github/shared-instructions.md}}
@@ -105,7 +111,7 @@ Run the benchmark suite and capture results using **bash** (not mcpscripts — t
 **Step 1**: Create directory for results
 
 ```bash
-mkdir -p /tmp/gh-aw/benchmarks
+mkdir -p /tmp/gh-aw/agent/benchmarks
 ```
 
 **Step 2**: Run benchmarks using bash
@@ -125,10 +131,10 @@ The targeted benchmarks include:
 
 ```bash
 # Copy benchmark results to our directory
-cp bench_performance.txt /tmp/gh-aw/benchmarks/bench_results.txt
+cp bench_performance.txt /tmp/gh-aw/agent/benchmarks/bench_results.txt
 
 # Extract just the summary
-grep "Benchmark" /tmp/gh-aw/benchmarks/bench_results.txt > /tmp/gh-aw/benchmarks/bench_summary.txt || true
+grep "Benchmark" /tmp/gh-aw/agent/benchmarks/bench_results.txt > /tmp/gh-aw/agent/benchmarks/bench_summary.txt || true
 ```
 
 **Expected benchmarks**:
@@ -146,11 +152,11 @@ Parse the benchmark output and extract key metrics:
 
 ```bash
 # Extract benchmark results using awk
-cat > /tmp/gh-aw/benchmarks/parse_results.sh << 'EOF'
+cat > /tmp/gh-aw/agent/benchmarks/parse_results.sh << 'EOF'
 #!/bin/bash
 # Parse Go benchmark output and create JSON
-results_file="/tmp/gh-aw/benchmarks/bench_results.txt"
-output_file="/tmp/gh-aw/benchmarks/current_metrics.json"
+results_file="/tmp/gh-aw/agent/benchmarks/bench_results.txt"
+output_file="/tmp/gh-aw/agent/benchmarks/current_metrics.json"
 
 # Initialize JSON
 echo "{" > "$output_file"
@@ -198,8 +204,8 @@ echo "Parsed benchmark results to $output_file"
 cat "$output_file"
 EOF
 
-chmod +x /tmp/gh-aw/benchmarks/parse_results.sh
-/tmp/gh-aw/benchmarks/parse_results.sh
+chmod +x /tmp/gh-aw/agent/benchmarks/parse_results.sh
+/tmp/gh-aw/agent/benchmarks/parse_results.sh
 ```
 
 ## Phase 2: Load Historical Data
@@ -233,7 +239,7 @@ fi
 
 # Append current results to history
 {
-  cat /tmp/gh-aw/benchmarks/current_metrics.json
+  cat /tmp/gh-aw/agent/benchmarks/current_metrics.json
   echo ""
 } >> "$HISTORY_FILE"
 
@@ -247,7 +253,7 @@ echo "Historical data updated ($(wc -l < "$HISTORY_FILE" | tr -d ' ') entries)"
 Analyze trends and detect regressions:
 
 ```bash
-cat > /tmp/gh-aw/benchmarks/analyze_trends.py << 'EOF'
+cat > /tmp/gh-aw/agent/benchmarks/analyze_trends.py << 'EOF'
 #!/usr/bin/env python3
 """
 Analyze benchmark trends and detect performance regressions
@@ -259,8 +265,8 @@ from pathlib import Path
 
 # Configuration
 HISTORY_FILE = '/tmp/gh-aw/repo-memory/default/benchmark_history.jsonl'
-CURRENT_FILE = '/tmp/gh-aw/benchmarks/current_metrics.json'
-OUTPUT_FILE = '/tmp/gh-aw/benchmarks/analysis.json'
+CURRENT_FILE = '/tmp/gh-aw/agent/benchmarks/current_metrics.json'
+OUTPUT_FILE = '/tmp/gh-aw/agent/benchmarks/analysis.json'
 
 # Bounded context window — must match MAX_HISTORY_ENTRIES in the bash pruning step
 MAX_HISTORY_ENTRIES = 14
@@ -380,8 +386,8 @@ if __name__ == '__main__':
     main()
 EOF
 
-chmod +x /tmp/gh-aw/benchmarks/analyze_trends.py
-python3 /tmp/gh-aw/benchmarks/analyze_trends.py
+chmod +x /tmp/gh-aw/agent/benchmarks/analyze_trends.py
+python3 /tmp/gh-aw/agent/benchmarks/analyze_trends.py
 ```
 
 ## Phase 4: Open Issues for Regressions
@@ -393,7 +399,7 @@ Review the analysis and determine if issues should be opened:
 ```bash
 # Display analysis summary
 echo "=== Performance Analysis Summary ==="
-cat /tmp/gh-aw/benchmarks/analysis.json | python3 -m json.tool
+cat /tmp/gh-aw/agent/benchmarks/analysis.json | python3 -m json.tool
 ```
 
 ### 4.2 Open Issues for Regressions
@@ -459,7 +465,7 @@ If regressions are detected, open issues with detailed information.
 Parse the analysis and create issues:
 
 ```bash
-cat > /tmp/gh-aw/benchmarks/create_issues.py << 'EOF'
+cat > /tmp/gh-aw/agent/benchmarks/create_issues.py << 'EOF'
 #!/usr/bin/env python3
 """
 Create GitHub issues for performance regressions
@@ -467,7 +473,7 @@ Create GitHub issues for performance regressions
 import json
 import os
 
-ANALYSIS_FILE = '/tmp/gh-aw/benchmarks/analysis.json'
+ANALYSIS_FILE = '/tmp/gh-aw/agent/benchmarks/analysis.json'
 
 def main():
     with open(ANALYSIS_FILE, 'r') as f:
@@ -493,15 +499,15 @@ def main():
         print(f"  - {reg['name']}: {reg['change_percent']:+.1f}%")
     
     # Save regressions for processing
-    with open('/tmp/gh-aw/benchmarks/regressions.json', 'w') as f:
+    with open('/tmp/gh-aw/agent/benchmarks/regressions.json', 'w') as f:
         json.dump(regressions, f, indent=2)
 
 if __name__ == '__main__':
     main()
 EOF
 
-chmod +x /tmp/gh-aw/benchmarks/create_issues.py
-python3 /tmp/gh-aw/benchmarks/create_issues.py
+chmod +x /tmp/gh-aw/agent/benchmarks/create_issues.py
+python3 /tmp/gh-aw/agent/benchmarks/create_issues.py
 ```
 
 Now, for each regression found, use the `create issue` tool to open an issue with the details.
@@ -513,15 +519,15 @@ Now, for each regression found, use the `create issue` tool to open an issue wit
 Generate a comprehensive summary of today's benchmark run:
 
 ```bash
-cat > /tmp/gh-aw/benchmarks/generate_report.py << 'EOF'
+cat > /tmp/gh-aw/agent/benchmarks/generate_report.py << 'EOF'
 #!/usr/bin/env python3
 """
 Generate performance summary report with proper markdown formatting
 """
 import json
 
-ANALYSIS_FILE = '/tmp/gh-aw/benchmarks/analysis.json'
-CURRENT_FILE = '/tmp/gh-aw/benchmarks/current_metrics.json'
+ANALYSIS_FILE = '/tmp/gh-aw/agent/benchmarks/analysis.json'
+CURRENT_FILE = '/tmp/gh-aw/agent/benchmarks/current_metrics.json'
 
 def format_ns(ns):
     """Format nanoseconds in human-readable form"""
@@ -544,7 +550,7 @@ def main():
     summary = analysis['summary']
     
     # Generate markdown report following formatting guidelines
-    with open('/tmp/gh-aw/benchmarks/report.md', 'w') as f:
+    with open('/tmp/gh-aw/agent/benchmarks/report.md', 'w') as f:
         # Brief summary (always visible)
         f.write("### 📊 Performance Summary\n\n")
         f.write(f"**Date**: {analysis['date']}  \n")
@@ -647,8 +653,8 @@ if __name__ == '__main__':
     main()
 EOF
 
-chmod +x /tmp/gh-aw/benchmarks/generate_report.py
-python3 /tmp/gh-aw/benchmarks/generate_report.py
+chmod +x /tmp/gh-aw/agent/benchmarks/generate_report.py
+python3 /tmp/gh-aw/agent/benchmarks/generate_report.py
 ```
 
 ## Success Criteria

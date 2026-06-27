@@ -10,7 +10,7 @@
  */
 
 const { sanitizeContent } = require("./sanitize_content.cjs");
-const { isTemporaryId } = require("./temporary_id.cjs");
+const { isTemporaryId, normalizeTemporaryId } = require("./temporary_id.cjs");
 const { getErrorMessage } = require("./error_helpers.cjs");
 const { unfenceMarkdown } = require("./markdown_unfencing.cjs");
 
@@ -26,15 +26,169 @@ const MAX_BODY_LENGTH = 65000;
 const MAX_GITHUB_USERNAME_LENGTH = 39;
 
 /**
- * @typedef {{ allowedAliases?: string[], maxBotMentions?: number }} ValidateOptions
+ * @typedef {{ allowedAliases?: string[], maxBotMentions?: number, normalizeIssueClosingKeywords?: boolean }} ValidateOptions
  */
+
+// GitHub issue-closing keywords:
+// https://docs.github.com/issues/tracking-your-work-with-issues/linking-a-pull-request-to-an-issue
+const ISSUE_CLOSING_KEYWORDS = "fix|fixes|fixed|close|closes|closed|resolve|resolves|resolved";
+const ISSUE_REFERENCE_PATTERN = "(?:[a-zA-Z0-9_.-]+\\/[a-zA-Z0-9_.-]+)?#\\d+";
+const ISSUE_CLOSING_WHOLE_SPAN_PATTERN = new RegExp(`\`(\\b(?:${ISSUE_CLOSING_KEYWORDS})\\b\\s+${ISSUE_REFERENCE_PATTERN})\``, "gi");
+const ISSUE_CLOSING_BOTH_BACKTICK_PATTERN = new RegExp(`\`(\\b(?:${ISSUE_CLOSING_KEYWORDS})\\b)\`(\\s+)\`(${ISSUE_REFERENCE_PATTERN})\``, "gi");
+const ISSUE_CLOSING_KEYWORD_BACKTICK_PATTERN = new RegExp(`\`(\\b(?:${ISSUE_CLOSING_KEYWORDS})\\b)\`(\\s+)(${ISSUE_REFERENCE_PATTERN})`, "gi");
+const ISSUE_CLOSING_REFERENCE_BACKTICK_PATTERN = new RegExp(`(\\b(?:${ISSUE_CLOSING_KEYWORDS})\\b)(\\s+)\`(${ISSUE_REFERENCE_PATTERN})\``, "gi");
+const NORMALIZE_CLOSER_BODY_TYPES = new Set(["create_issue", "add_comment", "create_pull_request"]);
+const ISSUE_INTENT_LABEL_TYPES = new Set(["add_labels", "remove_labels", "update_issue"]);
+
+/**
+ * Remove markdown backticks around recognized issue-closing keyword references.
+ * Only applied to body fields for configured safe output types.
+ * @param {string} content
+ * @returns {string}
+ */
+function normalizeIssueClosingKeywordBackticks(content) {
+  if (typeof content !== "string" || content.length === 0) {
+    return content;
+  }
+
+  // Order matters:
+  // 1) whole-span backticks: `Closes #1`
+  // 2) both parts backticked: `Closes` `#1`
+  // 3) keyword only: `Closes` #1
+  // 4) reference only: Closes `#1`
+  // Each step removes one specific form without reintroducing backticks, so later steps
+  // only need to handle the remaining unmatched variants.
+  let normalized = content.replace(ISSUE_CLOSING_WHOLE_SPAN_PATTERN, "$1");
+  normalized = normalized.replace(ISSUE_CLOSING_BOTH_BACKTICK_PATTERN, "$1$2$3");
+  normalized = normalized.replace(ISSUE_CLOSING_KEYWORD_BACKTICK_PATTERN, "$1$2$3");
+  return normalized.replace(ISSUE_CLOSING_REFERENCE_BACKTICK_PATTERN, "$1$2$3");
+}
+
+/**
+ * Validate and normalize issue-intent-aware label arrays.
+ * @param {any[]} value
+ * @param {number} lineNum
+ * @param {string} itemType
+ * @param {string} fieldName
+ * @param {ValidateOptions} [options]
+ * @returns {{isValid: boolean, normalizedValue?: any[], error?: string}}
+ */
+function validateIssueIntentLabels(value, lineNum, itemType, fieldName, options) {
+  const normalized = [];
+  for (let i = 0; i < value.length; i++) {
+    const label = value[i];
+    if (typeof label === "string") {
+      const name = sanitizeContent(label, {
+        maxLength: 128,
+        allowedAliases: options?.allowedAliases || [],
+        maxBotMentions: options?.maxBotMentions,
+      });
+      if (!name) {
+        return { isValid: false, error: `Line ${lineNum}: ${itemType} ${fieldName}[${i}] must be a non-empty string` };
+      }
+      normalized.push(name);
+      continue;
+    }
+
+    if (!label || typeof label !== "object" || Array.isArray(label)) {
+      return {
+        isValid: false,
+        error: `Line ${lineNum}: ${itemType} ${fieldName}[${i}] must be a string or an object with 'name'`,
+      };
+    }
+
+    const keys = Object.keys(label);
+    const invalidKeys = keys.filter(key => !["name", "rationale", "confidence", "suggest"].includes(key));
+    if (invalidKeys.length > 0) {
+      return {
+        isValid: false,
+        error: `Line ${lineNum}: ${itemType} ${fieldName}[${i}] contains unsupported fields: ${invalidKeys.join(", ")}`,
+      };
+    }
+    if (typeof label.name !== "string") {
+      return {
+        isValid: false,
+        error: `Line ${lineNum}: ${itemType} ${fieldName}[${i}].name must be a string`,
+      };
+    }
+    const name = sanitizeContent(label.name, {
+      maxLength: 128,
+      allowedAliases: options?.allowedAliases || [],
+      maxBotMentions: options?.maxBotMentions,
+    });
+    if (!name) {
+      return {
+        isValid: false,
+        error: `Line ${lineNum}: ${itemType} ${fieldName}[${i}].name must be a non-empty string`,
+      };
+    }
+
+    /** @type {{ name: string, rationale?: string, confidence?: "LOW"|"MEDIUM"|"HIGH", suggest?: boolean }} */
+    const normalizedLabel = { name };
+    if (label.rationale !== undefined) {
+      if (typeof label.rationale !== "string") {
+        return {
+          isValid: false,
+          error: `Line ${lineNum}: ${itemType} ${fieldName}[${i}].rationale must be a string`,
+        };
+      }
+      const rationale = sanitizeContent(unfenceMarkdown(label.rationale), {
+        maxLength: 1024,
+        allowedAliases: options?.allowedAliases || [],
+        maxBotMentions: options?.maxBotMentions,
+      }).trim();
+      if (rationale) {
+        normalizedLabel.rationale = rationale;
+      }
+    }
+    if (label.confidence !== undefined) {
+      if (label.confidence !== null && label.confidence !== "") {
+        const confidenceRaw = String(label.confidence).trim().toUpperCase();
+        /** @type {"LOW"|"MEDIUM"|"HIGH"} */
+        let confidence;
+        switch (confidenceRaw) {
+          case "LOW":
+            confidence = "LOW";
+            break;
+          case "MEDIUM":
+            confidence = "MEDIUM";
+            break;
+          case "HIGH":
+            confidence = "HIGH";
+            break;
+          default:
+            return {
+              isValid: false,
+              error: `Line ${lineNum}: ${itemType} ${fieldName}[${i}].confidence must be one of: LOW, MEDIUM, HIGH`,
+            };
+        }
+        normalizedLabel.confidence = confidence;
+      }
+    }
+    if (label.suggest !== undefined) {
+      if (typeof label.suggest !== "boolean") {
+        return {
+          isValid: false,
+          error: `Line ${lineNum}: ${itemType} ${fieldName}[${i}].suggest must be a boolean`,
+        };
+      }
+      if (label.suggest) {
+        normalizedLabel.suggest = true;
+      }
+    }
+    normalized.push(normalizedLabel);
+  }
+  return { isValid: true, normalizedValue: normalized };
+}
 
 /**
  * @typedef {Object} FieldValidation
  * @property {boolean} [required] - Whether the field is required
  * @property {string} [type] - Expected type: 'string', 'number', 'boolean', 'array'
+ * @property {string} [typeHint] - Overrides the type description in error messages (e.g. "GraphQL node ID string")
  * @property {boolean} [sanitize] - Whether to sanitize string content
  * @property {number} [maxLength] - Maximum length for strings
+ * @property {number} [minLength] - Minimum length for strings
  * @property {boolean} [positiveInteger] - Must be a positive integer
  * @property {boolean} [optionalPositiveInteger] - Optional but if present must be positive integer
  * @property {boolean} [issueOrPRNumber] - Can be issue/PR number or undefined
@@ -223,9 +377,10 @@ function validateIssueNumberOrTemporaryId(value, fieldName, lineNum) {
       error: `Line ${lineNum}: ${fieldName} must be a number or string`,
     };
   }
-  // Check if it's a temporary ID
+  // Check if it's a temporary ID. Both 'aw_abc1' and '#aw_abc1' are accepted;
+  // isTemporaryId handles both forms, and normalizeTemporaryId strips '#' for map keys.
   if (isTemporaryId(value)) {
-    return { isValid: true, normalizedValue: String(value).toLowerCase(), isTemporary: true };
+    return { isValid: true, normalizedValue: `#${normalizeTemporaryId(String(value))}`, isTemporary: true };
   }
   // Try to parse as positive integer
   const parsed = typeof value === "string" ? parseInt(value, 10) : value;
@@ -265,7 +420,7 @@ function validateField(value, fieldName, validation, itemType, lineNum, options)
 
   // Handle required check for other fields
   if (validation.required && (value === undefined || value === null)) {
-    const fieldType = validation.type || "string";
+    const fieldType = validation.typeHint || validation.type || "string";
     return {
       isValid: false,
       error: `Line ${lineNum}: ${itemType} requires a '${fieldName}' field (${fieldType})`,
@@ -292,9 +447,10 @@ function validateField(value, fieldName, validation, itemType, lineNum, options)
     if (typeof value !== "string") {
       // For required fields, use "requires a" format for both missing and wrong type
       if (validation.required) {
+        const fieldType = validation.typeHint || "string";
         return {
           isValid: false,
-          error: `Line ${lineNum}: ${itemType} requires a '${fieldName}' field (string)`,
+          error: `Line ${lineNum}: ${itemType} requires a '${fieldName}' field (${fieldType})`,
         };
       }
       return {
@@ -348,21 +504,40 @@ function validateField(value, fieldName, validation, itemType, lineNum, options)
     }
 
     // Handle sanitization
+    let finalValue = value;
     if (validation.sanitize) {
       // Apply unfencing to remove accidental outer markdown fences before sanitization
-      let processedValue = unfenceMarkdown(value);
-      const sanitized = sanitizeContent(processedValue, {
+      finalValue = sanitizeContent(unfenceMarkdown(value), {
         maxLength: validation.maxLength || MAX_BODY_LENGTH,
         allowedAliases: options?.allowedAliases || [],
         maxBotMentions: options?.maxBotMentions,
       });
-      return { isValid: true, normalizedValue: sanitized };
+    }
+    if (options?.normalizeIssueClosingKeywords && fieldName === "body" && NORMALIZE_CLOSER_BODY_TYPES.has(itemType)) {
+      finalValue = normalizeIssueClosingKeywordBackticks(finalValue);
     }
 
-    return { isValid: true, normalizedValue: value };
+    // Check minimum length after any sanitization (trim before checking to reject whitespace-padded placeholders)
+    if (validation.minLength && finalValue.trim().length < validation.minLength) {
+      return {
+        isValid: false,
+        error: `Line ${lineNum}: ${itemType} '${fieldName}' is too short (minimum ${validation.minLength} characters)`,
+      };
+    }
+
+    return { isValid: true, normalizedValue: finalValue };
   }
 
   if (validation.type === "array") {
+    // Backward compatibility: create_issue agents sometimes provide comma-separated labels as a string.
+    // Normalize this into a string array before strict array validation.
+    if (itemType === "create_issue" && fieldName === "labels" && typeof value === "string") {
+      value = value
+        .split(",")
+        .map(item => item.trim())
+        .filter(Boolean);
+    }
+
     if (!Array.isArray(value)) {
       // For required fields, use "requires a" format for both missing and wrong type
       if (validation.required) {
@@ -375,6 +550,10 @@ function validateField(value, fieldName, validation, itemType, lineNum, options)
         isValid: false,
         error: `Line ${lineNum}: ${itemType} '${fieldName}' must be an array`,
       };
+    }
+
+    if (fieldName === "labels" && ISSUE_INTENT_LABEL_TYPES.has(itemType)) {
+      return validateIssueIntentLabels(value, lineNum, itemType, fieldName, options);
     }
 
     // Validate array items

@@ -9,6 +9,7 @@ import (
 	"testing"
 
 	"github.com/github/gh-aw/pkg/testutil"
+	"github.com/github/gh-aw/pkg/typeutil"
 )
 
 // assertTokenInProcessSafeOutputsEnv verifies that a given environment variable name
@@ -149,6 +150,7 @@ engine: claude
 strict: false
 safe-outputs:
   create-issue:
+    deduplicate-by-title: 1
     title-prefix: "[genai] "
     labels: [copilot, automation]
 ---
@@ -196,6 +198,11 @@ This workflow tests the output configuration parsing.
 		if i >= len(workflowData.SafeOutputs.CreateIssues.Labels) || workflowData.SafeOutputs.CreateIssues.Labels[i] != expectedLabel {
 			t.Errorf("Expected label '%s' at index %d, got '%s'", expectedLabel, i, workflowData.SafeOutputs.CreateIssues.Labels[i])
 		}
+	}
+
+	deduplicateByTitle, ok := typeutil.ParseIntValue(workflowData.SafeOutputs.CreateIssues.DeduplicateByTitle)
+	if !ok || deduplicateByTitle != 1 {
+		t.Errorf("Expected deduplicate-by-title to parse as 1, got %#v", workflowData.SafeOutputs.CreateIssues.DeduplicateByTitle)
 	}
 }
 
@@ -344,6 +351,7 @@ engine: claude
 strict: false
 safe-outputs:
   create-issue:
+    deduplicate-by-title: 1
     title-prefix: "[genai] "
     labels: [copilot]
 ---
@@ -388,8 +396,8 @@ This workflow tests the create-issue job generation.
 	}
 
 	// Verify job properties
-	if !strings.Contains(lockContent, "timeout-minutes: 15") {
-		t.Error("Expected 15-minute timeout in consolidated safe_outputs job")
+	if !strings.Contains(lockContent, "timeout-minutes: 45") {
+		t.Error("Expected 45-minute timeout in consolidated safe_outputs job")
 	}
 
 	if !strings.Contains(lockContent, "issues: write") {
@@ -410,6 +418,10 @@ This workflow tests the create-issue job generation.
 		t.Error("Expected copilot label in handler config")
 	}
 
+	if !strings.Contains(lockContent, `\"deduplicate_by_title\":1`) {
+		t.Error("Expected deduplicate_by_title in handler config")
+	}
+
 	// Verify job dependencies
 	if !strings.Contains(lockContent, "needs:") {
 		t.Error("Expected safe_outputs job to depend on main job")
@@ -418,7 +430,7 @@ This workflow tests the create-issue job generation.
 	// t.Logf("Generated workflow content:\n%s", lockContent)
 }
 
-func TestOutputIssueJobGenerationWithCopilotAssigneeAddsAssignmentStep(t *testing.T) {
+func TestOutputIssueJobGenerationWithCopilotAssigneeUsesHandlerManagerOnly(t *testing.T) {
 	// Create temporary directory for test files
 	tmpDir := testutil.TempDir(t, "output-issue-copilot-assignee")
 
@@ -464,23 +476,22 @@ This workflow tests that copilot assignment is wired in consolidated safe output
 		t.Error("Expected process_safe_outputs step in generated workflow")
 	}
 
-	// Verify copilot assignment step is present and wired to handler manager output
-	if !strings.Contains(lockContent, "name: Assign Copilot to created issues") {
-		t.Error("Expected copilot assignment step in consolidated safe_outputs job")
+	// Copilot assignment for create-issue is handled directly by create_issue.cjs in
+	// process_safe_outputs, so the compiler should not emit a legacy follow-up step.
+	if strings.Contains(lockContent, "name: Assign Copilot to created issues") {
+		t.Error("Did not expect legacy copilot assignment step in consolidated safe_outputs job")
 	}
-	if !strings.Contains(lockContent, "id: assign_copilot_to_created_issues") {
-		t.Error("Expected copilot assignment step to have id: assign_copilot_to_created_issues")
+	if strings.Contains(lockContent, "id: assign_copilot_to_created_issues") {
+		t.Error("Did not expect legacy assign_copilot_to_created_issues step id")
 	}
-	if !strings.Contains(lockContent, "continue-on-error: true") {
-		t.Error("Expected copilot assignment step to have continue-on-error: true so failures propagate as outputs")
+	if strings.Contains(lockContent, "GH_AW_ISSUES_TO_ASSIGN_COPILOT") || strings.Contains(lockContent, "steps.process_safe_outputs.outputs.issues_to_assign_copilot") {
+		t.Error("Did not expect legacy issues_to_assign_copilot wiring from process_safe_outputs")
 	}
-	if !strings.Contains(lockContent, "GH_AW_ISSUES_TO_ASSIGN_COPILOT") || !strings.Contains(lockContent, "steps.process_safe_outputs.outputs.issues_to_assign_copilot") {
-		t.Error("Expected assignment step to consume issues_to_assign_copilot from process_safe_outputs")
+	if strings.Contains(lockContent, "assign_copilot_to_created_issues.cjs") {
+		t.Error("Did not expect legacy assign_copilot_to_created_issues.cjs requirement")
 	}
-	if !strings.Contains(lockContent, "assign_copilot_to_created_issues.cjs") {
-		t.Error("Expected assignment step to require assign_copilot_to_created_issues.cjs")
-	}
-	if !strings.Contains(lockContent, "assign_copilot_failure_count") || !strings.Contains(lockContent, "assign_copilot_errors") {
-		t.Error("Expected safe_outputs job to export assign_copilot_failure_count and assign_copilot_errors outputs for failure propagation")
+	if strings.Contains(lockContent, "steps.assign_copilot_to_created_issues.outputs.assign_copilot_failure_count") ||
+		strings.Contains(lockContent, "steps.assign_copilot_to_created_issues.outputs.assign_copilot_errors") {
+		t.Error("Did not expect legacy assign_copilot_to_created_issues output wiring in safe_outputs job")
 	}
 }

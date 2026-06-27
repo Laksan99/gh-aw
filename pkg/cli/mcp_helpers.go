@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"github.com/github/gh-aw/pkg/logger"
 )
@@ -39,6 +40,9 @@ func GetBinaryPath() (string, error) {
 	return resolvedPath, nil
 }
 
+// boolPtr returns a pointer to the given bool value, used for optional *bool fields.
+func boolPtr(b bool) *bool { return new(b) }
+
 // logAndValidateBinaryPath determines the binary path, logs it, and validates it exists.
 // Returns the detected binary path and an error if the path cannot be determined or if the file doesn't exist.
 // This is a helper used by both runMCPServer and validateMCPServerConfiguration.
@@ -63,4 +67,20 @@ func logAndValidateBinaryPath() (string, error) {
 	// Log the binary path for debugging
 	mcpHelpersLog.Printf("gh-aw binary path: %s", binaryPath)
 	return binaryPath, nil
+}
+
+func withNonInteractiveCIEnv(env []string) []string {
+	if env == nil {
+		env = os.Environ()
+	}
+
+	env = append([]string(nil), env...)
+	for i, entry := range env {
+		if strings.HasPrefix(entry, "CI=") {
+			env[i] = "CI=1"
+			return env
+		}
+	}
+
+	return append(env, "CI=1")
 }

@@ -12,7 +12,7 @@ var validPermissionScopes = func() map[string]struct{} {
 	scopes := GetAllPermissionScopes()
 	appOnlyScopes := GetAllGitHubAppOnlyScopes()
 
-	m := make(map[string]struct{}, len(scopes)+len(appOnlyScopes))
+	m := make(map[string]struct{}, safeAllocationCapacity(len(scopes), len(appOnlyScopes), 1))
 	for _, scope := range scopes {
 		m[string(scope)] = struct{}{}
 	}
@@ -80,8 +80,8 @@ const (
 	// GitHub App-only at runtime (excluded from GetAllPermissionScopes(), included in
 	// GetAllGitHubAppOnlyScopes() and IsGitHubAppOnlyScope).
 	PermissionOrganizationProj PermissionScope = "organization-projects"
-	// PermissionCopilotRequests is a GitHub Actions permission scope used with the copilot-requests feature.
-	// It enables use of the GitHub Actions token as the Copilot authentication token.
+	// PermissionCopilotRequests is a GitHub Actions permission scope that enables
+	// use of the GitHub Actions token as the Copilot authentication token.
 	PermissionCopilotRequests PermissionScope = "copilot-requests"
 
 	// GitHub App-only permission scopes (not supported by GITHUB_TOKEN, require a GitHub App token).

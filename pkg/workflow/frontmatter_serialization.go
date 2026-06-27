@@ -1,5 +1,7 @@
 package workflow
 
+import "reflect"
+
 // countRuntimes counts the number of non-nil runtimes in RuntimesConfig
 func countRuntimes(config *RuntimesConfig) int {
 	if config == nil {
@@ -59,6 +61,7 @@ func ExtractMapField(frontmatter map[string]any, key string) map[string]any {
 // ToMap converts FrontmatterConfig back to map[string]any for backward compatibility
 // This allows gradual migration from map[string]any to strongly-typed config
 func (fc *FrontmatterConfig) ToMap() map[string]any {
+	frontmatterTypesLog.Printf("Converting FrontmatterConfig to map: name=%s", fc.Name)
 	result := make(map[string]any)
 
 	// Core fields
@@ -139,12 +142,15 @@ func (fc *FrontmatterConfig) ToMap() map[string]any {
 	if fc.Network != nil {
 		// Convert NetworkPermissions to map format
 		// If allowed list is just ["defaults"], convert to string format "defaults"
-		if len(fc.Network.Allowed) == 1 && fc.Network.Allowed[0] == "defaults" && fc.Network.Firewall == nil && len(fc.Network.Blocked) == 0 {
+		if len(fc.Network.Allowed) == 1 && fc.Network.Allowed[0] == "defaults" && !fc.Network.AllowedInput && fc.Network.Firewall == nil && len(fc.Network.Blocked) == 0 {
 			result["network"] = "defaults"
 		} else {
 			networkMap := make(map[string]any)
 			if len(fc.Network.Allowed) > 0 {
 				networkMap["allowed"] = fc.Network.Allowed
+			}
+			if fc.Network.AllowedInput {
+				networkMap["allowed-input"] = true
 			}
 			if len(fc.Network.Blocked) > 0 {
 				networkMap["blocked"] = fc.Network.Blocked
@@ -165,9 +171,6 @@ func (fc *FrontmatterConfig) ToMap() map[string]any {
 	if fc.Features != nil {
 		result["features"] = fc.Features
 	}
-	if fc.InlineSubAgents != nil {
-		result["inline-sub-agents"] = *fc.InlineSubAgents
-	}
 	if fc.Env != nil {
 		result["env"] = fc.Env
 	}
@@ -176,10 +179,10 @@ func (fc *FrontmatterConfig) ToMap() map[string]any {
 	}
 
 	// Execution settings
-	if fc.RunsOn != "" {
+	if !isNilValue(fc.RunsOn) {
 		result["runs-on"] = fc.RunsOn
 	}
-	if fc.RunsOnSlim != "" {
+	if !isEmptyRunsOnValue(fc.RunsOnSlim) {
 		result["runs-on-slim"] = fc.RunsOnSlim
 	}
 	if fc.RunName != "" {
@@ -229,6 +232,20 @@ func (fc *FrontmatterConfig) ToMap() map[string]any {
 	return result
 }
 
+func isNilValue(v any) bool {
+	if v == nil {
+		return true
+	}
+
+	rv := reflect.ValueOf(v)
+	switch rv.Kind() {
+	case reflect.Chan, reflect.Func, reflect.Interface, reflect.Map, reflect.Pointer, reflect.Slice:
+		return rv.IsNil()
+	default:
+		return false
+	}
+}
+
 // runtimeConfigToMap converts a single RuntimeConfig to map[string]any
 func runtimeConfigToMap(rc *RuntimeConfig) map[string]any {
 	m := map[string]any{}
@@ -244,6 +261,9 @@ func runtimeConfigToMap(rc *RuntimeConfig) map[string]any {
 	if rc.ActionVersion != "" {
 		m["action-version"] = rc.ActionVersion
 	}
+	if rc.Cooldown != nil {
+		m["cooldown"] = *rc.Cooldown
+	}
 	if rc.RunInstallScripts != nil {
 		m["run-install-scripts"] = *rc.RunInstallScripts
 	}
@@ -255,6 +275,7 @@ func runtimesConfigToMap(config *RuntimesConfig) map[string]any {
 	if config == nil {
 		return nil
 	}
+	frontmatterTypesLog.Printf("Converting RuntimesConfig to map: %d runtime(s) configured", countRuntimes(config))
 
 	result := make(map[string]any)
 
@@ -298,9 +319,11 @@ func permissionsConfigToMap(config *PermissionsConfig) map[string]any {
 
 	// If shorthand is set, return it directly
 	if config.Shorthand != "" {
+		frontmatterTypesLog.Printf("Converting PermissionsConfig to map via shorthand: %s", config.Shorthand)
 		return map[string]any{config.Shorthand: config.Shorthand}
 	}
 
+	frontmatterTypesLog.Print("Converting detailed PermissionsConfig to map")
 	result := make(map[string]any)
 
 	// GitHub Actions permission scopes

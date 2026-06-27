@@ -15,6 +15,14 @@ import (
 	"github.com/github/gh-aw/pkg/workflow"
 )
 
+func isAlreadyMergedGHError(err error) bool {
+	if err == nil {
+		return false
+	}
+	//nolint:errstringmatch // gh pr merge reports already-merged states only via CLI text.
+	return strings.Contains(err.Error(), "already merged") || strings.Contains(err.Error(), "MERGED")
+}
+
 // createWorkflowPRAndConfigureSecret creates the PR, merges it, and adds the secret
 func (c *AddInteractiveConfig) createWorkflowPRAndConfigureSecret(ctx context.Context, workflowFiles, initFiles []string, secretName, secretValue string) error {
 	addInteractiveLog.Print("Applying changes")
@@ -26,20 +34,21 @@ func (c *AddInteractiveConfig) createWorkflowPRAndConfigureSecret(ctx context.Co
 	// Pass Quiet=true to suppress detailed output (already shown earlier in interactive mode)
 	// This returns the result including PR number and HasWorkflowDispatch
 	opts := AddOptions{
-		Verbose:                c.Verbose,
-		Quiet:                  true,
-		EngineOverride:         c.EngineOverride,
-		Name:                   "",
-		Force:                  false,
-		AppendText:             "",
-		CreatePR:               true,
-		NoGitattributes:        c.NoGitattributes,
-		WorkflowDir:            c.WorkflowDir,
-		NoStopAfter:            c.NoStopAfter,
-		StopAfter:              c.StopAfter,
-		DisableSecurityScanner: false,
+		Verbose:                      c.Verbose,
+		Quiet:                        true,
+		EngineOverride:               c.EngineOverride,
+		Name:                         "",
+		Force:                        false,
+		AppendText:                   "",
+		CreatePR:                     true,
+		NoGitattributes:              c.NoGitattributes,
+		WorkflowDir:                  c.WorkflowDir,
+		NoStopAfter:                  c.NoStopAfter,
+		StopAfter:                    c.StopAfter,
+		DisableSecurityScanner:       false,
+		AddCopilotRequestsPermission: c.UseCopilotRequests,
 	}
-	result, err := AddResolvedWorkflows(c.WorkflowSpecs, c.resolvedWorkflows, opts)
+	result, err := AddResolvedWorkflows(ctx, c.WorkflowSpecs, c.resolvedWorkflows, opts)
 	if err != nil {
 		return fmt.Errorf("failed to add workflow: %w", err)
 	}
@@ -106,7 +115,7 @@ func (c *AddInteractiveConfig) createWorkflowPRAndConfigureSecret(ctx context.Co
 			switch chosen {
 			case mergeActionAttempt:
 				if mergeErr := c.mergePullRequest(result.PRNumber); mergeErr != nil {
-					if strings.Contains(mergeErr.Error(), "already merged") || strings.Contains(mergeErr.Error(), "MERGED") {
+					if isAlreadyMergedGHError(mergeErr) {
 						fmt.Fprintln(os.Stderr, console.FormatSuccessMessage("Merged pull request "+result.PRURL))
 						mergeDone = true
 					} else {

@@ -1,4 +1,5 @@
 ---
+emoji: "🔀"
 name: Mergefest
 description: Automatically merges the main branch into pull request branches when invoked with /mergefest command
 on:
@@ -10,9 +11,11 @@ permissions:
   contents: read
   pull-requests: read
   actions: read
-engine: copilot
+engine:
+  id: copilot
+  copilot-sdk: true
 imports:
-  - shared/observability-otlp.md
+  - shared/otlp.md
 tools:
   cli-proxy: true
   bash:
@@ -52,12 +55,15 @@ steps:
       git config user.email "github-actions[bot]@users.noreply.github.com"
       
       # Create .gitignore to exclude workflow YAML files
-      cat > /tmp/merge-gitignore << 'EOF'
+      cat > /tmp/gh-aw/agent/merge-gitignore << 'EOF'
       # Exclude all .yml files in .github/workflows/
       .github/workflows/*.yml
       EOF
 
 
+sandbox:
+  agent:
+    sudo: false
 ---
 
 # Mergefest - Merge Main into Pull Request Branch

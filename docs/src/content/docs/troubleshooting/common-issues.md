@@ -207,7 +207,7 @@ safe-outputs:
   update-issue:     # no configuration required; uses defaults
 ```
 
-If your operation isn't in the [Safe Outputs reference](/gh-aw/reference/safe-outputs/), it may not be supported yet. See the [Safe Outputs Specification](/gh-aw/reference/safe-outputs-specification/) for the full list.
+If your operation isn't in the [Safe Outputs reference](/gh-aw/reference/safe-outputs/), it may not be supported yet. See the [Safe Outputs Specification](/gh-aw/specs/safe-outputs-specification/) for the full list.
 
 ### Safe Outputs Not Creating Issues
 
@@ -386,7 +386,7 @@ Common causes: missing tokens, permission mismatches, network restrictions, disa
 Using Copilot Chat (requires [agentic authoring setup](/gh-aw/guides/agentic-authoring/#configuring-your-repository)):
 
 ```text wrap
-/agent agentic-workflows debug https://github.com/OWNER/REPO/actions/runs/RUN_ID
+agentic-workflows debug https://github.com/OWNER/REPO/actions/runs/RUN_ID
 ```
 
 Using any coding agent (no setup required):

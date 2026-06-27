@@ -3,9 +3,11 @@ package workflow
 import (
 	"fmt"
 	"maps"
+	"path/filepath"
 	"strconv"
 	"strings"
 
+	"github.com/github/gh-aw/pkg/constants"
 	"github.com/github/gh-aw/pkg/logger"
 	"github.com/github/gh-aw/pkg/typeutil"
 )
@@ -107,6 +109,12 @@ func (c *Compiler) extractTrackerID(frontmatter map[string]any) (string, error) 
 		return "", fmt.Errorf("tracker-id must be at least 8 characters long (got %d)", len(trackerID))
 	}
 
+	// Validate maximum length
+	if len(trackerID) > 128 {
+		frontmatterMetadataLog.Printf("tracker-id too long: %d characters", len(trackerID))
+		return "", fmt.Errorf("tracker-id exceeds maximum length of 128 characters (got %d)", len(trackerID))
+	}
+
 	// Validate that it's a valid identifier (alphanumeric, hyphens, underscores)
 	for i, char := range trackerID {
 		if (char < 'a' || char > 'z') && (char < 'A' || char > 'Z') &&
@@ -157,6 +165,41 @@ func buildSourceURL(source string) string {
 	url := fmt.Sprintf("${{ github.server_url }}/%s/%s/blob/%s/%s", owner, repo, refPart, filePath)
 	frontmatterMetadataLog.Printf("Built source URL: %s/%s blob %s", owner, repo, refPart)
 	// Use github.server_url for enterprise GitHub deployments
+	return url
+}
+
+// buildLocalWorkflowSourceURL builds a GitHub URL for a local workflow markdown file.
+// It uses github.server_url, github.repository, and github.ref_name expressions so the URL
+// is resolved correctly at runtime, including on GitHub Enterprise Server.
+// Returns an empty string when the markdown path does not contain a ".github/" directory
+// component (e.g. for temporary test files), since a valid repo-relative URL cannot be derived.
+func buildLocalWorkflowSourceURL(markdownPath string) string {
+	if markdownPath == "" {
+		return ""
+	}
+
+	// Normalise path separators to forward slashes for consistent matching.
+	normalised := filepath.ToSlash(markdownPath)
+
+	// Extract the repo-relative path by finding the ".github/" directory component.
+	// Use LastIndex so paths like "/username.github.io/.github/workflows/x.md" resolve
+	// to ".github/workflows/x.md" rather than the outer username.github.io portion.
+	const githubDirPattern = "/.github/"
+	idx := strings.LastIndex(normalised, githubDirPattern)
+	var relPath string
+	if idx != -1 {
+		// Skip the leading slash to get ".github/workflows/...".
+		relPath = normalised[idx+1:]
+	} else if strings.HasPrefix(normalised, constants.GithubDir) {
+		// Already a relative path starting with ".github/".
+		relPath = normalised
+	} else {
+		// Non-standard path (e.g. /tmp/test.md) — cannot derive a valid URL.
+		return ""
+	}
+
+	url := "${{ github.server_url }}/${{ github.repository }}/blob/${{ github.ref_name }}/" + relPath
+	frontmatterMetadataLog.Printf("Built local workflow source URL for %s", relPath)
 	return url
 }
 

@@ -113,9 +113,9 @@ func TestAddHandlerManagerConfigEnvVar(t *testing.T) {
 							Max: strPtr("5"),
 						},
 					},
-					Status: testBoolPtr(true),
-					Title:  testBoolPtr(true),
-					Body:   testBoolPtr(true),
+					Status: new(true),
+					Title:  new(true),
+					Body:   new(true),
 				},
 			},
 			checkContains: []string{
@@ -188,7 +188,7 @@ func TestAddHandlerManagerConfigEnvVar(t *testing.T) {
 			safeOutputs: &SafeOutputsConfig{
 				PushToPullRequestBranch: &PushToPullRequestBranchConfig{
 					BaseSafeOutputConfig: BaseSafeOutputConfig{
-						Staged: true,
+						Staged: templatableBoolPtr("true"),
 					},
 					Target:      "*",
 					IfNoChanges: "warn",
@@ -206,7 +206,7 @@ func TestAddHandlerManagerConfigEnvVar(t *testing.T) {
 				ClosePullRequests: &ClosePullRequestsConfig{
 					BaseSafeOutputConfig: BaseSafeOutputConfig{
 						Max:    strPtr("1"),
-						Staged: true,
+						Staged: templatableBoolPtr("true"),
 					},
 				},
 			},
@@ -449,6 +449,27 @@ func TestAddHandlerManagerConfigEnvVar(t *testing.T) {
 			},
 			checkJSON:    true,
 			expectedKeys: []string{"dispatch_workflow"},
+		},
+		{
+			name: "dispatch_repository config",
+			safeOutputs: &SafeOutputsConfig{
+				DispatchRepository: &DispatchRepositoryConfig{
+					Tools: map[string]*DispatchRepositoryToolConfig{
+						"example_tool": {
+							Description: "Test dispatch",
+							Workflow:    "test-workflow",
+							EventType:   "test_event",
+							Repository:  "github/example",
+							Max:         strPtr("1"),
+						},
+					},
+				},
+			},
+			checkContains: []string{
+				"GH_AW_SAFE_OUTPUTS_HANDLER_CONFIG",
+			},
+			checkJSON:    true,
+			expectedKeys: []string{"dispatch_repository"},
 		},
 		{
 			name: "update_discussion config",
@@ -791,6 +812,22 @@ func TestAddHandlerManagerConfigEnvVar(t *testing.T) {
 			expectedKeys: []string{"merge_pull_request"},
 		},
 		{
+			name: "create_check_run config",
+			safeOutputs: &SafeOutputsConfig{
+				CreateCheckRun: &CreateCheckRunConfig{
+					BaseSafeOutputConfig: BaseSafeOutputConfig{
+						Max: strPtr("1"),
+					},
+					Name: "Copilot Analysis",
+				},
+			},
+			checkContains: []string{
+				"GH_AW_SAFE_OUTPUTS_HANDLER_CONFIG",
+			},
+			checkJSON:    true,
+			expectedKeys: []string{"create_check_run"},
+		},
+		{
 			name: "comment_memory config",
 			safeOutputs: &SafeOutputsConfig{
 				CommentMemory: &CommentMemoryConfig{
@@ -1004,8 +1041,8 @@ func TestHandlerConfigAddReviewerTeamReviewers(t *testing.T) {
 		Name: "Test Workflow",
 		SafeOutputs: &SafeOutputsConfig{
 			AddReviewer: &AddReviewerConfig{
-				Reviewers:     []string{"user1"},
-				TeamReviewers: []string{"team-a"},
+				AllowedReviewers:     []string{"user1"},
+				AllowedTeamReviewers: []string{"team-a"},
 			},
 		},
 	}
@@ -1103,6 +1140,17 @@ func TestHandlerConfigBooleanFields(t *testing.T) {
 			},
 			checkField: "add_comment",
 			checkKey:   "hide_older_comments",
+			expected:   true,
+		},
+		{
+			name: "add comment discussions opt-in",
+			safeOutputs: &SafeOutputsConfig{
+				AddComments: &AddCommentsConfig{
+					Discussions: boolPtr(true),
+				},
+			},
+			checkField: "add_comment",
+			checkKey:   "discussions",
 			expected:   true,
 		},
 		{
@@ -1382,6 +1430,98 @@ func TestHandlerConfigTargetRepo(t *testing.T) {
 	}
 }
 
+func TestHandlerConfigClosePullRequestTargetRepo(t *testing.T) {
+	compiler := NewCompiler()
+
+	workflowData := &WorkflowData{
+		Name: "Test Workflow",
+		SafeOutputs: &SafeOutputsConfig{
+			ClosePullRequests: &ClosePullRequestsConfig{
+				BaseSafeOutputConfig: BaseSafeOutputConfig{
+					Max: strPtr("1"),
+				},
+				SafeOutputTargetConfig: SafeOutputTargetConfig{
+					Target:         "*",
+					TargetRepoSlug: "${{ needs.input_parser.outputs.repo }}",
+				},
+			},
+		},
+	}
+
+	var steps []string
+	compiler.addHandlerManagerConfigEnvVar(&steps, workflowData)
+
+	for _, step := range steps {
+		if strings.Contains(step, "GH_AW_SAFE_OUTPUTS_HANDLER_CONFIG") {
+			parts := strings.Split(step, "GH_AW_SAFE_OUTPUTS_HANDLER_CONFIG: ")
+			if len(parts) == 2 {
+				jsonStr := strings.TrimSpace(parts[1])
+				jsonStr = strings.Trim(jsonStr, "\"")
+				jsonStr = strings.ReplaceAll(jsonStr, "\\\"", "\"")
+
+				var config map[string]map[string]any
+				err := json.Unmarshal([]byte(jsonStr), &config)
+				require.NoError(t, err)
+
+				closePRConfig, ok := config["close_pull_request"]
+				require.True(t, ok)
+
+				targetRepo, ok := closePRConfig["target-repo"]
+				require.True(t, ok)
+				assert.Equal(t, "${{ needs.input_parser.outputs.repo }}", targetRepo)
+
+				target, ok := closePRConfig["target"]
+				require.True(t, ok)
+				assert.Equal(t, "*", target)
+			}
+		}
+	}
+}
+
+func TestHandlerConfigCreateCheckRunTarget(t *testing.T) {
+	compiler := NewCompiler()
+
+	workflowData := &WorkflowData{
+		Name: "Test Workflow",
+		SafeOutputs: &SafeOutputsConfig{
+			CreateCheckRun: &CreateCheckRunConfig{
+				BaseSafeOutputConfig: BaseSafeOutputConfig{
+					Max: strPtr("1"),
+				},
+				Target: "*",
+			},
+		},
+	}
+
+	var steps []string
+	compiler.addHandlerManagerConfigEnvVar(&steps, workflowData)
+
+	foundHandlerConfig := false
+	for _, step := range steps {
+		if strings.Contains(step, "GH_AW_SAFE_OUTPUTS_HANDLER_CONFIG") {
+			foundHandlerConfig = true
+			parts := strings.Split(step, "GH_AW_SAFE_OUTPUTS_HANDLER_CONFIG: ")
+			if len(parts) == 2 {
+				jsonStr := strings.TrimSpace(parts[1])
+				jsonStr = strings.Trim(jsonStr, "\"")
+				jsonStr = strings.ReplaceAll(jsonStr, "\\\"", "\"")
+
+				var config map[string]map[string]any
+				err := json.Unmarshal([]byte(jsonStr), &config)
+				require.NoError(t, err)
+
+				checkRunConfig, ok := config["create_check_run"]
+				require.True(t, ok)
+
+				target, ok := checkRunConfig["target"]
+				require.True(t, ok)
+				assert.Equal(t, "*", target)
+			}
+		}
+	}
+	require.True(t, foundHandlerConfig, "Expected GH_AW_SAFE_OUTPUTS_HANDLER_CONFIG in generated steps")
+}
+
 // TestHandlerConfigPatchSize tests max patch size configuration
 func TestHandlerConfigPatchSize(t *testing.T) {
 	tests := []struct {
@@ -1392,7 +1532,7 @@ func TestHandlerConfigPatchSize(t *testing.T) {
 		{
 			name:         "default patch size",
 			maxPatchSize: 0,
-			expectedSize: 1024,
+			expectedSize: 4096,
 		},
 		{
 			name:         "custom patch size",
@@ -1548,15 +1688,107 @@ func TestParseSafeOutputsMaxPatchFiles(t *testing.T) {
 	}
 }
 
-// testBoolPtr is a helper function for bool pointers in config tests
-func testBoolPtr(b bool) *bool {
-	return &b
+func TestHandlerConfigCreatePullRequestPatchLimitsOverrideGlobals(t *testing.T) {
+	compiler := NewCompiler()
+
+	workflowData := &WorkflowData{
+		Name: "Test Workflow",
+		SafeOutputs: &SafeOutputsConfig{
+			MaximumPatchSize:  4096,
+			MaximumPatchFiles: 800,
+			CreatePullRequests: &CreatePullRequestsConfig{
+				MaxPatchSize:  2048,
+				MaxPatchFiles: 300,
+			},
+		},
+	}
+
+	var steps []string
+	compiler.addHandlerManagerConfigEnvVar(&steps, workflowData)
+
+	found := false
+	for _, step := range steps {
+		if !strings.Contains(step, "GH_AW_SAFE_OUTPUTS_HANDLER_CONFIG") {
+			continue
+		}
+		parts := strings.Split(step, "GH_AW_SAFE_OUTPUTS_HANDLER_CONFIG: ")
+		if len(parts) != 2 {
+			continue
+		}
+		jsonStr := strings.TrimSpace(parts[1])
+		jsonStr = strings.Trim(jsonStr, "\"")
+		jsonStr = strings.ReplaceAll(jsonStr, "\\\"", "\"")
+
+		var config map[string]map[string]any
+		err := json.Unmarshal([]byte(jsonStr), &config)
+		require.NoError(t, err)
+
+		prConfig, ok := config["create_pull_request"]
+		require.True(t, ok, "create_pull_request handler config should exist")
+
+		maxSize, ok := prConfig["max_patch_size"]
+		require.True(t, ok, "max_patch_size should be present in handler config")
+		assert.InDelta(t, float64(2048), maxSize, 0.0001, "create-pull-request max_patch_size should use per-handler override")
+
+		maxFiles, ok := prConfig["max_patch_files"]
+		require.True(t, ok, "max_patch_files should be present in handler config")
+		assert.InDelta(t, float64(300), maxFiles, 0.0001, "create-pull-request max_patch_files should use per-handler override")
+		found = true
+	}
+
+	assert.True(t, found, "GH_AW_SAFE_OUTPUTS_HANDLER_CONFIG step should be present")
 }
 
-// testStringPtr is a helper function for string pointers in config tests
-func testStringPtr(s string) *string {
-	return &s
+func TestHandlerConfigPushToPullRequestBranchPatchSizeOverridesGlobal(t *testing.T) {
+	compiler := NewCompiler()
+
+	workflowData := &WorkflowData{
+		Name: "Test Workflow",
+		SafeOutputs: &SafeOutputsConfig{
+			MaximumPatchSize: 4096,
+			PushToPullRequestBranch: &PushToPullRequestBranchConfig{
+				MaxPatchSize: 2048,
+			},
+		},
+	}
+
+	var steps []string
+	compiler.addHandlerManagerConfigEnvVar(&steps, workflowData)
+
+	found := false
+	for _, step := range steps {
+		if !strings.Contains(step, "GH_AW_SAFE_OUTPUTS_HANDLER_CONFIG") {
+			continue
+		}
+		parts := strings.Split(step, "GH_AW_SAFE_OUTPUTS_HANDLER_CONFIG: ")
+		if len(parts) != 2 {
+			continue
+		}
+		jsonStr := strings.TrimSpace(parts[1])
+		jsonStr = strings.Trim(jsonStr, "\"")
+		jsonStr = strings.ReplaceAll(jsonStr, "\\\"", "\"")
+
+		var config map[string]map[string]any
+		err := json.Unmarshal([]byte(jsonStr), &config)
+		require.NoError(t, err)
+
+		pushConfig, ok := config["push_to_pull_request_branch"]
+		require.True(t, ok, "push_to_pull_request_branch handler config should exist")
+
+		maxSize, ok := pushConfig["max_patch_size"]
+		require.True(t, ok, "max_patch_size should be present in handler config")
+		assert.InDelta(t, float64(2048), maxSize, 0.0001, "push-to-pull-request-branch max_patch_size should use per-handler override")
+		found = true
+	}
+
+	assert.True(t, found, "GH_AW_SAFE_OUTPUTS_HANDLER_CONFIG step should be present")
 }
+
+// testBoolPtr is a helper function for bool pointers in config tests
+func testBoolPtr(b bool) *bool { return new(b) }
+
+// testStringPtr is a helper function for string pointers in config tests
+func testStringPtr(s string) *string { return new(s) }
 
 // TestAutoEnabledHandlers tests that missing_tool and missing_data
 // are automatically enabled even when not explicitly configured.
@@ -1667,10 +1899,13 @@ func TestCreatePullRequestBaseBranch(t *testing.T) {
 		name                             string
 		baseBranch                       string
 		allowedBaseBranches              []string
+		allowedBranches                  []string
 		expectedBaseBranch               string
 		shouldHaveBaseBranchKey          bool
 		expectedAllowedBaseBranches      []string
 		shouldHaveAllowedBaseBranchesKey bool
+		expectedAllowedBranches          []string
+		shouldHaveAllowedBranchesKey     bool
 	}{
 		{
 			name:                    "custom base branch",
@@ -1694,10 +1929,13 @@ func TestCreatePullRequestBaseBranch(t *testing.T) {
 			name:                             "allowed base branches list",
 			baseBranch:                       "main",
 			allowedBaseBranches:              []string{"release/*", "main"},
+			allowedBranches:                  []string{"feature/*", "fix/*"},
 			expectedBaseBranch:               "main",
 			shouldHaveBaseBranchKey:          true,
 			expectedAllowedBaseBranches:      []string{"release/*", "main"},
 			shouldHaveAllowedBaseBranchesKey: true,
+			expectedAllowedBranches:          []string{"feature/*", "fix/*"},
+			shouldHaveAllowedBranchesKey:     true,
 		},
 	}
 
@@ -1714,6 +1952,7 @@ func TestCreatePullRequestBaseBranch(t *testing.T) {
 						},
 						BaseBranch:          tt.baseBranch,
 						AllowedBaseBranches: tt.allowedBaseBranches,
+						AllowedBranches:     tt.allowedBranches,
 					},
 				},
 			}
@@ -1758,6 +1997,19 @@ func TestCreatePullRequestBaseBranch(t *testing.T) {
 							}
 						} else {
 							require.False(t, ok, "allowed_base_branches should NOT be in config when no values set")
+						}
+
+						allowedBranches, ok := prConfig["allowed_branches"]
+						if tt.shouldHaveAllowedBranchesKey {
+							require.True(t, ok, "allowed_branches should be in config")
+							allowedSlice, ok := allowedBranches.([]any)
+							require.True(t, ok, "allowed_branches should be an array")
+							require.Len(t, allowedSlice, len(tt.expectedAllowedBranches), "allowed_branches length should match")
+							for i, expected := range tt.expectedAllowedBranches {
+								assert.Equal(t, expected, allowedSlice[i], "allowed_branches element should match")
+							}
+						} else {
+							require.False(t, ok, "allowed_branches should NOT be in config when no values set")
 						}
 					}
 				}
@@ -2136,7 +2388,7 @@ func TestHandlerConfigStagedMode(t *testing.T) {
 			safeOutputs: &SafeOutputsConfig{
 				PushToPullRequestBranch: &PushToPullRequestBranchConfig{
 					BaseSafeOutputConfig: BaseSafeOutputConfig{
-						Staged: true,
+						Staged: templatableBoolPtr("true"),
 					},
 					Target:      "*",
 					IfNoChanges: "warn",
@@ -2150,7 +2402,7 @@ func TestHandlerConfigStagedMode(t *testing.T) {
 				ClosePullRequests: &ClosePullRequestsConfig{
 					BaseSafeOutputConfig: BaseSafeOutputConfig{
 						Max:    strPtr("1"),
-						Staged: true,
+						Staged: templatableBoolPtr("true"),
 					},
 				},
 			},
@@ -2161,7 +2413,7 @@ func TestHandlerConfigStagedMode(t *testing.T) {
 			safeOutputs: &SafeOutputsConfig{
 				CreateIssues: &CreateIssuesConfig{
 					BaseSafeOutputConfig: BaseSafeOutputConfig{
-						Staged: true,
+						Staged: templatableBoolPtr("true"),
 					},
 				},
 			},
@@ -2172,7 +2424,7 @@ func TestHandlerConfigStagedMode(t *testing.T) {
 			safeOutputs: &SafeOutputsConfig{
 				AddComments: &AddCommentsConfig{
 					BaseSafeOutputConfig: BaseSafeOutputConfig{
-						Staged: true,
+						Staged: templatableBoolPtr("true"),
 					},
 				},
 			},
@@ -2183,7 +2435,7 @@ func TestHandlerConfigStagedMode(t *testing.T) {
 			safeOutputs: &SafeOutputsConfig{
 				CreatePullRequests: &CreatePullRequestsConfig{
 					BaseSafeOutputConfig: BaseSafeOutputConfig{
-						Staged: true,
+						Staged: templatableBoolPtr("true"),
 					},
 				},
 			},
@@ -2195,7 +2447,7 @@ func TestHandlerConfigStagedMode(t *testing.T) {
 				UpdateIssues: &UpdateIssuesConfig{
 					UpdateEntityConfig: UpdateEntityConfig{
 						BaseSafeOutputConfig: BaseSafeOutputConfig{
-							Staged: true,
+							Staged: templatableBoolPtr("true"),
 						},
 					},
 				},
@@ -2208,7 +2460,7 @@ func TestHandlerConfigStagedMode(t *testing.T) {
 				UpdatePullRequests: &UpdatePullRequestsConfig{
 					UpdateEntityConfig: UpdateEntityConfig{
 						BaseSafeOutputConfig: BaseSafeOutputConfig{
-							Staged: true,
+							Staged: templatableBoolPtr("true"),
 						},
 					},
 				},
@@ -2221,7 +2473,7 @@ func TestHandlerConfigStagedMode(t *testing.T) {
 				UpdateDiscussions: &UpdateDiscussionsConfig{
 					UpdateEntityConfig: UpdateEntityConfig{
 						BaseSafeOutputConfig: BaseSafeOutputConfig{
-							Staged: true,
+							Staged: templatableBoolPtr("true"),
 						},
 					},
 				},
@@ -2233,7 +2485,7 @@ func TestHandlerConfigStagedMode(t *testing.T) {
 			safeOutputs: &SafeOutputsConfig{
 				AddLabels: &AddLabelsConfig{
 					BaseSafeOutputConfig: BaseSafeOutputConfig{
-						Staged: true,
+						Staged: templatableBoolPtr("true"),
 					},
 				},
 			},
@@ -2244,7 +2496,7 @@ func TestHandlerConfigStagedMode(t *testing.T) {
 			safeOutputs: &SafeOutputsConfig{
 				DispatchWorkflow: &DispatchWorkflowConfig{
 					BaseSafeOutputConfig: BaseSafeOutputConfig{
-						Staged: true,
+						Staged: templatableBoolPtr("true"),
 					},
 					Workflows: []string{"my-workflow"},
 				},
@@ -2256,7 +2508,7 @@ func TestHandlerConfigStagedMode(t *testing.T) {
 			safeOutputs: &SafeOutputsConfig{
 				CallWorkflow: &CallWorkflowConfig{
 					BaseSafeOutputConfig: BaseSafeOutputConfig{
-						Staged: true,
+						Staged: templatableBoolPtr("true"),
 					},
 					Workflows: []string{"my-workflow"},
 				},
@@ -2300,8 +2552,53 @@ func TestHandlerConfigStagedMode(t *testing.T) {
 					assert.Equal(t, true, stagedVal, "staged field should be true")
 				}
 			}
+
 		})
 	}
+}
+
+func TestHandlerConfigStagedExpression(t *testing.T) {
+	t.Parallel()
+
+	compiler := NewCompiler()
+	workflowData := &WorkflowData{
+		Name: "Test Workflow",
+		SafeOutputs: &SafeOutputsConfig{
+			CreateIssues: &CreateIssuesConfig{
+				BaseSafeOutputConfig: BaseSafeOutputConfig{
+					Staged: templatableBoolPtr("${{ inputs.staged }}"),
+				},
+			},
+		},
+	}
+
+	var steps []string
+	compiler.addHandlerManagerConfigEnvVar(&steps, workflowData)
+	require.NotEmpty(t, steps, "Steps should not be empty")
+
+	for _, step := range steps {
+		if !strings.Contains(step, "GH_AW_SAFE_OUTPUTS_HANDLER_CONFIG") {
+			continue
+		}
+
+		parts := strings.Split(step, "GH_AW_SAFE_OUTPUTS_HANDLER_CONFIG: ")
+		require.Len(t, parts, 2, "Should have two parts")
+
+		jsonStr := strings.TrimSpace(parts[1])
+		jsonStr = strings.Trim(jsonStr, "\"")
+		jsonStr = strings.ReplaceAll(jsonStr, "\\\"", "\"")
+
+		var config map[string]map[string]any
+		err := json.Unmarshal([]byte(jsonStr), &config)
+		require.NoError(t, err, "Handler config JSON should be valid")
+
+		handlerConfig, ok := config["create_issue"]
+		require.True(t, ok, "Should have create_issue handler")
+		assert.Equal(t, "${{ inputs.staged }}", handlerConfig["staged"], "staged expression should pass through to handler config JSON unchanged")
+		return
+	}
+
+	t.Fatal("GH_AW_SAFE_OUTPUTS_HANDLER_CONFIG not found")
 }
 
 // TestAddHandlerManagerConfigEnvVar_CallWorkflow asserts that GH_AW_SAFE_OUTPUTS_HANDLER_CONFIG
@@ -2629,6 +2926,108 @@ func TestProtectTopLevelDotFolders(t *testing.T) {
 	}
 }
 
+func TestInjectCheckoutMappingForWildcardTargetRepo(t *testing.T) {
+	t.Run("injects mapping when target-repo is wildcard", func(t *testing.T) {
+		data := &WorkflowData{
+			CheckoutConfigs: []*CheckoutConfig{
+				{Repository: "octocat/Hello-World", Path: "./hello-world"},
+				{Repository: "octocat/Spoon-Knife", Path: "./spoon-knife"},
+			},
+		}
+		handlerCfg := map[string]any{"target-repo": "*"}
+		injectCheckoutMapping("create_pull_request", handlerCfg, data)
+		mapping, ok := handlerCfg["checkout_mapping"].(map[string]string)
+		require.True(t, ok, "checkout_mapping should be a map[string]string")
+		assert.Equal(t, "hello-world", mapping["octocat/hello-world"])
+		assert.Equal(t, "spoon-knife", mapping["octocat/spoon-knife"])
+	})
+
+	t.Run("skips when target-repo is not wildcard", func(t *testing.T) {
+		data := &WorkflowData{
+			CheckoutConfigs: []*CheckoutConfig{
+				{Repository: "octocat/Hello-World", Path: "./hello-world"},
+			},
+		}
+		handlerCfg := map[string]any{"target-repo": "octocat/Hello-World"}
+		injectCheckoutMapping("create_pull_request", handlerCfg, data)
+		_, ok := handlerCfg["checkout_mapping"]
+		assert.False(t, ok, "checkout_mapping should not be injected for non-wildcard")
+	})
+
+	t.Run("skips wiki checkouts", func(t *testing.T) {
+		data := &WorkflowData{
+			CheckoutConfigs: []*CheckoutConfig{
+				{Repository: "octocat/Hello-World", Path: "./hello-world", Wiki: true},
+			},
+		}
+		handlerCfg := map[string]any{"target-repo": "*"}
+		injectCheckoutMapping("create_pull_request", handlerCfg, data)
+		_, ok := handlerCfg["checkout_mapping"]
+		assert.False(t, ok, "checkout_mapping should not include wiki checkouts")
+	})
+
+	t.Run("skips unrelated handlers", func(t *testing.T) {
+		data := &WorkflowData{
+			CheckoutConfigs: []*CheckoutConfig{
+				{Repository: "octocat/Hello-World", Path: "./hello-world"},
+			},
+		}
+		handlerCfg := map[string]any{"target-repo": "*"}
+		injectCheckoutMapping("create_issue", handlerCfg, data)
+		_, ok := handlerCfg["checkout_mapping"]
+		assert.False(t, ok, "checkout_mapping should not be injected for unrelated handlers")
+	})
+}
+
+func TestHandlerConfigInjectsCurrentCheckoutPatchWorkspacePath(t *testing.T) {
+	compiler := NewCompiler()
+	workflowData := &WorkflowData{
+		Name: "Test Workflow",
+		CheckoutConfigs: []*CheckoutConfig{
+			{
+				Repository: "caido/proxy-frontend",
+				Path:       "./proxy-frontend",
+				Current:    true,
+			},
+		},
+		SafeOutputs: &SafeOutputsConfig{
+			CreatePullRequests: &CreatePullRequestsConfig{
+				BaseSafeOutputConfig: BaseSafeOutputConfig{Max: strPtr("1")},
+				TargetRepoSlug:       "caido/proxy-frontend",
+			},
+			PushToPullRequestBranch: &PushToPullRequestBranchConfig{
+				TargetRepoSlug: "caido/proxy-frontend",
+			},
+		},
+	}
+
+	var steps []string
+	compiler.addHandlerManagerConfigEnvVar(&steps, workflowData)
+	require.NotEmpty(t, steps, "should produce config steps")
+
+	var configJSON string
+	for _, step := range steps {
+		if strings.Contains(step, "GH_AW_SAFE_OUTPUTS_HANDLER_CONFIG") {
+			parts := strings.Split(step, "GH_AW_SAFE_OUTPUTS_HANDLER_CONFIG: ")
+			require.Len(t, parts, 2, "should split env var line")
+			configJSON = strings.TrimSpace(parts[1])
+			configJSON = strings.Trim(configJSON, "\"")
+			configJSON = strings.ReplaceAll(configJSON, "\\\"", "\"")
+		}
+	}
+	require.NotEmpty(t, configJSON, "should have extracted JSON")
+
+	var config map[string]map[string]any
+	require.NoError(t, json.Unmarshal([]byte(configJSON), &config), "config JSON should be valid")
+
+	for _, handlerName := range []string{"create_pull_request", "push_to_pull_request_branch"} {
+		handlerCfg, ok := config[handlerName]
+		require.True(t, ok, "%s handler should be present", handlerName)
+		assert.Equal(t, "proxy-frontend", handlerCfg["patch_workspace_path"])
+		assert.Equal(t, "caido/proxy-frontend", handlerCfg["current_checkout_repo"])
+	}
+}
+
 // TestProtectTopLevelMdFiles verifies that well-known top-level Markdown files
 // (README.md, CONTRIBUTING.md, CHANGELOG.md, SECURITY.md, CODE_OF_CONDUCT.md) are
 // always included in the protected_files list in both handler configs.
@@ -2916,6 +3315,42 @@ func TestPRPolicyFieldsExpressionsPassThrough(t *testing.T) {
 	}
 }
 
+func TestCreatePullRequestProtectedFilesPolicyDefault(t *testing.T) {
+	t.Parallel()
+
+	compiler := NewCompiler()
+	workflowData := &WorkflowData{
+		Name: "Test Workflow",
+		SafeOutputs: &SafeOutputsConfig{
+			CreatePullRequests: &CreatePullRequestsConfig{
+				BaseSafeOutputConfig: BaseSafeOutputConfig{Max: strPtr("1")},
+			},
+		},
+	}
+	var steps []string
+	compiler.addHandlerManagerConfigEnvVar(&steps, workflowData)
+	require.NotEmpty(t, steps, "should produce config steps")
+
+	var configJSON string
+	for _, step := range steps {
+		if strings.Contains(step, "GH_AW_SAFE_OUTPUTS_HANDLER_CONFIG") {
+			parts := strings.Split(step, "GH_AW_SAFE_OUTPUTS_HANDLER_CONFIG: ")
+			require.Len(t, parts, 2, "should split env var line")
+			configJSON = strings.TrimSpace(parts[1])
+			configJSON = strings.Trim(configJSON, "\"")
+			configJSON = strings.ReplaceAll(configJSON, "\\\"", "\"")
+		}
+	}
+	require.NotEmpty(t, configJSON, "should have extracted JSON")
+
+	var config map[string]map[string]any
+	require.NoError(t, json.Unmarshal([]byte(configJSON), &config), "config JSON should be valid")
+
+	handlerCfg, ok := config["create_pull_request"]
+	require.True(t, ok, "create_pull_request handler config should be present")
+	assert.Equal(t, "request_review", handlerCfg["protected_files_policy"], "default protected-files mode should be request_review")
+}
+
 // TestDispatchWorkflowRelayInjectsDispatchCompatibleRef verifies that when a workflow_call
 // trigger is present and dispatch_workflow safe-outputs are configured, the compiler injects
 // needs.activation.outputs.target_ref (the dispatch-compatible branch/tag ref) — not
@@ -2954,4 +3389,78 @@ func TestDispatchWorkflowRelayInjectsDispatchCompatibleRef(t *testing.T) {
 	// target_checkout_ref (SHA) must NOT be used as the dispatch ref
 	assert.NotContains(t, stepsContent, "target_checkout_ref",
 		"dispatch target-ref must NOT use target_checkout_ref (commit SHA)")
+}
+
+// TestReportFailureAsIssueWithCategoriesFilter tests that report-failure-as-issue
+// parsing supports both bool (legacy) and array of category strings
+func TestReportFailureAsIssueWithCategoriesFilter(t *testing.T) {
+	tests := []struct {
+		name                     string
+		reportValue              any
+		expectBool               *bool
+		expectCategories         []string
+		expectExcludedCategories []string
+	}{
+		{
+			name:        "boolean true",
+			reportValue: true,
+			expectBool:  boolPtr(true),
+		},
+		{
+			name:        "boolean false",
+			reportValue: false,
+			expectBool:  boolPtr(false),
+		},
+		{
+			name:             "array of categories",
+			reportValue:      []any{"agent_failure", "missing_safe_outputs"},
+			expectCategories: []string{"agent_failure", "missing_safe_outputs"},
+		},
+		{
+			name:             "array with one category",
+			reportValue:      []any{"agent_failure"},
+			expectCategories: []string{"agent_failure"},
+		},
+		{
+			name:                     "array with excluded categories",
+			reportValue:              []any{"!inference_access_error", "!ai_credits_rate_limit_error"},
+			expectExcludedCategories: []string{"inference_access_error", "ai_credits_rate_limit_error"},
+		},
+		{
+			name:                     "array with mixed include and exclude categories",
+			reportValue:              []any{"agent_failure", "missing_safe_outputs", "!unknown_model_ai_credits"},
+			expectCategories:         []string{"agent_failure", "missing_safe_outputs"},
+			expectExcludedCategories: []string{"unknown_model_ai_credits"},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			compiler := NewCompiler()
+
+			// Simulate the parsing by calling extractSafeOutputsConfig
+			frontmatter := map[string]any{
+				"safe-outputs": map[string]any{
+					"report-failure-as-issue": tt.reportValue,
+					"create-issue":            nil, // Enable safe outputs
+				},
+			}
+
+			config := compiler.extractSafeOutputsConfig(frontmatter)
+			require.NotNil(t, config, "SafeOutputsConfig should be created")
+
+			if tt.expectBool != nil {
+				reportBool, ok := config.ReportFailureAsIssue.(bool)
+				require.True(t, ok, "ReportFailureAsIssue should be bool")
+				assert.Equal(t, *tt.expectBool, reportBool, "Boolean value should match")
+			}
+
+			if len(tt.expectCategories) > 0 {
+				assert.Equal(t, tt.expectCategories, config.ReportFailureAsIssueCategories, "Categories should match")
+			}
+			if len(tt.expectExcludedCategories) > 0 {
+				assert.Equal(t, tt.expectExcludedCategories, config.ReportFailureAsIssueExcludedCategories, "Excluded categories should match")
+			}
+		})
+	}
 }

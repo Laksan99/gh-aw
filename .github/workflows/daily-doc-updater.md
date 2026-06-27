@@ -1,64 +1,81 @@
 ---
-name: Daily Documentation Updater
-description: Automatically reviews and updates documentation to ensure accuracy and completeness
+private: true
 on:
   schedule:
-    # Every day around 2am PST (10:00 UTC)
-    - cron: daily around 10:00
-  workflow_dispatch:
-
+  - cron: daily around 10:00
+  workflow_dispatch: null
+max-daily-ai-credits: 10000
 permissions:
   contents: read
   issues: read
   pull-requests: read
-
-tracker-id: daily-doc-updater
-engine: claude
-strict: true
-
 network:
   allowed:
-    - defaults
-    - github
-
+  - defaults
+  - github
+imports:
+- shared/github-guard-policy.md
+- shared/otlp.md
 safe-outputs:
   create-pull-request:
-    expires: 1d
-    title-prefix: "[docs] "
-    labels: [documentation, automation]
-    reviewers: [copilot]
-    draft: false
     auto-merge: true
+    draft: false
+    expires: 1d
+    labels:
+    - documentation
+    - automation
     protected-files: fallback-to-issue
-  noop:
-
-tools:
-  cli-proxy: true
-  cache-memory: true
-  github:
-    mode: gh-proxy
-    toolsets: [default]
-    min-integrity: approved
-  edit:
-  bash:
-    - "find docs -name '*.md' -o -name '*.mdx'"
-    - "find docs -maxdepth 1 -ls"
-    - "find docs -name '*.md' -exec cat {} +"
-    - "grep -r '*' docs"
-    - "git"
-    - "find pkg/parser/schemas -name '*.json'"
-    - "cat pkg/parser/schemas/*.json"
-
+    reviewers:
+    - copilot
+    title-prefix: "[docs] "
+  noop: null
+description: Automatically reviews and updates documentation to ensure accuracy and completeness
+emoji: 📝
+engine:
+  id: pi
+  model: copilot/gpt-5.4
+name: Daily Documentation Updater
+strict: true
+experiments:
+  model_size:
+    variants: [claude-sonnet-4.6, claude-haiku-4.5]
+    description: "Tests whether Claude Haiku achieves similar documentation update quality at lower token cost compared to Claude Sonnet."
+    hypothesis: "H0: no change in PR creation rate or run success rate. H1: Claude Haiku reduces AI credit usage >=30% with equivalent run success rate (>=0.90)."
+    metric: ai_credits_total
+    secondary_metrics: [run_success_rate, run_duration_ms]
+    guardrail_metrics:
+      - name: run_success_rate
+        threshold: ">=0.90"
+      - name: empty_output_rate
+        threshold: "<=0.10"
+    min_samples: 20
+    weight: [50, 50]
+    start_date: "2026-06-04"
 timeout-minutes: 45
-
-imports:
-  - shared/github-guard-policy.md
-  - shared/observability-otlp.md
-
-firewall:
-  effective-token-steering: true
+sandbox:
+  agent:
+    sudo: false
+tools:
+  bash:
+  - find docs -name "*.md" -o -name "*.mdx"
+  - find docs -maxdepth 1 -ls
+  - find docs -name "*.md" -exec cat {} +
+  - grep -r "*" docs
+  - git
+  - find pkg/parser/schemas -name "*.json"
+  - cat pkg/parser/schemas/*.json
+  cache-memory: true
+  cli-proxy: true
+  edit: null
+  github:
+    min-integrity: approved
+    mode: gh-proxy
+    toolsets:
+    - default
+tracker-id: daily-doc-updater
+features:
+  gh-aw-detection: true
 ---
-
 {{#runtime-import? .github/shared-instructions.md}}
 
 # Daily Documentation Updater
@@ -137,6 +154,11 @@ For each closed issue:
     4. If all listed items are already documented, treat the issue as already addressed and skip it (do not continue to Step 2 for this issue).
   - Otherwise, treat it as an unaddressed gap and follow the normal Step 2 flow.
 - **closed as not_planned**: Do not create documentation based solely on this issue. Instead, cross-reference the issue's subject matter against commits from the same 7-day window (Step 2). If a related code change is found, treat it as a new documentation gap (independent of the original issue decision) and follow the normal Step 2 flow for that code change.
+  - **Cross-cutting docs-coverage / convention gaps (no triggering code change)**: If the issue describes a cross-cutting documentation **coverage or convention** gap (e.g., example parity across multiple reference pages, consistent terminology, missing cross-links) and carries the `cookie`, `improvement`, or `quick-win` label, *and no triggering code change was found above*, do not require a code change to act. Instead:
+    1. Sample the files listed in the issue to confirm the gap still exists.
+    2. If the gap persists **and** the fix direction is unambiguous (e.g., a phrase is clearly missing from a specific location), apply the fix and reference the issue with `Closes #NNN`.
+    3. If the fix direction is a docs-convention choice (e.g., add parallel examples vs. omit redundant defaults vs. tabbed multi-engine blocks), **do not guess** — open a `[doc-healer]` maintainer-decision issue instead of editing.
+    4. If a triggering code change *was* already found, the code-change path (Step 2) takes full precedence; do not apply this coverage-gap path as well.
 
 ### 1d. Scan Cookie-Labeled Automation Issues
 
@@ -252,6 +274,28 @@ If you made any documentation changes:
    - Links to relevant merged PRs that triggered the updates
    - Any notes about features that need further review
 
+#### PR Description Formatting Requirements
+
+- **Header Levels**: Use h3 (`###`) or lower for all headers in your report to maintain proper document hierarchy. Never use h1 (`#`) or h2 (`##`) headers — these are reserved for issue/discussion titles.
+- **Progressive Disclosure**: Wrap long sections in `<details><summary>Section Name</summary>` tags to improve readability and reduce scrolling.
+
+Example:
+
+```markdown
+<details>
+<summary><b>Full Analysis Details</b></summary>
+
+[Long detailed content here...]
+
+</details>
+```
+
+- **Recommended Structure**:
+  1. Brief summary (always visible)
+  2. Key metrics or highlights (always visible)
+  3. Detailed analysis (in `<details>` tags)
+  4. Recommendations (always visible)
+
 **PR Title Format**: `[docs] Update documentation for features from [date]`
 
 **PR Description Template**:
@@ -318,6 +362,8 @@ When calling `noop`, use this format:
 - **Test Understanding**: If unsure about a feature, review the code changes in detail
 - **Issue-Driven**: Proactively check open `documentation` issues — do not wait for them to be reported manually.
 - **Validate Examples**: YAML frontmatter examples in docs must be structurally valid. When in doubt, test with `gh aw compile`.
+- **Default-value awareness for engine examples**: `engine: copilot` is the default and is redundant when `copilot` is the intended engine (omitting it produces identical behaviour). When normalizing engine examples, prefer *removing* the redundant `engine: copilot` line over duplicating workflow blocks with alternative engine values. This keeps examples engine-agnostic by default, reduces unnecessary doc size, and aligns with the `unbloat-docs` effort.
+- **`unbloat-docs` guardrail**: Example-coverage fixes **must not** duplicate large workflow blocks. Prefer `<Tabs>` for multi-engine illustration only where the engine choice is genuinely instructive to the reader; otherwise omit the redundant `engine:` line rather than adding parallel copies.
 
 ## Important Notes
 

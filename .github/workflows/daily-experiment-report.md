@@ -1,9 +1,12 @@
 ---
+private: true
+emoji: "🧪"
 description: Daily statistical report that uses the experiments CLI command to list active experiments and the experiments analyze tool to get per-variant statistics and statistical significance, then computes per-variant success rates and durations from run artifacts, renders bar charts and an ASCII comparison table per experiment, and posts a discussion with a promote/extend/abandon recommendation; notifies tracking issues when experiments reach statistical significance or min_samples
 name: daily-experiment-report
 on:
   schedule: daily around 8:00
   workflow_dispatch:
+max-daily-ai-credits: 10000
 permissions:
   contents: read
   actions: read
@@ -11,7 +14,13 @@ permissions:
   pull-requests: read
   discussions: read
 
-engine: copilot
+  copilot-requests: write
+engine:
+  id: copilot
+  copilot-sdk: true
+sandbox:
+  agent:
+    sudo: false
 tools:
   cli-proxy: true
   github:
@@ -30,7 +39,7 @@ imports:
       title-prefix: "[experiments] "
       expires: 3d
 
-  - shared/observability-otlp.md
+  - shared/otlp.md
 safe-outputs:
   upload-asset:
     max: 10
@@ -44,12 +53,8 @@ safe-outputs:
   max-bot-mentions: 1
 
 timeout-minutes: 30
-
 features:
-  copilot-requests: true
-
-firewall:
-  effective-token-steering: true
+  gh-aw-detection: true
 ---
 
 # Daily Experiment Report
@@ -75,6 +80,16 @@ If the command returns an empty array, append the following to `$GITHUB_STEP_SUM
 ```
 No active experiments found in ${{ github.repository }} — nothing to report.
 ```
+
+Before using that fallback message, verify whether experiment data is being written correctly:
+
+1. Find at least one workflow that declares `experiments:` in frontmatter.
+2. List recent workflow runs for that workflow (latest completed runs).
+3. Inspect jobs in one recent run and confirm whether `push_experiments_state` ran.
+4. Read `state.json` from the expected `experiments/<sanitized-workflow-id>` branch (the same branch used in `GH_AW_EXPERIMENT_BRANCH`; for example, `ci-coach` maps to `experiments/cicoach`).
+
+If runs exist and `state.json` contains counts/runs, treat experiments as active and continue the report.
+Only emit the "No active experiments" message when this verification also confirms no usable experiment state.
 
 For each workflow in the list, run the `experiments analyze` CLI command to retrieve per-variant
 statistics and experiment configuration:
@@ -349,6 +364,28 @@ plt.close()
 After saving each chart, upload it using the `upload_asset` safe-output tool and store the returned
 asset URLs — they will be embedded in the discussion body.
 
+## Step 5.5 — Build `min_samples` Progress Bars
+
+Add a helper to render per-variant progress toward `min_samples` using fixed-width Unicode bars:
+
+```python
+def render_progress_bar(current, target, width=10):
+    if target <= 0:
+        return "░" * width + f" {current}/{target} (N/A)"
+    ratio = max(0.0, min(1.0, current / target))
+    filled = int(round(ratio * width))
+    bar = "█" * filled + "░" * (width - filled)
+    return f"{bar} {current}/{target} ({ratio*100:.0f}%)"
+```
+
+Use this helper in the per-experiment sample-size table:
+
+```
+███████░░░ 15/20 (75%)
+██████████ 20/20 (100%)
+██░░░░░░░░ 5/20 (25%)
+```
+
 ## Step 6 — Render ASCII Comparison Table
 
 For each experiment, produce an ASCII table inside a fenced code block:
@@ -404,26 +441,62 @@ title-prefix `[experiments]`, category `audits`, and automatic cleanup of older 
 
 ### Discussion body structure
 
+Use h3 (`###`) or lower for all headers in your report. Never use h1 (`#`) or h2 (`##`) inside issue/comment bodies — these are reserved for the issue title.
+
+Wrap long sections in `<details><summary><b>Section Name</b></summary>` tags to improve readability and reduce scrolling. Keep critical summaries and key metrics always visible.
+
+Use visual cues consistently:
+- Use emojis strategically (for example: `📊` charts, `✅` success, `⚠️` warnings, `❌` failures)
+- Use status badges for readiness (`🟢 READY`, `🟡 COLLECTING`, `🔴 FAILED`)
+- Bold final recommendations and wrap variant names in inline code
+
+Suggested structure:
+- Brief summary (always visible)
+- Key metrics or highlights (always visible)
+- Detailed analysis (in `<details>` tags)
+- Recommendations (always visible)
+
 ```markdown
 ### 🧪 Daily Experiment Report — YYYY-MM-DD
 
 [1–2 sentence executive summary: N experiments analysed across M workflows,
  K reached significance (p < 0.05), list recommendations at a glance.]
 
+### ⚡ Quick Stats
+
+| Metric | Value |
+|--------|-------|
+| Active experiments | N |
+| Ready for analysis | R |
+| Statistically significant (p < 0.05) | K |
+| Recommendations | ✅ PROMOTE: P · 🟡 EXTEND: E · ❌ ABANDON: A |
+
 ---
 
 #### `<experiment_name>` · `<workflow_basename>`
 
+> **Status**: 🟢 READY / 🟡 COLLECTING / 🔴 FAILED
 > **Variants**: `<v1>` vs `<v2>` · **Window**: last 30 runs · **Analysed**: N runs with artifacts
-> **min_samples**: <min_samples> per variant
+> **min_samples**: <min_samples> per variant · **Significance**: p = <p-value>
 
 <hypothesis if declared>
 
-![Success Rate Chart](<ASSET_URL_success_rate>)
+<details>
+<summary><b>📈 View Detailed Statistics</b></summary>
 
-![Duration Chart](<ASSET_URL_duration>)
+**Sample Sizes & Progress**
+| Variant | Runs | Progress |
+|---------|------|----------|
+| `<control>` | n | ██████░░░░ n/<min_samples> (##%) |
+| `<variant_B>` | n | ███░░░░░░░ n/<min_samples> (##%) |
+
+![📊 Success Rate Chart](<ASSET_URL_success_rate>)
+
+![⏱️ Duration Chart](<ASSET_URL_duration>)
 
 <ASCII comparison table from Step 6 inside a ``` code block>
+
+</details>
 
 **Recommendation: PROMOTE / EXTEND / ABANDON** — <one sentence rationale>
 
@@ -433,9 +506,14 @@ title-prefix `[experiments]`, category `audits`, and automatic cleanup of older 
 
 ### 📊 Summary
 
+<details>
+<summary><b>View Full Experiments Table</b></summary>
+
 | Experiment | Workflow | Control | Best variant | p-value | Guardrails | Recommendation |
 |-----------|---------|---------|-------------|---------|-----------|----------------|
 | ... | ... | ... | ... | ... | PASS/FAIL | ... |
+
+</details>
 
 > Analysis window: last 30 runs per workflow · Significance threshold: p < 0.05 (two-tailed)
 > Run: [${{ github.run_id }}](https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }})

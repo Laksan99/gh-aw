@@ -31,9 +31,7 @@ playwright-cli browser_run_code --code "async (page) => { await page.goto('https
 
 ### MCP Mode (Deprecated)
 
-:::caution[Deprecated]
 MCP mode is deprecated and emits a compile-time warning. Migrate to `mode: cli` for the reasons listed above. MCP mode runs Playwright in a Docker container with `--network host`, so `localhost` resolves to the Docker host and bridge IP detection is required to reach local servers.
-:::
 
 ```yaml wrap
 tools:
@@ -153,7 +151,7 @@ steps:
 tools:
   playwright:
     mode: cli
-    version: "v1.52.0"
+    version: "0.1.13"  # pins `@playwright/cli` npm package; see Configuration > Version
   bash:
     - "npm *"
     - "curl http://localhost:*"

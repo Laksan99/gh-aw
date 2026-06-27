@@ -4,26 +4,16 @@ import (
 	"fmt"
 	"os/exec"
 	"strings"
-	"sync"
 
 	"github.com/github/gh-aw/pkg/logger"
+	"github.com/github/gh-aw/pkg/syncutil"
 	"github.com/github/gh-aw/pkg/workflow"
 )
 
 var repoLog = logger.New("cli:repo")
 
-// repoSlugCacheState holds the cached repository slug and protects it with a mutex.
-// Using a mutex-guarded struct instead of sync.Once avoids the data race that arises
-// when resetting sync.Once via struct assignment (= sync.Once{}) after first use.
-type repoSlugCacheState struct {
-	mu     sync.Mutex
-	result string
-	err    error
-	done   bool
-}
-
 // Global cache for current repository info
-var currentRepoSlugCache repoSlugCacheState
+var currentRepoSlugCache syncutil.OnceLoader[string]
 
 // getCurrentRepoSlugUncached gets the current repository slug (owner/repo) using gh CLI (uncached)
 // Falls back to git remote parsing if gh CLI is not available
@@ -57,25 +47,12 @@ func getCurrentRepoSlugUncached() (string, error) {
 	remoteURL := strings.TrimSpace(string(gitOutput))
 	repoLog.Printf("Parsing git remote URL: %s", remoteURL)
 
-	// Parse GitHub repository from remote URL
-	// Handle both SSH and HTTPS formats
-	var repoPath string
-
-	// SSH format: git@github.com:owner/repo.git
-	if after, ok := strings.CutPrefix(remoteURL, "git@github.com:"); ok {
-		repoPath = after
-	} else if strings.Contains(remoteURL, "github.com/") {
-		// HTTPS format: https://github.com/owner/repo.git
-		parts := strings.Split(remoteURL, "github.com/")
-		if len(parts) >= 2 {
-			repoPath = parts[1]
-		}
-	} else {
+	// Delegate to the shared helper which supports both HTTPS and SSH formats,
+	// including GitHub Enterprise hosts configured via getGitHubHost().
+	repoPath := parseGitHubRepoSlugFromURL(remoteURL)
+	if repoPath == "" {
 		return "", fmt.Errorf("remote URL does not appear to be a GitHub repository: %s", remoteURL)
 	}
-
-	// Remove .git suffix if present
-	repoPath = strings.TrimSuffix(repoPath, ".git")
 
 	// Validate format (should be owner/repo)
 	parts := strings.Split(repoPath, "/")
@@ -91,14 +68,7 @@ func getCurrentRepoSlugUncached() (string, error) {
 // GetCurrentRepoSlug gets the current repository slug with caching.
 // This is the recommended function to use for repository access across the codebase.
 func GetCurrentRepoSlug() (string, error) {
-	currentRepoSlugCache.mu.Lock()
-	if !currentRepoSlugCache.done {
-		currentRepoSlugCache.result, currentRepoSlugCache.err = getCurrentRepoSlugUncached()
-		currentRepoSlugCache.done = true
-	}
-	result := currentRepoSlugCache.result
-	err := currentRepoSlugCache.err
-	currentRepoSlugCache.mu.Unlock()
+	result, err := currentRepoSlugCache.Get(getCurrentRepoSlugUncached)
 
 	if err != nil {
 		return "", err

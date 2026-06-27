@@ -123,7 +123,6 @@ func TestLogsJSONRunDataFields(t *testing.T) {
 			Status:           "completed",
 			Conclusion:       "success",
 			TokenUsage:       1000,
-			EstimatedCost:    0.01,
 			Turns:            5,
 			ErrorCount:       0,
 			WarningCount:     0,
@@ -139,7 +138,10 @@ func TestLogsJSONRunDataFields(t *testing.T) {
 		"engine_name":   "GitHub Copilot CLI",
 		"workflow_name": "Test Workflow",
 	}
-	awInfoBytes, _ := json.Marshal(awInfo)
+	awInfoBytes, err := json.Marshal(awInfo)
+	if err != nil {
+		t.Fatalf("Failed to marshal aw_info data: %v", err)
+	}
 	if err := os.WriteFile(awInfoPath, awInfoBytes, 0644); err != nil {
 		t.Fatalf("Failed to write mock aw_info.json: %v", err)
 	}
@@ -266,7 +268,7 @@ func TestLogsJSONOutputStructure(t *testing.T) {
 	// Verify summary has all required fields
 	summary := parsed["summary"].(map[string]any)
 	requiredFields := []string{
-		"total_runs", "total_duration", "total_tokens", "total_cost",
+		"total_runs", "total_duration", "total_tokens",
 		"total_turns", "total_errors", "total_warnings", "total_missing_tools",
 		"total_episodes", "high_confidence_episodes",
 	}

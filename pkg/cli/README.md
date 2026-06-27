@@ -49,12 +49,19 @@ All diagnostic output MUST go to `stderr` using `console` formatting helpers. St
 | `gh aw secrets` | `NewSecretsCommand` | Manage workflow secrets |
 | `gh aw secrets set` | (secret_set_command.go) | Create or update a repository secret |
 | `gh aw secrets bootstrap` | (secret_set_command.go) | Validate and configure all required secrets for workflows |
+| `gh aw env` | `NewEnvCommand` | Manage compiler defaults as GitHub variables |
+| `gh aw env pull` | (env_command.go) | Download compiler defaults into a YAML file |
+| `gh aw env push` | (env_command.go) | Upload compiler defaults from a YAML file |
+| `gh aw view` | `NewViewCommand` | Render unified timeline and safe outputs for a workflow run |
 | `gh aw lint` | `NewLintCommand` | Lint existing `.lock.yml` workflows with actionlint |
 | `gh aw experiments` | `NewExperimentsCommand` | Explore ongoing A/B experiments in the repository (hidden) |
 | `gh aw experiments list` | `NewExperimentsListSubcommand` | List all experiment workflow branches |
 | `gh aw experiments analyze` | `NewExperimentsAnalyzeSubcommand` | Analyze a specific experiment workflow in detail |
 | `gh aw forecast` | `NewForecastCommand` | Forecast token usage and costs for agentic workflows (experimental) |
 | `gh aw trial` | `NewTrialCommand` | Run trial workflow executions |
+| `gh aw deploy` | `NewDeployCommand` | Deploy agentic workflows to a target repository using a pull request |
+| `gh aw outcomes` | `NewOutcomesCommand` | Check what happened to a workflow run's safe outputs |
+| `gh aw outcomes history` | `NewOutcomesHistorySubcommand` | Score recent closed issues and merged PRs against the objective mapping |
 | _No `gh aw deps` command_ | `deps_*.go` (internal utilities) | Dependency reporting/advisory helpers used by other commands |
 | `gh aw version` | `versionCmd` (main.go) | Show version information |
 | `gh aw completion` | `NewCompletionCommand` | Generate shell completion scripts |
@@ -82,7 +89,7 @@ All diagnostic output MUST go to `stderr` using `console` formatting helpers. St
 | `DependencyReport` | `deps_report.go` | Full dependency report |
 | `OutdatedDependency` | `deps_outdated.go` | An outdated dependency entry |
 | `SecurityAdvisory` | `deps_security.go` | A security advisory entry |
-| `WorkflowStatus` | `status_command.go` | Run status for a single workflow |
+| `WorkflowStatus` | `status_command.go` | Run status for a single workflow; embeds `WorkflowListItem` |
 | `MCPRegistryClient` | `mcp_registry.go` | Client for the MCP registry API |
 | `ToolGraph` | `tool_graph.go` | Dependency graph of MCP tools |
 | `DependencyGraph` | `dependency_graph.go` | Dependency graph across workflows |
@@ -96,6 +103,8 @@ All diagnostic output MUST go to `stderr` using `console` formatting helpers. St
 | `UpgradeConfig` | `upgrade_command.go` | Configuration for `NewUpgradeCommand` |
 | `ChecksConfig` | `checks_command.go` | Configuration for `RunChecks` |
 | `ChecksResult` | `checks_command.go` | Result of `FetchChecksResult` |
+| `OutcomesConfig` | `outcomes_command.go` | Configuration for `RunOutcomes` safe-output outcome evaluation |
+| `OutcomesData` | `outcomes_command.go` | Evaluated outcome data returned by `RunOutcomes` |
 
 ### Key Functions
 
@@ -186,6 +195,9 @@ All diagnostic output MUST go to `stderr` using `console` formatting helpers. St
 | `ParseCopilotCodingAgentLogMetrics` | `func(logContent string, verbose bool) workflow.LogMetrics` | Parses Copilot coding-agent logs into metrics |
 | `ExtractLogMetricsFromRun` | `func(ProcessedRun) workflow.LogMetrics` | Extracts log metrics from a processed run |
 | `TrainDrain3Weights` | `func([]ProcessedRun, outputDir string, verbose bool) error` | Trains Drain3 anomaly-detection weights from run history |
+| `EvaluateOutcomes` | `func(items []CreatedItemReport, repoOverride string, mapping *github.ObjectiveMapping) []OutcomeReport` | Checks the current state of all safe output items from a run |
+| `ComputeOutcomeSummary` | `func(reports []OutcomeReport, mapping *github.ObjectiveMapping) OutcomeSummary` | Aggregates outcome reports into a summary with acceptance and zero-touch rates |
+| `RunOutcomesHistory` | `func(OutcomesHistoryConfig) error` | Scores recent closed issues and merged PRs against the objective mapping |
 | `DisplayOutdatedDependencies` | `func([]OutdatedDependency, int)` | Renders an outdated-dependencies table to stdout |
 | `DisplayDependencyReport` | `func(*DependencyReport)` | Renders a full dependency report to stdout |
 | `DisplayDependencyReportJSON` | `func(*DependencyReport) error` | Renders a dependency report as JSON to stdout |
@@ -227,7 +239,7 @@ The `cli` package exports many types used across its command implementations. Th
 | `ActionlintStats` | struct | Static-analysis statistics from an actionlint run |
 | `AddInteractiveConfig` | struct | Configuration for the interactive `add-wizard` command |
 | `AgenticAssessment` | struct | Agentic behavior assessment derived from audit logs |
-| `AmbientContextMetrics` | struct | Token metrics for ambient context (input, cached, effective token counts) |
+| `AmbientContextMetrics` | struct | Token metrics for ambient context (input, cached, and output token counts) |
 | `Argument` | struct | A command-line argument definition from the MCP registry API |
 | `ArtifactSet` | string alias | Named set of artifacts (e.g. `"agent"`, `"detection"`) |
 | `AuditComparisonClassification` | struct | A classification label and reason codes for an audit comparison |
@@ -267,6 +279,7 @@ The `cli` package exports many types used across its command implementations. Th
 | `DifcFilteredEvent` | struct | A DIFC-filtered event from the MCP gateway log |
 | `DockerUnavailableError` | struct | Error returned when the Docker daemon is not reachable |
 | `DomainAnalysis` | struct | Aggregated per-domain network request analysis |
+| `DomainBreakdown` | struct | Per-domain outcome breakdown from outcome evaluation |
 | `DomainBuckets` | struct | Domain requests bucketed by category (allow, deny, unknown) |
 | `DomainDiffEntry` | struct | Per-domain diff between two runs |
 | `DownloadResult` | struct | Result of a log artifact download |
@@ -323,6 +336,11 @@ The `cli` package exports many types used across its command implementations. Th
 | `NoopReport` | struct | Report for a noop safe-output event |
 | `ObservabilityInsight` | struct | An insight derived from observability data |
 | `OverviewData` | struct | High-level overview data for a workflow run |
+| `OutcomeEvaluation` | struct | Evaluation state embedded in `OutcomeReport` (status, merge/close metadata) |
+| `OutcomeReport` | struct | Result of evaluating one safe output item — outcome, timing, human engagement, and objective value |
+| `OutcomeResult` | string alias | Outcome classification: `accepted`, `rejected`, `ignored`, `pending`, `unknown`, `lifecycle`, `error` |
+| `OutcomeSummary` | struct | Aggregated outcome statistics across multiple safe output items |
+| `OutcomesHistoryConfig` | struct | Configuration for `RunOutcomesHistory` |
 | `PRCheckRun` | struct | A single CI check run attached to a pull request |
 | `PRCommitStatus` | struct | A commit status context for a pull request |
 | `PRInfo` | struct | Pull-request metadata used by `gh aw pr` commands |
@@ -385,7 +403,7 @@ The `cli` package exports many types used across its command implementations. Th
 | `WorkflowFailure` | struct | A workflow failure record |
 | `WorkflowFileStatus` | struct | Status of a workflow file (exists, outdated, etc.) |
 | `WorkflowJob` | struct | A GitHub Actions job within a workflow run |
-| `WorkflowListItem` | struct | A single item in the `gh aw list` output |
+| `WorkflowListItem` | struct | A single item in `gh aw list`; shared workflow metadata fields (name, engine, compiled status, labels, triggers) also embedded in `WorkflowStatus` |
 | `WorkflowMCPMetadata` | struct | MCP server metadata scanned from a workflow file |
 | `WorkflowNode` | struct | A node in the workflow dependency graph |
 | `WorkflowOption` | struct | A selectable workflow option for interactive prompts |
@@ -460,17 +478,24 @@ err := cli.RunHealth(cli.HealthConfig{
 - `github.com/github/gh-aw/pkg/constants` — engine names, job names, feature flags
 - `github.com/github/gh-aw/pkg/agentdrain` — Drain log anomaly detection for audit analysis
 - `github.com/github/gh-aw/pkg/envutil` — environment variable reading with bounds validation
+- `github.com/github/gh-aw/pkg/errorutil` — shared error classification helpers for GitHub and gh CLI responses
 - `github.com/github/gh-aw/pkg/semverutil` — semantic version comparison for dependency checks
+- `github.com/github/gh-aw/pkg/workflow/compilerenv` — enterprise compiler-default and timezone override helpers
 - `github.com/github/gh-aw/pkg/sliceutil` — slice utilities
 - `github.com/github/gh-aw/pkg/stats` — incremental statistics for health metrics
 - `github.com/github/gh-aw/pkg/styles` — terminal color styles and lipgloss configuration
 - `github.com/github/gh-aw/pkg/timeutil` — human-readable duration formatting
 - `github.com/github/gh-aw/pkg/tty` — terminal detection
 - `github.com/github/gh-aw/pkg/types` — shared MCP server configuration types
+- `github.com/github/gh-aw/pkg/typeutil` — type conversion helpers for dynamic frontmatter values
 - `github.com/github/gh-aw/pkg/fileutil` — file system helpers
 - `github.com/github/gh-aw/pkg/gitutil` — Git and GitHub CLI helpers
 - `github.com/github/gh-aw/pkg/repoutil` — repository name parsing and normalization
 - `github.com/github/gh-aw/pkg/stringutil` — string manipulation and sanitization utilities
+- `github.com/github/gh-aw/pkg/syncutil` — thread-safe one-shot caching (used for repository slug lookup)
+
+**Test-only**:
+- `github.com/github/gh-aw/pkg/testutil` — shared test fixtures and assertion helpers used by CLI package tests
 
 **External**:
 - `github.com/spf13/cobra` — CLI framework

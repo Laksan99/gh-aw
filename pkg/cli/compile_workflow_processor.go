@@ -22,6 +22,7 @@
 package cli
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"os"
@@ -29,11 +30,22 @@ import (
 
 	"github.com/github/gh-aw/pkg/console"
 	"github.com/github/gh-aw/pkg/logger"
+	"github.com/github/gh-aw/pkg/setutil"
 	"github.com/github/gh-aw/pkg/stringutil"
 	"github.com/github/gh-aw/pkg/workflow"
 )
 
 var compileWorkflowProcessorLog = logger.New("cli:compile_workflow_processor")
+
+func appendValidationErrors(dst []CompileValidationError, errorType string, err error) []CompileValidationError {
+	for _, message := range workflow.ExpandErrorMessages(err) {
+		dst = append(dst, CompileValidationError{
+			Type:    errorType,
+			Message: message,
+		})
+	}
+	return dst
+}
 
 // compileWorkflowFileResult represents the result of compiling a single workflow file
 type compileWorkflowFileResult struct {
@@ -43,19 +55,24 @@ type compileWorkflowFileResult struct {
 	success          bool
 }
 
+// compileWorkflowFileOptions holds flags for compileWorkflowFile.
+type compileWorkflowFileOptions struct {
+	verbose    bool
+	jsonOutput bool
+	noEmit     bool
+	zizmor     bool
+	poutine    bool
+	strict     bool
+	validate   bool
+}
+
 // compileWorkflowFile compiles a single workflow file (not a campaign spec)
 // Returns the workflow data, lock file path, validation result, and success status
 func compileWorkflowFile(
+	ctx context.Context,
 	compiler *workflow.Compiler,
 	resolvedFile string,
-	verbose bool,
-	jsonOutput bool,
-	noEmit bool,
-	zizmor bool,
-	poutine bool,
-	actionlint bool,
-	strict bool,
-	validate bool,
+	opts compileWorkflowFileOptions,
 ) compileWorkflowFileResult {
 	compileWorkflowProcessorLog.Printf("Processing workflow file: %s", resolvedFile)
 
@@ -103,7 +120,7 @@ func compileWorkflowFile(
 		// Check if this is a shared workflow (not an error, just info)
 		var sharedErr *workflow.SharedWorkflowError
 		if errors.As(err, &sharedErr) {
-			if !jsonOutput {
+			if !opts.jsonOutput {
 				// Print info message instead of error
 				fmt.Fprintln(os.Stderr, console.FormatInfoMessage(sharedErr.Error()))
 			}
@@ -120,7 +137,7 @@ func compileWorkflowFile(
 		// Check if this is a redirect-only workflow (not an error, just info)
 		var redirectErr *workflow.RedirectOnlyWorkflowError
 		if errors.As(err, &redirectErr) {
-			if !jsonOutput {
+			if !opts.jsonOutput {
 				// Print info message instead of error
 				fmt.Fprintln(os.Stderr, console.FormatInfoMessage(redirectErr.Error()))
 			}
@@ -137,10 +154,7 @@ func compileWorkflowFile(
 		// Don't print error here - it will be displayed in the compilation summary
 		// The error is stored in ValidationResult for JSON output and summary display
 		result.validationResult.Valid = false
-		result.validationResult.Errors = append(result.validationResult.Errors, CompileValidationError{
-			Type:    "parse_error",
-			Message: err.Error(),
-		})
+		result.validationResult.Errors = appendValidationErrors(result.validationResult.Errors, "parse_error", err)
 		return result
 	}
 	result.workflowData = workflowData
@@ -148,20 +162,23 @@ func compileWorkflowFile(
 	compileWorkflowProcessorLog.Printf("Starting compilation of %s", resolvedFile)
 
 	// Compile the workflow
-	// Disable per-file actionlint run (false instead of actionlint && !noEmit) - we'll batch them
-	if err := CompileWorkflowDataWithValidation(compiler, workflowData, resolvedFile, verbose && !jsonOutput, zizmor && !noEmit, poutine && !noEmit, false, strict, validate && !noEmit); err != nil {
+	// Per-file actionlint is always disabled here; actionlint runs in batch after all files are compiled.
+	if err := CompileWorkflowDataWithValidation(ctx, compiler, workflowData, resolvedFile, CompileValidationOptions{
+		Verbose:            opts.verbose && !opts.jsonOutput,
+		RunZizmorPerFile:   opts.zizmor && !opts.noEmit,
+		RunPoutinePerFile:  opts.poutine && !opts.noEmit,
+		Strict:             opts.strict,
+		ValidateActionSHAs: opts.validate && !opts.noEmit,
+	}); err != nil {
 		// Don't print error here - it will be displayed in the compilation summary
 		// The error is stored in ValidationResult for JSON output and summary display
 		result.validationResult.Valid = false
-		result.validationResult.Errors = append(result.validationResult.Errors, CompileValidationError{
-			Type:    "compilation_error",
-			Message: err.Error(),
-		})
+		result.validationResult.Errors = appendValidationErrors(result.validationResult.Errors, "compilation_error", err)
 		return result
 	}
 
 	result.success = true
-	if !noEmit {
+	if !opts.noEmit {
 		result.validationResult.CompiledFile = lockFile
 	}
 
@@ -181,12 +198,14 @@ func extractSafeOutputLabels(data *workflow.WorkflowData) []string {
 		return nil
 	}
 
-	seen := make(map[string]bool)
+	seen := make(map[string]struct {
+	})
 	var labels []string
 
 	addLabel := func(label string) {
-		if label != "" && !seen[label] {
-			seen[label] = true
+		if label != "" && !setutil.Contains(seen, label) {
+			seen[label] = struct {
+			}{}
 			labels = append(labels, label)
 		}
 	}

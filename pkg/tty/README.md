@@ -1,6 +1,6 @@
 # tty Package
 
-The `tty` package provides TTY (terminal) detection utilities.
+> TTY (terminal) detection utilities for stdout and stderr streams.
 
 ## Overview
 
@@ -34,6 +34,14 @@ if tty.IsStderrTerminal() {
     // Safe to emit spinner or progress animation to stderr
 }
 ```
+
+## Dependencies
+
+**Internal**:
+- None
+
+**External**:
+- `golang.org/x/term` — TTY detection via `term.IsTerminal`
 
 ## Design Notes
 

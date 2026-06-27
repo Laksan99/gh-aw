@@ -1,4 +1,6 @@
 ---
+private: true
+emoji: "📊"
 name: Daily Copilot PR Merged Report
 description: Generates a daily report analyzing Copilot pull requests merged in the last 24 hours, tracking code generation, tests, and token usage
 on:
@@ -7,15 +9,22 @@ on:
     - cron: "daily around 15:00 on weekdays"
   workflow_dispatch:
 
+max-daily-ai-credits: 10000
 permissions:
   contents: read
   issues: read
   pull-requests: read
   actions: read
 
-engine: copilot
+  copilot-requests: write
+engine:
+  id: copilot
+  copilot-sdk: true
 strict: false
 
+sandbox:
+  agent:
+    sudo: false
 tools:
   cli-proxy: true
   github: false
@@ -27,6 +36,7 @@ network:
     - api.github.com
 
 imports:
+  - shared/reporting.md
   - uses: shared/daily-audit-base.md
     with:
       title-prefix: "[copilot-pr-merged-report] "
@@ -34,12 +44,12 @@ imports:
   - shared/gh.md
   - shared/copilot-pr-analysis-base.md
 
-  - shared/observability-otlp.md
+  - shared/otlp.md
 timeout-minutes: 10
 features:
-  copilot-requests: true
-
+  gh-aw-detection: true
 ---
+
 # Daily Copilot PR Merged Report
 
 You are an AI analytics agent that generates daily reports on GitHub Copilot coding agent pull requests that were **merged** in the last 24 hours.
@@ -64,9 +74,9 @@ Analyze merged Copilot pull requests from the last 24 hours and generate a basic
 
 **Step 1.1: Filter Merged PRs from Pre-Fetched Data**
 
-Use the pre-fetched PR dataset at `/tmp/gh-aw/pr-data/copilot-prs.json` and filter by `mergedAt` in the last 24 hours:
+Use the pre-fetched PR dataset at `/tmp/gh-aw/agent/pr-data/copilot-prs.json` and filter by `mergedAt` in the last 24 hours:
 ```bash
-jq '[.[] | select(.mergedAt != null and (.mergedAt | fromdateiso8601) >= (now - 86400))]' /tmp/gh-aw/pr-data/copilot-prs.json
+jq '[.[] | select(.mergedAt != null and (.mergedAt | fromdateiso8601) >= (now - 86400))]' /tmp/gh-aw/agent/pr-data/copilot-prs.json
 ```
 
 This filter:
@@ -90,7 +100,7 @@ Save this data for further analysis.
 For each merged PR found in Phase 1:
 
 - **Important**: Build the filtered merged PR list first, then iterate only that filtered list.
-- **Do not** call `pr view` for every PR in `/tmp/gh-aw/pr-data/copilot-prs.json`.
+- **Do not** call `pr view` for every PR in `/tmp/gh-aw/agent/pr-data/copilot-prs.json`.
 
 **Step 2.1: Get PR Files**
 

@@ -121,6 +121,7 @@ describe("submit_pr_review (Handler Factory Architecture)", () => {
     expect(result.success).toBe(true);
     expect(result.event).toBe("APPROVE");
     expect(result.body_length).toBe(20);
+    expect(result.deferred_manifest).toBe(true);
     expect(buffer.hasReviewMetadata()).toBe(true);
   });
 
@@ -729,8 +730,8 @@ describe("submit_pr_review (Handler Factory Architecture)", () => {
     expect(result.success).toBe(true);
     expect(localBuffer.hasReviewMetadata()).toBe(true);
 
-    // Review context should NOT be set because the disallowed repo was rejected
-    // submitReview() will subsequently fail with "No review context available"
+    // Review context should NOT be set because the disallowed repo was rejected.
+    // submitReview() will subsequently be skipped due to missing review context.
     expect(localBuffer.getReviewContext()).toBeNull();
 
     delete global.context;

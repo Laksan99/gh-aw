@@ -1,4 +1,5 @@
 ---
+emoji: "👾"
 name: Issue Monster
 description: The Cookie Monster of issues - assigns issues to Copilot coding agent one at a time
 on:
@@ -21,7 +22,7 @@ on:
   steps:
     - name: Search for candidate issues
       id: search
-      uses: actions/github-script@v9
+      uses: actions/github-script@v9.0.0
       with:
         script: |
           const { owner, repo } = context.repo;
@@ -75,7 +76,7 @@ on:
                 });
                 
                 const comments = prTimelineResult?.repository?.pullRequest?.timelineItems?.nodes || [];
-                const rateLimitPattern = /rate limit|API rate limit|secondary rate limit|abuse detection|429|too many requests/i;
+                const rateLimitPattern = /rate limit|API rate limit|secondary rate limit|abuse detection|\b429\b|too many requests/i;
                 
                 for (const comment of comments) {
                   if (comment.body && rateLimitPattern.test(comment.body)) {
@@ -121,6 +122,7 @@ on:
             
             // Labels that indicate an issue is a GOOD candidate for auto-assignment
             const priorityLabels = [
+              'community',
               'good first issue',
               'good-first-issue',
               'bug',
@@ -298,6 +300,11 @@ on:
                 let score = 0;
                 
                 // Score based on priority labels (higher score = higher priority)
+                // Community issues always get the highest priority — these are
+                // requests from external contributors and should be addressed first.
+                if (issueLabels.includes('community')) {
+                  score += 60;
+                }
                 if (issueLabels.includes('good first issue') || issueLabels.includes('good-first-issue')) {
                   score += 50;
                 }
@@ -387,16 +394,17 @@ permissions:
   contents: read
   issues: read
   pull-requests: read
+  copilot-requests: write
 
 engine:
-  id: copilot
-  model: claude-haiku-4.5
+  id: pi
+  model: copilot/gpt-5.4
 
 imports:
   - shared/github-guard-policy.md
   - shared/activation-app.md
 
-  - shared/observability-otlp.md
+  - shared/otlp.md
 timeout-minutes: 30
 
 tools:
@@ -422,16 +430,15 @@ safe-outputs:
     max: 3
     target: "*"           # Requires explicit issue_number in agent output
     allowed: [copilot]    # Only allow copilot agent
+    ignore-if-error: true # Don't fail the workflow if copilot is temporarily unavailable
   add-comment:
     max: 3
     target: "*"
   messages:
-    footer: "> 🍪 *Om nom nom by [{workflow_name}]({run_url})*{effective_tokens_suffix}{history_link}"
+    footer: "> 🍪 *Om nom nom by [{workflow_name}]({run_url})*{ai_credits_suffix}{history_link}"
     run-started: "🍪 ISSUE! ISSUE! [{workflow_name}]({run_url}) hungry for issues on this {event_type}! Om nom nom..."
     run-success: "🍪 YUMMY! [{workflow_name}]({run_url}) ate the issues! That was DELICIOUS! Me want MORE! 😋"
     run-failure: "🍪 Aww... [{workflow_name}]({run_url}) {status}. No cookie for monster today... 😢"
-
-
 ---
 
 {{#runtime-import? .github/shared-instructions.md}}
@@ -448,6 +455,7 @@ Find up to three issues that need work and assign them to the Copilot coding age
 
 - **Repository**: ${{ github.repository }}
 - **Run Time**: $(date -u +"%Y-%m-%d %H:%M:%S UTC")
+- Apply inline skills `issue-monster-token-budget` and `issue-monster-report-formatting` for budget and report-shape constraints.
 
 ## Step-by-Step Process
 
@@ -472,6 +480,7 @@ The issue search has already been performed in the pre-activation job with smart
 
 **Scoring System:**
 Issues are scored and sorted by priority:
+- **Community**: +60 points *(always highest — issues from external contributors)*
 - Good first issue: +50 points
 - Security: +45 points
 - Bug: +40 points
@@ -587,6 +596,8 @@ safeoutputs/assign_to_agent(issue_number=<issue_number>, agent="copilot")
 
 Use the exact field name `issue_number` (underscore). Do **not** use `issue-number` (hyphen), which is invalid and will fail safe-output validation.
 
+**Important**: Only call `assign_to_agent` for **issues**, never for pull requests. The pre-fetched list already contains only issues, so never pass a PR number here. If you are ever unsure whether a number refers to an issue or a PR, call `issue_read` with `method: get` and check: if the response includes a `pull_request` URL field, skip that item.
+
 Do not use GitHub tools for this assignment. The `assign_to_agent` tool will handle the actual assignment.
 
 The Copilot coding agent will:
@@ -605,7 +616,10 @@ safeoutputs/add_comment(item_number=<issue_number>, body="🍪 **Issue Monster s
 
 **Important**: You must specify the `item_number` parameter with the issue number you're commenting on. This workflow runs on a schedule without a triggering issue, so the target must be explicitly specified.
 
-## Token Budget Guidelines
+## skill: `issue-monster-token-budget`
+---
+description: Keeps recurring issue-monster runs lean and bounded.
+---
 
 Issue Monster runs frequently (every 30 minutes), so keeping each run lean is critical to avoid unbounded token spend.
 
@@ -629,6 +643,23 @@ Issue Monster runs frequently (every 30 minutes), so keeping each run lean is cr
 - ✅ **Always report outcome**: If no issues are assigned, use the `noop` tool to explain why
 - ✅ **Skip integrity-blocked issues**: If `issue_read` is blocked by integrity policy, skip that issue and continue — never call `missing_data` for integrity errors
 - ❌ **Don't force batching**: If only 1-2 clearly separate issues exist, assign only those
+- ❌ **Never assign pull requests**: `assign_to_agent` is for issues only — never pass a PR number
+
+## skill: `issue-monster-report-formatting`
+---
+description: Defines report formatting and progressive disclosure rules.
+---
+
+- **Header Levels**: Use h3 (`###`) or lower for all headers in your report to maintain proper document hierarchy. Never use h1 (`#`) or h2 (`##`) headers.
+- **Progressive Disclosure**: Wrap long sections or verbose details in `<details><summary>Section Name</summary>` tags to improve readability and reduce scrolling.
+- Keep critical information visible (summary, key outcomes, and recommendations) and use collapsible sections for secondary details.
+
+### Recommended Report Structure
+
+1. **Overview**: 1-2 paragraphs summarizing key findings (always visible)
+2. **Critical Information**: Key metrics, status, critical issues (always visible)
+3. **Details**: Use `<details><summary>Section Name</summary>` for expanded content
+4. **Recommendations**: Actionable next steps (always visible)
 
 ## Success Criteria
 

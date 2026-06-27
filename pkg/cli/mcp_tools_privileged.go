@@ -4,11 +4,13 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"os/exec"
 	"strconv"
 	"strings"
 
+	"github.com/github/gh-aw/pkg/constants"
 	"github.com/modelcontextprotocol/go-sdk/jsonrpc"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
@@ -41,7 +43,7 @@ type logsArgs struct {
 	BeforeRunID       int64    `json:"before_run_id,omitempty" jsonschema:"Filter runs with database ID before this value (exclusive)"`
 	Timeout           int      `json:"timeout,omitempty" jsonschema:"Maximum time in minutes to spend downloading logs (default: 1 for MCP server)"`
 	MaxTokens         int      `json:"max_tokens,omitempty" jsonschema:"Deprecated: accepted for backward compatibility but ignored. Output is always written to a file."`
-	Artifacts         []string `json:"artifacts,omitempty" jsonschema:"Artifact sets to download (default: all). Valid sets: all, activation, agent, detection, firewall, github-api, mcp"`
+	Artifacts         []string `json:"artifacts,omitempty" jsonschema:"Artifact sets to download (default: usage). Valid sets: all, activation, agent, detection, experiment, firewall, github-api, mcp, usage"`
 }
 
 // The logs tool requires write+ access and checks actor permissions.
@@ -62,6 +64,9 @@ func registerLogsTool(server *mcp.Server, execCmd execCmdFunc, actor string, val
 	}
 	if err := AddSchemaDefault(logsSchema, "max_tokens", 12000); err != nil {
 		mcpLog.Printf("Failed to add default for max_tokens: %v", err)
+	}
+	if err := AddSchemaDefault(logsSchema, "artifacts", []string{"usage"}); err != nil {
+		mcpLog.Printf("Failed to add default for artifacts: %v", err)
 	}
 
 	mcp.AddTool(server, &mcp.Tool{
@@ -132,7 +137,7 @@ from where the previous request stopped due to timeout.`,
 
 		// Build command arguments
 		// Force output directory to /tmp/gh-aw/aw-mcp/logs for MCP server
-		cmdArgs := []string{"logs", "-o", "/tmp/gh-aw/aw-mcp/logs"}
+		cmdArgs := []string{"logs", "-o", constants.TmpAwMcpLogsDir}
 		if args.WorkflowName != "" {
 			cmdArgs = append(cmdArgs, args.WorkflowName)
 		}
@@ -158,7 +163,9 @@ from where the previous request stopped due to timeout.`,
 			cmdArgs = append(cmdArgs, "--filtered-integrity")
 		}
 		if args.Branch != "" {
-			cmdArgs = append(cmdArgs, "--branch", args.Branch)
+			// The MCP parameter is named "branch" for backwards compatibility,
+			// but the logs CLI flag is --ref (which accepts branches and tags).
+			cmdArgs = append(cmdArgs, "--ref", args.Branch)
 		}
 		if args.AfterRunID > 0 {
 			cmdArgs = append(cmdArgs, "--after-run-id", strconv.FormatInt(args.AfterRunID, 10))
@@ -192,8 +199,7 @@ from where the previous request stopped due to timeout.`,
 		// Use separate stdout/stderr capture instead of CombinedOutput because:
 		// - Stdout contains JSON output (--json flag)
 		// - Stderr contains console messages and error details
-		cmd := execCmd(ctx, cmdArgs...)
-		stdout, err := cmd.Output()
+		stdout, err := runMCPExecOutput(ctx, execCmd, cmdArgs...)
 
 		// The logs command outputs JSON to stdout when --json flag is used.
 		// If the command fails, we need to provide detailed error information.
@@ -250,12 +256,37 @@ from where the previous request stopped due to timeout.`,
 
 // auditArgs holds the input parameters for the audit tool.
 type auditArgs struct {
-	RunIDOrURL   string   `json:"run_id_or_url,omitempty"   jsonschema:"Deprecated: use run_ids_or_urls instead. Single GitHub Actions workflow run ID or URL."`
+	RunID        any      `json:"run_id,omitempty"          jsonschema:"Alias for run_id_or_url. Accepts run ID or run/job URL (including step anchors). String or number."`
+	RunIDOrURL   any      `json:"run_id_or_url,omitempty"   jsonschema:"Deprecated: use run_ids_or_urls instead. Accepts run ID or run/job URL (including step anchors). String or number."`
 	RunIDsOrURLs []string `json:"run_ids_or_urls,omitempty" jsonschema:"One or more workflow run IDs or URLs. Single item: detailed audit report. Multiple items: diff mode with first as base (see tool description for accepted formats)."`
-	Artifacts    []string `json:"artifacts,omitempty"        jsonschema:"Artifact sets to download (default: all). Valid sets: all, activation, agent, detection, firewall, github-api, mcp"`
+	Artifacts    []string `json:"artifacts,omitempty"        jsonschema:"Artifact sets to download (default: all). Valid sets: all, activation, agent, detection, experiment, firewall, github-api, mcp, usage"`
 	MaxTokens    int      `json:"max_tokens,omitempty"       jsonschema:"Deprecated: accepted for backward compatibility but ignored."`
 	Experiment   string   `json:"experiment,omitempty"       jsonschema:"Filter to runs that include this experiment name. When set, runs whose experiment artifact does not contain an assignment for this experiment name are skipped."`
 	Variant      string   `json:"variant,omitempty"          jsonschema:"Filter to runs assigned this specific variant value. Requires experiment to be set."`
+}
+
+// normalizeAuditRunInput converts a single-run audit input (run_id or
+// run_id_or_url) from supported MCP argument types into the CLI positional
+// argument format. The bool return indicates whether a non-empty value was
+// provided.
+func normalizeAuditRunInput(input any, fieldName string) (string, bool, error) {
+	switch v := input.(type) {
+	case nil:
+		return "", false, nil
+	case string:
+		if strings.TrimSpace(v) == "" {
+			return "", false, nil
+		}
+		return v, true, nil
+	case float64:
+		return strconv.FormatFloat(v, 'f', -1, 64), true, nil
+	case int:
+		return strconv.Itoa(v), true, nil
+	case int64:
+		return strconv.FormatInt(v, 10), true, nil
+	default:
+		return "", false, fmt.Errorf("%s must be a string or number", fieldName)
+	}
 }
 
 // registerAuditTool registers the audit tool with the MCP server.
@@ -329,13 +360,28 @@ Multi-run diff returns JSON describing changes between the base and each compari
 		}
 
 		// Resolve the list of run IDs/URLs to pass to the audit command.
-		// run_ids_or_urls takes precedence; fall back to the deprecated run_id_or_url field.
+		// run_ids_or_urls takes precedence; fall back to run_id, then deprecated run_id_or_url.
 		runItems := args.RunIDsOrURLs
-		if len(runItems) == 0 && args.RunIDOrURL != "" {
-			runItems = []string{args.RunIDOrURL}
+		if len(runItems) == 0 {
+			runID, hasRunID, err := normalizeAuditRunInput(args.RunID, "run_id")
+			if err != nil {
+				return nil, nil, newMCPError(jsonrpc.CodeInvalidParams, err.Error(), nil)
+			}
+			if hasRunID {
+				runItems = []string{runID}
+			}
 		}
 		if len(runItems) == 0 {
-			return nil, nil, newMCPError(jsonrpc.CodeInvalidParams, "at least one run ID or URL must be provided via run_ids_or_urls or run_id_or_url", nil)
+			runIDOrURL, hasRunIDOrURL, err := normalizeAuditRunInput(args.RunIDOrURL, "run_id_or_url")
+			if err != nil {
+				return nil, nil, newMCPError(jsonrpc.CodeInvalidParams, err.Error(), nil)
+			}
+			if hasRunIDOrURL {
+				runItems = []string{runIDOrURL}
+			}
+		}
+		if len(runItems) == 0 {
+			return nil, nil, newMCPError(jsonrpc.CodeInvalidParams, "at least one run ID or URL must be provided via run_ids_or_urls, run_id, or run_id_or_url", nil)
 		}
 
 		// Build command arguments.
@@ -344,7 +390,7 @@ Multi-run diff returns JSON describing changes between the base and each compari
 		// Pass all run IDs/URLs directly - the audit command handles single vs. diff mode.
 		cmdArgs := []string{"audit"}
 		cmdArgs = append(cmdArgs, runItems...)
-		cmdArgs = append(cmdArgs, "-o", "/tmp/gh-aw/aw-mcp/logs", "--json")
+		cmdArgs = append(cmdArgs, "-o", constants.TmpAwMcpLogsDir, "--json")
 		if len(args.Artifacts) > 0 {
 			cmdArgs = append(cmdArgs, "--artifacts", strings.Join(args.Artifacts, ","))
 		}
@@ -363,8 +409,7 @@ Multi-run diff returns JSON describing changes between the base and each compari
 		// Use separate stdout/stderr capture instead of CombinedOutput because:
 		// - Stdout contains JSON output (--json flag)
 		// - Stderr contains console messages and debug logs that shouldn't be mixed with JSON
-		cmd := execCmd(ctx, cmdArgs...)
-		stdout, err := cmd.Output()
+		stdout, err := runMCPExecOutput(ctx, execCmd, cmdArgs...)
 
 		// The audit command outputs JSON to stdout when --json flag is used.
 		// If the command fails, we need to provide detailed error information.
@@ -431,7 +476,7 @@ Multi-run diff returns JSON describing changes between the base and each compari
 type auditDiffArgs struct {
 	BaseRunID     string   `json:"base_run_id"     jsonschema:"Numeric ID of the base (reference) workflow run"`
 	CompareRunIDs []string `json:"compare_run_ids" jsonschema:"One or more numeric IDs of the comparison runs"`
-	Artifacts     []string `json:"artifacts,omitempty" jsonschema:"Artifact sets to download (default: all). Valid sets: all, activation, agent, detection, firewall, github-api, mcp"`
+	Artifacts     []string `json:"artifacts,omitempty" jsonschema:"Artifact sets to download (default: all). Valid sets: all, activation, agent, detection, experiment, firewall, github-api, mcp, usage"`
 }
 
 // registerAuditDiffTool registers the audit-diff tool with the MCP server.
@@ -486,7 +531,7 @@ Returns JSON describing the differences between the base run and each comparison
 		// Build: gh aw audit diff <base> <compare...> -o ... --json [--artifacts ...]
 		cmdArgs := []string{"audit", "diff", args.BaseRunID}
 		cmdArgs = append(cmdArgs, args.CompareRunIDs...)
-		cmdArgs = append(cmdArgs, "-o", "/tmp/gh-aw/aw-mcp/logs", "--json")
+		cmdArgs = append(cmdArgs, "-o", constants.TmpAwMcpLogsDir, "--json")
 		if len(args.Artifacts) > 0 {
 			cmdArgs = append(cmdArgs, "--artifacts", strings.Join(args.Artifacts, ","))
 		}
@@ -495,8 +540,7 @@ Returns JSON describing the differences between the base run and each comparison
 
 		notifyProgress(ctx, req, 0, 100, "Downloading artifacts for diff...")
 
-		cmd := execCmd(ctx, cmdArgs...)
-		stdout, err := cmd.Output()
+		stdout, err := runMCPExecOutput(ctx, execCmd, cmdArgs...)
 		outputStr := string(stdout)
 
 		if err != nil {

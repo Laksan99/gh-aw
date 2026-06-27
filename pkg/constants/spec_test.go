@@ -28,6 +28,8 @@ func TestSpec_EngineConstants_NameValues(t *testing.T) {
 		{name: "CodexEngine value", constant: constants.CodexEngine, expected: "codex"},
 		// From spec: constants.GeminiEngine // "gemini"
 		{name: "GeminiEngine value", constant: constants.GeminiEngine, expected: "gemini"},
+		// From spec: constants.AntigravityEngine // "antigravity"
+		{name: "AntigravityEngine value", constant: constants.AntigravityEngine, expected: "antigravity"},
 		// From spec: constants.OpenCodeEngine // "opencode"
 		{name: "OpenCodeEngine value", constant: constants.OpenCodeEngine, expected: "opencode"},
 		// From spec: constants.CrushEngine // "crush"
@@ -48,13 +50,13 @@ func TestSpec_EngineConstants_NameValues(t *testing.T) {
 
 // TestSpec_EngineConstants_AgenticEngines validates the documented AgenticEngines list.
 // Spec section: "// All supported engine names"
-// Spec documents: constants.AgenticEngines // []string{"claude", "codex", "copilot", "gemini", "opencode", "crush", "pi"}
+// Spec documents: constants.AgenticEngines // []string{"claude", "codex", "copilot", "gemini", "antigravity", "opencode", "crush", "pi"}
 func TestSpec_EngineConstants_AgenticEngines(t *testing.T) {
 	engines := constants.AgenticEngines
 	require.NotEmpty(t, engines, "AgenticEngines should be non-empty")
 
-	// Spec documents all seven engines, including pi (experimental).
-	documentedEngines := []string{"claude", "codex", "copilot", "gemini", "opencode", "crush", "pi"}
+	// Spec documents all eight engines, including antigravity and pi (experimental).
+	documentedEngines := []string{"claude", "codex", "copilot", "gemini", "antigravity", "opencode", "crush", "pi"}
 	for _, expected := range documentedEngines {
 		assert.Contains(t, engines, expected,
 			"AgenticEngines should contain documented engine %q", expected)
@@ -270,6 +272,10 @@ func TestSpec_RuntimeConfiguration_RateLimits(t *testing.T) {
 
 // TestSpec_FeatureFlags_Values validates the documented feature flag constant values.
 // Spec section: "## Feature Flags"
+//
+// SPEC_MISMATCH: README documents constants.MCPCLIFeatureFlag ("mcp-cli") but that
+// constant is not defined in pkg/constants/feature_constants.go. It is omitted from
+// the test cases below to keep the suite compiling against the implementation.
 func TestSpec_FeatureFlags_Values(t *testing.T) {
 	tests := []struct {
 		name     string
@@ -282,14 +288,16 @@ func TestSpec_FeatureFlags_Values(t *testing.T) {
 		{name: "MCPGatewayFeatureFlag", constant: constants.MCPGatewayFeatureFlag, expected: "mcp-gateway"},
 		// From spec: DisableXPIAPromptFeatureFlag // "disable-xpia-prompt"
 		{name: "DisableXPIAPromptFeatureFlag", constant: constants.DisableXPIAPromptFeatureFlag, expected: "disable-xpia-prompt"},
-		// From spec: CopilotRequestsFeatureFlag // "copilot-requests"
-		{name: "CopilotRequestsFeatureFlag", constant: constants.CopilotRequestsFeatureFlag, expected: "copilot-requests"},
+		// From spec: DIFCProxyFeatureFlag // "difc-proxy" (deprecated)
+		{name: "DIFCProxyFeatureFlag", constant: constants.DIFCProxyFeatureFlag, expected: "difc-proxy"},
 		// From spec: CliProxyFeatureFlag // "cli-proxy"
 		{name: "CliProxyFeatureFlag", constant: constants.CliProxyFeatureFlag, expected: "cli-proxy"},
+		// From spec: AwfDiagnosticLogsFeatureFlag // "awf-diagnostic-logs"
+		{name: "AwfDiagnosticLogsFeatureFlag", constant: constants.AwfDiagnosticLogsFeatureFlag, expected: "awf-diagnostic-logs"},
+		// From spec: ByokCopilotFeatureFlag // "byok-copilot" (deprecated)
+		{name: "ByokCopilotFeatureFlag", constant: constants.ByokCopilotFeatureFlag, expected: "byok-copilot"},
 		// From spec: IntegrityReactionsFeatureFlag // "integrity-reactions"
 		{name: "IntegrityReactionsFeatureFlag", constant: constants.IntegrityReactionsFeatureFlag, expected: "integrity-reactions"},
-		// From spec: GroupConcurrencyQueueFeatureFlag // "group-concurrency-queue"
-		{name: "GroupConcurrencyQueueFeatureFlag", constant: constants.GroupConcurrencyQueueFeatureFlag, expected: "group-concurrency-queue"},
 	}
 
 	for _, tt := range tests {
@@ -455,4 +463,132 @@ func TestSpec_ModelEnvVars_Pi(t *testing.T) {
 func TestSpec_VersionConstants_DefaultPiVersion(t *testing.T) {
 	assert.NotEmpty(t, constants.DefaultPiVersion.String(),
 		"DefaultPiVersion should be a non-empty Version as documented")
+}
+
+// TestSpec_CopilotBYOK validates the documented Copilot BYOK constants.
+// Spec section: "### Copilot BYOK"
+func TestSpec_CopilotBYOK(t *testing.T) {
+	// From spec: CopilotBYOKDummyAPIKey // "dummy-byok-key-for-offline-mode"
+	assert.Equal(t, "dummy-byok-key-for-offline-mode", constants.CopilotBYOKDummyAPIKey,
+		"CopilotBYOKDummyAPIKey should match the documented value")
+
+	// From spec: CopilotBYOKDefaultModel // "claude-sonnet-4.6"
+	assert.Equal(t, "claude-sonnet-4.6", constants.CopilotBYOKDefaultModel,
+		"CopilotBYOKDefaultModel should match the documented fallback model")
+}
+
+// TestSpec_RuntimeConfiguration_GhAwRootDir validates the documented runtime root directory
+// constants. Spec section: "## Runtime Configuration"
+func TestSpec_RuntimeConfiguration_GhAwRootDir(t *testing.T) {
+	// From spec: GhAwRootDir // "${{ runner.temp }}/gh-aw" (use in with:/env: YAML)
+	assert.Equal(t, "${{ runner.temp }}/gh-aw", constants.GhAwRootDir,
+		"GhAwRootDir should match the documented GitHub Actions expression form")
+
+	// From spec: GhAwRootDirShell // "${RUNNER_TEMP}/gh-aw" (use inside run: blocks)
+	assert.Equal(t, "${RUNNER_TEMP}/gh-aw", constants.GhAwRootDirShell,
+		"GhAwRootDirShell should match the documented shell environment variable form")
+}
+
+// TestSpec_URLConstants_Values validates the documented URL constant values.
+// Spec section: "## URL Constants"
+func TestSpec_URLConstants_Values(t *testing.T) {
+	// From spec: DefaultMCPRegistryURL // "https://api.mcp.github.com/v0.1"
+	assert.Equal(t, "https://api.mcp.github.com/v0.1", string(constants.DefaultMCPRegistryURL),
+		"DefaultMCPRegistryURL should match the documented value")
+
+	// From spec: PublicGitHubHost // "https://github.com"
+	assert.Equal(t, "https://github.com", string(constants.PublicGitHubHost),
+		"PublicGitHubHost should match the documented value")
+
+	// From spec: DocsEnginesURL // engines reference documentation
+	assert.NotEmpty(t, constants.DocsEnginesURL.String(),
+		"DocsEnginesURL should be a non-empty documentation URL as documented")
+}
+
+// TestSpec_AWFConstants_Values validates the documented AWF constants.
+// Spec section: "## AWF (Agentic Workflow Firewall) Constants"
+func TestSpec_AWFConstants_Values(t *testing.T) {
+	// From spec: AWFDefaultCommand // "sudo -E awf"
+	assert.Equal(t, "sudo -E awf", constants.AWFDefaultCommand,
+		"AWFDefaultCommand should be 'sudo -E awf' as documented")
+
+	// From spec: AWFProxyLogsDir // "/tmp/gh-aw/sandbox/firewall/logs"
+	assert.Equal(t, "/tmp/gh-aw/sandbox/firewall/logs", constants.AWFProxyLogsDir,
+		"AWFProxyLogsDir should match the documented value")
+
+	// From spec: AWFAuditDir // "/tmp/gh-aw/sandbox/firewall/audit"
+	assert.Equal(t, "/tmp/gh-aw/sandbox/firewall/audit", constants.AWFAuditDir,
+		"AWFAuditDir should match the documented value")
+
+	// From spec: AWFDefaultLogLevel // "info"
+	assert.Equal(t, "info", constants.AWFDefaultLogLevel,
+		"AWFDefaultLogLevel should be 'info' as documented")
+}
+
+// TestSpec_ContainerImages_Values validates the documented container image constants.
+// Spec section: "### Images"
+func TestSpec_ContainerImages_Values(t *testing.T) {
+	tests := []struct {
+		name     string
+		actual   string
+		expected string
+	}{
+		// From spec: DefaultNodeAlpineLTSImage // "node:lts-alpine"
+		{name: "DefaultNodeAlpineLTSImage", actual: constants.DefaultNodeAlpineLTSImage, expected: "node:lts-alpine"},
+		// From spec: DefaultPythonAlpineLTSImage // "python:alpine"
+		{name: "DefaultPythonAlpineLTSImage", actual: constants.DefaultPythonAlpineLTSImage, expected: "python:alpine"},
+		// From spec: DefaultAlpineImage // "alpine:latest"
+		{name: "DefaultAlpineImage", actual: constants.DefaultAlpineImage, expected: "alpine:latest"},
+		// From spec: DevModeGhAwImage // "localhost/gh-aw:dev"
+		{name: "DevModeGhAwImage", actual: constants.DevModeGhAwImage, expected: "localhost/gh-aw:dev"},
+		// From spec: DefaultMCPGatewayContainer // "ghcr.io/github/gh-aw-mcpg"
+		{name: "DefaultMCPGatewayContainer", actual: constants.DefaultMCPGatewayContainer, expected: "ghcr.io/github/gh-aw-mcpg"},
+		// From spec: DefaultFirewallRegistry // "ghcr.io/github/gh-aw-firewall"
+		{name: "DefaultFirewallRegistry", actual: constants.DefaultFirewallRegistry, expected: "ghcr.io/github/gh-aw-firewall"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.expected, tt.actual,
+				"container image %s should have documented value %q", tt.name, tt.expected)
+		})
+	}
+}
+
+// TestSpec_PublicAPI_GetWorkflowDir validates the documented GetWorkflowDir function.
+// Spec section: "## Runtime Configuration"
+//
+// Specification:
+// "GetWorkflowDir returns '.github/workflows' (or override from GH_AW_WORKFLOWS_DIR env var)"
+// "GetWorkflowDir() reads GH_AW_WORKFLOWS_DIR from the environment at call time,
+// allowing the directory to be overridden in tests and CI."
+func TestSpec_PublicAPI_GetWorkflowDir(t *testing.T) {
+	t.Run("returns documented default when env var is unset", func(t *testing.T) {
+		t.Setenv("GH_AW_WORKFLOWS_DIR", "")
+		assert.Equal(t, ".github/workflows", constants.GetWorkflowDir(),
+			"GetWorkflowDir should return '.github/workflows' when GH_AW_WORKFLOWS_DIR is unset")
+	})
+
+	t.Run("respects override from GH_AW_WORKFLOWS_DIR env var", func(t *testing.T) {
+		t.Setenv("GH_AW_WORKFLOWS_DIR", "custom/workflows")
+		assert.Equal(t, "custom/workflows", constants.GetWorkflowDir(),
+			"GetWorkflowDir should return the override when GH_AW_WORKFLOWS_DIR is set")
+	})
+}
+
+// TestSpec_RuntimeConfiguration_MaxSymlinkDepth validates the documented
+// MaxSymlinkDepth constant. Spec section: "## Runtime Configuration"
+// Spec: MaxSymlinkDepth // 5 — max recursive symlink depth for remote file fetching
+func TestSpec_RuntimeConfiguration_MaxSymlinkDepth(t *testing.T) {
+	assert.Equal(t, 5, constants.MaxSymlinkDepth,
+		"MaxSymlinkDepth should be 5 as documented")
+}
+
+// TestSpec_RuntimeConfiguration_DefaultActivationJobRunnerImage validates
+// the documented default activation job runner image.
+// Spec section: "## Runtime Configuration"
+// Spec: DefaultActivationJobRunnerImage // "ubuntu-slim"
+func TestSpec_RuntimeConfiguration_DefaultActivationJobRunnerImage(t *testing.T) {
+	assert.Equal(t, "ubuntu-slim", constants.DefaultActivationJobRunnerImage,
+		"DefaultActivationJobRunnerImage should be 'ubuntu-slim' as documented")
 }

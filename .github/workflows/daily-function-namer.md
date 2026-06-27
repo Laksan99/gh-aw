@@ -1,10 +1,13 @@
 ---
+private: true
+emoji: "🔧"
 name: Daily Go Function Namer
 description: Analyzes one entire Go package per day using Serena to extract function names and suggest renames that improve agent discoverability, using round-robin over package directories via cache-memory
 on:
   schedule: daily
   workflow_dispatch:
 
+max-daily-ai-credits: 10000
 permissions:
   contents: read
   issues: read
@@ -12,7 +15,9 @@ permissions:
 
 tracker-id: daily-function-namer
 
-engine: claude
+engine:
+  id: pi
+  model: copilot/gpt-5.4
 
 imports:
   - uses: shared/daily-audit-base.md
@@ -21,7 +26,7 @@ imports:
       expires: 3d
   - shared/mcp/serena-go.md
 
-  - shared/observability-otlp.md
+  - shared/otlp.md
 safe-outputs:
   create-issue:
     expires: 7d
@@ -30,6 +35,9 @@ safe-outputs:
     max: 1
     close-older-issues: true
 
+sandbox:
+  agent:
+    sudo: false
 tools:
   cli-proxy: true
   cache-memory: true
@@ -40,9 +48,8 @@ tools:
 
 timeout-minutes: 30
 strict: true
-
-firewall:
-  effective-token-steering: true
+features:
+  gh-aw-detection: true
 ---
 
 # Daily Go Function Namer
@@ -252,6 +259,8 @@ If the state file was missing at the start of the run, initialize it from scratc
 
 If any rename suggestions were found across the analyzed package, create a GitHub issue.
 
+Use h3 (`###`) or lower for all headers in the issue body. Never use h1 (`#`) or h2 (`##`) — these are reserved for the issue title.
+
 If **no improvements were found**, emit `noop` and exit:
 
 ```json
@@ -267,7 +276,7 @@ Otherwise, create an issue with this structure:
 **Body**:
 
 ```markdown
-# 🏷️ Go Function Rename Plan
+### 🏷️ Go Function Rename Plan
 
 **Package Analyzed**: `<package>`
 **Analysis Date**: <YYYY-MM-DD>

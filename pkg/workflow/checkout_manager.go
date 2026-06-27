@@ -4,6 +4,7 @@ import (
 	"strings"
 
 	"github.com/github/gh-aw/pkg/logger"
+	"github.com/github/gh-aw/pkg/setutil"
 )
 
 var checkoutManagerLog = logger.New("workflow:checkout_manager")
@@ -97,6 +98,11 @@ type CheckoutConfig struct {
 	// When true, the effective repository becomes "{repository}.wiki" (e.g. "owner/repo.wiki").
 	// Defaults to false.
 	Wiki bool `json:"wiki,omitempty"`
+
+	// CleanGitCredentials keeps actions/checkout credential persistence enabled and
+	// injects a follow-up cleanup step that removes credentials from git config files
+	// (including submodule configs) without using git submodule foreach.
+	CleanGitCredentials bool `json:"force-clean-git-credentials,omitempty"`
 }
 
 // checkoutKey uniquely identifies a checkout target used for grouping/deduplication.
@@ -122,6 +128,7 @@ type resolvedCheckout struct {
 	lfs            bool
 	current        bool     // true if this checkout is the logical current repository
 	fetchRefs      []string // merged fetch ref patterns (see CheckoutConfig.Fetch)
+	cleanCreds     bool     // true enables persist-credentials + injected cleanup step
 	// wiki is intentionally not stored here; use entry.key.wiki instead.
 }
 
@@ -155,6 +162,23 @@ type CheckoutManager struct {
 	// on the default-branch checkout behaviour.
 	// An empty string means the checkout uses the repository's default branch.
 	crossRepoTargetRef string
+	// keepCredentialsForPush, when true, makes every generated checkout step retain its
+	// credentials (persist-credentials: true) and suppresses the post-checkout credential
+	// cleanup step. This is enabled for the safe_outputs job, which legitimately performs
+	// git fetch/push against the checked-out repositories (e.g. push_to_pull_request_branch,
+	// create_pull_request) and therefore needs the push-capable token left on disk.
+	//
+	// The agent job leaves this false: the untrusted agent must not be able to read
+	// credentials from disk, so its checkouts use persist-credentials: false.
+	keepCredentialsForPush bool
+	// pushToken is the token expression persisted into .git/config by every generated
+	// checkout step when keepCredentialsForPush is enabled and the checkout entry does
+	// not carry its own explicit token/app auth. Setting this ensures the credential
+	// retained on disk matches the token the safe_outputs handlers use to push, so a
+	// single (correct) Authorization header is sent and no separate per-command
+	// http.extraheader injection is required. Empty means "fall back to the
+	// actions/checkout default token".
+	pushToken string
 }
 
 // NewCheckoutManager creates a new CheckoutManager pre-loaded with user-supplied
@@ -203,6 +227,24 @@ func (cm *CheckoutManager) SetCrossRepoTargetRef(ref string) {
 // SetCrossRepoTargetRef, or an empty string if no cross-repo ref was set.
 func (cm *CheckoutManager) GetCrossRepoTargetRef() string {
 	return cm.crossRepoTargetRef
+}
+
+// SetKeepCredentialsForPush enables credential retention on all generated checkout steps.
+// Call this for the safe_outputs job so the push-capable token installed at checkout time
+// remains in .git/config for subsequent git fetch/push operations. The agent job must not
+// call this; its checkouts intentionally strip credentials (persist-credentials: false).
+func (cm *CheckoutManager) SetKeepCredentialsForPush(keep bool) {
+	checkoutManagerLog.Printf("Setting keepCredentialsForPush: %t", keep)
+	cm.keepCredentialsForPush = keep
+}
+
+// SetPushToken sets the token expression persisted into .git/config by the generated
+// checkout steps when keepCredentialsForPush is enabled. Call this for the safe_outputs
+// job with the resolved PR push token so the retained credential matches the token the
+// handlers use to fetch/push. Has no effect on entries that declare their own token/app.
+func (cm *CheckoutManager) SetPushToken(token string) {
+	checkoutManagerLog.Printf("Setting pushToken: present=%t", token != "")
+	cm.pushToken = token
 }
 
 // add processes a single CheckoutConfig and either creates a new entry or merges
@@ -259,6 +301,9 @@ func (cm *CheckoutManager) add(cfg *CheckoutConfig) {
 		if len(cfg.Fetch) > 0 {
 			entry.fetchRefs = mergeFetchRefs(entry.fetchRefs, cfg.Fetch)
 		}
+		if cfg.CleanGitCredentials {
+			entry.cleanCreds = true
+		}
 		checkoutManagerLog.Printf("Merged checkout for path=%q repository=%q", key.path, key.repository)
 	} else {
 		entry := &resolvedCheckout{
@@ -270,6 +315,7 @@ func (cm *CheckoutManager) add(cfg *CheckoutConfig) {
 			submodules: cfg.Submodules,
 			lfs:        cfg.LFS,
 			current:    cfg.Current,
+			cleanCreds: cfg.CleanGitCredentials,
 		}
 		if cfg.SparseCheckout != "" {
 			entry.sparsePatterns = mergeSparsePatterns(nil, cfg.SparseCheckout)
@@ -309,6 +355,51 @@ func (cm *CheckoutManager) HasAppAuth() bool {
 		}
 	}
 	return false
+}
+
+// resolveCheckoutPermissions determines the permissions used when minting checkout
+// GitHub App tokens. Both the agent job and the safe_outputs job resolve them the same
+// way: explicit cached permissions take precedence, then parsed frontmatter permissions,
+// then the default permission set.
+func resolveCheckoutPermissions(data *WorkflowData) *Permissions {
+	switch {
+	case data.CachedPermissions != nil:
+		return data.CachedPermissions
+	case data.Permissions != "":
+		return NewPermissionsParser(data.Permissions).ToPermissions()
+	default:
+		return NewPermissions()
+	}
+}
+
+// GetCurrentRepository returns the repository slug for the checkout marked
+// current:true. Returns an empty string when no current checkout is configured
+// or when the current checkout targets the workflow repository.
+func (cm *CheckoutManager) GetCurrentRepository() string {
+	for _, entry := range cm.ordered {
+		if entry.current {
+			return entry.key.repository
+		}
+	}
+	return ""
+}
+
+// GetCurrentCheckoutPath returns the current checkout path after trimming
+// leading "./" and surrounding whitespace. Returns an empty string when no
+// current checkout is configured or when the current checkout is at workspace
+// root.
+func (cm *CheckoutManager) GetCurrentCheckoutPath() string {
+	for _, entry := range cm.ordered {
+		if !entry.current {
+			continue
+		}
+		path := strings.TrimSpace(strings.TrimPrefix(entry.key.path, "./"))
+		if path == "." || path == "" {
+			return ""
+		}
+		return path
+	}
+	return ""
 }
 
 // HasExternalRootCheckout returns true if any checkout entry targets an external
@@ -357,21 +448,24 @@ func deeperFetchDepth(a, b *int) *int {
 // mergeSparsePatterns parses and unions sparse-checkout patterns.
 // Patterns can be newline-separated.
 func mergeSparsePatterns(existing []string, newPatterns string) []string {
-	seen := make(map[string]bool, len(existing))
+	seen := make(map[string]struct {
+	}, len(existing))
 	result := make([]string, 0, len(existing))
 
 	for _, p := range existing {
 		p = strings.TrimSpace(p)
-		if p != "" && !seen[p] {
-			seen[p] = true
+		if p != "" && !setutil.Contains(seen, p) {
+			seen[p] = struct {
+			}{}
 			result = append(result, p)
 		}
 	}
 
 	for p := range strings.SplitSeq(newPatterns, "\n") {
 		p = strings.TrimSpace(p)
-		if p != "" && !seen[p] {
-			seen[p] = true
+		if p != "" && !setutil.Contains(seen, p) {
+			seen[p] = struct {
+			}{}
 			result = append(result, p)
 		}
 	}
@@ -381,19 +475,22 @@ func mergeSparsePatterns(existing []string, newPatterns string) []string {
 
 // mergeFetchRefs unions two sets of fetch ref patterns preserving insertion order.
 func mergeFetchRefs(existing []string, newRefs []string) []string {
-	seen := make(map[string]bool, len(existing))
+	seen := make(map[string]struct {
+	}, len(existing))
 	result := make([]string, 0)
 	for _, r := range existing {
 		r = strings.TrimSpace(r)
-		if r != "" && !seen[r] {
-			seen[r] = true
+		if r != "" && !setutil.Contains(seen, r) {
+			seen[r] = struct {
+			}{}
 			result = append(result, r)
 		}
 	}
 	for _, r := range newRefs {
 		r = strings.TrimSpace(r)
-		if r != "" && !seen[r] {
-			seen[r] = true
+		if r != "" && !setutil.Contains(seen, r) {
+			seen[r] = struct {
+			}{}
 			result = append(result, r)
 		}
 	}

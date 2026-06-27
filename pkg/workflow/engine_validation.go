@@ -51,9 +51,36 @@ import (
 var engineValidationLog = newValidationLogger("engine")
 var safeHarnessScriptPattern = regexp.MustCompile(`^[A-Za-z0-9_][A-Za-z0-9._-]*$`)
 
-// validateEngineVersion warns (non-strict) or errors (strict) when the workflow
-// explicitly pins the engine CLI to "latest". Unpinned "latest" versions change
-// unpredictably and undermine supply chain security guarantees.
+// safeSDKDriverSegmentPattern allows path segments that may start with a dot followed by an
+// alphanumeric/underscore (e.g. ".github"), but still rejects ".." traversals, leading hyphens,
+// and shell metacharacters.
+var safeSDKDriverSegmentPattern = regexp.MustCompile(`^(?:\.[A-Za-z0-9_]|[A-Za-z0-9_])[A-Za-z0-9._-]*$`)
+
+func validateEngineScriptFilename(fieldName, scriptName string) error {
+	if strings.TrimSpace(scriptName) != scriptName {
+		return fmt.Errorf("%s must be a safe basename without leading/trailing whitespace (found: %s).\n\nSee: %s", fieldName, scriptName, constants.DocsEnginesURL)
+	}
+
+	if filepath.IsAbs(scriptName) ||
+		strings.Contains(scriptName, "/") ||
+		strings.Contains(scriptName, `\`) ||
+		strings.Contains(scriptName, "..") ||
+		!safeHarnessScriptPattern.MatchString(scriptName) {
+		return fmt.Errorf("%s must be a safe basename (no path separators, '..', or shell metacharacters) ending with .js, .cjs, or .mjs (found: %s).\n\nSee: %s", fieldName, scriptName, constants.DocsEnginesURL)
+	}
+
+	ext := strings.ToLower(filepath.Ext(scriptName))
+	switch ext {
+	case ".js", ".cjs", ".mjs":
+		return nil
+	default:
+		return fmt.Errorf("%s must be a Node.js script ending with .js, .cjs, or .mjs (found: %s).\n\nSee: %s", fieldName, scriptName, constants.DocsEnginesURL)
+	}
+}
+
+// validateEngineVersion warns when the workflow explicitly pins the engine CLI
+// to "latest". Unpinned "latest" versions change unpredictably and undermine
+// supply chain security guarantees.
 func (c *Compiler) validateEngineVersion(workflowData *WorkflowData) error {
 	if workflowData.EngineConfig == nil || workflowData.EngineConfig.Version == "" {
 		// No explicit version set; the compiler uses its own pinned default.
@@ -71,10 +98,6 @@ func (c *Compiler) validateEngineVersion(workflowData *WorkflowData) error {
 		"and may introduce vulnerabilities or breaking changes. " +
 		"Pin the engine version to a specific version for reproducibility and security."
 
-	if c.strictMode {
-		return fmt.Errorf("strict mode: %s", warningMsg)
-	}
-
 	fmt.Fprintln(os.Stderr, console.FormatWarningMessage(warningMsg))
 	c.IncrementWarningCount()
 	return nil
@@ -87,25 +110,68 @@ func (c *Compiler) validateEngineHarnessScript(workflowData *WorkflowData) error
 		return nil
 	}
 
-	harnessScript := workflowData.EngineConfig.HarnessScript
-	if strings.TrimSpace(harnessScript) != harnessScript {
-		return fmt.Errorf("engine.harness must be a safe basename without leading/trailing whitespace (found: %s).\n\nSee: %s", workflowData.EngineConfig.HarnessScript, constants.DocsEnginesURL)
+	return validateEngineScriptFilename("engine.harness", workflowData.EngineConfig.HarnessScript)
+}
+
+// validateEngineDriver validates the shared engine.driver field (also accepted as
+// engine.copilot-sdk-driver for backward compatibility with the copilot engine).
+// engine.driver must be either:
+//   - a relative path (with safe segments separated by '/') ending with a supported
+//     extension for the engine in use, or
+//   - a bare command name without any extension (treated as an arbitrary executable in
+//     PATH for the copilot engine, or as a built-in driver for the pi engine).
+//
+// The allowed extensions depend on the engine:
+//   - copilot: .js, .cjs, .mjs (Node.js), .py (Python), .ts/.mts (TypeScript), .rb (Ruby)
+//   - all other engines (e.g. pi): .js, .cjs, .mjs only
+//
+// Absolute paths, backslashes, '..' components, and shell metacharacters are rejected.
+func (c *Compiler) validateEngineDriver(workflowData *WorkflowData) error {
+	if workflowData == nil || workflowData.EngineConfig == nil || workflowData.EngineConfig.Driver == "" {
+		return nil
 	}
 
-	if filepath.IsAbs(harnessScript) ||
-		strings.Contains(harnessScript, "/") ||
-		strings.Contains(harnessScript, `\`) ||
-		strings.Contains(harnessScript, "..") ||
-		!safeHarnessScriptPattern.MatchString(harnessScript) {
-		return fmt.Errorf("engine.harness must be a safe basename (no path separators, '..', or shell metacharacters) ending with .js, .cjs, or .mjs (found: %s).\n\nSee: %s", workflowData.EngineConfig.HarnessScript, constants.DocsEnginesURL)
+	name := workflowData.EngineConfig.Driver
+	isCopilotEngine := workflowData.EngineConfig.ID == "copilot"
+
+	if strings.TrimSpace(name) != name {
+		return fmt.Errorf("engine.driver must be a safe path without leading/trailing whitespace (found: %s).\n\nSee: %s", name, constants.DocsEnginesURL)
 	}
 
-	ext := strings.ToLower(filepath.Ext(harnessScript))
+	if filepath.IsAbs(name) ||
+		strings.Contains(name, `\`) ||
+		strings.Contains(name, "..") {
+		return fmt.Errorf("engine.driver must be a relative path (no absolute paths, '..', or backslashes) with a supported extension (found: %s).\n\nSee: %s", name, constants.DocsEnginesURL)
+	}
+
+	// Each path segment must be safe (alphanumeric, underscore, dot, hyphen; may start with dot).
+	// Empty segments (consecutive slashes, leading/trailing slashes) are rejected.
+	for segment := range strings.SplitSeq(name, "/") {
+		if segment == "" {
+			return fmt.Errorf("engine.driver must not contain empty path segments (e.g. consecutive '/' or leading/trailing '/') (found: %s).\n\nSee: %s", name, constants.DocsEnginesURL)
+		}
+		if !safeSDKDriverSegmentPattern.MatchString(segment) {
+			return fmt.Errorf("engine.driver must not contain shell metacharacters (found unsafe segment %q in: %s).\n\nSee: %s", segment, name, constants.DocsEnginesURL)
+		}
+	}
+
+	ext := strings.ToLower(filepath.Ext(name))
 	switch ext {
 	case ".js", ".cjs", ".mjs":
 		return nil
+	case ".py", ".ts", ".mts", ".rb":
+		if isCopilotEngine {
+			return nil
+		}
+		return fmt.Errorf("engine.driver has unsupported extension %q for this engine (found: %s). Must be a JavaScript file ending with .js, .cjs, or .mjs, or a bare name without an extension.\n\nSee: %s", ext, name, constants.DocsEnginesURL)
+	case "":
+		// No extension — valid as a bare built-in driver name or arbitrary command in PATH.
+		return nil
 	default:
-		return fmt.Errorf("engine.harness must be a Node.js script ending with .js, .cjs, or .mjs (found: %s).\n\nSee: %s", workflowData.EngineConfig.HarnessScript, constants.DocsEnginesURL)
+		if isCopilotEngine {
+			return fmt.Errorf("engine.driver has unsupported extension %q (found: %s). Must be a script ending with .js, .cjs, .mjs, .py, .ts, .mts, or .rb, or a bare command name without an extension.\n\nSee: %s", ext, name, constants.DocsEnginesURL)
+		}
+		return fmt.Errorf("engine.driver has unsupported extension %q (found: %s). Must be a JavaScript file ending with .js, .cjs, or .mjs, or a bare name without an extension.\n\nSee: %s", ext, name, constants.DocsEnginesURL)
 	}
 }
 
@@ -415,9 +481,10 @@ func (c *Compiler) validateSingleEngineSpecification(mainEngineSetting string, i
 // This is used to determine whether the secret_verification_result job output should be added.
 //
 // The validate-secret step is provided by engines that override GetSecretValidationStep():
-//   - Copilot engine: Adds step unless copilot-requests feature is enabled or custom command is set
+//   - Copilot engine: Adds step unless permissions.copilot-requests is write or custom command is set
 //   - Claude engine: Adds step unless custom command is set
 //   - Codex engine: Adds step unless custom command is set
+//   - Antigravity engine: Adds step unless custom command is set
 //   - Gemini engine: Adds step unless custom command is set
 //   - Custom engine: Never adds this step (uses BaseEngine default which returns empty)
 //

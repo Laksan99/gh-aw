@@ -8,6 +8,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/github/gh-aw/pkg/constants"
 	"golang.org/x/crypto/nacl/box"
 )
 
@@ -127,10 +128,9 @@ func TestEncryptWithPublicKeyEmptyPlaintext(t *testing.T) {
 	if encrypted == "" {
 		t.Error("expected non-empty ciphertext even for empty plaintext")
 	}
-	// NaCl sealed box adds 48 bytes overhead (16 auth + 32 ephemeral pubkey)
-	// So even empty plaintext should produce base64 of at least 64 characters
-	if len(encrypted) < 64 {
-		t.Errorf("encrypted length = %d, expected at least 64 (base64 of 48-byte overhead)", len(encrypted))
+	minBase64CiphertextLen := base64.StdEncoding.EncodedLen(box.AnonymousOverhead)
+	if len(encrypted) < minBase64CiphertextLen {
+		t.Errorf("encrypted length = %d, expected at least %d", len(encrypted), minBase64CiphertextLen)
 	}
 }
 
@@ -165,4 +165,46 @@ func TestEncryptDecryptRoundTrip(t *testing.T) {
 	if string(decrypted) != plaintext {
 		t.Errorf("decrypted = %q, want %q", string(decrypted), plaintext)
 	}
+}
+
+func TestSecretSetClientOptions(t *testing.T) {
+	t.Run("defaults include timeout", func(t *testing.T) {
+		opts := secretSetClientOptions("")
+		if opts.Host != "" {
+			t.Fatalf("expected empty host, got %q", opts.Host)
+		}
+		if opts.Timeout != constants.DefaultHTTPClientTimeout {
+			t.Fatalf("expected timeout %s, got %s", constants.DefaultHTTPClientTimeout, opts.Timeout)
+		}
+	})
+
+	t.Run("normalizes host when api-url is provided", func(t *testing.T) {
+		opts := secretSetClientOptions("https://ghe.example.com")
+		if opts.Host != "ghe.example.com" {
+			t.Fatalf("expected host ghe.example.com, got %q", opts.Host)
+		}
+		if opts.Timeout != constants.DefaultHTTPClientTimeout {
+			t.Fatalf("expected timeout %s, got %s", constants.DefaultHTTPClientTimeout, opts.Timeout)
+		}
+	})
+
+	t.Run("strips API path from api-url", func(t *testing.T) {
+		opts := secretSetClientOptions("https://ghe.example.com/api/v3")
+		if opts.Host != "ghe.example.com" {
+			t.Fatalf("expected host ghe.example.com, got %q", opts.Host)
+		}
+		if opts.Timeout != constants.DefaultHTTPClientTimeout {
+			t.Fatalf("expected timeout %s, got %s", constants.DefaultHTTPClientTimeout, opts.Timeout)
+		}
+	})
+
+	t.Run("maps api.github.com to github.com", func(t *testing.T) {
+		opts := secretSetClientOptions("https://api.github.com")
+		if opts.Host != "github.com" {
+			t.Fatalf("expected host github.com, got %q", opts.Host)
+		}
+		if opts.Timeout != constants.DefaultHTTPClientTimeout {
+			t.Fatalf("expected timeout %s, got %s", constants.DefaultHTTPClientTimeout, opts.Timeout)
+		}
+	})
 }
